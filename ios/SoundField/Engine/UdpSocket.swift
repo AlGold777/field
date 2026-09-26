@@ -11,24 +11,25 @@ final class UdpSocket {
     var onPacket: ((UnsafeRawBufferPointer, Addr, Int64) -> Void)?
 
     init?() {
-        fd = socket(AF_INET6, SOCK_DGRAM, IPPROTO_UDP)
-        guard fd >= 0 else { return nil }
+        let socketFD = socket(AF_INET6, SOCK_DGRAM, IPPROTO_UDP)
+        guard socketFD >= 0 else { return nil }
+        fd = socketFD
         var off: Int32 = 0
-        setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &off, socklen_t(MemoryLayout<Int32>.size))
+        setsockopt(socketFD, IPPROTO_IPV6, IPV6_V6ONLY, &off, socklen_t(MemoryLayout<Int32>.size))
         var tos: Int32 = 0xB8 // DSCP EF — приоритетный трафик (если сеть учитывает)
-        setsockopt(fd, IPPROTO_IPV6, IPV6_TCLASS, &tos, socklen_t(MemoryLayout<Int32>.size))
+        setsockopt(socketFD, IPPROTO_IPV6, IPV6_TCLASS, &tos, socklen_t(MemoryLayout<Int32>.size))
         var addr = sockaddr_in6()
         addr.sin6_family = sa_family_t(AF_INET6)
         addr.sin6_len = UInt8(MemoryLayout<sockaddr_in6>.size)
         addr.sin6_addr = in6addr_any
         addr.sin6_port = 0
         let ok = withUnsafePointer(to: &addr) {
-            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in6>.size)) }
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { bind(socketFD, $0, socklen_t(MemoryLayout<sockaddr_in6>.size)) }
         }
-        guard ok == 0 else { close(fd); return nil }
+        guard ok == 0 else { close(socketFD); return nil }
         var bound = sockaddr_in6(); var len = socklen_t(MemoryLayout<sockaddr_in6>.size)
         _ = withUnsafeMutablePointer(to: &bound) {
-            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { getsockname(fd, $0, &len) }
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { getsockname(socketFD, $0, &len) }
         }
         port = UInt16(bigEndian: bound.sin6_port)
         let t = Thread { [weak self] in self?.loop() }
