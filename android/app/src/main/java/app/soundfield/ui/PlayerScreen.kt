@@ -56,7 +56,12 @@ fun PlayerScreen(ui: UiState, engine: Engine, openCalibration: () -> Unit, openD
         Row(Modifier.fillMaxWidth().padding(vertical = 28.dp), horizontalArrangement = Arrangement.SpaceEvenly,
             verticalAlignment = Alignment.CenterVertically) {
             SpeakerCircle("L", Ch.L, ui.playing, leftName, roleOf(Ch.L), leftIsMe) { engine.swapChannels() }
-            Box(Modifier.width(40.dp).height(2.dp).background(SFColors.accent))
+            Box(Modifier.width(48.dp).height(44.dp).offset(y = (-20).dp)
+                .clickable(role = androidx.compose.ui.semantics.Role.Button,
+                    onClickLabel = "Поменять каналы L и R") { engine.swapChannels() },
+                contentAlignment = Alignment.Center) {
+                Box(Modifier.width(40.dp).height(2.dp).background(SFColors.accent))
+            }
             SpeakerCircle("R", Ch.R, ui.playing, rightName, roleOf(Ch.R), !leftIsMe) { engine.swapChannels() }
         }
 
@@ -172,7 +177,6 @@ fun PlayerScreen(ui: UiState, engine: Engine, openCalibration: () -> Unit, openD
                 onChange = { r = it; engine.setVolume("R", it) })
         }
 
-        SecondaryButton("🔄  Поменять L/R местами") { engine.swapChannels() }
         SecondaryButton("🎯  Калибровка задержки") { openCalibration() }
         SecondaryButton("📊  Диагностика пары") { openDiagnostics() }
         DangerButton("⛓  Разорвать пару") { confirmDisconnect = true }

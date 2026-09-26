@@ -94,7 +94,6 @@ struct PlayerView: View {
                         .onChange(of: volR) { if abs($0 - Double(ui.volR)) > 0.004 { engine.setVolume("R", Float($0)) } }
                 }
 
-                SecondaryButton(title: "🔄  Поменять L/R местами") { engine.swapChannels() }
                 SecondaryButton(title: "🎯  Калибровка задержки") { openCalibration() }
                 SecondaryButton(title: "📊  Диагностика пары") { openDiagnostics() }
                 DangerButton(title: "⛓  Разорвать пару") { confirmDisconnect = true }
@@ -200,7 +199,14 @@ struct PlayerView: View {
         return HStack {
             SpeakerCircle(label: "L", ch: Ch.L, playing: ui.playing, caption: leftIsMe ? "Этот телефон" : ui.peerName,
                           sub: role(Ch.L), highlight: leftIsMe) { engine.swapChannels() }
-            Rectangle().fill(SFColor.accent).frame(width: 40, height: 2)
+            Button { engine.swapChannels() } label: {
+                Rectangle().fill(SFColor.accent).frame(width: 40, height: 2)
+                    .frame(width: 48, height: 44)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .offset(y: -20)
+            .accessibilityLabel("Поменять каналы L и R")
             SpeakerCircle(label: "R", ch: Ch.R, playing: ui.playing, caption: leftIsMe ? ui.peerName : "Этот телефон",
                           sub: role(Ch.R), highlight: !leftIsMe) { engine.swapChannels() }
         }
