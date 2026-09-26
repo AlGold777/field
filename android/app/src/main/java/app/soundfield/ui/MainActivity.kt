@@ -11,10 +11,15 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.safeDrawingPadding
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -42,11 +47,25 @@ fun AppRoot(engine: Engine) {
         if (granted) engine.micPermissionGranted()
         else Toast.makeText(ctx, "Без микрофона доступна только ручная калибровка", Toast.LENGTH_LONG).show()
     }
+    val audioFilesLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
+        if (uris.isNotEmpty()) engine.addAudioFiles(uris)
+    }
+    val audioFolderLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
+        if (uri != null) engine.addAudioFiles(listOf(uri))
+    }
+    var showAudioSourceDialog by rememberSaveable { mutableStateOf(false) }
+    var handledPickerRequest by rememberSaveable { mutableIntStateOf(ui.filePickerRequest) }
     LaunchedEffect(Unit) {
         if (Build.VERSION.SDK_INT >= 33) notifLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
     }
     LaunchedEffect(ui.messageId) {
         if (ui.messageId > 0 && ui.message.isNotEmpty()) Toast.makeText(ctx, ui.message, Toast.LENGTH_SHORT).show()
+    }
+    LaunchedEffect(ui.filePickerRequest) {
+        if (ui.filePickerRequest > handledPickerRequest) {
+            handledPickerRequest = ui.filePickerRequest
+            showAudioSourceDialog = true
+        }
     }
     if (!ui.inPair) sub = Sub.NONE
     BackHandler(enabled = sub != Sub.NONE) { sub = Sub.NONE }
@@ -57,7 +76,26 @@ fun AppRoot(engine: Engine) {
             sub == Sub.CALIBRATION -> CalibrationScreen(ui, engine,
                 requestMic = { micLauncher.launch(Manifest.permission.RECORD_AUDIO) }, onBack = { sub = Sub.NONE })
             sub == Sub.DIAGNOSTICS -> DiagnosticsScreen(ui, onBack = { sub = Sub.NONE })
-            else -> PlayerScreen(ui, engine, openCalibration = { sub = Sub.CALIBRATION }, openDiagnostics = { sub = Sub.DIAGNOSTICS })
+            else -> PlayerScreen(ui, engine, openCalibration = { sub = Sub.CALIBRATION }, openDiagnostics = { sub = Sub.DIAGNOSTICS },
+                openTrackPicker = { engine.requestTrackPicker() })
         }
+    }
+    if (showAudioSourceDialog) {
+        AlertDialog(
+            onDismissRequest = { showAudioSourceDialog = false },
+            title = { Text("Добавить музыку") },
+            text = { Text("Выберите отдельные аудиофайлы или папку. Файлы из папки будут добавлены в очередь по имени.") },
+            confirmButton = {
+                TextButton(onClick = { showAudioSourceDialog = false; audioFilesLauncher.launch(arrayOf("audio/*")) }) {
+                    Text("Выбрать файлы")
+                }
+            },
+            dismissButton = {
+                Row {
+                    TextButton(onClick = { showAudioSourceDialog = false; audioFolderLauncher.launch(null) }) { Text("Выбрать папку") }
+                    TextButton(onClick = { showAudioSourceDialog = false }) { Text("Отмена") }
+                }
+            },
+        )
     }
 }

@@ -61,6 +61,12 @@ struct CalibUi: Equatable {
     var needsMicPermission = false
 }
 
+struct QueueTrackUi: Identifiable, Equatable {
+    let id: String
+    let title: String
+    let artist: String
+}
+
 struct UiState: Equatable {
     var myId = ""
     var myName = ""
@@ -77,6 +83,12 @@ struct UiState: Equatable {
     var durationMs: Int64 = 0
     var title = ""
     var artist = ""
+    var queueIndex = -1
+    var queueTracks: [QueueTrackUi] = []
+    var loadingTracks = false
+    var loadingTrackId: String? = nil
+    var queueExpanded = false
+    var filePickerRequest = 0
     var mode: SourceMode = .music
     var volL: Float = 1
     var volR: Float = 1

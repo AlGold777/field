@@ -2,6 +2,7 @@ import Foundation
 import Network
 import UIKit
 import AVFoundation
+import UniformTypeIdentifiers
 
 /// Модель для SwiftUI (главный поток).
 final class AppModel: ObservableObject {
@@ -13,10 +14,18 @@ final class AppModel: ObservableObject {
 /// Потоки: q (serial) — всё состояние сессии; sf-udp — приём UDP; sf-tick — каждые 5 мс отправка аудио (Server)
 /// или PING/NACK (Point); аудиопоток — AudioOutput → ServerRenderer/PointRenderer.
 final class Engine {
+    private struct QueueEntry {
+        let id: String
+        let fileURL: URL
+        let title: String
+        let artist: String
+    }
+
     static let shared = Engine()
 
     let model = AppModel()
     private let q = DispatchQueue(label: "sf.engine", qos: .userInitiated)
+    private let queueIo = DispatchQueue(label: "sf.queue.io", qos: .userInitiated)
     private let defaults = UserDefaults.standard
 
     let myId: String
@@ -25,6 +34,15 @@ final class Engine {
 
     // аудио
     let music: PcmSource
+    private var queue: [QueueEntry] = []
+    private var queueIndex = -1
+    private var hasImportedQueue = false
+    private var pendingTrackId: String?
+    private var currentQueueSource: AudioSource?
+    private var queueRevision = 0
+    private var incomingQueueRevision = -1
+    private var incomingQueueParts = 0
+    private var incomingQueue: [Int: [QueueTrackUi]] = [:]
     private let audio = AudioOutput()
     private let mic = MicRecorder()
 
@@ -104,6 +122,13 @@ final class Engine {
     // ================================================================== запуск
     func boot() {
         q.async { [self] in
+            if let support = try? FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask,
+                                                          appropriateFor: nil, create: true) {
+                let folder = support.appendingPathComponent("SoundField/AudioQueue", isDirectory: true)
+                if let files = try? FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil) {
+                    files.forEach { try? FileManager.default.removeItem(at: $0) }
+                }
+            }
             udp = UdpSocket()
             udp.onPacket = { [weak self] p, from, now in self?.onUdp(p, from, now) }
             discovery = Discovery(queue: q, myId: myId)
@@ -123,6 +148,7 @@ final class Engine {
                 s.myId = myId; s.myName = myName; s.remembered = record
                 s.durationMs = music.totalFrames * 1000 / Int64(SF.sampleRate)
                 s.title = music.title; s.artist = music.artist
+                s.queueExpanded = defaults.bool(forKey: "sf.queueExpanded")
             }
         }
     }
@@ -186,6 +212,76 @@ final class Engine {
     func measure() { cmd("measure") }
     func metronome(_ on: Bool) { cmd("metronome", ["on": on]) }
     func channelTest() { cmd("lrtest") }
+    func requestTrackPicker() {
+        q.async {
+            guard !self.calibRunning else { self.toast("Сначала завершите калибровку"); return }
+            if self.role == .server { self.ui { $0.filePickerRequest += 1 } }
+            else { self.toast("Добавьте файлы на телефоне Server") }
+        }
+    }
+    func addAudioFiles(_ urls: [URL]) {
+        guard !urls.isEmpty else { return }
+        q.async {
+            guard self.role == .server, self.phase == .paired || self.phase == .reconnecting, !self.calibRunning else {
+                self.toast("Добавление музыки сейчас недоступно"); return
+            }
+            self.ui { $0.loadingTracks = true }
+            self.queueIo.async {
+                var prepared: [PreparedAudioFile] = []
+                var failures = 0
+                for selection in urls {
+                    let accessed = selection.startAccessingSecurityScopedResource()
+                    defer { if accessed { selection.stopAccessingSecurityScopedResource() } }
+                    let values = try? selection.resourceValues(forKeys: [.isDirectoryKey])
+                    let candidates: [URL]
+                    if values?.isDirectory == true {
+                        let enumerator = FileManager.default.enumerator(at: selection,
+                            includingPropertiesForKeys: [.isRegularFileKey, .contentTypeKey],
+                            options: [.skipsHiddenFiles, .skipsPackageDescendants])
+                        candidates = (enumerator?.allObjects as? [URL] ?? []).filter { url in
+                            let resource = try? url.resourceValues(forKeys: [.isRegularFileKey, .contentTypeKey])
+                            return resource?.isRegularFile == true && (resource?.contentType?.conforms(to: .audio) == true ||
+                                ["aac", "aif", "aiff", "alac", "amr", "flac", "m4a", "m4b", "mp3", "oga", "ogg", "opus", "wav", "weba", "wma"].contains(url.pathExtension.lowercased()))
+                        }.sorted { $0.path.localizedStandardCompare($1.path) == .orderedAscending }
+                    } else { candidates = [selection] }
+                    for candidate in candidates {
+                        do { prepared.append(try AudioFileDecoder.prepare(candidate)) }
+                        catch { failures += 1; NSLog("SoundField: could not import %@: %@", candidate.lastPathComponent, error.localizedDescription) }
+                    }
+                }
+                self.q.async {
+                    guard self.role == .server, self.phase == .paired || self.phase == .reconnecting, !self.calibRunning else {
+                        prepared.forEach { try? FileManager.default.removeItem(at: $0.url) }
+                        self.ui { $0.loadingTracks = false }
+                        return
+                    }
+                    guard !prepared.isEmpty else {
+                        self.ui { $0.loadingTracks = false }
+                        self.toast("Не удалось открыть аудиофайлы")
+                        return
+                    }
+                    let firstImport = !self.hasImportedQueue
+                    if firstImport {
+                        self.queue.forEach { try? FileManager.default.removeItem(at: $0.fileURL) }
+                        self.queue.removeAll(); self.currentQueueSource = nil; self.queueIndex = -1; self.hasImportedQueue = true
+                    }
+                    self.queue.append(contentsOf: prepared.map { QueueEntry(id: $0.id, fileURL: $0.url, title: $0.title, artist: $0.artist) })
+                    self.ui { $0.queueTracks = self.queue.map { QueueTrackUi(id: $0.id, title: $0.title, artist: $0.artist) } }
+                    self.publishQueue()
+                    if firstImport {
+                        if self.playBox.value.timeline.playing { self.newEpoch(false, self.posFrame(), MonoClock.nowNs()) }
+                        self.selectQueueTrack(at: 0, forcePaused: true)
+                    } else { self.ui { $0.loadingTracks = false }; self.publishState() }
+                    let added = prepared.count
+                    self.toast(failures == 0 ? "Добавлено в очередь: \(added) треков" : "Добавлено: \(added), пропущено файлов: \(failures)")
+                }
+            }
+        }
+    }
+    func selectQueueTrack(_ id: String) { cmd("select", ["id": id]) }
+    func setQueueExpanded(_ expanded: Bool) {
+        q.async { self.defaults.set(expanded, forKey: "sf.queueExpanded"); self.ui { $0.queueExpanded = expanded } }
+    }
     func setVolume(_ ch: String, _ v: Float) {
         q.async { self.ui { s in switch ch { case "L": s.volL = v; case "R": s.volR = v; default: s.master = v } } }
         cmd("vol", ["ch": ch, "v": Double(v)])
@@ -416,11 +512,17 @@ final class Engine {
             }
             sessionId = Int32.random(in: 1...Int32.max)
             pointUdpBox.value = nil; pointClockReady = false
-            if !continuing { mode = .music; source = music; newEpoch(false, 0, MonoClock.nowNs()) } else { rebuildPlayState() }
+            if !continuing {
+                mode = .music
+                source = queue.indices.contains(queueIndex) ? currentQueueSource ?? music : music
+                newEpoch(false, 0, MonoClock.nowNs())
+                if queue.indices.contains(queueIndex), currentQueueSource == nil { selectQueueTrack(at: queueIndex, forcePaused: true) }
+            } else { rebuildPlayState() }
             audio.source = serverRenderer
             l.send(["t": "session", "session": Int(sessionId), "udpPort": Int(udp.port), "name": myName])
             sendTimeline()
             publishState()
+            publishQueue()
         } else {
             sessionId = 0; serverUdpBox.value = nil
             clock.reset(); rx.reset()
@@ -467,6 +569,7 @@ final class Engine {
         if let l = link { link = nil; l.tag = "dead"; if sendBye { l.sendAndClose(["t": "bye"]) } else { l.close() } }
         if let p = pending { pending = nil; p.tag = "dead"; p.close() }
         phase = .idle
+        pendingTrackId = nil
         audio.source = nil
         DispatchQueue.main.async { self.audio.stop() }
         playBox.value = ServerPlayState(timeline: .none, source: music, channel: Ch.L, gain: 0)
@@ -477,6 +580,7 @@ final class Engine {
         ui { s in
             s.phase = .idle; s.linkOk = false; s.remembered = record; s.playing = false; s.calib = CalibUi()
             s.serverDiag = Diag(); s.pointDiag = Diag()
+            s.loadingTracks = false; s.loadingTrackId = nil
         }
         toast(reason)
     }
@@ -514,6 +618,7 @@ final class Engine {
                 NSLog("SoundField: не удалось определить адрес Server")
             }
         case "state": if role == .point { applyState(o) }
+        case "queue": if role == .point { applyQueue(o) }
         case "timeline":
             if role == .point {
                 rx.onTimeline(Timeline(epoch: Int32(truncatingIfNeeded: J.i64(o, "epoch")), playing: J.b(o, "playing"),
@@ -550,8 +655,40 @@ final class Engine {
     private func stateJson() -> [String: Any] {
         ["t": "state", "playing": playBox.value.timeline.playing, "durFrames": source.totalFrames,
          "title": source.title, "artist": source.artist, "mode": mode.rawValue,
+         "queueIndex": queueIndex, "queueCount": queue.count, "trackId": queue.indices.contains(queueIndex) ? queue[queueIndex].id : "",
          "volL": Double(volL), "volR": Double(volR), "master": Double(master),
          "pointCh": Ch.name(pointChannel), "trimMs": Double(trimNs) / 1e6, "serverName": myName]
+    }
+
+    private func publishQueue() {
+        let tracks = queue.map { QueueTrackUi(id: $0.id, title: $0.title, artist: $0.artist) }
+        ui { $0.queueTracks = tracks; $0.queueIndex = queueIndex }
+        queueRevision += 1
+        let parts = max(1, (tracks.count + 99) / 100)
+        for part in 0..<parts {
+            let items: [[String: String]] = tracks.dropFirst(part * 100).prefix(100).map {
+                ["id": $0.id, "title": $0.title, "artist": $0.artist]
+            }
+            link?.send(["t": "queue", "revision": queueRevision, "part": part, "parts": parts, "items": items])
+        }
+    }
+
+    private func applyQueue(_ o: [String: Any]) {
+        let revision = Int(J.i64(o, "revision", -1)), part = Int(J.i64(o, "part", -1)), parts = Int(J.i64(o, "parts"))
+        guard revision >= 0, parts > 0, parts <= 10_000, part >= 0, part < parts,
+              let rawItems = o["items"] as? [[String: Any]] else { return }
+        if revision != incomingQueueRevision {
+            incomingQueueRevision = revision; incomingQueueParts = parts; incomingQueue.removeAll()
+        }
+        guard incomingQueueParts == parts else { return }
+        incomingQueue[part] = rawItems.compactMap { item in
+            let id = J.s(item, "id")
+            guard !id.isEmpty else { return nil }
+            return QueueTrackUi(id: id, title: J.s(item, "title"), artist: J.s(item, "artist"))
+        }
+        if incomingQueue.count == incomingQueueParts {
+            ui { $0.queueTracks = (0..<incomingQueueParts).flatMap { incomingQueue[$0] ?? [] } }
+        }
     }
 
     private func publishState() {
@@ -572,6 +709,7 @@ final class Engine {
         ui { s in
             s.playing = playing; s.durationMs = dur * 1000 / Int64(SF.sampleRate)
             s.title = J.s(o, "title"); s.artist = J.s(o, "artist"); s.mode = SourceMode(rawValue: J.s(o, "mode")) ?? .music
+            s.queueIndex = Int(J.i64(o, "queueIndex", -1))
             s.volL = vL; s.volR = vR; s.master = m; s.pointChannel = pCh; s.trimMs = trim
         }
     }
@@ -589,6 +727,9 @@ final class Engine {
         case "toggle": if playBox.value.timeline.playing && mode != .calib { cmdPause() } else { cmdPlay() }
         case "seek": seekFrame(J.i64(o, "ms") * sr / 1000)
         case "skip": seekFrame(posFrame() + J.i64(o, "ms") * sr / 1000)
+        case "next": selectQueueTrack(at: queueIndex + 1)
+        case "previous": selectQueueTrack(at: max(0, queueIndex - 1))
+        case "select": selectQueueTrack(id: J.s(o, "id"))
         case "vol":
             let v = Float(min(1, max(0, J.d(o, "v", 1))))
             switch J.s(o, "ch") { case "L": volL = v; case "R": volR = v; default: master = v }
@@ -638,23 +779,59 @@ final class Engine {
 
     private func startTestMode(_ src: AudioSource) {
         guard !calibRunning else { return }
+        pendingTrackId = nil
+        ui { $0.loadingTracks = false; $0.loadingTrackId = nil }
         if mode == .music { savedFrame = posFrame(); savedPlaying = playBox.value.timeline.playing }
         mode = src.mode; source = src
         newEpoch(true, 0, MonoClock.nowNs() + SF.startDelayNs)
     }
 
     private func restoreMusic(_ resume: Bool) {
-        mode = .music; source = music
+        mode = .music
+        source = queue.indices.contains(queueIndex) ? currentQueueSource ?? music : music
         let now = MonoClock.nowNs()
         newEpoch(resume, savedFrame, resume ? now + SF.startDelayNs : now)
+    }
+
+    private func selectQueueTrack(id: String) {
+        guard let index = queue.firstIndex(where: { $0.id == id }) else { return }
+        selectQueueTrack(at: index)
+    }
+
+    private func selectQueueTrack(at index: Int, forcePaused: Bool = false) {
+        guard !calibRunning, (phase == .paired || phase == .reconnecting), queue.indices.contains(index) else { return }
+        let item = queue[index]
+        guard queueIndex != index || pendingTrackId != nil else { return }
+        let shouldPlay = !forcePaused && playBox.value.timeline.playing
+        pendingTrackId = item.id
+        ui { $0.loadingTracks = true; $0.loadingTrackId = item.id }
+        queueIo.async {
+            let loaded = try? AudioFileDecoder.decode(PreparedAudioFile(id: item.id, url: item.fileURL, title: item.title, artist: item.artist))
+            self.q.async {
+                guard self.pendingTrackId == item.id, self.queue.indices.contains(index), self.queue[index].id == item.id,
+                      self.role == .server, !self.calibRunning else { return }
+                self.pendingTrackId = nil
+                guard let loaded else {
+                    self.ui { $0.loadingTracks = false; $0.loadingTrackId = nil }
+                    self.toast("Не удалось загрузить «\(item.title)»")
+                    return
+                }
+                self.queueIndex = index; self.mode = .music; self.source = loaded; self.currentQueueSource = loaded; self.savedFrame = 0
+                self.ui { $0.loadingTracks = false; $0.loadingTrackId = nil; $0.queueIndex = index }
+                let now = MonoClock.nowNs()
+                self.newEpoch(shouldPlay, 0, shouldPlay ? now + SF.startDelayNs : now)
+            }
+        }
     }
 
     private func serverTick() {
         guard role == .server, state.inPair else { return }
         let tl = playBox.value.timeline
-        guard tl.playing, tl.positionFrame(MonoClock.nowNs()) >= source.totalFrames else { return }
+        guard tl.playing, pendingTrackId == nil, tl.positionFrame(MonoClock.nowNs()) >= source.totalFrames else { return }
         switch mode {
-        case .music: newEpoch(false, 0, MonoClock.nowNs())
+        case .music:
+            if queueIndex + 1 < queue.count { selectQueueTrack(at: queueIndex + 1) }
+            else { newEpoch(false, source.totalFrames, MonoClock.nowNs()) }
         case .lrtest: restoreMusic(savedPlaying)
         default: break
         }
@@ -663,6 +840,8 @@ final class Engine {
     // ================================================================== калибровка
     private func startCalibration(apply: Bool) {
         guard !calibRunning else { return }
+        pendingTrackId = nil
+        ui { $0.loadingTracks = false; $0.loadingTrackId = nil }
         guard phase == .paired, pointUdpBox.value != nil else {
             broadcastCalib(false, "", "Point не на связи — калибровка невозможна", false, nil); return
         }

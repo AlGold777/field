@@ -10,12 +10,17 @@ import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
+import android.provider.DocumentsContract
+import android.provider.OpenableColumns
 import android.provider.Settings
 import android.util.Log
+import android.net.Uri
 import androidx.core.content.ContextCompat
 import app.soundfield.R
 import app.soundfield.audio.AudioOutput
+import app.soundfield.audio.AudioFileDecoder
 import app.soundfield.audio.MicRecorder
+import app.soundfield.audio.PreparedAudioFile
 import app.soundfield.core.*
 import app.soundfield.service.PlaybackService
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -28,6 +33,7 @@ import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
 import java.security.SecureRandom
+import java.io.File
 import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.TimeUnit
@@ -46,6 +52,8 @@ import kotlin.math.roundToInt
  *  • sf-audio  — AudioOutput, вызывает ServerRenderer/PointRenderer.
  */
 class Engine private constructor(private val app: Context) {
+
+    private data class QueueItem(val id: String, val file: java.io.File, val title: String, val artist: String)
 
     companion object {
         const val TAG = "SoundField"
@@ -78,6 +86,16 @@ class Engine private constructor(private val app: Context) {
 
     // ------------------------------------------------------------------ аудио
     val music: PcmSource = loadMusic()
+    private val queue = mutableListOf<QueueItem>()
+    private val queueIo = Executors.newSingleThreadExecutor { Thread(it, "sf-queue") }
+    private var queueIndex = -1
+    private var hasImportedQueue = false
+    private var pendingTrackId: String? = null
+    private var currentQueueSource: AudioSource? = null
+    private var queueRevision = 0
+    private var incomingQueueRevision = -1
+    private var incomingQueueParts = 0
+    private val incomingQueue = sortedMapOf<Int, List<QueueTrackUi>>()
     private val audio = AudioOutput(app)
     private val mic = MicRecorder(app)
     private val am = app.getSystemService(Context.AUDIO_SERVICE) as AudioManager
@@ -145,6 +163,7 @@ class Engine private constructor(private val app: Context) {
 
     // ================================================================== запуск
     private fun boot() {
+        File(app.filesDir, "audio_queue").listFiles()?.forEach { it.delete() }
         tcp = ServerSocket(0)
         udp = DatagramSocket(0)
         discovery = Discovery(app, myId) { peers -> ui { copy(nearby = peers) } }
@@ -156,7 +175,7 @@ class Engine private constructor(private val app: Context) {
         ex.scheduleAtFixedRate({ try { heartbeat() } catch (t: Throwable) { Log.e(TAG, "hb", t) } }, 1, 1, TimeUnit.SECONDS)
         ex.scheduleAtFixedRate({ try { serverTick() } catch (t: Throwable) { Log.e(TAG, "tick", t) } }, 100, 100, TimeUnit.MILLISECONDS)
         ui { copy(myId = myId, myName = myName, remembered = record, durationMs = music.totalFrames * 1000 / SF.SAMPLE_RATE,
-            title = music.title, artist = music.artist) }
+            title = music.title, artist = music.artist, queueExpanded = prefs.getBoolean("queueExpanded", false)) }
     }
 
     private fun defaultName(): String {
@@ -203,6 +222,114 @@ class Engine private constructor(private val app: Context) {
     fun measure() = cmd("measure")
     fun metronome(on: Boolean) = cmd("metronome") { put("on", on) }
     fun channelTest() = cmd("lrtest")
+    fun nextTrack() = cmd("next")
+    fun previousTrack() = cmd("previous")
+    fun selectTrack(id: String) {
+        if (role == Role.SERVER) post { selectTrack(queue.indexOfFirst { it.id == id }) }
+        else cmd("select") { put("id", id) }
+    }
+    fun setQueueExpanded(expanded: Boolean) = post {
+        prefs.edit().putBoolean("queueExpanded", expanded).apply()
+        ui { copy(queueExpanded = expanded) }
+    }
+    fun requestTrackPicker() {
+        post {
+            if (calibRunning) { toast("Сначала завершите калибровку"); return@post }
+            if (role == Role.SERVER) ui { copy(filePickerRequest = filePickerRequest + 1) }
+            else toast("Добавьте файлы на телефоне Server")
+        }
+    }
+
+    /** Decode picked files (or all audio files under a picked folder), then add them to the Server queue. */
+    fun addAudioFiles(uris: List<Uri>) {
+        if (uris.isEmpty()) return
+        post { if (role != Role.SERVER || calibRunning) { toast("Добавление музыки сейчас недоступно"); return@post }; ui { copy(loadingTracks = true) } }
+        queueIo.execute {
+            val candidates = mutableListOf<Pair<Uri, String>>()
+            uris.forEach { uri ->
+                if (DocumentsContract.isTreeUri(uri)) candidates += listAudioDocuments(uri)
+                else candidates += uri to displayName(uri)
+            }
+            val prepared = candidates.mapNotNull { (uri, name) ->
+                try { AudioFileDecoder.prepare(app, uri, name) }
+                catch (e: Exception) { Log.w(TAG, "Could not decode $name", e); null }
+            }
+            post {
+                if (role != Role.SERVER || (phase != Phase.PAIRED && phase != Phase.RECONNECTING) || calibRunning) {
+                    prepared.forEach { it.file.delete() }
+                    ui { copy(loadingTracks = false) }
+                    return@post
+                }
+                if (prepared.isEmpty()) {
+                    ui { copy(loadingTracks = false) }
+                    toast("Не удалось открыть аудиофайлы")
+                    return@post
+                }
+                val isFirstImport = !hasImportedQueue
+                if (isFirstImport) {
+                    queue.forEach { it.file.delete() }
+                    queue.clear()
+                    currentQueueSource = null
+                    hasImportedQueue = true
+                    queueIndex = -1
+                }
+                queue.addAll(prepared.map { QueueItem(it.id, it.file, it.title, it.artist) })
+                val count = prepared.size
+                val failedCount = candidates.size - count
+                ui { copy(queueTracks = queue.map { QueueTrackUi(it.id, it.title, it.artist) }) }
+                publishQueue()
+                if (isFirstImport) {
+                    if (serverPlay.timeline.playing) newEpoch(false, posFrame(), System.nanoTime())
+                    selectTrack(0, forcePaused = true)
+                } else {
+                    ui { copy(loadingTracks = false) }
+                    publishState()
+                }
+                toast(if (failedCount == 0) "Добавлено в очередь: $count ${if (count == 1) "трек" else "треков"}"
+                    else "Добавлено: $count, пропущено файлов: $failedCount")
+            }
+        }
+    }
+
+    private fun displayName(uri: Uri): String {
+        var name: String? = null
+        try {
+            app.contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
+                if (cursor.moveToFirst()) name = cursor.getString(0)
+            }
+        } catch (_: Exception) {}
+        return name?.takeIf { it.isNotBlank() } ?: uri.lastPathSegment ?: "Аудиофайл"
+    }
+
+    private fun listAudioDocuments(tree: Uri): List<Pair<Uri, String>> {
+        val result = mutableListOf<Pair<Uri, String>>()
+        val visited = mutableSetOf<String>()
+        val root = try { DocumentsContract.getTreeDocumentId(tree) } catch (_: Exception) { return emptyList() }
+        fun walk(parentId: String, depth: Int) {
+            if (depth > 32 || !visited.add(parentId)) return
+            val children = mutableListOf<Triple<String, String, String?>>()
+            val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(tree, parentId)
+            try {
+                app.contentResolver.query(childrenUri,
+                    arrayOf(DocumentsContract.Document.COLUMN_DOCUMENT_ID, DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+                        DocumentsContract.Document.COLUMN_MIME_TYPE), null, null, null)?.use { cursor ->
+                    while (cursor.moveToNext()) {
+                        children += Triple(cursor.getString(0), cursor.getString(1) ?: "", cursor.getString(2))
+                    }
+                }
+            } catch (e: Exception) { Log.w(TAG, "Could not scan folder", e) }
+            children.sortedBy { it.second.lowercase() }.forEach { (id, name, mime) ->
+                if (mime == DocumentsContract.Document.MIME_TYPE_DIR) walk(id, depth + 1)
+                else if (mime?.startsWith("audio/") == true || name.substringAfterLast('.', "").lowercase() in audioExtensions) {
+                    result += DocumentsContract.buildDocumentUriUsingTree(tree, id) to name
+                }
+            }
+        }
+        walk(root, 0)
+        return result
+    }
+
+    private val audioExtensions = setOf("aac", "aif", "aiff", "alac", "amr", "flac", "m4a", "m4b", "mp3", "oga", "ogg", "opus", "wav", "weba", "wma")
     fun setVolume(ch: String, v: Float) {
         ui { when (ch) { "L" -> copy(volL = v); "R" -> copy(volR = v); else -> copy(master = v) } } // мгновенный отклик UI
         cmd("vol") { put("ch", ch); put("v", v.toDouble()) }
@@ -461,13 +588,19 @@ class Engine private constructor(private val app: Context) {
             }
             sessionId = rnd.nextInt().let { if (it == 0) 1 else it }
             pointUdp = null; pointClockReady = false
-            if (!continuing) { mode = SourceMode.MUSIC; source = music; newEpoch(false, 0, System.nanoTime()) }
+            if (!continuing) {
+                mode = SourceMode.MUSIC
+                source = if (queueIndex in queue.indices) currentQueueSource ?: music else music
+                newEpoch(false, 0, System.nanoTime())
+                if (queueIndex in queue.indices && currentQueueSource == null) selectTrack(queueIndex, forcePaused = true)
+            }
             else rebuildPlayState()
             audio.source = serverRenderer
             l.send(JSONObject().put("t", "session").put("session", sessionId).put("udpPort", udp.localPort)
                 .put("name", myName))
             sendTimeline()
             publishState()
+            publishQueue()
         } else {
             sessionId = 0; serverUdp = null
             clock.reset(); rx.reset()
@@ -519,16 +652,17 @@ class Engine private constructor(private val app: Context) {
         link?.let { l -> link = null; l.tag = "dead"; if (sendBye) l.sendAndClose(JSONObject().put("t", "bye")) else l.close() }
         pending?.let { p -> pending = null; p.tag = "dead"; p.close() }
         phase = Phase.IDLE
+        pendingTrackId = null
         audio.stop(); audio.source = null
         abandonFocus()
         try { PlaybackService.stop(app) } catch (_: Exception) {}
-        serverPlay = ServerPlayState(Timeline.NONE, music, Ch.L, 0f)
+        serverPlay = ServerPlayState(Timeline.NONE, source, Ch.L, 0f)
         pointUdp = null; serverUdp = null; sessionId = 0
         rx.reset(); clock.reset()
         calibRunning = false
         discovery.startBrowse()
         ui { copy(phase = Phase.IDLE, linkOk = false, remembered = record, playing = false, calib = CalibUi(),
-            serverDiag = Diag(), pointDiag = Diag()) }
+            loadingTracks = false, loadingTrackId = null, serverDiag = Diag(), pointDiag = Diag()) }
         toast(reason)
     }
 
@@ -561,6 +695,7 @@ class Engine private constructor(private val app: Context) {
                 pingBurst = 20
             }
             "state" -> if (role == Role.POINT) applyState(o)
+            "queue" -> if (role == Role.POINT) applyQueue(o)
             "timeline" -> if (role == Role.POINT) {
                 rx.onTimeline(Timeline(o.getInt("epoch"), o.getBoolean("playing"),
                     o.getString("anchorFrame").toLong(), o.getString("anchorNs").toLong()))
@@ -595,8 +730,44 @@ class Engine private constructor(private val app: Context) {
         val tl = serverPlay.timeline
         return JSONObject().put("t", "state").put("playing", tl.playing).put("durFrames", source.totalFrames)
             .put("title", source.title).put("artist", source.artist).put("mode", mode.wire)
+            .put("queueIndex", queueIndex).put("queueCount", queue.size).put("trackId", queue.getOrNull(queueIndex)?.id ?: "")
             .put("volL", volL.toDouble()).put("volR", volR.toDouble()).put("master", master.toDouble())
             .put("pointCh", Ch.name(pointChannel)).put("trimMs", trimNs / 1e6).put("serverName", myName)
+    }
+
+    private fun publishQueue() {
+        val tracks = queue.map { QueueTrackUi(it.id, it.title, it.artist) }
+        ui { copy(queueTracks = tracks, queueIndex = queueIndex) }
+        queueRevision++
+        val parts = maxOf(1, (tracks.size + 99) / 100)
+        for (part in 0 until parts) {
+            val items = org.json.JSONArray()
+            tracks.drop(part * 100).take(100).forEach { track ->
+                items.put(JSONObject().put("id", track.id).put("title", track.title).put("artist", track.artist))
+            }
+            link?.send(JSONObject().put("t", "queue").put("revision", queueRevision).put("part", part)
+                .put("parts", parts).put("items", items))
+        }
+    }
+
+    private fun applyQueue(o: JSONObject) {
+        val revision = o.optInt("revision", -1)
+        val part = o.optInt("part", -1)
+        val parts = o.optInt("parts", 0)
+        if (revision < 0 || part !in 0 until parts || parts !in 1..10_000) return
+        if (revision != incomingQueueRevision) {
+            incomingQueueRevision = revision
+            incomingQueueParts = parts
+            incomingQueue.clear()
+        }
+        if (incomingQueueParts != parts) return
+        val items = o.optJSONArray("items") ?: return
+        incomingQueue[part] = (0 until items.length()).mapNotNull { index ->
+            val item = items.optJSONObject(index) ?: return@mapNotNull null
+            QueueTrackUi(item.optString("id"), item.optString("title"), item.optString("artist"))
+                .takeIf { it.id.isNotBlank() }
+        }
+        if (incomingQueue.size == incomingQueueParts) ui { copy(queueTracks = incomingQueue.values.flatten()) }
     }
 
     private fun publishState() {
@@ -618,6 +789,7 @@ class Engine private constructor(private val app: Context) {
         }
         ui { copy(playing = playing, durationMs = dur * 1000 / SF.SAMPLE_RATE, title = o.optString("title"),
             artist = o.optString("artist"), mode = SourceMode.fromWire(o.optString("mode")),
+            queueIndex = o.optInt("queueIndex", -1),
             volL = vL, volR = vR, master = m, pointChannel = pCh, trimMs = trim) }
         if (playing) requestFocus()
         PlaybackService.refresh(app)
@@ -633,6 +805,9 @@ class Engine private constructor(private val app: Context) {
             "toggle" -> if (serverPlay.timeline.playing && mode != SourceMode.CALIBRATION) cmdPause() else cmdPlay()
             "seek" -> seekFrame(o.optLong("ms") * SF.SAMPLE_RATE / 1000)
             "skip" -> seekFrame(posFrame() + o.optLong("ms") * SF.SAMPLE_RATE / 1000)
+            "next" -> selectTrack(queueIndex + 1)
+            "previous" -> selectTrack((queueIndex - 1).coerceAtLeast(0))
+            "select" -> selectTrack(queue.indexOfFirst { it.id == o.optString("id") })
             "vol" -> {
                 val v = o.optDouble("v", 1.0).toFloat().coerceIn(0f, 1f)
                 when (o.optString("ch")) { "L" -> volL = v; "R" -> volR = v; else -> master = v }
@@ -684,24 +859,58 @@ class Engine private constructor(private val app: Context) {
 
     private fun startTestMode(src: AudioSource) {
         if (calibRunning) return
+        pendingTrackId = null
+        ui { copy(loadingTracks = false, loadingTrackId = null) }
         if (mode == SourceMode.MUSIC) { savedFrame = posFrame(); savedPlaying = serverPlay.timeline.playing }
         mode = src.mode; source = src
         newEpoch(true, 0, System.nanoTime() + SF.START_DELAY_NS)
     }
 
     private fun restoreMusic(resume: Boolean) {
-        mode = SourceMode.MUSIC; source = music
+        mode = SourceMode.MUSIC
+        source = if (queueIndex in queue.indices) currentQueueSource ?: music else music
         val now = System.nanoTime()
         newEpoch(resume, savedFrame, if (resume) now + SF.START_DELAY_NS else now)
+    }
+
+    private fun selectTrack(index: Int, forcePaused: Boolean = false) {
+        if (calibRunning || (phase != Phase.PAIRED && phase != Phase.RECONNECTING) || index !in queue.indices) return
+        val item = queue[index]
+        if (queueIndex == index && pendingTrackId == null) return
+        val wasPlaying = !forcePaused && serverPlay.timeline.playing
+        pendingTrackId = item.id
+        ui { copy(loadingTracks = true, loadingTrackId = item.id) }
+        queueIo.execute {
+            val loaded = try { AudioFileDecoder.decode(PreparedAudioFile(item.id, item.file, item.title, item.artist)) }
+            catch (e: Exception) { Log.w(TAG, "Could not load ${item.title}", e); null }
+            post {
+                if (pendingTrackId != item.id || queue.getOrNull(index)?.id != item.id || role != Role.SERVER || calibRunning) return@post
+                pendingTrackId = null
+                if (loaded == null) {
+                    ui { copy(loadingTracks = false, loadingTrackId = null) }
+                    toast("Не удалось загрузить «${item.title}»")
+                    return@post
+                }
+                queueIndex = index
+                mode = SourceMode.MUSIC
+                source = loaded
+                currentQueueSource = loaded
+                savedFrame = 0
+                ui { copy(loadingTracks = false, loadingTrackId = null, queueIndex = queueIndex) }
+                val now = System.nanoTime()
+                newEpoch(wasPlaying, 0, if (wasPlaying) now + SF.START_DELAY_NS else now)
+            }
+        }
     }
 
     /** Каждые 100 мс: конец трека / конец тестового сигнала. */
     private fun serverTick() {
         if (role != Role.SERVER || !ui.value.inPair) return
         val tl = serverPlay.timeline
-        if (!tl.playing || tl.positionFrame(System.nanoTime()) < source.totalFrames) return
+        if (!tl.playing || pendingTrackId != null || tl.positionFrame(System.nanoTime()) < source.totalFrames) return
         when (mode) {
-            SourceMode.MUSIC -> newEpoch(false, 0, System.nanoTime())
+            SourceMode.MUSIC -> if (queueIndex + 1 < queue.size) selectTrack(queueIndex + 1)
+                else newEpoch(false, source.totalFrames, System.nanoTime())
             SourceMode.CHANNEL_TEST -> restoreMusic(savedPlaying)
             else -> {}
         }
@@ -710,6 +919,8 @@ class Engine private constructor(private val app: Context) {
     // ================================================================== калибровка
     private fun startCalibration(apply: Boolean) {
         if (calibRunning) return
+        pendingTrackId = null
+        ui { copy(loadingTracks = false, loadingTrackId = null) }
         if (phase != Phase.PAIRED || pointUdp == null) { broadcastCalib(false, "", "Point не на связи — калибровка невозможна", false, null); return }
         if (!pointClockReady) { broadcastCalib(false, "", "Часы ещё синхронизируются. Повторите через пару секунд", false, null); return }
         if (ContextCompat.checkSelfPermission(app, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {

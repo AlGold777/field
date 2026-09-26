@@ -1,4 +1,5 @@
 import SwiftUI
+import UniformTypeIdentifiers
 
 struct PlayerView: View {
     let ui: UiState
@@ -12,6 +13,10 @@ struct PlayerView: View {
     @State private var master = 0.8
     @State private var volL = 1.0
     @State private var volR = 1.0
+    @AppStorage("sf.queueExpanded") private var queueExpanded = false
+    @State private var showingAudioSourceDialog = false
+    @State private var showingAudioFiles = false
+    @State private var showingAudioFolder = false
     private let timer = Timer.publish(every: 0.2, on: .main, in: .common).autoconnect()
 
     var body: some View {
@@ -37,9 +42,17 @@ struct PlayerView: View {
                     }
                 }
 
-                Text(ui.title).font(.system(size: 20, weight: .bold)).foregroundColor(SFColor.text)
-                    .multilineTextAlignment(.center).frame(maxWidth: .infinity)
+                Button { engine.requestTrackPicker() } label: {
+                    Text(ui.title).font(.system(size: 20, weight: .bold)).foregroundColor(SFColor.text)
+                        .multilineTextAlignment(.center).frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.plain)
                 Subtitle(text: ui.artist, align: .center).frame(maxWidth: .infinity).padding(.top, 4).padding(.bottom, 12)
+                Text(ui.loadingTracks ? "Подготовка аудиофайла…" : (ui.role == .point
+                     ? "Нажмите на название, чтобы добавить музыку на Server"
+                     : "Нажмите на название, чтобы добавить файлы или папку"))
+                    .font(.system(size: 12)).foregroundColor(SFColor.dim).multilineTextAlignment(.center)
+                    .frame(maxWidth: .infinity).padding(.bottom, 8)
 
                 let dur = Double(max(1, ui.durationMs))
                 Slider(value: Binding(get: { dragging ?? min(1, Double(pos) / dur) }, set: { dragging = $0 }),
@@ -69,6 +82,8 @@ struct PlayerView: View {
                 }
                 .padding(.vertical, 18)
 
+                queueSection
+
                 SFCard {
                     H3(text: "Громкость")
                     SliderRow(label: "Общая (оба канала)", valueText: "\(Int(master * 100))%", value: $master, color: SFColor.master)
@@ -87,10 +102,27 @@ struct PlayerView: View {
             .padding(.horizontal, 20).padding(.vertical, 24)
         }
         .onReceive(timer) { _ in pos = engine.positionMs() }
-        .onAppear { syncVolumes() }
+        .onAppear { syncVolumes(); engine.setQueueExpanded(queueExpanded) }
         .onChange(of: ui.master) { _ in syncVolumes() }
         .onChange(of: ui.volL) { _ in syncVolumes() }
         .onChange(of: ui.volR) { _ in syncVolumes() }
+        .onChange(of: ui.filePickerRequest) { request in
+            if request > 0 { showingAudioSourceDialog = true }
+        }
+        .onChange(of: queueExpanded) { expanded in engine.setQueueExpanded(expanded) }
+        .confirmationDialog("Добавить музыку", isPresented: $showingAudioSourceDialog, titleVisibility: .visible) {
+            Button("Выбрать файлы") { showingAudioFiles = true }
+            Button("Выбрать папку") { showingAudioFolder = true }
+            Button("Отмена", role: .cancel) {}
+        } message: {
+            Text("Файлы из папки будут добавлены в очередь по имени.")
+        }
+        .fileImporter(isPresented: $showingAudioFiles, allowedContentTypes: [.audio], allowsMultipleSelection: true) { result in
+            if case .success(let urls) = result { engine.addAudioFiles(urls) }
+        }
+        .fileImporter(isPresented: $showingAudioFolder, allowedContentTypes: [.folder]) { result in
+            if case .success(let url) = result { engine.addAudioFiles([url]) }
+        }
         .alert("Разорвать пару?", isPresented: $confirmDisconnect) {
             Button("Разорвать", role: .destructive) { engine.disconnect() }
             Button("Отмена", role: .cancel) {}
@@ -103,6 +135,62 @@ struct PlayerView: View {
         if abs(master - Double(ui.master)) > 0.005 { master = Double(ui.master) }
         if abs(volL - Double(ui.volL)) > 0.005 { volL = Double(ui.volL) }
         if abs(volR - Double(ui.volR)) > 0.005 { volR = Double(ui.volR) }
+    }
+
+    private var queueSection: some View {
+        VStack(spacing: 0) {
+            Button { queueExpanded.toggle() } label: {
+                HStack {
+                    Text("Очередь · \(ui.queueTracks.count) треков")
+                        .font(.system(size: 13, weight: .semibold)).tracking(1).foregroundColor(SFColor.dim)
+                    Spacer()
+                    Image(systemName: queueExpanded ? "chevron.up" : "chevron.down")
+                        .font(.system(size: 14, weight: .semibold)).foregroundColor(SFColor.text)
+                }
+                .contentShape(Rectangle()).padding(.vertical, 6)
+            }
+            .buttonStyle(.plain)
+            if queueExpanded {
+                if ui.queueTracks.isEmpty {
+                    Text("Список появится после добавления музыки на Server")
+                        .font(.system(size: 14)).foregroundColor(SFColor.dim).frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.top, 8)
+                } else {
+                    ScrollView(.vertical) {
+                        VStack(spacing: 2) {
+                            ForEach(ui.queueTracks.indices, id: \.self) { index in
+                                let track = ui.queueTracks[index]
+                                let selected = index == ui.queueIndex || track.id == ui.loadingTrackId
+                                Button { engine.selectQueueTrack(track.id) } label: {
+                                    HStack(spacing: 10) {
+                                        Text("\(index + 1).").font(.system(size: 13)).foregroundColor(SFColor.dim).frame(width: 28, alignment: .leading)
+                                        VStack(alignment: .leading, spacing: 3) {
+                                            Text(track.title).font(.system(size: 14, weight: selected ? .semibold : .regular))
+                                                .foregroundColor(selected ? SFColor.accent1 : SFColor.text).lineLimit(1)
+                                            if !track.artist.isEmpty { Text(track.artist).font(.system(size: 12)).foregroundColor(SFColor.dim).lineLimit(1) }
+                                        }
+                                        Spacer(minLength: 4)
+                                        if selected {
+                                            if track.id == ui.loadingTrackId { ProgressView().tint(SFColor.accent1) }
+                                            else { Image(systemName: "music.note").foregroundColor(SFColor.accent1) }
+                                        }
+                                    }
+                                    .padding(.horizontal, 8).padding(.vertical, 9)
+                                    .background(selected ? SFColor.accent1.opacity(0.16) : .clear)
+                                    .clipShape(RoundedRectangle(cornerRadius: 9))
+                                }
+                                .buttonStyle(.plain).disabled(ui.loadingTracks)
+                            }
+                        }
+                    }
+                    .frame(maxHeight: 260).padding(.top, 6)
+                }
+            }
+        }
+        .padding(18).frame(maxWidth: .infinity, alignment: .leading)
+        .background(SFColor.card, in: RoundedRectangle(cornerRadius: 16))
+        .overlay(RoundedRectangle(cornerRadius: 16).stroke(SFColor.cardBorder, lineWidth: 1))
+        .padding(.bottom, 16)
     }
 
     private var stage: some View {

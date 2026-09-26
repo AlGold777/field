@@ -1,4 +1,69 @@
 import Foundation
+import AVFoundation
+
+struct PreparedAudioFile {
+    let id: String
+    let url: URL
+    let title: String
+    let artist: String
+}
+
+enum AudioFileDecoder {
+    static func prepare(_ source: URL) throws -> PreparedAudioFile {
+        let manager = FileManager.default
+        let support = try manager.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
+        let folder = support.appendingPathComponent("SoundField/AudioQueue", isDirectory: true)
+        try manager.createDirectory(at: folder, withIntermediateDirectories: true)
+        let id = UUID().uuidString
+        let ext = source.pathExtension.isEmpty ? "audio" : source.pathExtension
+        let destination = folder.appendingPathComponent(id).appendingPathExtension(ext)
+        try manager.copyItem(at: source, to: destination)
+
+        let metadata = AVURLAsset(url: source).commonMetadata
+        let title = metadata.first { $0.commonKey == .commonKeyTitle }?.stringValue
+            ?? source.deletingPathExtension().lastPathComponent
+        let artist = metadata.first { $0.commonKey == .commonKeyArtist }?.stringValue ?? "Локальная музыка"
+        return PreparedAudioFile(id: id, url: destination, title: title, artist: artist)
+    }
+
+    static func decode(_ item: PreparedAudioFile) throws -> PcmSource {
+        let file = try AVAudioFile(forReading: item.url)
+        let inputFormat = file.processingFormat
+        guard inputFormat.sampleRate > 0, file.length > 0,
+              let input = AVAudioPCMBuffer(pcmFormat: inputFormat, frameCapacity: AVAudioFrameCount(file.length)) else {
+            throw NSError(domain: "SoundField.Audio", code: 1, userInfo: [NSLocalizedDescriptionKey: "В файле нет аудиоданных"])
+        }
+        try file.read(into: input)
+        guard let outputFormat = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: Double(SF.sampleRate),
+                                               channels: 2, interleaved: false),
+              let converter = AVAudioConverter(from: inputFormat, to: outputFormat) else {
+            throw NSError(domain: "SoundField.Audio", code: 2, userInfo: [NSLocalizedDescriptionKey: "Формат аудио не поддерживается"])
+        }
+        let ratio = Double(SF.sampleRate) / inputFormat.sampleRate
+        let capacity = AVAudioFrameCount(ceil(Double(input.frameLength) * ratio) + 2048)
+        guard let output = AVAudioPCMBuffer(pcmFormat: outputFormat, frameCapacity: max(1, capacity)) else {
+            throw NSError(domain: "SoundField.Audio", code: 3, userInfo: [NSLocalizedDescriptionKey: "Не удалось подготовить аудио"])
+        }
+        var suppliedInput = false
+        var conversionError: NSError?
+        let status = converter.convert(to: output, error: &conversionError) { _, inputStatus in
+            guard !suppliedInput else { inputStatus.pointee = .endOfStream; return nil }
+            suppliedInput = true
+            inputStatus.pointee = .haveData
+            return input
+        }
+        if status == .error { throw conversionError ?? NSError(domain: "SoundField.Audio", code: 4) }
+        guard let channels = output.int16ChannelData, output.frameLength > 0 else {
+            throw NSError(domain: "SoundField.Audio", code: 5, userInfo: [NSLocalizedDescriptionKey: "Кодек не вернул аудиоданные"])
+        }
+        var pcm = [Int16](repeating: 0, count: Int(output.frameLength) * 2)
+        for frame in 0..<Int(output.frameLength) {
+            pcm[frame * 2] = channels[0][frame]
+            pcm[frame * 2 + 1] = channels[1][frame]
+        }
+        return PcmSource(pcm: pcm, title: item.title, artist: item.artist)
+    }
+}
 
 /// Источник со случайным доступом по номеру кадра (48 кГц). ch: 0 = L, 1 = R.
 protocol AudioSource: AnyObject {

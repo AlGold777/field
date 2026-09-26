@@ -3,6 +3,8 @@ package app.soundfield.ui
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.verticalScroll
@@ -27,7 +29,8 @@ import kotlin.math.abs
 import kotlin.math.roundToInt
 
 @Composable
-fun PlayerScreen(ui: UiState, engine: Engine, openCalibration: () -> Unit, openDiagnostics: () -> Unit) {
+fun PlayerScreen(ui: UiState, engine: Engine, openCalibration: () -> Unit, openDiagnostics: () -> Unit,
+    openTrackPicker: () -> Unit) {
     var confirmDisconnect by remember { mutableStateOf(false) }
     var pos by remember { mutableLongStateOf(0L) }
     var dragging by remember { mutableStateOf<Float?>(null) }
@@ -81,8 +84,17 @@ fun PlayerScreen(ui: UiState, engine: Engine, openCalibration: () -> Unit, openD
 
         // --- трек ---
         Text(ui.title, color = SFColors.Text, fontSize = 20.sp, fontWeight = FontWeight.Bold, textAlign = TextAlign.Center,
-            modifier = Modifier.fillMaxWidth())
+            modifier = Modifier.fillMaxWidth().clickable(onClick = openTrackPicker))
         Subtitle(ui.artist, Modifier.fillMaxWidth().padding(top = 4.dp), align = TextAlign.Center)
+        Text(
+            when {
+                ui.loadingTracks -> "Подготовка аудиофайла…"
+                ui.role == Role.POINT -> "Нажмите на название, чтобы добавить музыку на Server"
+                else -> "Нажмите на название, чтобы добавить файлы или папку"
+            },
+            color = SFColors.TextDim, fontSize = 12.sp, textAlign = TextAlign.Center,
+            modifier = Modifier.fillMaxWidth().padding(top = 5.dp, bottom = 8.dp),
+        )
         Spacer(Modifier.height(12.dp))
         val dur = ui.durationMs.coerceAtLeast(1)
         Slider(
@@ -106,6 +118,44 @@ fun PlayerScreen(ui: UiState, engine: Engine, openCalibration: () -> Unit, openD
                 Text(if (ui.playing) "❚❚" else "▶", color = Color.White, fontSize = 28.sp)
             }
             RoundIcon("⏩") { engine.skipMs(10_000) }
+        }
+
+        SFCard {
+            Row(
+                Modifier.fillMaxWidth().clip(CircleShape).clickable { engine.setQueueExpanded(!ui.queueExpanded) }
+                    .padding(vertical = 4.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                H3("Очередь · ${ui.queueTracks.size} треков")
+                Spacer(Modifier.weight(1f))
+                Text(if (ui.queueExpanded) "⌃" else "⌄", color = SFColors.Text, fontSize = 22.sp)
+            }
+            if (ui.queueExpanded) {
+                if (ui.queueTracks.isEmpty()) {
+                    Text("Список появится после добавления музыки на Server", color = SFColors.TextDim, fontSize = 14.sp)
+                } else {
+                    LazyColumn(Modifier.fillMaxWidth().heightIn(max = 280.dp)) {
+                        itemsIndexed(ui.queueTracks, key = { _, item -> item.id }) { index, item ->
+                            val selected = index == ui.queueIndex || item.id == ui.loadingTrackId
+                            Row(
+                                Modifier.fillMaxWidth().clip(MaterialTheme.shapes.medium)
+                                    .background(if (selected) SFColors.Accent1.copy(alpha = 0.18f) else Color.Transparent)
+                                    .clickable(enabled = !ui.loadingTracks) { engine.selectTrack(item.id) }
+                                    .padding(horizontal = 10.dp, vertical = 11.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Text("${index + 1}.", color = SFColors.TextDim, fontSize = 13.sp, modifier = Modifier.width(30.dp))
+                                Column(Modifier.weight(1f)) {
+                                    Text(item.title, color = if (selected) SFColors.Accent1 else SFColors.Text,
+                                        fontSize = 14.sp, fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal)
+                                    if (item.artist.isNotBlank()) Subtitle(item.artist, Modifier.padding(top = 2.dp))
+                                }
+                                if (selected) Text(if (item.id == ui.loadingTrackId) "…" else "♫", color = SFColors.Accent1, fontSize = 17.sp)
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         // --- громкость ---

@@ -96,6 +96,8 @@ data class CalibUi(
     val needsMicPermission: Boolean = false,
 )
 
+data class QueueTrackUi(val id: String, val title: String, val artist: String)
+
 data class UiState(
     val myId: String = "",
     val myName: String = "",
@@ -113,6 +115,12 @@ data class UiState(
     val durationMs: Long = 0,
     val title: String = "",
     val artist: String = "",
+    val queueIndex: Int = -1,
+    val queueTracks: List<QueueTrackUi> = emptyList(),
+    val loadingTracks: Boolean = false,
+    val loadingTrackId: String? = null,
+    val queueExpanded: Boolean = false,
+    val filePickerRequest: Int = 0,
     val mode: SourceMode = SourceMode.MUSIC,
     val volL: Float = 1f,
     val volR: Float = 1f,
