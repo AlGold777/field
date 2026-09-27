@@ -6,6 +6,7 @@ import android.content.pm.PackageManager
 import android.media.AudioAttributes
 import android.media.AudioFocusRequest
 import android.media.AudioManager
+import android.media.MediaCodec
 import android.net.ConnectivityManager
 import android.net.LinkProperties
 import android.net.Network
@@ -71,7 +72,7 @@ class Engine private constructor(private val app: Context) {
     }
     private data class IncomingFileTransfer(
         val id: String, val name: String, val size: Long, val temporaryFile: File,
-        val output: BufferedOutputStream, var received: Long = 0,
+        val output: BufferedOutputStream, val startedElapsedMs: Long, var received: Long = 0,
     )
 
     companion object {
@@ -639,15 +640,26 @@ class Engine private constructor(private val app: Context) {
         if (!fileTransferActive.compareAndSet(false, true)) { toast("Передача файлов уже идёт"); return }
         val activeLink = link
         if (activeLink == null || !activeLink.isOpen) {
+            telemetry.event("FILE_TRANSFER_REJECTED", "direction=send reason=no_link")
             fileTransferActive.set(false); toast("Нет соединения с Server — повторите после переподключения"); return
         }
         if (serverFileTransferToken.isBlank()) {
+            telemetry.event("FILE_TRANSFER_REJECTED", "direction=send reason=missing_server_token")
             fileTransferActive.set(false); toast("Для передачи файлов обновите SoundField до версии 1.4.0 на обоих Android-телефонах"); return
         }
         fileTransferCancelled.set(false)
+        val requestedAt = SystemClock.elapsedRealtime()
+        telemetry.event("FILE_TRANSFER_PREPARING", "direction=send selections=${uris.size}")
         ui { copy(fileTransferText = "Подготовка отправки файлов…") }
         fileTransferIo.execute {
             var currentFileId: String? = null
+            var totalFiles = 0
+            var totalBytes = 0L
+            var batchSent = 0L
+            var currentFileIndex = 0
+            var batchStartedAt = requestedAt
+            var fileStartedAt = requestedAt
+            var transferStarted = false
             try {
                 val candidates = mutableListOf<Pair<Uri, String>>()
                 uris.forEach { uri ->
@@ -663,12 +675,19 @@ class Engine private constructor(private val app: Context) {
                 require(files.isNotEmpty()) { "В выбранной папке нет поддерживаемых аудиофайлов" }
                 require(files.sumOf { it.size } <= MAX_TRANSFER_BATCH_BYTES) { "Размер выбранных файлов превышает 1 ГБ" }
                 val total = files.sumOf { it.size }
-                var batchSent = 0L
+                totalFiles = files.size
+                totalBytes = total
+                batchStartedAt = SystemClock.elapsedRealtime()
+                transferStarted = true
+                telemetry.event("FILE_TRANSFER_START", "direction=send files=$totalFiles bytes=$totalBytes preparationMs=${batchStartedAt - requestedAt}")
                 val buffer = ByteArray(TRANSFER_CHUNK_BYTES)
-                files.forEach { file ->
+                files.forEachIndexed { fileIndex, file ->
                     checkTransferStillActive(activeLink)
+                    currentFileIndex = fileIndex + 1
+                    fileStartedAt = SystemClock.elapsedRealtime()
                     val id = java.util.UUID.randomUUID().toString()
                     currentFileId = id
+                    telemetry.event("FILE_TRANSFER_FILE_START", "direction=send id=$id file=$currentFileIndex/$totalFiles bytes=${file.size}")
                     val started = awaitFileReply(activeLink, id, JSONObject()
                         .put("t", "file-start").put("id", id).put("name", file.name).put("size", file.size)
                         .put("token", serverFileTransferToken))
@@ -686,6 +705,8 @@ class Engine private constructor(private val app: Context) {
                             offset += count
                             check(ack.optLong("offset", -1) == offset) { "Server подтвердил неверный размер передачи" }
                             batchSent += count
+                            telemetry.limited("FILE_TRANSFER_PROGRESS",
+                                "direction=send id=$id file=$currentFileIndex/$totalFiles fileBytes=$offset/${file.size} batchBytes=$batchSent/$totalBytes")
                             post { if (fileTransferActive.get()) ui { copy(fileTransferText =
                                 "Отправка на Server · ${(batchSent * 100 / total).toInt()}%") } }
                         }
@@ -693,11 +714,19 @@ class Engine private constructor(private val app: Context) {
                     }
                     val completed = awaitFileReply(activeLink, id, JSONObject().put("t", "file-end").put("id", id))
                     check(completed.optBoolean("complete")) { "Server не сохранил «${file.name}»" }
+                    telemetry.event("FILE_TRANSFER_FILE_COMPLETE",
+                        "direction=send id=$id file=$currentFileIndex/$totalFiles bytes=${file.size} elapsedMs=${SystemClock.elapsedRealtime() - fileStartedAt}")
                     currentFileId = null
                 }
+                telemetry.event("FILE_TRANSFER_COMPLETE",
+                    "direction=send files=$totalFiles bytes=$totalBytes elapsedMs=${SystemClock.elapsedRealtime() - batchStartedAt}")
                 post { ui { copy(fileTransferText = "") }; toast("Файлы отправлены на Server") }
             } catch (e: Exception) {
                 currentFileId?.let { id -> if (activeLink.isOpen) activeLink.send(JSONObject().put("t", "file-cancel").put("id", id)) }
+                val cancelled = fileTransferCancelled.get()
+                val elapsed = SystemClock.elapsedRealtime() - if (transferStarted) batchStartedAt else requestedAt
+                telemetry.event(if (cancelled) "FILE_TRANSFER_CANCELLED" else "FILE_TRANSFER_ABORTED",
+                    "direction=send stage=${if (transferStarted) "transfer" else "prepare"} file=$currentFileIndex/$totalFiles bytes=$batchSent/$totalBytes elapsedMs=$elapsed errorType=${e.javaClass.simpleName}")
                 val message = e.message?.takeIf { it.isNotBlank() } ?: "Передачу файлов прервали"
                 post { ui { copy(fileTransferText = "") }; toast(message) }
             } finally {
@@ -743,7 +772,8 @@ class Engine private constructor(private val app: Context) {
         try { transfer.output.close() } catch (_: Exception) {}
         transfer.temporaryFile.delete()
         ui { copy(fileTransferText = "") }
-        if (reason != null) telemetry.event("FILE_TRANSFER_ABORTED", "id=${transfer.id} bytes=${transfer.received}/$reason")
+        if (reason != null) telemetry.event("FILE_TRANSFER_ABORTED",
+            "direction=receive id=${transfer.id} bytes=${transfer.received}/${transfer.size} elapsedMs=${SystemClock.elapsedRealtime() - transfer.startedElapsedMs} reason=${reason.take(100)}")
     }
 
     private fun handleIncomingFileStart(o: JSONObject) {
@@ -762,7 +792,9 @@ class Engine private constructor(private val app: Context) {
         val tmp = File(directory, "$id.part")
         try {
             val output = BufferedOutputStream(FileOutputStream(tmp), 1 shl 16)
-            incomingFileTransfer = IncomingFileTransfer(id, name, size, tmp, output)
+            val startedElapsedMs = SystemClock.elapsedRealtime()
+            incomingFileTransfer = IncomingFileTransfer(id, name, size, tmp, output, startedElapsedMs)
+            telemetry.event("FILE_TRANSFER_START", "direction=receive id=$id bytes=$size extension=${name.substringAfterLast('.', "").lowercase().take(8)}")
             ui { copy(fileTransferText = "Получение от Point · 0%") }
             link?.send(JSONObject().put("t", "file-ack").put("id", id).put("offset", 0))
         } catch (e: Exception) { sendFileError(id, "Не удалось создать файл на Server") }
@@ -781,6 +813,8 @@ class Engine private constructor(private val app: Context) {
             }
             transfer.output.write(bytes)
             transfer.received += bytes.size
+            telemetry.limited("FILE_TRANSFER_PROGRESS",
+                "direction=receive id=$id bytes=${transfer.received}/${transfer.size}")
             ui { copy(fileTransferText = "Получение от Point · ${(transfer.received * 100 / transfer.size).toInt()}%") }
             link?.send(JSONObject().put("t", "file-ack").put("id", id).put("offset", transfer.received))
         } catch (e: Exception) {
@@ -805,6 +839,8 @@ class Engine private constructor(private val app: Context) {
             val target = File(transfer.temporaryFile.parentFile, "${java.util.UUID.randomUUID()}.$ext")
             check(transfer.temporaryFile.renameTo(target)) { "Не удалось сохранить принятый файл" }
             incomingFileTransfer = null
+            telemetry.event("FILE_TRANSFER_COMPLETE",
+                "direction=receive id=$id bytes=${transfer.size} elapsedMs=${SystemClock.elapsedRealtime() - transfer.startedElapsedMs} extension=$ext")
             ui { copy(fileTransferText = "Подготовка аудиофайла…") }
             link?.send(JSONObject().put("t", "file-ack").put("id", id).put("offset", transfer.size).put("complete", true))
             addAudioFiles(listOf(Uri.fromFile(target)), deleteIfImportFails = listOf(target))
@@ -1738,15 +1774,45 @@ class Engine private constructor(private val app: Context) {
         onReady: (AudioSource) -> Unit = {},
         onProgress: (app.soundfield.core.SegmentedPcmSource) -> Unit = {},
     ): AudioSource? {
-        decodedTracks[item.id]?.let { onReady(it); return it }
+        decodedTracks[item.id]?.let {
+            telemetry.event("AUDIO_DECODE_CACHE_HIT", "trackId=${item.id} frames=${it.totalFrames}")
+            onReady(it)
+            return it
+        }
+        val inputBytes = runCatching { fileSize(item.ref().uri) }.getOrDefault(-1L)
+        val mime = runCatching { app.contentResolver.getType(item.ref().uri) }.getOrNull() ?: "unknown"
+        val startedAt = SystemClock.elapsedRealtime()
+        var firstAudioAt: Long? = null
+        telemetry.event("AUDIO_DECODE_START", "trackId=${item.id} mime=$mime bytes=$inputBytes")
         return try {
-            val t0 = SystemClock.elapsedRealtime()
-            AudioFileDecoder.decode(app, item.ref(), cancelled,
-                onReady = { onReady(it) }, onProgress = onProgress).also {
-                Log.i(TAG, "decoded «${item.title}» in ${SystemClock.elapsedRealtime() - t0} ms")
-            }
+            val decoded = AudioFileDecoder.decode(app, item.ref(), cancelled,
+                onReady = { ready ->
+                    val now = SystemClock.elapsedRealtime()
+                    if (firstAudioAt == null) {
+                        firstAudioAt = now
+                        telemetry.event("AUDIO_DECODE_FIRST_AUDIO",
+                            "trackId=${item.id} elapsedMs=${now - startedAt} readyFrames=${ready.readyFrames} estimatedFrames=${ready.totalFrames}")
+                    }
+                    onReady(ready)
+                }, onProgress = { progress ->
+                    telemetry.limited("AUDIO_DECODE_PROGRESS",
+                        "trackId=${item.id} readyFrames=${progress.readyFrames} estimatedFrames=${progress.totalFrames}")
+                    onProgress(progress)
+                })
+            val elapsed = SystemClock.elapsedRealtime() - startedAt
+            val durationMs = (decoded.totalFrames * 1_000.0 / SF.SAMPLE_RATE).toLong()
+            telemetry.event("AUDIO_DECODE_COMPLETE",
+                "trackId=${item.id} mime=$mime bytes=$inputBytes elapsedMs=$elapsed durationMs=$durationMs frames=${decoded.totalFrames} firstAudioMs=${firstAudioAt?.minus(startedAt) ?: -1L}")
+            Log.i(TAG, "decoded «${item.title}» in $elapsed ms")
+            decoded
         } catch (t: Throwable) {
-            if (!cancelled()) Log.w(TAG, "Could not load ${item.title}", t)
+            val wasCancelled = cancelled()
+            val elapsed = SystemClock.elapsedRealtime() - startedAt
+            val codecDiagnostic = (t as? MediaCodec.CodecException)?.diagnosticInfo
+                ?.take(160)?.let { " codecDiagnostic=$it" }.orEmpty()
+            telemetry.event(if (wasCancelled) "AUDIO_DECODE_CANCELLED" else "AUDIO_DECODE_FAILED",
+                "trackId=${item.id} mime=$mime bytes=$inputBytes elapsedMs=$elapsed firstAudioMs=${firstAudioAt?.minus(startedAt) ?: -1L} errorType=${t.javaClass.simpleName}$codecDiagnostic")
+            if (!wasCancelled) Log.w(TAG, "Could not load ${item.title}", t)
             null
         }
     }
