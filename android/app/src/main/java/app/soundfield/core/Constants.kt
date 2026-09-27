@@ -10,6 +10,7 @@ object SF {
     const val PACKET_FRAMES = 480                    // 10 мс PCM в одном UDP-пакете
     const val LEAD_NS = 400_000_000L                 // Server отправляет аудио на 400 мс вперёд
     const val START_DELAY_NS = 300_000_000L          // play/seek стартуют через 300 мс (успеть разослать)
+    const val PAUSE_LEAD_NS = 150_000_000L           // пауза наступает через 150 мс — одновременно на обоих телефонах
     const val SERVICE_TYPE = "_soundfield._tcp"      // Bonjour / NSD
     const val SERVICE_PREFIX = "SF-"
     const val HEARTBEAT_MS = 1_000L

@@ -92,7 +92,9 @@ fun PlayerScreen(ui: UiState, engine: Engine, openCalibration: () -> Unit, openD
         }
 
         // --- трек ---
-        Text(ui.title, color = SFColors.Text, fontSize = 20.sp, fontWeight = FontWeight.Bold, textAlign = TextAlign.Center,
+        // «Название - Исполнитель» одной строкой; для тестовых сигналов — только название
+        val trackTitle = if (ui.mode == SourceMode.MUSIC) app.soundfield.engine.trackLabel(ui.title, ui.artist) else ui.title
+        Text(trackTitle, color = SFColors.Text, fontSize = 20.sp, fontWeight = FontWeight.Bold, textAlign = TextAlign.Center,
             modifier = Modifier.fillMaxWidth().pointerInput(engine, swipeThreshold) {
                 var distance = 0f
                 detectHorizontalDragGestures(
@@ -105,7 +107,6 @@ fun PlayerScreen(ui: UiState, engine: Engine, openCalibration: () -> Unit, openD
                     onHorizontalDrag = { change, amount -> change.consume(); distance += amount },
                 )
             }.clickable(onClick = openTrackPicker))
-        Subtitle(ui.artist, Modifier.fillMaxWidth().padding(top = 4.dp), align = TextAlign.Center)
         Text(
             when {
                 ui.loadingTracks -> "Подготовка аудиофайла…"
@@ -140,43 +141,7 @@ fun PlayerScreen(ui: UiState, engine: Engine, openCalibration: () -> Unit, openD
             RoundIcon("⏩") { engine.skipMs(10_000) }
         }
 
-        SFCard {
-            Row(
-                Modifier.fillMaxWidth().clip(CircleShape).clickable { engine.setQueueExpanded(!ui.queueExpanded) }
-                    .padding(vertical = 4.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                H3("Очередь · ${ui.queueTracks.size} треков")
-                Spacer(Modifier.weight(1f))
-                Text(if (ui.queueExpanded) "⌃" else "⌄", color = SFColors.Text, fontSize = 22.sp)
-            }
-            if (ui.queueExpanded) {
-                if (ui.queueTracks.isEmpty()) {
-                    Text("Список появится после добавления музыки на Server", color = SFColors.TextDim, fontSize = 14.sp)
-                } else {
-                    LazyColumn(Modifier.fillMaxWidth().heightIn(max = 280.dp)) {
-                        itemsIndexed(ui.queueTracks, key = { _, item -> item.id }) { index, item ->
-                            val selected = index == ui.queueIndex || item.id == ui.loadingTrackId
-                            Row(
-                                Modifier.fillMaxWidth().clip(MaterialTheme.shapes.medium)
-                                    .background(if (selected) SFColors.Accent1.copy(alpha = 0.18f) else Color.Transparent)
-                                    .clickable(enabled = !ui.loadingTracks) { engine.selectTrack(item.id) }
-                                    .padding(horizontal = 10.dp, vertical = 11.dp),
-                                verticalAlignment = Alignment.CenterVertically,
-                            ) {
-                                Text("${index + 1}.", color = SFColors.TextDim, fontSize = 13.sp, modifier = Modifier.width(30.dp))
-                                Column(Modifier.weight(1f)) {
-                                    Text(item.title, color = if (selected) SFColors.Accent1 else SFColors.Text,
-                                        fontSize = 14.sp, fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal)
-                                    if (item.artist.isNotBlank()) Subtitle(item.artist, Modifier.padding(top = 2.dp))
-                                }
-                                if (selected) Text(if (item.id == ui.loadingTrackId) "…" else "♫", color = SFColors.Accent1, fontSize = 17.sp)
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        QueueCard(ui, engine)
 
         // --- громкость ---
         SFCard {

@@ -22,7 +22,8 @@ class ServerRenderer(
         val src = st.source
         for (i in 0 until n) {
             val f = corrector.frame(i, n)
-            out[i] = if (f < tl.anchorFrame) 0f else src.sample(f, st.channel)
+            val g = tl.envelope(f)
+            out[i] = if (g == 0f) 0f else src.sample(f, st.channel) * g
         }
         positionFrame = corrector.frame(n - 1, n)
         ramp.apply(out, n, st.gain)
@@ -63,11 +64,13 @@ class PointRenderer(
         var missing = 0
         for (i in 0 until n) {
             val f = corrector.frame(i, n)
+            val g = tl.envelope(f)
+            if (g == 0f) { out[i] = 0f; continue }
             val s = rx.read(f)
             if (s.isNaN()) {
                 out[i] = 0f
-                if (f >= tl.anchorFrame && (p.totalFrames <= 0 || f < p.totalFrames)) missing++
-            } else out[i] = s
+                if (p.totalFrames <= 0 || f < p.totalFrames) missing++
+            } else out[i] = s * g
         }
         if (missing > 0) {
             underrunFrames += missing

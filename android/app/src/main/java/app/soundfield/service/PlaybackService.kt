@@ -142,7 +142,7 @@ class PlaybackService : Service() {
             return NotificationCompat.Builder(ctx, CHANNEL)
                 .setSmallIcon(R.drawable.ic_stat_soundfield)
                 .setContentTitle(title)
-                .setContentText("$roleText · $ch канал · ${if (s.playing) "играет" else "пауза"} — ${s.title}")
+                .setContentText("$roleText · $ch канал · ${if (s.playing) "играет" else "пауза"} — ${app.soundfield.engine.trackLabel(s.title, s.artist)}")
                 .setContentIntent(open)
                 .setOngoing(true)
                 .setOnlyAlertOnce(true)

@@ -13,7 +13,16 @@ class Timeline(
     val playing: Boolean,
     val anchorFrame: Long,
     val anchorNs: Long,
+    /**
+     * Запланированная остановка в той же эпохе: кадры ≥ stopFrame не звучат (с коротким затуханием).
+     * Пауза назначается на «сейчас + 150 мс» — оба телефона замолкают на одном и том же кадре, хотя
+     * команда до Point идёт по сети. −1 — остановки нет.
+     */
+    val stopFrame: Long = -1,
 ) {
+    /** Играет и не останавливается. */
+    val running: Boolean get() = playing && stopFrame < 0
+
     fun frameAt(serverNs: Long): Double =
         anchorFrame + (serverNs - anchorNs).toDouble() * SF.SAMPLE_RATE / 1e9
 
@@ -21,10 +30,33 @@ class Timeline(
         anchorNs + ((frame - anchorFrame).toDouble() * 1e9 / SF.SAMPLE_RATE).toLong()
 
     /** Позиция для UI (не раньше якоря). */
-    fun positionFrame(serverNs: Long): Long =
-        if (!playing) anchorFrame else maxOf(anchorFrame, frameAt(serverNs).toLong())
+    fun positionFrame(serverNs: Long): Long {
+        if (!playing) return anchorFrame
+        val f = maxOf(anchorFrame, frameAt(serverNs).toLong())
+        return if (stopFrame >= 0) minOf(f, stopFrame) else f
+    }
 
-    companion object { val NONE = Timeline(-1, false, 0, 0) }
+    /**
+     * Огибающая против щелчков: плавное нарастание 5 мс после якоря (старт, seek, смена трека)
+     * и затухание 5 мс перед stopFrame (пауза). 0 — кадр не должен звучать.
+     */
+    fun envelope(frame: Long): Float {
+        if (frame < anchorFrame) return 0f
+        var g = 1f
+        val sinceStart = frame - anchorFrame
+        if (sinceStart < FADE_FRAMES) g = (sinceStart + 1).toFloat() / FADE_FRAMES
+        if (stopFrame >= 0) {
+            val left = stopFrame - frame
+            if (left <= 0) return 0f
+            if (left < FADE_FRAMES) g = minOf(g, left.toFloat() / FADE_FRAMES)
+        }
+        return g
+    }
+
+    companion object {
+        val NONE = Timeline(-1, false, 0, 0)
+        const val FADE_FRAMES = 240   // 5 мс
+    }
 }
 
 /**

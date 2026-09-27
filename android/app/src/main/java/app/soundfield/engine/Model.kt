@@ -102,7 +102,16 @@ data class CalibUi(
     val needsMicPermission: Boolean = false,
 )
 
-data class QueueTrackUi(val id: String, val title: String, val artist: String)
+data class QueueTrackUi(val id: String, val title: String, val artist: String) {
+    /** «Название - Исполнитель» (или только название, если исполнитель неизвестен). */
+    val label: String get() = trackLabel(title, artist)
+}
+
+fun trackLabel(title: String, artist: String): String =
+    if (artist.isBlank()) title else "$title - $artist"
+
+/** Сохранённый плейлист (хранится внутри приложения, в filesDir/playlists). */
+data class PlaylistInfo(val id: String, val name: String, val count: Int, val savedAt: Long)
 
 data class UiState(
     val myId: String = "",
@@ -129,6 +138,10 @@ data class UiState(
     val artist: String = "",
     val queueIndex: Int = -1,
     val queueTracks: List<QueueTrackUi> = emptyList(),
+    /** Сохранённые плейлисты (только на Server). */
+    val playlists: List<PlaylistInfo> = emptyList(),
+    /** Текст полосы «Удалено … · Вернуть»; пусто — полосы нет. Приходит и на Point. */
+    val undoText: String = "",
     val loadingTracks: Boolean = false,
     val loadingTrackId: String? = null,
     val queueExpanded: Boolean = false,
