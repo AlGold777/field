@@ -141,6 +141,9 @@ class Engine private constructor(private val app: Context) {
     private var autoResumeUntil = 0L
     private var lastAutoAttempt = 0L
     private var lastNetSignature: String? = null
+    /** Приложение на экране. В фоне без пары Android замораживает процесс — такой телефон не должен быть виден. */
+    @Volatile private var appVisible = true
+    private var inviteRinging = false
     private val connLog = ArrayDeque<String>()
     private val logTime = java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.US)
 
@@ -224,7 +227,7 @@ class Engine private constructor(private val app: Context) {
 
     private fun onNetworkChanged() {
         log("Сеть изменилась")
-        discovery.advertise(tcp.localPort, myName)
+        if (discovery.advertising || phase != Phase.IDLE) discovery.advertise(tcp.localPort, myName)
         if (discovery.browsing) { lastBrowseRestart = SystemClock.elapsedRealtime(); discovery.restartBrowse() }
         if (phase == Phase.RECONNECTING && pending == null) scheduleReconnect(200)
     }
@@ -310,8 +313,26 @@ class Engine private constructor(private val app: Context) {
     fun forgetPair() = post { record = null; setAutoResume(false); stopAutoResume(); prefs.edit().remove("pair").apply(); ui { copy(remembered = null) } }
     fun disconnect() = post { setAutoResume(false); goIdle(sendBye = true, reason = "Пара разорвана") }
 
+    /**
+     * Приложение ушло с экрана. Без пары у SoundField нет foreground-сервиса, и Android вскоре замораживает
+     * процесс: TCP-соединения ещё принимаются ядром, но никто не отвечает. Второй телефон видел такой телефон
+     * в списке и ждал ответа «бесконечно». Поэтому без пары в фоне снимаем публикацию и поиск; вернёмся — включим.
+     */
+    fun onBackground() = post {
+        appVisible = false
+        if (phase == Phase.IDLE) hideWhileBackground()
+    }
+
+    private fun hideWhileBackground() {
+        stopAutoResume()
+        if (discovery.advertising) { discovery.unadvertise(); log("Приложение в фоне без пары — телефон скрыт из поиска") }
+        discovery.stopBrowse()
+    }
+
     /** Приложение снова на экране (разблокировка, возврат из другого приложения). */
     fun onForeground() = post {
+        appVisible = true
+        if (!discovery.advertising) { discovery.advertise(tcp.localPort, myName); log("Телефон снова виден в сети") }
         when (phase) {
             Phase.IDLE -> {
                 if (!discovery.browsing) discovery.startBrowse()
@@ -491,8 +512,12 @@ class Engine private constructor(private val app: Context) {
         stopAutoResume()
         pendingKey = hex(16)
         phase = Phase.INVITING
-        ui { copy(phase = Phase.INVITING, invitingName = p.name, resuming = false) }
-        connectOutgoing(p, "invite-out", inviteJson(pendingKey), 30_000)
+        inviteRinging = false
+        ui { copy(phase = Phase.INVITING, invitingName = p.name, resuming = false, inviteRinging = false) }
+        log("Приглашение → «${p.name}» ${p.host?.hostAddress}:${p.port}")
+        // 8 с на то, чтобы второй телефон ответил «ringing» (показал диалог). Если он спит/заморожен в фоне,
+        // TCP всё равно соединится (очередь ядра), но ответа не будет — раньше это ожидание длилось 30 с.
+        connectOutgoing(p, "invite-out", inviteJson(pendingKey), 8_000)
     }
 
     private fun doManualResume(auto: Boolean = false) {
@@ -634,6 +659,7 @@ class Engine private constructor(private val app: Context) {
                     pendingPeer = Peer(pid, pname, pplat, l.remoteAddress, o.optInt("tcpPort", 0))
                     pendingKey = o.optString("key")
                     phase = Phase.INCOMING
+                    l.send(JSONObject().put("t", "ringing"))
                     log("Приглашение от «$pname»")
                     ui { copy(phase = Phase.INCOMING, incomingName = pname) }
                     pendingTimeout?.cancel(false)
@@ -725,6 +751,13 @@ class Engine private constructor(private val app: Context) {
                     phase == Phase.RECONNECTING -> scheduleReconnect(if (reason == "crossed") 1_500 else 2_000)
                 }
             }
+            "ringing" -> if (l.tag == "invite-out") {
+                inviteRinging = true
+                ui { copy(inviteRinging = true) }
+                pendingTimeout?.cancel(false)
+                pendingTimeout = later(65_000) { if (pending === l) l.close() }   // у второго диалог живёт 60 с
+                log("«$pname» показал приглашение, ждём подтверждения")
+            }
             "cancel" -> if (l.tag == "incoming") {
                 pending = null; l.tag = "dead"; l.close()
                 phase = Phase.IDLE; ui { copy(phase = Phase.IDLE) }; toast("Приглашение отменено")
@@ -739,7 +772,11 @@ class Engine private constructor(private val app: Context) {
             when (phase) {
                 Phase.INCOMING -> { phase = Phase.IDLE; ui { copy(phase = Phase.IDLE) } }
                 Phase.INVITING -> if (l.tag == "resume-out") later(700) { tryManualResume() } else {
-                    phase = Phase.IDLE; ui { copy(phase = Phase.IDLE) }; toast("Нет ответа от второго телефона")
+                    phase = Phase.IDLE; ui { copy(phase = Phase.IDLE) }
+                    val who = ui.value.invitingName
+                    log(if (inviteRinging) "«$who» не подтвердил приглашение" else "«$who» не ответил на приглашение")
+                    toast(if (inviteRinging) "«$who» не подтвердил приглашение"
+                          else "«$who» не отвечает. Откройте SoundField на втором телефоне (экран включён) и попробуйте снова")
                 }
                 Phase.RECONNECTING -> scheduleReconnect(reconnectDelay())
                 else -> {}
@@ -771,6 +808,7 @@ class Engine private constructor(private val app: Context) {
                  else PairRecord(key, pid, pname, pplat, r, lastHost = host, lastPort = port)
         persistRecord()
         setAutoResume(true)
+        if (!discovery.advertising) discovery.advertise(tcp.localPort, myName)
         log("Пара ${if (continuing) "продолжена" else if (resumed) "восстановлена" else "создана"}: «$pname» $host:$port, роль ${r.wire}")
         discovery.stopBrowse()
 
@@ -864,6 +902,7 @@ class Engine private constructor(private val app: Context) {
         rx.reset(); clock.reset()
         calibRunning = false
         discovery.startBrowse()
+        if (!appVisible) hideWhileBackground()   // пару разорвали, пока приложение в фоне
         ui { copy(phase = Phase.IDLE, linkOk = false, remembered = record, playing = false, calib = CalibUi(),
             loadingTracks = false, loadingTrackId = null, serverDiag = Diag(), pointDiag = Diag()) }
         toast(reason)

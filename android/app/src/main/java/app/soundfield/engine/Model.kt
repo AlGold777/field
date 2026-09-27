@@ -117,6 +117,8 @@ data class UiState(
     val resuming: Boolean = false,
     /** Фоновое (без диалога) восстановление знакомой пары после запуска/возврата в приложение. */
     val autoResuming: Boolean = false,
+    /** Второй телефон подтвердил, что показал приглашение (сообщение ringing). */
+    val inviteRinging: Boolean = false,
     val incomingName: String = "",
     val linkOk: Boolean = false,
     // плеер

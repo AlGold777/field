@@ -33,21 +33,44 @@ class Discovery(
     private val main = Handler(Looper.getMainLooper())
 
     val browsing: Boolean get() = discListener != null
+    /** Сервис этого телефона опубликован (или публикуется) в сети. */
+    val advertising: Boolean get() = wantAdvertise
+    @Volatile private var wantAdvertise = false
+    @Volatile private var wantBrowse = false
+    @Volatile private var adPort = 0
+    @Volatile private var adName = ""
+    private var regAttempts = 0
 
+    /**
+     * Публикация сервиса. Повторная публикация идёт с паузой после снятия старой: мгновенный
+     * unregister+register с тем же именем на многих прошивках даёт отказ, и телефон становится невидим.
+     */
     fun advertise(port: Int, name: String) {
+        val had = regListener != null
         unadvertise()
+        wantAdvertise = true; adPort = port; adName = name; regAttempts = 0
         multicastLock.acquire()
+        if (had) main.postDelayed({ if (wantAdvertise && regListener == null) register() }, 700) else register()
+    }
+
+    private fun register() {
         val info = NsdServiceInfo().apply {
             serviceName = SF.SERVICE_PREFIX + myId
             serviceType = SF.SERVICE_TYPE
-            setPort(port)
-            setAttribute("n", name.take(60))
+            setPort(adPort)
+            setAttribute("n", adName.take(60))
             setAttribute("p", "android")
             setAttribute("id", myId)
         }
         val l = object : NsdManager.RegistrationListener {
-            override fun onServiceRegistered(i: NsdServiceInfo) { Log.i(TAG, "registered ${i.serviceName}") }
-            override fun onRegistrationFailed(i: NsdServiceInfo, e: Int) { Log.w(TAG, "register failed $e") }
+            override fun onServiceRegistered(i: NsdServiceInfo) { Log.i(TAG, "registered ${i.serviceName}"); regAttempts = 0 }
+            override fun onRegistrationFailed(i: NsdServiceInfo, e: Int) {
+                Log.w(TAG, "register failed $e")
+                if (regListener !== this) return
+                regListener = null
+                // без повтора телефон остаётся невидимым для второго до перезапуска приложения
+                if (wantAdvertise && regAttempts++ < 6) main.postDelayed({ if (wantAdvertise && regListener == null) register() }, 1_500)
+            }
             override fun onServiceUnregistered(i: NsdServiceInfo) {}
             override fun onUnregistrationFailed(i: NsdServiceInfo, e: Int) {}
         }
@@ -56,11 +79,13 @@ class Discovery(
     }
 
     fun unadvertise() {
+        wantAdvertise = false
         regListener?.let { try { nsd.unregisterService(it) } catch (_: Exception) {} }
         regListener = null
     }
 
     fun startBrowse() {
+        wantBrowse = true
         if (discListener != null) return
         multicastLock.acquire()
         synchronized(lock) { peers.clear(); resolveQueue.clear(); resolving = false; resolveToken++ }
@@ -71,13 +96,14 @@ class Discovery(
             override fun onStartDiscoveryFailed(t: String, e: Int) {
                 Log.w(TAG, "discovery failed $e")
                 if (discListener === this) discListener = null
-                main.postDelayed({ if (discListener == null) startBrowse() }, 2_000)
+                main.postDelayed({ if (wantBrowse && discListener == null) startBrowse() }, 2_000)
             }
             override fun onStopDiscoveryFailed(t: String, e: Int) {}
             override fun onServiceFound(info: NsdServiceInfo) {
                 if (!info.serviceName.startsWith(SF.SERVICE_PREFIX)) return
                 if (info.serviceName == SF.SERVICE_PREFIX + myId) return
-                synchronized(lock) { resolveQueue.addLast(info) }
+                // NSD часто сообщает об одном и том же сервисе много раз — не копим дубликаты в очереди resolve
+                synchronized(lock) { if (resolveQueue.none { it.serviceName == info.serviceName }) resolveQueue.addLast(info) }
                 resolveNext()
             }
             override fun onServiceLost(info: NsdServiceInfo) {
@@ -92,6 +118,7 @@ class Discovery(
     }
 
     fun stopBrowse() {
+        wantBrowse = false
         discListener?.let { try { nsd.stopServiceDiscovery(it) } catch (_: Exception) {} }
         discListener = null
     }

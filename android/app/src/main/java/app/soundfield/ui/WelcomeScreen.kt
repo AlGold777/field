@@ -90,8 +90,11 @@ fun WelcomeScreen(ui: UiState, engine: Engine) {
                 Column {
                     LinearProgressIndicator(Modifier.fillMaxWidth(), color = SFColors.Accent1)
                     Spacer(Modifier.height(12.dp))
-                    Text(if (ui.resuming) "Восстанавливаем пару с «${ui.invitingName}»…"
-                         else "Ждём подтверждения на «${ui.invitingName}».")
+                    Text(when {
+                        ui.resuming -> "Восстанавливаем пару с «${ui.invitingName}»…"
+                        ui.inviteRinging -> "Ждём подтверждения на «${ui.invitingName}»."
+                        else -> "Соединяемся с «${ui.invitingName}»…"
+                    })
                 }
             },
             confirmButton = {},

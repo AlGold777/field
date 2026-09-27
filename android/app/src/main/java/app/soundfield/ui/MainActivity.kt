@@ -38,6 +38,11 @@ class MainActivity : ComponentActivity() {
         // Разблокировка / возврат в приложение: сразу проверяем связь и восстанавливаем пару, не дожидаясь таймаутов.
         Engine.get(this).onForeground()
     }
+
+    override fun onStop() {
+        super.onStop()
+        Engine.get(this).onBackground()
+    }
 }
 
 private enum class Sub { NONE, CALIBRATION, DIAGNOSTICS }
