@@ -147,6 +147,7 @@ class Engine private constructor(private val app: Context) {
     private val incomingTelemetry = ConcurrentHashMap<String, IncomingTelemetryTransfer>()
     private val telemetryRateSamples = ArrayDeque<Long>()
     private var lastHeartbeatAtMs = 0L
+    private var lastHeartbeatState: Map<String, Any?>? = null
     private var previousUdpPackets = 0L
     private var previousSentAudioPackets = 0L
     private var previousNacksSent = 0L
@@ -183,6 +184,8 @@ class Engine private constructor(private val app: Context) {
         ex.schedule({ try { block() } catch (t: Throwable) { Log.e(TAG, "engine", t); telemetry.event("ENGINE_EXCEPTION", error = t) } }, ms, TimeUnit.MILLISECONDS)
 
     private val prefs = app.getSharedPreferences("soundfield", Context.MODE_PRIVATE)
+    private var processFreezeCount = prefs.getInt("processFreezeCount", 0)
+    private var processFreezeTotalMs = prefs.getLong("processFreezeTotalMs", 0L)
     val myId: String = prefs.getString("id", null) ?: hex(4).also { prefs.edit().putString("id", it).apply() }
     var myName: String = prefs.getString("name", null) ?: defaultName(); private set
 
@@ -407,6 +410,7 @@ class Engine private constructor(private val app: Context) {
         ex.scheduleAtFixedRate({ try { heartbeat() } catch (t: Throwable) { Log.e(TAG, "hb", t); telemetry.event("HEARTBEAT_EXCEPTION", error = t) } }, 1, 1, TimeUnit.SECONDS)
         ex.scheduleAtFixedRate({ try { serverTick() } catch (t: Throwable) { Log.e(TAG, "tick", t); telemetry.limited("ENGINE_TICK_EXCEPTION", error = t) } }, 100, 100, TimeUnit.MILLISECONDS)
         ui { copy(myId = myId, myName = myName, remembered = record, durationMs = music.totalFrames * 1000 / SF.SAMPLE_RATE,
+            freezeCount = processFreezeCount, freezeDurationMs = processFreezeTotalMs,
             title = music.title, artist = music.artist, queueExpanded = prefs.getBoolean("queueExpanded", false)) }
         watchNetwork()
         log("Запуск: TCP ${tcp.localPort}, UDP ${udp.localPort}")
@@ -733,6 +737,17 @@ class Engine private constructor(private val app: Context) {
         }
     }
 
+    private fun maybeShowStabilitySettings(reason: String) {
+        val now = System.currentTimeMillis()
+        val previous = prefs.getLong("stabilitySettingsShownAt", 0L)
+        if (previous > 0L && now - previous < TimeUnit.DAYS.toMillis(1)) return
+        prefs.edit().putLong("stabilitySettingsShownAt", now).apply()
+        telemetry.record("STABILITY_SETTINGS_SUGGESTED", mapOf("reason" to reason))
+        ui { copy(showStabilitySettings = true) }
+    }
+
+    fun dismissStabilitySettings() = post { ui { copy(showStabilitySettings = false) } }
+
     private fun defaultName(): String {
         val n = try { Settings.Global.getString(app.contentResolver, Settings.Global.DEVICE_NAME) } catch (_: Exception) { null }
         return (n ?: "${Build.MANUFACTURER.replaceFirstChar { it.uppercase() }} ${Build.MODEL}").take(40)
@@ -1012,6 +1027,7 @@ class Engine private constructor(private val app: Context) {
                 .put("android", Build.VERSION.RELEASE).put("sdk", Build.VERSION.SDK_INT))
             put("role", role.name.lowercase()); put("phase", phase.name); put("visible", appVisible)
             put("audioPath", currentAudioPath); put("clockPath", currentClockPath)
+            put("processFreezeCount", processFreezeCount); put("processFreezeTotalMs", processFreezeTotalMs)
             put("pair", pairTag); put("session", sessionId); put("epoch", if (role == Role.SERVER) serverPlay.timeline.epoch else rx.timeline.epoch)
             put("track", (if (role == Role.SERVER) queue.getOrNull(queueIndex)?.id else state.queueTracks.getOrNull(state.queueIndex)?.id)
                 ?.let(TelemetryIdentifiers::hash) ?: "")
@@ -2292,6 +2308,7 @@ class Engine private constructor(private val app: Context) {
                 if (queueIndex in queue.indices && currentQueueSource == null) selectTrack(queueIndex, forcePaused = true)
             }
             else rebuildPlayState()
+            audio.playbackActive = serverPlay.timeline.playing
             audio.source = serverRenderer
             fileTransferToken = hex(24)
             sendSession(l)
@@ -2302,6 +2319,7 @@ class Engine private constructor(private val app: Context) {
             sessionId = 0; serverUdp = null
             serverFileTransferToken = ""
             if (!continuing) { clock.reset(); rx.reset(); tcpAudioBuffer.clear() }
+            audio.playbackActive = rx.timeline.playing
             audio.source = pointRenderer
         }
         audio.start()
@@ -2364,6 +2382,7 @@ class Engine private constructor(private val app: Context) {
             val attempts = reconnectCandidateHistory.toList()
             telemetry.record("PEER_UNREACHABLE", mapOf("peer" to rec.peerId, "peerName" to rec.peerName,
                 "elapsedMs" to now - reconnectSince, "attemptedRoutes" to attempts))
+            maybeShowStabilitySettings("peer_unreachable")
             toast("Не удаётся найти «${rec.peerName}» больше минуты. Проверьте Wi‑Fi на обоих телефонах; при двойном Wi‑Fi попробуйте оставить одну сеть.")
         }
         if (now - lastBrowseRestart > 20_000) { lastBrowseRestart = now; discovery.restartBrowse() }
@@ -2505,6 +2524,7 @@ class Engine private constructor(private val app: Context) {
                     o.getString("anchorFrame").toLong(), o.getString("anchorNs").toLong(),
                     o.optString("stopFrame", "-1").toLongOrNull() ?: -1L)
                 rx.onTimeline(timeline)
+                audio.playbackActive = timeline.playing
                 if (currentAudioPath == "tcp") tcpAudioBuffer.activate(timeline.epoch)
             }
             "sdiag" -> if (role == Role.POINT) ui { copy(serverDiag = Diag.fromJson(o)) }
@@ -2628,6 +2648,7 @@ class Engine private constructor(private val app: Context) {
         epoch = newEpoch
         preloadEpochCounter = maxOf(preloadEpochCounter, newEpoch)
         serverPlay = ServerPlayState(Timeline(epoch, playing, frame, anchorNs), source, serverChannel(), serverGain())
+        audio.playbackActive = playing
         if (role == Role.POINT) tcpAudioBuffer.activate(epoch)
         sendTimeline()
         publishState()
@@ -3425,6 +3446,25 @@ class Engine private constructor(private val app: Context) {
         autoResumeTick()
         val nowMs = SystemClock.elapsedRealtime()
         val heartbeatInterval = if (lastHeartbeatAtMs == 0L) 1_000L else (nowMs - lastHeartbeatAtMs).coerceAtLeast(0)
+        val stateAfter = mapOf<String, Any?>(
+            "phase" to phase.name, "role" to role.name.lowercase(),
+            "playing" to if (role == Role.SERVER) serverPlay.timeline.playing else rx.timeline.playing,
+            "audioPath" to currentAudioPath, "clockPath" to currentClockPath,
+            "linkOpen" to (link?.isOpen == true), "wifiNetworks" to availableNetworkRoutes(wifiOnly = true).size)
+        val stateBefore = lastHeartbeatState
+        if (stateBefore != null && heartbeatInterval > 5_000L) {
+            val frozenMs = (heartbeatInterval - 1_000L).coerceAtLeast(0)
+            processFreezeCount++
+            processFreezeTotalMs += frozenMs
+            prefs.edit().putInt("processFreezeCount", processFreezeCount)
+                .putLong("processFreezeTotalMs", processFreezeTotalMs).apply()
+            telemetry.record("PROCESS_FROZEN", mapOf("durationMs" to frozenMs,
+                "heartbeatIntervalMs" to heartbeatInterval, "expectedIntervalMs" to 1_000,
+                "stateBefore" to stateBefore, "stateAfter" to stateAfter))
+            ui { copy(freezeCount = processFreezeCount, freezeDurationMs = processFreezeTotalMs) }
+            maybeShowStabilitySettings("process_frozen")
+        }
+        lastHeartbeatState = stateAfter
         lastHeartbeatAtMs = nowMs
         telemetryRateSamples.addLast(heartbeatInterval)
         while (telemetryRateSamples.size > 20) telemetryRateSamples.removeFirst()
@@ -3692,6 +3732,7 @@ class Engine private constructor(private val app: Context) {
                 "track" to track?.let(TelemetryIdentifiers::hash), "mode" to state.mode.wire,
             ),
             "loops" to mapOf("tickP95Ms" to serverDiag.tickP95Ms, "heartbeatIntervalP95Ms" to serverDiag.heartbeatIntervalMs),
+            "process" to mapOf("freezeCount" to processFreezeCount, "freezeTotalMs" to processFreezeTotalMs),
         )
     }
 

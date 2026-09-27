@@ -45,7 +45,7 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-private enum class Sub { NONE, CALIBRATION, DIAGNOSTICS }
+private enum class Sub { NONE, CALIBRATION, DIAGNOSTICS, STABILITY }
 
 @Composable
 fun AppRoot(engine: Engine) {
@@ -78,11 +78,21 @@ fun AppRoot(engine: Engine) {
             showAudioSourceDialog = true
         }
     }
-    if (!ui.inPair) sub = Sub.NONE
-    BackHandler(enabled = sub != Sub.NONE) { sub = Sub.NONE }
+    LaunchedEffect(ui.showStabilitySettings) {
+        if (ui.showStabilitySettings) sub = Sub.STABILITY
+    }
+    if (!ui.inPair && sub != Sub.STABILITY) sub = Sub.NONE
+    BackHandler(enabled = sub != Sub.NONE) {
+        if (sub == Sub.STABILITY) engine.dismissStabilitySettings()
+        sub = Sub.NONE
+    }
 
     Box(Modifier.fillMaxSize().background(SFColors.background).safeDrawingPadding()) {
         when {
+            sub == Sub.STABILITY -> StabilitySettingsScreen(onBack = {
+                engine.dismissStabilitySettings()
+                sub = Sub.NONE
+            })
             !ui.inPair -> WelcomeScreen(ui, engine)
             sub == Sub.CALIBRATION -> CalibrationScreen(ui, engine,
                 requestMic = { micLauncher.launch(Manifest.permission.RECORD_AUDIO) }, onBack = { sub = Sub.NONE })

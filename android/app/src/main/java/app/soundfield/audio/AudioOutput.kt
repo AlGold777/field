@@ -31,6 +31,7 @@ import java.util.concurrent.atomic.AtomicReference
  */
 class AudioOutput(private val ctx: Context) {
     @Volatile var source: RenderSource? = null
+    @Volatile var playbackActive: Boolean = false
     @Volatile var latencyMs = 0.0; private set
     @Volatile var underruns = 0L; private set
     @Volatile var timestampOk = false; private set
@@ -172,9 +173,33 @@ class AudioOutput(private val ctx: Context) {
             var lastPoll = Long.MIN_VALUE
             var lastHead = 0L
             var lastProgress = System.nanoTime()
+            var pausedAtMs = 0L
+            var pausedByEngine = false
             t.play()
             while (active()) {
                 val now = System.nanoTime()
+                if (!playbackActive) {
+                    if (pausedAtMs == 0L) pausedAtMs = android.os.SystemClock.elapsedRealtime()
+                    if (!pausedByEngine && android.os.SystemClock.elapsedRealtime() - pausedAtMs >= 5_000L) {
+                        t.pause()
+                        pausedByEngine = true
+                        timestampOk = false
+                        lastPoll = Long.MIN_VALUE
+                    }
+                    if (pausedByEngine) {
+                        Thread.sleep(50)
+                        continue
+                    }
+                } else {
+                    pausedAtMs = 0L
+                    if (pausedByEngine) {
+                        t.play()
+                        pausedByEngine = false
+                        timestampOk = false
+                        lastPoll = Long.MIN_VALUE
+                        lastProgress = now
+                    }
+                }
                 if (lastPoll == Long.MIN_VALUE || now - lastPoll >= 100_000_000L) {
                     lastPoll = now
                     if (t.getTimestamp(ts)) {

@@ -109,6 +109,12 @@ fun DiagnosticsScreen(ui: UiState, engine: Engine, onBack: () -> Unit) {
             ui.activeIncidents.forEach { DiagRow(it, "идёт", SFColors.Bad) }
         }
 
+        SFCard {
+            H3("Работа в фоне")
+            DiagRow("Заморозки процесса", "${ui.freezeCount}")
+            DiagRow("Суммарный простой", "%.1f с".format(ui.freezeDurationMs / 1000.0))
+        }
+
         if (BuildConfig.DEBUG && ui.inPair) {
             SFCard {
                 H3("Тестовые сбои · debug")
