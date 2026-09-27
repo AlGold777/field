@@ -56,11 +56,14 @@ struct PlayerView: View {
                         }
                 )
                 Subtitle(text: ui.artist, align: .center).frame(maxWidth: .infinity).padding(.top, 4).padding(.bottom, 12)
-                Text(ui.loadingTracks ? "Подготовка аудиофайла…" : (ui.role == .point
-                     ? "Нажмите на название, чтобы добавить музыку на Server"
-                     : "Нажмите на название, чтобы добавить FLAC, WAV или MP3"))
+                Text(trackStatusText)
                     .font(.system(size: 12)).foregroundColor(SFColor.dim).multilineTextAlignment(.center)
                     .frame(maxWidth: .infinity).padding(.bottom, 8)
+                if ui.audioMissing {
+                    Text("Нет аудио на Point · восстанавливаем соединение")
+                        .font(.system(size: 12)).foregroundColor(SFColor.warn).multilineTextAlignment(.center)
+                        .frame(maxWidth: .infinity).padding(.bottom, 8)
+                }
 
                 let dur = Double(max(1, ui.durationMs))
                 Slider(value: Binding(get: { dragging ?? min(1, Double(pos) / dur) }, set: { dragging = $0 }),
@@ -142,6 +145,14 @@ struct PlayerView: View {
         if abs(master - Double(ui.master)) > 0.005 { master = Double(ui.master) }
         if abs(volL - Double(ui.volL)) > 0.005 { volL = Double(ui.volL) }
         if abs(volR - Double(ui.volR)) > 0.005 { volR = Double(ui.volR) }
+    }
+
+    private var trackStatusText: String {
+        if ui.loadingTracks { return "Подготовка аудиофайла…" }
+        if ui.audioBuffering { return "Буферизация аудио…" }
+        if let progress = ui.decodingProgress { return "Подготовка аудиофайла… \(Int(progress * 100))%" }
+        if ui.role == .point { return "Добавление файлов с Point доступно только при паре Android ↔ Android" }
+        return "Нажмите на название, чтобы добавить FLAC, WAV или MP3"
     }
 
     private var queueSection: some View {

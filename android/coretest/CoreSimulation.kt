@@ -1,6 +1,8 @@
 // Симуляционные тесты ядра SoundField (запускаются на JVM без Android).
 import app.soundfield.core.*
 import java.io.File
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import kotlin.math.*
 import kotlin.random.Random
 
@@ -230,11 +232,49 @@ fun testWavAndSources() {
     check("calib: server chirp at 1.0 s on L", cal.sample(48_000 + 300, Ch.L) != 0f && cal.sample(48_000 + 300, Ch.R) == 0f)
 }
 
+fun testSegmentedPcmSource() {
+    println("[SegmentedPcmSource]")
+    val dir = kotlin.io.path.createTempDirectory("sf-segments").toFile()
+    try {
+        val frames = SegmentedPcmSource.SEGMENT_FRAMES
+        fun segment(file: File, left: Short, right: Short) {
+            val bytes = ByteArray(frames * 4)
+            ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN).apply {
+                putShort(0, left); putShort(2, right)
+            }
+            file.writeBytes(bytes)
+        }
+
+        val source = SegmentedPcmSource(dir, "segmented", "", frames.toLong() * 2)
+        val first = File(dir, "first.pcm48").apply { segment(this, 16_384, (-16_384).toShort()) }
+        val second = File(dir, "second.pcm48").apply { segment(this, 8_192, (-8_192).toShort()) }
+        source.publish(0, first, frames)
+        check("first segment publishes stereo samples", source.readyFrames == frames.toLong() &&
+            abs(source.sample(0, Ch.L) - 0.5f) < 0.001f && abs(source.sample(0, Ch.R) + 0.5f) < 0.001f)
+        check("missing segment is nonblocking silence", source.sample(frames.toLong(), Ch.L) == 0f)
+        source.publish(1, second, frames)
+        check("progress reaches full length", abs(source.progress() - 1f) < 0.001f)
+        check("next segment is addressable", abs(source.sample(frames.toLong(), Ch.L) - 0.25f) < 0.001f)
+        source.finish(frames.toLong() * 2)
+        check("finished source reports exact duration", source.complete && source.totalFrames == frames.toLong() * 2)
+
+        val largeStartIndex = Int.MAX_VALUE.toLong() / frames + 1
+        val largeStart = largeStartIndex * frames
+        val large = SegmentedPcmSource(dir, "large", "", largeStart + frames)
+        large.publish(largeStartIndex, first, frames)
+        check("long tracks exceed a single Int-sized mapping", large.readyFrames > Int.MAX_VALUE &&
+            abs(large.sample(largeStart, Ch.L) - 0.5f) < 0.001f)
+    } finally {
+        dir.deleteRecursively()
+    }
+}
+
 fun main() {
     testWire()
     testCorrectorFrames()
     testClockSync()
     testWavAndSources()
+    testSegmentedPcmSource()
     testEndToEnd(0.0, 1.0, 0.0, 1.0)
     testEndToEnd(3.0, 4.0, 3.0, 1.5)
     testEndToEnd(10.0, 12.0, 8.0, 3.0)

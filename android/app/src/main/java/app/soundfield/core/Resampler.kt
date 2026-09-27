@@ -5,6 +5,7 @@ import java.io.RandomAccessFile
 import java.nio.ByteOrder
 import java.nio.MappedByteBuffer
 import java.nio.channels.FileChannel
+import java.util.concurrent.ConcurrentHashMap
 import kotlin.math.PI
 import kotlin.math.cos
 import kotlin.math.min
@@ -120,5 +121,65 @@ class MappedPcmSource(file: File, override val title: String, override val artis
     override fun sample(frame: Long, ch: Int): Float {
         if (frame < 0 || frame >= totalFrames) return 0f
         return buf.getShort(((frame * 2 + ch) * 2).toInt()) / 32768f
+    }
+}
+
+/**
+ * PCM-файл, публикуемый декодером частями. Реалтайм-чтение никогда не ждёт декодер:
+ * ещё не готовый сегмент возвращает тишину. Server отправляет эту же тишину в UDP,
+ * поэтому обе стороны сохраняют одну временную шкалу. Размер трека не ограничен Int.MAX_VALUE.
+ */
+class SegmentedPcmSource(
+    private val directory: File,
+    override val title: String,
+    override val artist: String,
+    estimatedFrames: Long,
+) : AudioSource {
+    override val mode = SourceMode.MUSIC
+    @Volatile override var totalFrames: Long = estimatedFrames.coerceAtLeast(0)
+        private set
+    @Volatile var readyFrames: Long = 0
+        private set
+    @Volatile var complete: Boolean = false
+        private set
+    private val segments = ConcurrentHashMap<Long, MappedByteBuffer>()
+
+    fun publish(index: Long, file: File, frames: Int) {
+        require(frames in 1..SEGMENT_FRAMES)
+        RandomAccessFile(file, "r").use { raf ->
+            val bytes = frames.toLong() * BYTES_PER_FRAME
+            val mapped = raf.channel.map(FileChannel.MapMode.READ_ONLY, 0, bytes)
+            mapped.order(ByteOrder.LITTLE_ENDIAN)
+            segments[index] = mapped
+        }
+        val ready = index * SEGMENT_FRAMES + frames
+        readyFrames = maxOf(readyFrames, ready)
+        // Некоторые контейнеры/потоки не сообщают длительность заранее. До конца декодирования
+        // показываем уже доступную длину; finish() заменит её точным числом кадров.
+        if (!complete) totalFrames = maxOf(totalFrames, ready)
+    }
+
+    fun finish(actualFrames: Long) {
+        totalFrames = actualFrames
+        readyFrames = actualFrames
+        complete = true
+    }
+
+    fun progress(): Float = if (complete) 1f else if (totalFrames <= 0) 0f
+        else (readyFrames.toDouble() / totalFrames).toFloat().coerceIn(0f, 1f)
+
+    override fun sample(frame: Long, ch: Int): Float {
+        if (frame < 0 || frame >= totalFrames || ch !in 0..1) return 0f
+        val index = frame / SEGMENT_FRAMES
+        val mapped = segments[index] ?: return 0f
+        val within = (frame % SEGMENT_FRAMES).toInt()
+        val offset = (within * BYTES_PER_FRAME + ch * 2).toInt()
+        if (offset + 2 > mapped.limit()) return 0f
+        return mapped.getShort(offset) / 32768f
+    }
+
+    companion object {
+        const val SEGMENT_FRAMES = 5 * SF.SAMPLE_RATE
+        private const val BYTES_PER_FRAME = 4L
     }
 }

@@ -35,6 +35,14 @@ fun DiagnosticsScreen(ui: UiState, onBack: () -> Unit) {
 
         SFCard {
             H3("Сеть (Point ← Server)")
+            DiagRow("Аудиопакеты на Point", when {
+                p.audioAgeMs < 0 -> "не поступают"
+                else -> "${p.audioAgeMs} мс назад"
+            }, when {
+                p.audioAgeMs < 0 || p.audioAgeMs >= 5_000 -> SFColors.Bad
+                p.audioAgeMs >= 2_000 -> SFColors.Warn
+                else -> SFColors.Good
+            })
             if (!p.valid) DiagRow("Нет данных", "—") else {
                 DiagRow("RTT (среднее)", "%.1f мс".format(p.rttMs), c(p.rttMs, 15.0, 50.0))
                 DiagRow("Разброс RTT", "%.1f мс".format(p.rttJitterMs), c(p.rttJitterMs, 5.0, 20.0))

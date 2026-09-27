@@ -66,6 +66,7 @@ private fun HeaderIcon(icon: ImageVector, label: String, active: Boolean = false
 @Composable
 fun QueueCard(ui: UiState, engine: Engine) {
     val isServer = ui.role == Role.SERVER
+    val canAddHere = isServer || (ui.inPair && ui.peerPlatform.equals("android", true))
     var selecting by remember { mutableStateOf(false) }
     var selected by remember { mutableStateOf(setOf<String>()) }
     var showPlaylists by remember { mutableStateOf(false) }
@@ -88,7 +89,9 @@ fun QueueCard(ui: UiState, engine: Engine) {
                 Spacer(Modifier.width(6.dp))
                 Text(if (ui.queueExpanded) "⌃" else "⌄", color = SFColors.TextDim, fontSize = 18.sp)
             }
-            HeaderIcon(QueueIcons.PlaylistAdd, "Добавить музыку", enabled = isServer) { engine.requestTrackPicker() }
+            HeaderIcon(QueueIcons.PlaylistAdd,
+                if (isServer) "Добавить музыку" else "Отправить файлы на Server",
+                enabled = canAddHere) { engine.requestTrackPicker() }
             HeaderIcon(QueueIcons.Checklist, "Выбрать треки", active = selecting, enabled = ui.queueTracks.isNotEmpty()) {
                 selecting = !selecting; selected = emptySet()
                 if (selecting && !ui.queueExpanded) engine.setQueueExpanded(true)
@@ -99,7 +102,8 @@ fun QueueCard(ui: UiState, engine: Engine) {
         if (ui.queueExpanded) {
             if (ui.queueTracks.isEmpty()) {
                 Text(if (isServer) "Добавьте музыку значком «+» или откройте плейлист"
-                     else "Список появится после добавления музыки на Server",
+                     else if (ui.peerPlatform.equals("android", true)) "Отправьте музыку на Server значком «+»"
+                     else "Добавление с Point доступно только в паре Android ↔ Android",
                     color = SFColors.TextDim, fontSize = 14.sp, modifier = Modifier.padding(vertical = 6.dp))
             } else {
                 LazyColumn(Modifier.fillMaxWidth().heightIn(max = 300.dp)) {

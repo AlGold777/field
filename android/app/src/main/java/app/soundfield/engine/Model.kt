@@ -74,13 +74,15 @@ data class Diag(
     val latencyMs: Double = 0.0,
     val resent: Long = 0,
     val clockReady: Boolean = false,
+    /** Сколько мс назад Point принял последний audio-пакет; −1 означает, что аудио ещё не приходило. */
+    val audioAgeMs: Long = -1,
     val valid: Boolean = false,
 ) {
     fun toJson(t: String): JSONObject = JSONObject().apply {
         put("t", t); put("rtt", rttMs); put("rttJit", rttJitterMs); put("jitter", jitterMs); put("loss", lossPct)
         put("recovered", recovered); put("late", late); put("stale", stale); put("buffer", bufferMs)
         put("drift", driftPpm); put("unc", clockUncMs); put("underruns", underruns); put("syncErr", syncErrMs)
-        put("latency", latencyMs); put("resent", resent); put("clockReady", clockReady)
+        put("latency", latencyMs); put("resent", resent); put("clockReady", clockReady); put("audioAge", audioAgeMs)
     }
 
     companion object {
@@ -88,7 +90,7 @@ data class Diag(
             o.optDouble("rtt"), o.optDouble("rttJit"), o.optDouble("jitter"), o.optDouble("loss"),
             o.optLong("recovered"), o.optLong("late"), o.optLong("stale"), o.optDouble("buffer"),
             o.optDouble("drift"), o.optDouble("unc"), o.optLong("underruns"), o.optDouble("syncErr"),
-            o.optDouble("latency"), o.optLong("resent"), o.optBoolean("clockReady"), true,
+            o.optDouble("latency"), o.optLong("resent"), o.optBoolean("clockReady"), o.optLong("audioAge", -1), true,
         )
     }
 }
@@ -144,6 +146,14 @@ data class UiState(
     val undoText: String = "",
     val loadingTracks: Boolean = false,
     val loadingTrackId: String? = null,
+    /** Процент подготовки выбранного длинного трека после того, как доступен стартовый сегмент. */
+    val decodingProgress: Float? = null,
+    /** Передача/приём файлов между двумя Android-телефонами. */
+    val fileTransferText: String = "",
+    /** Пара подключена, но Point давно не получает аудиопакеты. */
+    val audioMissing: Boolean = false,
+    /** Воспроизведение автоматически ждёт, пока декодер подготовит следующий сегмент. */
+    val audioBuffering: Boolean = false,
     val queueExpanded: Boolean = false,
     val filePickerRequest: Int = 0,
     val mode: SourceMode = SourceMode.MUSIC,

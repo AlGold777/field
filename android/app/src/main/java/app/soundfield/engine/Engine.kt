@@ -19,6 +19,7 @@ import android.provider.DocumentsContract
 import android.provider.OpenableColumns
 import android.provider.Settings
 import android.util.Log
+import android.util.Base64
 import android.net.Uri
 import androidx.core.content.ContextCompat
 import app.soundfield.R
@@ -41,10 +42,15 @@ import java.net.ServerSocket
 import java.net.Socket
 import java.security.SecureRandom
 import java.io.File
+import java.io.FileOutputStream
+import java.io.BufferedOutputStream
+import java.util.concurrent.CompletableFuture
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.abs
 import kotlin.math.roundToInt
 
@@ -63,6 +69,10 @@ class Engine private constructor(private val app: Context) {
     private data class QueueItem(val id: String, val uri: Uri, val title: String, val artist: String) {
         fun ref() = PreparedAudioFile(id, uri, title, artist)
     }
+    private data class IncomingFileTransfer(
+        val id: String, val name: String, val size: Long, val temporaryFile: File,
+        val output: BufferedOutputStream, var received: Long = 0,
+    )
 
     companion object {
         const val TAG = "SoundField"
@@ -72,6 +82,13 @@ class Engine private constructor(private val app: Context) {
         }
         private val rnd = SecureRandom()
         private fun hex(bytes: Int) = ByteArray(bytes).also { rnd.nextBytes(it) }.joinToString("") { "%02x".format(it) }
+        private const val TRANSFER_CHUNK_BYTES = 48 * 1024
+        private const val MAX_TRANSFER_FILE_BYTES = 512L * 1024 * 1024
+        private const val MAX_TRANSFER_BATCH_BYTES = 1024L * 1024 * 1024
+        private val PROGRESSIVE_LOOKAHEAD_FRAMES =
+            (SF.LEAD_NS + SF.PAUSE_LEAD_NS + 100_000_000L) * SF.SAMPLE_RATE / 1_000_000_000L
+        private val PROGRESSIVE_RESUME_BUFFER_FRAMES = SF.SAMPLE_RATE.toLong()
+        private val PROGRESSIVE_FADE_FRAMES = SF.SAMPLE_RATE / 10L
     }
 
     private val telemetry = Telemetry.get(app)
@@ -99,12 +116,22 @@ class Engine private constructor(private val app: Context) {
     val music: PcmSource = loadMusic()
     private val queue = mutableListOf<QueueItem>()
     private val queueIo = Executors.newSingleThreadExecutor { Thread(it, "sf-queue") }
+    private val fileTransferIo = Executors.newSingleThreadExecutor { Thread(it, "sf-file-transfer") }
+    private val fileTransferActive = AtomicBoolean(false)
+    private val fileTransferCancelled = AtomicBoolean(false)
+    private val fileTransferAcks = ConcurrentHashMap<String, CompletableFuture<JSONObject>>()
+    private var incomingFileTransfer: IncomingFileTransfer? = null
     private var queueIndex = -1
     private var hasImportedQueue = false
     private var pendingTrackId: String? = null
     private var pendingShouldPlay = false
     @Volatile private var trackLoadGeneration = 0L
     private var currentQueueSource: AudioSource? = null
+    @Volatile private var decodeProgress: Float? = null
+    @Volatile private var decodeProgressTrackId: String? = null
+    private var progressiveStopFrame = -1L
+    private var progressivePausedFrame = -1L
+    private var progressiveResumeAfterBuffer = true
     private var queueRevision = 0
     private var incomingQueueRevision = -1
     private var incomingQueueParts = 0
@@ -123,7 +150,7 @@ class Engine private constructor(private val app: Context) {
     @Volatile private var phase = Phase.IDLE
         set(value) { if (field != value) telemetry.event("PHASE", "$field -> $value"); field = value }
     @Volatile private var role = Role.SERVER
-    private var link: ControlLink? = null
+    @Volatile private var link: ControlLink? = null
     private var pending: ControlLink? = null
     private var pendingPeer: Peer? = null
     private var pendingKey = ""
@@ -174,6 +201,12 @@ class Engine private constructor(private val app: Context) {
     @Volatile private var pointChannel = Ch.R
     private var trimNs = 0L
     @Volatile private var pointUdp: InetSocketAddress? = null
+    private val lastAudioRxAt = java.util.concurrent.atomic.AtomicLong(0)
+    private var pairedAtMs = 0L
+    private var lastAudioSessionResetMs = 0L
+    private val sentAudioPackets = java.util.concurrent.atomic.AtomicLong(0)
+    @Volatile private var fileTransferToken = ""
+    @Volatile private var serverFileTransferToken = ""
     private val serverRenderer = ServerRenderer { serverPlay }
     private var calibRunning = false
     private var pointClockReady = false
@@ -448,6 +481,7 @@ class Engine private constructor(private val app: Context) {
     fun onBackground() = post {
         telemetry.event("APP_BACKGROUND", "phase=$phase")
         appVisible = false
+        if (role == Role.POINT) cancelPointFileTransfer()
         if (phase == Phase.IDLE) hideWhileBackground()
     }
 
@@ -519,61 +553,276 @@ class Engine private constructor(private val app: Context) {
     fun requestTrackPicker() {
         post {
             if (calibRunning) { toast("Сначала завершите калибровку"); return@post }
-            if (role == Role.SERVER) ui { copy(filePickerRequest = filePickerRequest + 1) }
-            else toast("Добавьте файлы на телефоне Server")
+            if (role == Role.SERVER || (role == Role.POINT && peerPlatform.equals("android", true))) {
+                ui { copy(filePickerRequest = filePickerRequest + 1) }
+            } else if (role == Role.POINT) {
+                toast("Отправка файлов доступна, только если оба телефона — Android")
+            } else toast("Сначала подключите второй телефон")
         }
     }
 
     /** Decode picked files (or all audio files under a picked folder), then add them to the Server queue. */
-    fun addAudioFiles(uris: List<Uri>) {
+    fun addAudioFiles(uris: List<Uri>, deleteIfImportFails: List<File> = emptyList()) {
         if (uris.isEmpty()) return
-        post { if (role != Role.SERVER || calibRunning) { toast("Добавление музыки сейчас недоступно"); return@post }; ui { copy(loadingTracks = true) } }
-        queueIo.execute {
-            val candidates = mutableListOf<Pair<Uri, String>>()
-            uris.forEach { persistReadGrant(it) }   // доступ сохраняется после перезапуска — нужен для плейлистов
-            uris.forEach { uri ->
-                if (DocumentsContract.isTreeUri(uri)) candidates += listAudioDocuments(uri)
-                else candidates += uri to displayName(uri)
+        post {
+            if (calibRunning || (phase != Phase.PAIRED && phase != Phase.RECONNECTING)) {
+                deleteIfImportFails.forEach { it.delete() }
+                toast("Добавление музыки сейчас недоступно"); return@post
             }
-            val prepared = candidates.mapNotNull { (uri, name) ->
-                try { AudioFileDecoder.prepare(app, uri, name) }
-                catch (e: Exception) { Log.w(TAG, "Could not decode $name", e); null }
+            if (role == Role.POINT) {
+                if (!peerPlatform.equals("android", true)) {
+                    toast("Передача файлов с Point поддерживается, если оба телефона — Android"); return@post
+                }
+                beginPointFileTransfer(uris)
+                return@post
             }
-            post {
-                if (role != Role.SERVER || (phase != Phase.PAIRED && phase != Phase.RECONNECTING) || calibRunning) {
-                    ui { copy(loadingTracks = false) }
-                    return@post
+            ui { copy(loadingTracks = true) }
+            queueIo.execute {
+                val candidates = mutableListOf<Pair<Uri, String>>()
+                uris.forEach { persistReadGrant(it) }   // доступ сохраняется после перезапуска — нужен для плейлистов
+                uris.forEach { uri ->
+                    if (DocumentsContract.isTreeUri(uri)) candidates += listAudioDocuments(uri)
+                    else candidates += uri to displayName(uri)
                 }
-                if (prepared.isEmpty()) {
-                    ui { copy(loadingTracks = false) }
-                    toast("Не удалось открыть аудиофайлы")
-                    return@post
+                val prepared = candidates.mapNotNull { (uri, name) ->
+                    try { AudioFileDecoder.prepare(app, uri, name) }
+                    catch (e: Exception) { Log.w(TAG, "Could not decode $name", e); null }
                 }
-                val isFirstImport = !hasImportedQueue
-                if (isFirstImport) {
-                    deleteQueueFiles(queue.toList())
-                    queue.clear()
-                    currentQueueSource = null
-                    hasImportedQueue = true
-                    queueIndex = -1
+                post {
+                    if (role != Role.SERVER || (phase != Phase.PAIRED && phase != Phase.RECONNECTING) || calibRunning) {
+                        deleteIfImportFails.forEach { it.delete() }
+                        ui { copy(loadingTracks = false, fileTransferText = "") }
+                        return@post
+                    }
+                    if (prepared.isEmpty()) {
+                        deleteIfImportFails.forEach { it.delete() }
+                        ui { copy(loadingTracks = false, fileTransferText = "") }
+                        toast("Не удалось открыть аудиофайлы")
+                        return@post
+                    }
+                    val isFirstImport = !hasImportedQueue
+                    if (isFirstImport) {
+                        deleteQueueFiles(queue.toList())
+                        queue.clear()
+                        currentQueueSource = null
+                        hasImportedQueue = true
+                        queueIndex = -1
+                    }
+                    queue.addAll(prepared.map { QueueItem(it.id, it.uri, it.title, it.artist) })
+                    ui { copy(fileTransferText = "") }
+                    if (isFirstImport) releaseUnusedGrants()
+                    val count = prepared.size
+                    val failedCount = candidates.size - count
+                    ui { copy(queueTracks = queue.map { QueueTrackUi(it.id, it.title, it.artist) }) }
+                    publishQueue()
+                    if (isFirstImport) {
+                        if (serverPlay.timeline.playing) { cancelScheduledPause(); newEpoch(false, posFrame(), System.nanoTime()) }
+                        selectTrack(0, forcePaused = true)
+                    } else {
+                        ui { copy(loadingTracks = false) }
+                        publishState()
+                    }
+                    toast(if (failedCount == 0) "Добавлено в очередь: $count ${if (count == 1) "трек" else "треков"}"
+                        else "Добавлено: $count, пропущено файлов: $failedCount")
                 }
-                queue.addAll(prepared.map { QueueItem(it.id, it.uri, it.title, it.artist) })
-                if (isFirstImport) releaseUnusedGrants()
-                val count = prepared.size
-                val failedCount = candidates.size - count
-                ui { copy(queueTracks = queue.map { QueueTrackUi(it.id, it.title, it.artist) }) }
-                publishQueue()
-                if (isFirstImport) {
-                    if (serverPlay.timeline.playing) { cancelScheduledPause(); newEpoch(false, posFrame(), System.nanoTime()) }
-                    selectTrack(0, forcePaused = true)
-                } else {
-                    ui { copy(loadingTracks = false) }
-                    publishState()
-                }
-                toast(if (failedCount == 0) "Добавлено в очередь: $count ${if (count == 1) "трек" else "треков"}"
-                    else "Добавлено: $count, пропущено файлов: $failedCount")
             }
         }
+    }
+
+    fun cancelFileTransfer() = post {
+        if (role == Role.POINT) cancelPointFileTransfer()
+    }
+
+    private data class TransferCandidate(val uri: Uri, val name: String, val size: Long)
+
+    private fun beginPointFileTransfer(uris: List<Uri>) {
+        if (!fileTransferActive.compareAndSet(false, true)) { toast("Передача файлов уже идёт"); return }
+        val activeLink = link
+        if (activeLink == null || !activeLink.isOpen) {
+            fileTransferActive.set(false); toast("Нет соединения с Server — повторите после переподключения"); return
+        }
+        if (serverFileTransferToken.isBlank()) {
+            fileTransferActive.set(false); toast("Для передачи файлов обновите SoundField до версии 1.4.0 на обоих Android-телефонах"); return
+        }
+        fileTransferCancelled.set(false)
+        ui { copy(fileTransferText = "Подготовка отправки файлов…") }
+        fileTransferIo.execute {
+            var currentFileId: String? = null
+            try {
+                val candidates = mutableListOf<Pair<Uri, String>>()
+                uris.forEach { uri ->
+                    if (DocumentsContract.isTreeUri(uri)) candidates += listAudioDocuments(uri)
+                    else candidates += uri to displayName(uri)
+                }
+                val files = candidates.map { (uri, name) ->
+                    val size = fileSize(uri)
+                    require(name.substringAfterLast('.', "").lowercase() in audioExtensions) { "Не аудиофайл: $name" }
+                    require(size in 1..MAX_TRANSFER_FILE_BYTES) { "Файл «$name» пуст или больше 512 МБ" }
+                    TransferCandidate(uri, name, size)
+                }
+                require(files.isNotEmpty()) { "В выбранной папке нет поддерживаемых аудиофайлов" }
+                require(files.sumOf { it.size } <= MAX_TRANSFER_BATCH_BYTES) { "Размер выбранных файлов превышает 1 ГБ" }
+                val total = files.sumOf { it.size }
+                var batchSent = 0L
+                val buffer = ByteArray(TRANSFER_CHUNK_BYTES)
+                files.forEach { file ->
+                    checkTransferStillActive(activeLink)
+                    val id = java.util.UUID.randomUUID().toString()
+                    currentFileId = id
+                    val started = awaitFileReply(activeLink, id, JSONObject()
+                        .put("t", "file-start").put("id", id).put("name", file.name).put("size", file.size)
+                        .put("token", serverFileTransferToken))
+                    check(started.optLong("offset", -1) == 0L) { "Server не подтвердил начало передачи" }
+                    app.contentResolver.openInputStream(file.uri).use { input ->
+                        requireNotNull(input) { "Не удалось открыть «${file.name}»" }
+                        var offset = 0L
+                        while (true) {
+                            checkTransferStillActive(activeLink)
+                            val count = input.read(buffer)
+                            if (count < 0) break
+                            val chunk = Base64.encodeToString(buffer, 0, count, Base64.NO_WRAP)
+                            val ack = awaitFileReply(activeLink, id, JSONObject()
+                                .put("t", "file-chunk").put("id", id).put("offset", offset).put("data", chunk))
+                            offset += count
+                            check(ack.optLong("offset", -1) == offset) { "Server подтвердил неверный размер передачи" }
+                            batchSent += count
+                            post { if (fileTransferActive.get()) ui { copy(fileTransferText =
+                                "Отправка на Server · ${(batchSent * 100 / total).toInt()}%") } }
+                        }
+                        check(offset == file.size) { "Размер «${file.name}» изменился во время передачи" }
+                    }
+                    val completed = awaitFileReply(activeLink, id, JSONObject().put("t", "file-end").put("id", id))
+                    check(completed.optBoolean("complete")) { "Server не сохранил «${file.name}»" }
+                    currentFileId = null
+                }
+                post { ui { copy(fileTransferText = "") }; toast("Файлы отправлены на Server") }
+            } catch (e: Exception) {
+                currentFileId?.let { id -> if (activeLink.isOpen) activeLink.send(JSONObject().put("t", "file-cancel").put("id", id)) }
+                val message = e.message?.takeIf { it.isNotBlank() } ?: "Передачу файлов прервали"
+                post { ui { copy(fileTransferText = "") }; toast(message) }
+            } finally {
+                fileTransferAcks.values.forEach { it.completeExceptionally(IllegalStateException("Передача завершена")) }
+                fileTransferAcks.clear()
+                fileTransferActive.set(false)
+            }
+        }
+    }
+
+    private fun checkTransferStillActive(activeLink: ControlLink) {
+        check(!fileTransferCancelled.get()) { "Передачу файлов отменили" }
+        check(activeLink.isOpen && link === activeLink && phase == Phase.PAIRED && role == Role.POINT) {
+            "Связь с Server потеряна — передача отменена"
+        }
+    }
+
+    private fun awaitFileReply(activeLink: ControlLink, id: String, message: JSONObject): JSONObject {
+        val waiter = CompletableFuture<JSONObject>()
+        check(fileTransferAcks.putIfAbsent(id, waiter) == null) { "Передача уже ожидает ответ Server" }
+        try {
+            check(activeLink.isOpen) { "Нет соединения с Server" }
+            activeLink.send(message)
+            val reply = waiter.get(30, TimeUnit.SECONDS)
+            check(reply.optString("t") == "file-ack") { reply.optString("message", "Server отклонил файл") }
+            return reply
+        } finally { fileTransferAcks.remove(id, waiter) }
+    }
+
+    private fun fileSize(uri: Uri): Long {
+        try {
+            app.contentResolver.query(uri, arrayOf(OpenableColumns.SIZE), null, null, null)?.use { c ->
+                if (c.moveToFirst() && !c.isNull(0)) c.getLong(0).takeIf { it >= 0 }?.let { return it }
+            }
+        } catch (_: Exception) {}
+        return try { app.contentResolver.openAssetFileDescriptor(uri, "r")?.use { it.length } ?: -1L }
+        catch (_: Exception) { -1L }
+    }
+
+    private fun abortIncomingFileTransfer(reason: String? = null) {
+        val transfer = incomingFileTransfer ?: return
+        incomingFileTransfer = null
+        try { transfer.output.close() } catch (_: Exception) {}
+        transfer.temporaryFile.delete()
+        ui { copy(fileTransferText = "") }
+        if (reason != null) telemetry.event("FILE_TRANSFER_ABORTED", "id=${transfer.id} bytes=${transfer.received}/$reason")
+    }
+
+    private fun handleIncomingFileStart(o: JSONObject) {
+        val id = o.optString("id")
+        val name = File(o.optString("name")).name.take(160)
+        val size = o.optLong("size", -1)
+        if (role != Role.SERVER || calibRunning || !peerPlatform.equals("android", true) || o.optString("token") != fileTransferToken) {
+            sendFileError(id, "Передача не поддерживается этой парой"); return
+        }
+        if (incomingFileTransfer != null) { sendFileError(id, "Server уже принимает другой файл"); return }
+        if (id.isBlank() || name.substringAfterLast('.', "").lowercase() !in audioExtensions ||
+            size !in 1..MAX_TRANSFER_FILE_BYTES) {
+            sendFileError(id, "Неподдерживаемый или слишком большой аудиофайл"); return
+        }
+        val directory = File(app.filesDir, "audio_received").apply { mkdirs() }
+        val tmp = File(directory, "$id.part")
+        try {
+            val output = BufferedOutputStream(FileOutputStream(tmp), 1 shl 16)
+            incomingFileTransfer = IncomingFileTransfer(id, name, size, tmp, output)
+            ui { copy(fileTransferText = "Получение от Point · 0%") }
+            link?.send(JSONObject().put("t", "file-ack").put("id", id).put("offset", 0))
+        } catch (e: Exception) { sendFileError(id, "Не удалось создать файл на Server") }
+    }
+
+    private fun handleIncomingFileChunk(o: JSONObject) {
+        val transfer = incomingFileTransfer
+        val id = o.optString("id")
+        if (transfer == null || transfer.id != id) { sendFileError(id, "Передача уже завершена"); return }
+        try {
+            val offset = o.optLong("offset", -1)
+            require(offset == transfer.received) { "Нарушен порядок блоков файла" }
+            val bytes = Base64.decode(o.getString("data"), Base64.NO_WRAP)
+            require(bytes.isNotEmpty() && bytes.size <= TRANSFER_CHUNK_BYTES && transfer.received + bytes.size <= transfer.size) {
+                "Неверный размер блока файла"
+            }
+            transfer.output.write(bytes)
+            transfer.received += bytes.size
+            ui { copy(fileTransferText = "Получение от Point · ${(transfer.received * 100 / transfer.size).toInt()}%") }
+            link?.send(JSONObject().put("t", "file-ack").put("id", id).put("offset", transfer.received))
+        } catch (e: Exception) {
+            abortIncomingFileTransfer("${transfer.received}/${transfer.size}")
+            sendFileError(id, e.message ?: "Ошибка приёма файла")
+        }
+    }
+
+    private fun handleIncomingFileEnd(o: JSONObject) {
+        val transfer = incomingFileTransfer
+        val id = o.optString("id")
+        if (transfer == null || transfer.id != id) {
+            sendFileError(id, "Передача уже завершена"); return
+        }
+        if (transfer.received != transfer.size) {
+            abortIncomingFileTransfer("неполный файл")
+            sendFileError(id, "Файл передан не полностью"); return
+        }
+        try {
+            transfer.output.flush(); transfer.output.close()
+            val ext = transfer.name.substringAfterLast('.', "audio").lowercase().take(8)
+            val target = File(transfer.temporaryFile.parentFile, "${java.util.UUID.randomUUID()}.$ext")
+            check(transfer.temporaryFile.renameTo(target)) { "Не удалось сохранить принятый файл" }
+            incomingFileTransfer = null
+            ui { copy(fileTransferText = "Подготовка аудиофайла…") }
+            link?.send(JSONObject().put("t", "file-ack").put("id", id).put("offset", transfer.size).put("complete", true))
+            addAudioFiles(listOf(Uri.fromFile(target)), deleteIfImportFails = listOf(target))
+        } catch (e: Exception) {
+            abortIncomingFileTransfer(e.message ?: "ошибка завершения")
+            sendFileError(id, e.message ?: "Не удалось завершить передачу")
+        }
+    }
+
+    private fun sendFileError(id: String, message: String) {
+        link?.send(JSONObject().put("t", "file-error").put("id", id).put("message", message))
+    }
+
+    private fun cancelPointFileTransfer() {
+        if (!fileTransferActive.get()) return
+        fileTransferCancelled.set(true)
+        fileTransferAcks.values.forEach { it.completeExceptionally(IllegalStateException("Передачу файлов отменили")) }
+        ui { copy(fileTransferText = "") }
     }
 
     private fun displayName(uri: Uri): String {
@@ -969,7 +1218,10 @@ class Engine private constructor(private val app: Context) {
         link = l
         role = r; peerId = pid; peerName = pname; peerPlatform = pplat
         phase = Phase.PAIRED
+        pairedAtMs = SystemClock.elapsedRealtime()
+        lastAudioSessionResetMs = pairedAtMs
         udpLastRx.set(0)
+        lastAudioRxAt.set(0)
 
         val old = record
         val host = l.remoteAddress.hostAddress
@@ -999,20 +1251,21 @@ class Engine private constructor(private val app: Context) {
             }
             else rebuildPlayState()
             audio.source = serverRenderer
-            l.send(JSONObject().put("t", "session").put("session", sessionId).put("udpPort", udp.localPort)
-                .put("name", myName))
+            fileTransferToken = hex(24)
+            sendSession(l)
             sendTimeline()
             publishState()
             publishQueue()
         } else {
             sessionId = 0; serverUdp = null
+            serverFileTransferToken = ""
             clock.reset(); rx.reset()
             audio.source = pointRenderer
         }
         audio.start()
         try { PlaybackService.start(app) } catch (e: Exception) { Log.w(TAG, "fgs", e); telemetry.event("FOREGROUND_SERVICE_FAILED", error = e) }
-        ui { copy(phase = Phase.PAIRED, role = r, peerName = pname, peerPlatform = pplat, linkOk = true, remembered = record, autoResuming = false,
-            calib = CalibUi()) }
+        ui { copy(phase = Phase.PAIRED, role = r, peerName = pname, peerPlatform = pplat, linkOk = true, remembered = record,
+            autoResuming = false, audioMissing = false, calib = CalibUi()) }
         PlaybackService.refresh(app)
         toast(if (resumed) "Пара восстановлена" else "Стереопара создана")
     }
@@ -1025,10 +1278,13 @@ class Engine private constructor(private val app: Context) {
     }
 
     private fun onLinkLost() {
+        cancelPointFileTransfer()
+        abortIncomingFileTransfer("control link lost")
         link = null
         if (phase != Phase.PAIRED) return
         phase = Phase.RECONNECTING
-        ui { copy(phase = Phase.RECONNECTING, linkOk = false) }
+        pairedAtMs = 0
+        ui { copy(phase = Phase.RECONNECTING, linkOk = false, audioMissing = false) }
         log("Связь с «$peerName» потеряна")
         reconnectSince = SystemClock.elapsedRealtime()
         resumeAttempt = 0
@@ -1065,6 +1321,8 @@ class Engine private constructor(private val app: Context) {
     }
 
     private fun goIdle(sendBye: Boolean, reason: String) {
+        cancelPointFileTransfer()
+        abortIncomingFileTransfer("pair disconnected")
         reconnectTask?.cancel(false); pendingTimeout?.cancel(false)
         link?.let { l -> link = null; l.tag = "dead"; if (sendBye) l.sendAndClose(JSONObject().put("t", "bye")) else l.close() }
         pending?.let { p -> pending = null; p.tag = "dead"; p.close() }
@@ -1072,6 +1330,7 @@ class Engine private constructor(private val app: Context) {
         manualResumeActive = false
         log(reason)
         pendingTrackId = null
+        clearProgressiveBufferState()
         audio.stop(); audio.source = null
         abandonFocus()
         try { PlaybackService.stop(app) } catch (_: Exception) {}
@@ -1081,7 +1340,7 @@ class Engine private constructor(private val app: Context) {
         calibRunning = false
         discovery.startBrowse()
         if (!appVisible) hideWhileBackground()   // пару разорвали, пока приложение в фоне
-        ui { copy(phase = Phase.IDLE, linkOk = false, remembered = record, playing = false, calib = CalibUi(),
+        ui { copy(phase = Phase.IDLE, linkOk = false, remembered = record, playing = false, audioMissing = false, calib = CalibUi(),
             loadingTracks = false, loadingTrackId = null, serverDiag = Diag(), pointDiag = Diag()) }
         toast(reason)
     }
@@ -1109,11 +1368,22 @@ class Engine private constructor(private val app: Context) {
             }
             // --- на Point ---
             "session" -> if (role == Role.POINT) {
-                sessionId = o.getInt("session")
+                val newSession = o.getInt("session")
+                if (sessionId != newSession) {
+                    sessionId = newSession
+                    lastAudioRxAt.set(0)
+                    clock.reset(); rx.reset()
+                }
+                serverFileTransferToken = o.optString("fileToken")
                 val l = link ?: return
                 serverUdp = InetSocketAddress(l.remoteAddress, o.getInt("udpPort"))
                 pingBurst = 20
             }
+            "file-ack", "file-error" -> fileTransferAcks[o.optString("id")]?.complete(o)
+            "file-start" -> handleIncomingFileStart(o)
+            "file-chunk" -> handleIncomingFileChunk(o)
+            "file-end" -> handleIncomingFileEnd(o)
+            "file-cancel" -> if (incomingFileTransfer?.id == o.optString("id")) abortIncomingFileTransfer("cancelled by Point")
             "state" -> if (role == Role.POINT) applyState(o)
             "queue" -> if (role == Role.POINT) applyQueue(o)
             "timeline" -> if (role == Role.POINT) {
@@ -1134,6 +1404,27 @@ class Engine private constructor(private val app: Context) {
         serverPlay = ServerPlayState(serverPlay.timeline, source, serverChannel(), serverGain())
     }
 
+    private fun sendSession(target: ControlLink? = link) {
+        target?.send(JSONObject().put("t", "session").put("session", sessionId)
+            .put("udpPort", udp.localPort).put("name", myName).put("fileToken", fileTransferToken))
+    }
+
+    /** Replaces only the UDP audio session; TCP pairing and the playback epoch remain intact. */
+    private fun renewAudioSession(reason: String) {
+        if (phase != Phase.PAIRED || role != Role.SERVER) return
+        val now = SystemClock.elapsedRealtime()
+        sessionId = rnd.nextInt().let { if (it == 0) 1 else it }
+        pointUdp = null
+        pointClockReady = false
+        fileTransferToken = hex(24)
+        abortIncomingFileTransfer("audio session changed")
+        lastAudioSessionResetMs = now
+        telemetry.event("AUDIO_SESSION_RENEW", "reason=$reason session=$sessionId sent=${sentAudioPackets.get()} point=${ui.value.pointDiag.audioAgeMs}ms")
+        log("UDP-аудиосессия пересоздана: $reason")
+        sendSession()
+        sendTimeline()
+    }
+
     private fun newEpoch(playing: Boolean, frame: Long, anchorNs: Long) {
         epoch++
         serverPlay = ServerPlayState(Timeline(epoch, playing, frame, anchorNs), source, serverChannel(), serverGain())
@@ -1150,12 +1441,13 @@ class Engine private constructor(private val app: Context) {
 
     private fun stateJson(): JSONObject {
         val tl = serverPlay.timeline
-        return JSONObject().put("t", "state").put("playing", tl.running).put("durFrames", source.totalFrames)
+        return JSONObject().put("t", "state").put("playing", tl.running || ui.value.audioBuffering).put("durFrames", source.totalFrames)
             .put("title", source.title).put("artist", source.artist).put("mode", mode.wire)
             .put("queueIndex", queueIndex).put("queueCount", queue.size).put("trackId", queue.getOrNull(queueIndex)?.id ?: "")
             .put("volL", volL.toDouble()).put("volR", volR.toDouble()).put("master", master.toDouble())
             .put("pointCh", Ch.name(pointChannel)).put("trimMs", trimNs / 1e6).put("serverName", myName)
-            .put("undo", undoText)
+            .put("undo", undoText).put("decodeProgress", decodeProgress ?: JSONObject.NULL)
+            .put("audioBuffering", ui.value.audioBuffering)
     }
 
     private fun publishQueue() {
@@ -1210,10 +1502,11 @@ class Engine private constructor(private val app: Context) {
         if (role == Role.POINT) {
             pointParams = PointParams(m * (if (pCh == Ch.L) vL else vR), (trim * 1e6).toLong(), dur)
         }
+        val progress = if (o.isNull("decodeProgress")) null else o.optDouble("decodeProgress").toFloat().coerceIn(0f, 1f)
         ui { copy(playing = playing, durationMs = dur * 1000 / SF.SAMPLE_RATE, title = o.optString("title"),
-            artist = o.optString("artist"), mode = SourceMode.fromWire(o.optString("mode")),
+            artist = o.optString("artist"), mode = SourceMode.fromWire(o.optString("mode")), audioBuffering = o.optBoolean("audioBuffering"),
             queueIndex = o.optInt("queueIndex", -1), undoText = o.optString("undo", ""),
-            volL = vL, volR = vR, master = m, pointChannel = pCh, trimMs = trim) }
+            volL = vL, volR = vR, master = m, pointChannel = pCh, trimMs = trim, decodingProgress = progress) }
         if (playing) requestFocus()
         PlaybackService.refresh(app)
     }
@@ -1225,7 +1518,7 @@ class Engine private constructor(private val app: Context) {
         when (o.optString("a")) {
             "play" -> cmdPlay()
             "pause" -> cmdPause()
-            "toggle" -> if (serverPlay.timeline.running && mode != SourceMode.CALIBRATION) cmdPause() else cmdPlay()
+            "toggle" -> if ((serverPlay.timeline.running || ui.value.audioBuffering) && mode != SourceMode.CALIBRATION) cmdPause() else cmdPlay()
             "seek" -> seekFrame(o.optLong("ms") * SF.SAMPLE_RATE / 1000)
             "skip" -> seekFrame(posFrame() + o.optLong("ms") * SF.SAMPLE_RATE / 1000)
             "next" -> selectTrack(navigationIndex() + 1, startPlayback = true)
@@ -1272,6 +1565,7 @@ class Engine private constructor(private val app: Context) {
         if (mode != SourceMode.MUSIC) restoreMusic(false)
         val tl = serverPlay.timeline
         if (tl.running) return
+        clearProgressiveBufferState()
         cancelScheduledPause()
         val pos = posFrame()   // при отменённой паузе — кадр, на котором она бы наступила
         val f = if (pos >= source.totalFrames) 0L else pos
@@ -1283,7 +1577,16 @@ class Engine private constructor(private val app: Context) {
         pendingShouldPlay = false
         if (mode != SourceMode.MUSIC) { restoreMusic(false); return }
         val tl = serverPlay.timeline
-        if (!tl.running) return
+        if (!tl.running) {
+            if (progressiveStopFrame >= 0) {
+                progressiveResumeAfterBuffer = false
+                setProgressiveBuffering(false)
+            } else if (progressivePausedFrame >= 0) {
+                clearProgressiveBufferState(); publishState()
+            }
+            return
+        }
+        clearProgressiveBufferState()
         // Пауза по общей шкале: оба телефона замолкают на одном кадре через PAUSE_LEAD. Раньше Server
         // замолкал сразу, а Point — только когда до него доходила команда (на 10–200 мс позже), со щелчком.
         val at = System.nanoTime() + SF.PAUSE_LEAD_NS
@@ -1301,8 +1604,13 @@ class Engine private constructor(private val app: Context) {
     private fun seekFrame(frame: Long) {
         if (calibRunning) return
         if (mode != SourceMode.MUSIC) restoreMusic(false)
-        val f = frame.coerceIn(0L, maxOf(0L, source.totalFrames - 1))
+        val progressive = source as? app.soundfield.core.SegmentedPcmSource
+        val readyLimit = progressive?.takeUnless { it.complete }?.let { (it.readyFrames - 1).coerceAtLeast(0) }
+        val requested = frame.coerceIn(0L, maxOf(0L, source.totalFrames - 1))
+        val f = readyLimit?.let { requested.coerceAtMost(it) } ?: requested
+        if (readyLimit != null && f != requested) toast("Можно перематывать до подготовленного участка (${f * 1000 / SF.SAMPLE_RATE / 1000} с)")
         val playing = serverPlay.timeline.running
+        clearProgressiveBufferState()
         cancelScheduledPause()
         val now = System.nanoTime()
         newEpoch(playing, f, if (playing) now + SF.START_DELAY_NS else now)
@@ -1313,12 +1621,14 @@ class Engine private constructor(private val app: Context) {
         pendingTrackId = null
         ui { copy(loadingTracks = false, loadingTrackId = null) }
         if (mode == SourceMode.MUSIC) { savedFrame = posFrame(); savedPlaying = serverPlay.timeline.running }
+        clearProgressiveBufferState()
         cancelScheduledPause()
         mode = src.mode; source = src
         newEpoch(true, 0, System.nanoTime() + SF.START_DELAY_NS)
     }
 
     private fun restoreMusic(resume: Boolean) {
+        clearProgressiveBufferState()
         mode = SourceMode.MUSIC
         source = if (queueIndex in queue.indices) currentQueueSource ?: music else music
         val now = System.nanoTime()
@@ -1338,36 +1648,83 @@ class Engine private constructor(private val app: Context) {
             return
         }
         pendingShouldPlay = !forcePaused && (startPlayback || serverPlay.timeline.running)
+        clearProgressiveBufferState()
         val generation = ++trackLoadGeneration
         pendingTrackId = item.id
-        ui { copy(loadingTracks = true, loadingTrackId = item.id) }
+        decodeProgress = null; decodeProgressTrackId = item.id
+        ui { copy(loadingTracks = true, loadingTrackId = item.id, decodingProgress = null) }
         queueIo.execute {
-            val loaded = loadTrack(item)
+            var initialSource: AudioSource? = null
+            val cancelled = { generation != trackLoadGeneration || phase !in setOf(Phase.PAIRED, Phase.RECONNECTING) || role != Role.SERVER }
+            val loaded = loadTrack(item, cancelled,
+                onReady = { ready ->
+                    initialSource = ready
+                    post { activateLoadedTrack(index, item, generation, ready) }
+                },
+                onProgress = { progressSource ->
+                    val value = progressSource.progress()
+                    post {
+                        if (generation == trackLoadGeneration &&
+                            (queueIndex == index && currentQueueSource === progressSource || pendingTrackId == item.id)) {
+                            decodeProgress = value
+                            ui { copy(decodingProgress = value) }
+                            publishState()
+                        }
+                    }
+                })
             post {
-                if (generation != trackLoadGeneration || pendingTrackId != item.id) return@post   // уже выбран другой трек
-                pendingTrackId = null
-                if (queue.getOrNull(index)?.id != item.id || role != Role.SERVER || calibRunning) {
-                    // раньше здесь выходили, не сняв индикатор, — «Подготовка аудиофайла…» висела бесконечно
-                    ui { copy(loadingTracks = false, loadingTrackId = null) }
-                    return@post
+                if (generation != trackLoadGeneration) return@post
+                if (loaded != null) {
+                    decodedTracks[item.id] = loaded
+                    if (initialSource == null) activateLoadedTrack(index, item, generation, loaded)
+                    if (currentQueueSource === loaded) {
+                        decodeProgress = null; decodeProgressTrackId = null
+                        ui { copy(decodingProgress = null, loadingTracks = false, loadingTrackId = null) }
+                        publishState()
+                    }
+                    Log.i(TAG, "decoded «${item.title}» fully")
+                } else if (initialSource == null) {
+                    failTrackLoad(index, item, generation)
+                } else if (currentQueueSource === initialSource && queueIndex == index) {
+                    val progressiveSource = initialSource as? app.soundfield.core.SegmentedPcmSource
+                    progressiveSource?.finish(progressiveSource.readyFrames)
+                    val lastReady = (progressiveSource?.readyFrames?.minus(1)
+                        ?: ((initialSource?.totalFrames ?: 1L) - 1L)).coerceAtLeast(0)
+                    clearProgressiveBufferState()
+                    newEpoch(false, posFrame().coerceAtMost(lastReady), System.nanoTime())
+                    decodeProgress = null; decodeProgressTrackId = null
+                    ui { copy(decodingProgress = null, loadingTracks = false, loadingTrackId = null) }
+                    publishState(); toast("Не удалось завершить подготовку «${item.title}»")
                 }
-                if (loaded == null) {
-                    ui { copy(loadingTracks = false, loadingTrackId = null) }
-                    toast("Не удалось загрузить «${item.title}»")
-                    return@post
-                }
-                queueIndex = index
-                mode = SourceMode.MUSIC
-                source = loaded
-                currentQueueSource = loaded
-                savedFrame = 0
-                ui { copy(loadingTracks = false, loadingTrackId = null, queueIndex = queueIndex) }
-                val now = System.nanoTime()
-                cancelScheduledPause()
-                newEpoch(pendingShouldPlay, 0, if (pendingShouldPlay) now + SF.START_DELAY_NS else now)
-                prefetchAround(index)
             }
         }
+    }
+
+    /** Запускает источник, когда доступен первый полный PCM-сегмент, не дожидаясь длинного файла целиком. */
+    private fun activateLoadedTrack(index: Int, item: QueueItem, generation: Long, loaded: AudioSource) {
+        if (generation != trackLoadGeneration || pendingTrackId != item.id || queue.getOrNull(index)?.id != item.id ||
+            role != Role.SERVER || calibRunning) return
+        pendingTrackId = null
+        clearProgressiveBufferState()
+        queueIndex = index
+        mode = SourceMode.MUSIC
+        source = loaded
+        currentQueueSource = loaded
+        savedFrame = 0
+        decodeProgress = (loaded as? app.soundfield.core.SegmentedPcmSource)?.takeUnless { it.complete }?.progress()
+        ui { copy(loadingTracks = false, loadingTrackId = null, queueIndex = queueIndex, decodingProgress = decodeProgress) }
+        val now = System.nanoTime()
+        cancelScheduledPause()
+        newEpoch(pendingShouldPlay, 0, if (pendingShouldPlay) now + SF.START_DELAY_NS else now)
+        prefetchAround(index)
+    }
+
+    private fun failTrackLoad(index: Int, item: QueueItem, generation: Long) {
+        if (generation != trackLoadGeneration || pendingTrackId != item.id) return
+        pendingTrackId = null
+        decodeProgress = null; decodeProgressTrackId = null
+        ui { copy(loadingTracks = false, loadingTrackId = null, decodingProgress = null) }
+        toast("Не удалось загрузить «${item.title}»")
     }
 
     // ------------------------------------------------------------------ декодированные треки
@@ -1375,12 +1732,17 @@ class Engine private constructor(private val app: Context) {
     private val decodedTracks = java.util.concurrent.ConcurrentHashMap<String, AudioSource>()
 
     /** Декодирование в фоне (queueIo). Ловим Throwable: OutOfMemoryError раньше ронял приложение. */
-    private fun loadTrack(item: QueueItem, cancelled: () -> Boolean = { false }): AudioSource? {
-        decodedTracks[item.id]?.let { return it }
+    private fun loadTrack(
+        item: QueueItem,
+        cancelled: () -> Boolean = { false },
+        onReady: (AudioSource) -> Unit = {},
+        onProgress: (app.soundfield.core.SegmentedPcmSource) -> Unit = {},
+    ): AudioSource? {
+        decodedTracks[item.id]?.let { onReady(it); return it }
         return try {
             val t0 = SystemClock.elapsedRealtime()
-            AudioFileDecoder.decode(app, item.ref(), cancelled).also {
-                decodedTracks[item.id] = it
+            AudioFileDecoder.decode(app, item.ref(), cancelled,
+                onReady = { onReady(it) }, onProgress = onProgress).also {
                 Log.i(TAG, "decoded «${item.title}» in ${SystemClock.elapsedRealtime() - t0} ms")
             }
         } catch (t: Throwable) {
@@ -1397,7 +1759,7 @@ class Engine private constructor(private val app: Context) {
         val keep = listOfNotNull(queue.getOrNull(index - 1), queue.getOrNull(index), queue.getOrNull(index + 1)).map { it.id }.toSet()
         decodedTracks.keys.filter { it !in keep }.forEach { id ->
             decodedTracks.remove(id)
-            queue.firstOrNull { it.id == id }?.let { AudioFileDecoder.pcmFile(app, it.ref()).delete() }
+            queue.firstOrNull { it.id == id }?.let { AudioFileDecoder.pcmFile(app, it.ref()).deleteRecursively() }
         }
         val next = queue.getOrNull(index + 1) ?: return
         if (decodedTracks.containsKey(next.id)) return
@@ -1441,7 +1803,7 @@ class Engine private constructor(private val app: Context) {
         } else if (current != null) {
             queueIndex = queue.indexOfFirst { it.id == current.id }
         }
-        removed.forEach { (_, item) -> decodedTracks.remove(item.id); AudioFileDecoder.pcmFile(app, item.ref()).delete() }
+        removed.forEach { (_, item) -> decodedTracks.remove(item.id); AudioFileDecoder.pcmFile(app, item.ref()).deleteRecursively() }
 
         undoText = if (removed.size == 1) "Удалено: ${trackLabel(removed[0].second.title, removed[0].second.artist)}"
                    else "Удалено треков: ${removed.size}"
@@ -1583,15 +1945,86 @@ class Engine private constructor(private val app: Context) {
     private fun deleteQueueFiles(items: List<QueueItem>) {
         items.forEach { item ->
             decodedTracks.remove(item.id)
-            AudioFileDecoder.pcmFile(app, item.ref()).delete()
+            AudioFileDecoder.pcmFile(app, item.ref()).deleteRecursively()
         }
+    }
+
+    private fun clearProgressiveBufferState() {
+        progressiveStopFrame = -1L
+        progressivePausedFrame = -1L
+        progressiveResumeAfterBuffer = true
+        if (ui.value.audioBuffering) ui { copy(audioBuffering = false) }
+    }
+
+    private fun setProgressiveBuffering(buffering: Boolean) {
+        if (ui.value.audioBuffering == buffering) return
+        ui { copy(audioBuffering = buffering) }
+        publishState()
     }
 
     /** Каждые 100 мс: конец трека / конец тестового сигнала. */
     private fun serverTick() {
         if (role != Role.SERVER || !ui.value.inPair) return
         val tl = serverPlay.timeline
-        if (!tl.playing || pendingTrackId != null || tl.positionFrame(System.nanoTime()) < source.totalFrames) return
+        val nowNs = System.nanoTime()
+        val progressive = if (mode == SourceMode.MUSIC) source as? app.soundfield.core.SegmentedPcmSource else null
+
+        if (progressivePausedFrame >= 0) {
+            val pausedAt = progressivePausedFrame
+            if (progressive == null || progressive.complete && pausedAt >= progressive.totalFrames) {
+                progressivePausedFrame = -1L
+                setProgressiveBuffering(false)
+                if (queueIndex + 1 < queue.size) selectTrack(queueIndex + 1, startPlayback = true)
+                else newEpoch(false, source.totalFrames, nowNs)
+                return
+            }
+            if (progressive.complete || progressive.readyFrames >= pausedAt + PROGRESSIVE_RESUME_BUFFER_FRAMES) {
+                progressivePausedFrame = -1L
+                setProgressiveBuffering(false)
+                newEpoch(true, pausedAt.coerceAtMost((source.totalFrames - 1).coerceAtLeast(0)), nowNs + SF.START_DELAY_NS)
+            }
+            return
+        }
+
+        if (progressiveStopFrame >= 0) {
+            if (progressive?.complete == true && progressiveResumeAfterBuffer) {
+                progressiveStopFrame = -1L
+                setProgressiveBuffering(false)
+                newEpoch(true, tl.positionFrame(nowNs), nowNs + SF.START_DELAY_NS)
+                return
+            }
+            val stop = progressiveStopFrame
+            if (nowNs >= tl.timeOf(stop)) {
+                progressiveStopFrame = -1L
+                progressivePausedFrame = if (progressiveResumeAfterBuffer) stop else -1L
+                newEpoch(false, stop, nowNs)
+            }
+            return
+        }
+
+        if (!tl.playing || pendingTrackId != null) return
+        val position = tl.positionFrame(nowNs)
+        if (progressive != null && !progressive.complete) {
+            if (position >= source.totalFrames || progressive.readyFrames < position + PROGRESSIVE_LOOKAHEAD_FRAMES) {
+                val safeReady = (progressive.readyFrames - PROGRESSIVE_FADE_FRAMES).coerceAtLeast(0)
+                val scheduled = minOf(tl.positionFrame(nowNs + SF.PAUSE_LEAD_NS), safeReady)
+                progressiveResumeAfterBuffer = true
+                setProgressiveBuffering(true)
+                if (scheduled <= position) {
+                    progressivePausedFrame = position
+                    newEpoch(false, position, nowNs)
+                } else {
+                    progressiveStopFrame = scheduled
+                    serverPlay = ServerPlayState(
+                        Timeline(tl.epoch, true, tl.anchorFrame, tl.anchorNs, scheduled), source, serverChannel(), serverGain())
+                    sendTimeline(); publishState()
+                }
+                return
+            }
+        }
+        if (position < source.totalFrames) return
+        // Метаданные иногда занижают длительность. Не переключаем очередь до завершения декодирования.
+        if (progressive != null && !progressive.complete) return
         when (mode) {
             SourceMode.MUSIC -> if (queueIndex + 1 < queue.size) selectTrack(queueIndex + 1)
                 else newEpoch(false, source.totalFrames, System.nanoTime())
@@ -1694,6 +2127,13 @@ class Engine private constructor(private val app: Context) {
                 underruns = audio.underruns, resent = resent.get(), clockReady = true, valid = true)
             ui { copy(serverDiag = d) }
             l.send(d.toJson("sdiag"))
+            val pointAge = ui.value.pointDiag.audioAgeMs
+            val audioMissing = serverPlay.timeline.running && SystemClock.elapsedRealtime() - pairedAtMs > 5_000 &&
+                (pointUdp == null || pointAge < 0 || pointAge >= 5_000)
+            ui { copy(audioMissing = audioMissing) }
+            if (audioMissing && SystemClock.elapsedRealtime() - lastAudioSessionResetMs >= 5_000) {
+                renewAudioSession("Point не получает аудиопакеты")
+            }
         } else {
             val recv = rx.received; val lost = rx.lostFinal
             val dR = recv - lastRecv; val dL = lost - lastLost
@@ -1703,8 +2143,11 @@ class Engine private constructor(private val app: Context) {
                 recovered = rx.recovered, late = rx.late, stale = rx.stale, bufferMs = rx.bufferMs,
                 driftPpm = clock.driftPpm, clockUncMs = clock.uncertaintyMs,
                 underruns = pointRenderer.underrunEvents + audio.underruns, syncErrMs = pointRenderer.corrector.syncErrorMs,
-                latencyMs = audio.latencyMs, clockReady = clock.ready, valid = true)
+                latencyMs = audio.latencyMs, clockReady = clock.ready,
+                audioAgeMs = lastAudioRxAt.get().let { if (it == 0L) -1 else SystemClock.elapsedRealtime() - it }, valid = true)
             ui { copy(pointDiag = d) }
+            ui { copy(audioMissing = rx.timeline.playing && SystemClock.elapsedRealtime() - pairedAtMs > 5_000 &&
+                (d.audioAgeMs < 0 || d.audioAgeMs >= 5_000)) }
             l.send(d.toJson("diag"))
         }
     }
@@ -1731,7 +2174,10 @@ class Engine private constructor(private val app: Context) {
                     }
                     is UdpMsg.Nack -> if (role == Role.SERVER) resend(m)
                     is UdpMsg.Pong -> if (role == Role.POINT) clock.addPong(m.t1, m.t2, m.t3, now)
-                    is UdpMsg.Audio -> if (role == Role.POINT && phase == Phase.PAIRED) rx.onAudio(m, now)
+                    is UdpMsg.Audio -> if (role == Role.POINT && phase == Phase.PAIRED) {
+                        lastAudioRxAt.set(SystemClock.elapsedRealtime())
+                        rx.onAudio(m, now)
+                    }
                 }
             } catch (e: Exception) {
                 telemetry.limited("UDP_RECEIVE_FAILED", error = e); Log.w(TAG, "udp: ${e.message}"); SystemClock.sleep(10)
@@ -1774,6 +2220,7 @@ class Engine private constructor(private val app: Context) {
             val i = seq and 1023
             cacheSeq[i] = seq; cacheEpoch[i] = tl.epoch; cacheStart[i] = nextFrame
             udp.send(DatagramPacket(b, b.size, addr))
+            sentAudioPackets.incrementAndGet()
             nextFrame += SF.PACKET_FRAMES; k++
         }
     } }

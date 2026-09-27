@@ -69,6 +69,10 @@ final class Engine {
     private var peerId = "", peerName = "", peerPlatform = ""
     private let sessionBox = Locked<Int32>(0)
     private var sessionId: Int32 { get { sessionBox.value } set { sessionBox.value = newValue } }
+    private let lastAudioRxAtNs = Locked<Int64>(0)
+    private let sentAudioPackets = Locked<Int64>(0)
+    private var pairedAtNs: Int64 = 0
+    private var lastAudioSessionResetNs: Int64 = 0
     private var record: PairRecord?
     private var reconnectTask: DispatchWorkItem?
     private var lastBrowseRestart = Date.distantPast
@@ -206,10 +210,29 @@ final class Engine {
         guard udpBox.value?.broken ?? true else { return }
         log("UDP-сокет недоступен — пересоздаём")
         makeUdp()
-        guard let u = udpBox.value else { return }
+        guard udpBox.value != nil else { return }
         if role == .server, phase == .paired, let l = link {
-            l.send(["t": "session", "session": Int(sessionId), "udpPort": Int(u.port), "name": myName])
+            sendSession(l)
         }
+    }
+
+    private func sendSession(_ target: ControlLink? = nil) {
+        let l = target ?? link
+        l?.send(["t": "session", "session": Int(sessionId), "udpPort": Int(udp?.port ?? 0), "name": myName])
+    }
+
+    /// Rebuild the UDP media session without dropping the TCP pair. Point responds with a fresh PING burst.
+    private func renewAudioSession(_ reason: String) {
+        guard phase == .paired, role == .server else { return }
+        let now = MonoClock.nowNs()
+        sessionId = Int32.random(in: 1...Int32.max)
+        pointUdpBox.value = nil
+        pointClockReady = false
+        lastAudioSessionResetNs = now
+        lastAudioRxAtNs.value = 0
+        log("UDP-аудиосессия пересоздана: \(reason); session=\(sessionId), отправлено=\(sentAudioPackets.value), аудио Point=\(state.pointDiag.audioAgeMs)мс")
+        sendSession()
+        sendTimeline()
     }
 
     /// Приложение снова на экране: проверяем сокеты, аудио и связь — не ждём таймаутов.
@@ -351,7 +374,7 @@ final class Engine {
         q.async {
             guard !self.calibRunning else { self.toast("Сначала завершите калибровку"); return }
             if self.role == .server { self.ui { $0.filePickerRequest += 1 } }
-            else { self.toast("Добавьте файлы на телефоне Server") }
+            else { self.toast("Импорт файлов с Point доступен только при паре Android ↔ Android") }
         }
     }
     func addAudioFiles(_ urls: [URL]) {
@@ -716,6 +739,9 @@ final class Engine {
         link = l
         role = r; peerId = pid; peerName = pname; peerPlatform = pplat
         phase = .paired
+        pairedAtNs = MonoClock.nowNs()
+        lastAudioSessionResetNs = pairedAtNs
+        lastAudioRxAtNs.value = 0
 
         let host = Self.hostString(l.remoteHost)
         if var old = record, old.key == key {
@@ -747,7 +773,7 @@ final class Engine {
                 if queue.indices.contains(queueIndex), currentQueueSource == nil { selectQueueTrack(at: queueIndex, forcePaused: true) }
             } else { rebuildPlayState() }
             audio.source = serverRenderer
-            l.send(["t": "session", "session": Int(sessionId), "udpPort": Int(udp?.port ?? 0), "name": myName])
+            sendSession(l)
             sendTimeline()
             publishState()
             publishQueue()
@@ -758,7 +784,7 @@ final class Engine {
         }
         DispatchQueue.main.async { self.audio.start() }
         ui { s in
-            s.phase = .paired; s.role = r; s.peerName = pname; s.peerPlatform = pplat; s.linkOk = true
+            s.phase = .paired; s.role = r; s.peerName = pname; s.peerPlatform = pplat; s.linkOk = true; s.audioMissing = false
             s.remembered = record; s.calib = CalibUi(); s.autoResuming = false
         }
         toast(resumed ? "Пара восстановлена" : "Стереопара создана")
@@ -768,7 +794,8 @@ final class Engine {
         link = nil
         guard phase == .paired else { return }
         phase = .reconnecting
-        ui { $0.phase = .reconnecting; $0.linkOk = false }
+        pairedAtNs = 0
+        ui { $0.phase = .reconnecting; $0.linkOk = false; $0.audioMissing = false }
         log("Связь с «\(peerName)» потеряна")
         reconnectSince = Date(); resumeAttempt = 0
         discovery.startBrowse()
@@ -808,13 +835,14 @@ final class Engine {
         DispatchQueue.main.async { self.audio.stop() }
         playBox.value = ServerPlayState(timeline: .none, source: music, channel: Ch.L, gain: 0)
         pointUdpBox.value = nil; serverUdpBox.value = nil; sessionId = 0
+        pairedAtNs = 0; lastAudioRxAtNs.value = 0
         rx.reset(); clock.reset()
         calibRunning = false
         discovery.startBrowse()
         ui { s in
             s.phase = .idle; s.linkOk = false; s.remembered = record; s.playing = false; s.calib = CalibUi()
             s.serverDiag = Diag(); s.pointDiag = Diag()
-            s.loadingTracks = false; s.loadingTrackId = nil
+            s.loadingTracks = false; s.loadingTrackId = nil; s.audioMissing = false; s.audioBuffering = false
         }
         toast(reason)
     }
@@ -843,7 +871,12 @@ final class Engine {
             if role == .server { let d = Diag.from(o); pointClockReady = d.clockReady; ui { $0.pointDiag = d } }
         case "session":
             guard role == .point, let l = link else { return }
-            sessionId = Int32(truncatingIfNeeded: J.i64(o, "session"))
+            let newSession = Int32(truncatingIfNeeded: J.i64(o, "session"))
+            if sessionId != newSession {
+                sessionId = newSession
+                lastAudioRxAtNs.value = 0
+                clock.reset(); rx.reset()
+            }
             let port = UInt16(truncatingIfNeeded: J.i64(o, "udpPort"))
             if let host = l.remoteHost, let addr = UdpSocket.resolve(host: host, port: port) {
                 serverUdpBox.value = addr
@@ -937,11 +970,14 @@ final class Engine {
         let vL = Float(J.d(o, "volL", 1)), vR = Float(J.d(o, "volR", 1)), m = Float(J.d(o, "master", 0.8))
         let pCh = Ch.parse(J.s(o, "pointCh", "R"))
         let trim = J.d(o, "trimMs")
+        let decodingProgress = (o["decodeProgress"] as? NSNumber)?.doubleValue
         if role == .point {
             paramsBox.value = PointParams(gain: m * (pCh == Ch.L ? vL : vR), trimNs: Int64(trim * 1e6), totalFrames: dur)
         }
         ui { s in
             s.playing = playing; s.durationMs = dur * 1000 / Int64(SF.sampleRate)
+            s.audioBuffering = J.b(o, "audioBuffering")
+            s.decodingProgress = decodingProgress
             s.title = J.s(o, "title"); s.artist = J.s(o, "artist"); s.mode = SourceMode(rawValue: J.s(o, "mode")) ?? .music
             s.queueIndex = Int(J.i64(o, "queueIndex", -1))
             s.volL = vL; s.volR = vR; s.master = m; s.pointChannel = pCh; s.trimMs = trim
@@ -1190,18 +1226,28 @@ final class Engine {
                          latencyMs: audio.latencyMs, resent: resent, clockReady: true, valid: true)
             ui { $0.serverDiag = d }
             l.send(d.json("sdiag"))
+            let now = MonoClock.nowNs()
+            let pointAge = state.pointDiag.audioAgeMs
+            let audioMissing = playBox.value.timeline.playing && pairedAtNs > 0 && now - pairedAtNs > 5_000_000_000 &&
+                (pointUdpBox.value == nil || pointAge < 0 || pointAge >= 5_000)
+            ui { $0.audioMissing = audioMissing }
+            if audioMissing && now - lastAudioSessionResetNs >= 5_000_000_000 {
+                renewAudioSession("Point давно не получает аудио")
+            }
         } else {
             let recv = rx.received, lost = rx.lostFinal
             let dR = recv - lastRecv, dL = lost - lastLost
             lastRecv = recv; lastLost = lost
             let loss = dR + dL > 0 ? Double(dL) * 100 / Double(dR + dL) : 0
+            let audioAge = lastAudioRxAtNs.value == 0 ? -1 : max(0, (MonoClock.nowNs() - lastAudioRxAtNs.value) / 1_000_000)
             let d = Diag(rttMs: clock.rttAvgMs, rttJitterMs: clock.rttJitterMs, jitterMs: rx.jitterMs, lossPct: loss,
                          recovered: rx.recovered, late: rx.late, stale: rx.stale, bufferMs: rx.bufferMs,
                          driftPpm: clock.driftPpm, clockUncMs: clock.uncertaintyMs,
                          underruns: pointRenderer.underrunEvents + audio.underruns,
                          syncErrMs: pointRenderer.corrector.syncErrorMs, latencyMs: audio.latencyMs,
-                         clockReady: clock.ready, valid: true)
-            ui { $0.pointDiag = d }
+                         clockReady: clock.ready, audioAgeMs: audioAge, valid: true)
+            let now = MonoClock.nowNs()
+            ui { $0.pointDiag = d; $0.audioMissing = rx.timeline.playing && pairedAtNs > 0 && now - pairedAtNs > 5_000_000_000 && (audioAge < 0 || audioAge >= 5_000) }
             l.send(d.json("diag"))
         }
     }
@@ -1221,7 +1267,10 @@ final class Engine {
         case .pong(_, let t1, let t2, let t3, _):
             if role == .point { clock.addPong(t1: t1, t2: t2, t3: t3, t4: now) }
         case .audio(let a):
-            if role == .point && phase == .paired { rx.onAudio(a, arrivalLocalNs: now) }
+            if role == .point && phase == .paired {
+                lastAudioRxAtNs.value = now
+                rx.onAudio(a, arrivalLocalNs: now)
+            }
         }
     }
 
@@ -1261,6 +1310,7 @@ final class Engine {
             let i = Int(seq & 1023)
             cacheSeq[i] = seq; cacheEpoch[i] = tl.epoch; cacheStart[i] = nextFrame
             udp?.send(b, to: addr)
+            sentAudioPackets.value += 1
             nextFrame += Int64(SF.packetFrames); k += 1
         }
     }

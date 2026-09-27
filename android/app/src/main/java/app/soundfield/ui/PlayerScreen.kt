@@ -109,13 +109,28 @@ fun PlayerScreen(ui: UiState, engine: Engine, openCalibration: () -> Unit, openD
             }.clickable(onClick = openTrackPicker))
         Text(
             when {
+                ui.fileTransferText.isNotBlank() -> ui.fileTransferText
                 ui.loadingTracks -> "Подготовка аудиофайла…"
-                ui.role == Role.POINT -> "Нажмите на название, чтобы добавить музыку на Server"
+                ui.audioBuffering -> "Буферизация аудио…"
+                ui.decodingProgress != null -> "Подготовка аудиофайла… ${(ui.decodingProgress * 100).roundToInt()}%"
+                ui.role == Role.POINT -> if (ui.peerPlatform.equals("android", true))
+                    "Нажмите на название, чтобы отправить музыку на Server"
+                else "Добавление с Point доступно, если оба телефона — Android"
                 else -> "Нажмите на название, чтобы добавить FLAC, WAV или MP3"
             },
-            color = SFColors.TextDim, fontSize = 12.sp, textAlign = TextAlign.Center,
+            color = if (ui.fileTransferText.isNotBlank()) SFColors.Accent1 else SFColors.TextDim,
+            fontSize = 12.sp, textAlign = TextAlign.Center,
             modifier = Modifier.fillMaxWidth().padding(top = 5.dp, bottom = 8.dp),
         )
+        if (ui.role == Role.POINT && ui.fileTransferText.isNotBlank()) {
+            TextButton(onClick = engine::cancelFileTransfer, modifier = Modifier.align(Alignment.CenterHorizontally)) {
+                Text("Отменить передачу", color = SFColors.Warn, fontSize = 12.sp)
+            }
+        }
+        if (ui.audioMissing) {
+            Text("Нет аудио на Point · восстанавливаем соединение", color = SFColors.Warn,
+                fontSize = 12.sp, textAlign = TextAlign.Center, modifier = Modifier.fillMaxWidth())
+        }
         Spacer(Modifier.height(12.dp))
         val dur = ui.durationMs.coerceAtLeast(1)
         Slider(
@@ -136,7 +151,7 @@ fun PlayerScreen(ui: UiState, engine: Engine, openCalibration: () -> Unit, openD
             RoundIcon("⏪") { engine.skipMs(-10_000) }
             Box(Modifier.size(76.dp).clip(CircleShape).background(SFColors.accent).clickable { engine.togglePlay() },
                 contentAlignment = Alignment.Center) {
-                Text(if (ui.playing) "❚❚" else "▶", color = Color.White, fontSize = 28.sp)
+                Text(if (ui.playing || ui.audioBuffering) "❚❚" else "▶", color = Color.White, fontSize = 28.sp)
             }
             RoundIcon("⏩") { engine.skipMs(10_000) }
         }

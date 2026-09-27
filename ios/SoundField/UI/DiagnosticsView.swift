@@ -53,6 +53,10 @@ struct DiagnosticsView: View {
 
                 SFCard {
                     H3(text: "Аудиовыход")
+                    let age = ui.pointDiag.audioAgeMs
+                    DiagRow(label: "Аудиопакеты на Point",
+                            value: age < 0 ? "не поступают" : "\(age) мс назад",
+                            color: age < 0 ? SFColor.bad : age < 2_000 ? SFColor.good : age < 5_000 ? SFColor.warn : SFColor.bad)
                     DiagRow(label: "Ошибка воспроизведения Server", value: s.valid ? String(format: "%+.2f мс", s.syncErrMs) : "—")
                     DiagRow(label: "Ошибка воспроизведения Point", value: p.valid ? String(format: "%+.2f мс", p.syncErrMs) : "—")
                     DiagRow(label: "Underrun Server", value: s.valid ? "\(s.underruns)" : "—", color: s.underruns > 0 ? SFColor.warn : SFColor.text)

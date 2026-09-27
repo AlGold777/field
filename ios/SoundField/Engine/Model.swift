@@ -39,12 +39,14 @@ struct Diag: Equatable {
     var syncErrMs = 0.0, latencyMs = 0.0
     var resent: Int64 = 0
     var clockReady = false
+    /// Milliseconds since Point accepted its last valid audio packet; -1 means no packets yet.
+    var audioAgeMs: Int64 = -1
     var valid = false
 
     func json(_ t: String) -> [String: Any] {
         ["t": t, "rtt": rttMs, "rttJit": rttJitterMs, "jitter": jitterMs, "loss": lossPct, "recovered": recovered,
          "late": late, "stale": stale, "buffer": bufferMs, "drift": driftPpm, "unc": clockUncMs, "underruns": underruns,
-         "syncErr": syncErrMs, "latency": latencyMs, "resent": resent, "clockReady": clockReady]
+         "syncErr": syncErrMs, "latency": latencyMs, "resent": resent, "clockReady": clockReady, "audioAge": audioAgeMs]
     }
 
     static func from(_ o: [String: Any]) -> Diag {
@@ -52,7 +54,7 @@ struct Diag: Equatable {
              recovered: J.i64(o, "recovered"), late: J.i64(o, "late"), stale: J.i64(o, "stale"), bufferMs: J.d(o, "buffer"),
              driftPpm: J.d(o, "drift"), clockUncMs: J.d(o, "unc"), underruns: J.i64(o, "underruns"),
              syncErrMs: J.d(o, "syncErr"), latencyMs: J.d(o, "latency"), resent: J.i64(o, "resent"),
-             clockReady: J.b(o, "clockReady"), valid: true)
+             clockReady: J.b(o, "clockReady"), audioAgeMs: J.i64(o, "audioAge", -1), valid: true)
     }
 }
 
@@ -93,6 +95,9 @@ struct UiState: Equatable {
     var queueTracks: [QueueTrackUi] = []
     var loadingTracks = false
     var loadingTrackId: String? = nil
+    var decodingProgress: Double? = nil
+    var audioMissing = false
+    var audioBuffering = false
     var queueExpanded = false
     var filePickerRequest = 0
     var mode: SourceMode = .music
