@@ -1,6 +1,7 @@
 package app.soundfield.audio
 
 import android.content.Context
+import app.soundfield.diagnostics.Telemetry
 import android.media.AudioAttributes
 import android.media.AudioDeviceCallback
 import android.media.AudioDeviceInfo
@@ -80,6 +81,7 @@ class AudioOutput(private val ctx: Context) {
                     break
                 } catch (e: Exception) {
                     Log.w("SoundField", "Recreating audio output", e)
+                    Telemetry.get(ctx).limited("AUDIO_RECOVERY", error = e)
                     if (active()) Thread.sleep(250)
                 }
             }

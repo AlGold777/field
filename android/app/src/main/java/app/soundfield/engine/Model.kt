@@ -148,6 +148,8 @@ data class UiState(
     val messageId: Int = 0,
     /** Журнал событий подключения (новые — в конце), показывается в «Диагностике». */
     val connLog: List<String> = emptyList(),
+    val telemetrySaving: Boolean = false,
+    val telemetryFile: String? = null,
 ) {
     val myChannel: Int get() = if (role == Role.POINT) pointChannel else Ch.other(pointChannel)
     val inPair: Boolean get() = phase == Phase.PAIRED || phase == Phase.RECONNECTING

@@ -22,6 +22,7 @@ import android.util.Log
 import android.net.Uri
 import androidx.core.content.ContextCompat
 import app.soundfield.R
+import app.soundfield.diagnostics.Telemetry
 import app.soundfield.audio.AudioOutput
 import app.soundfield.audio.AudioFileDecoder
 import app.soundfield.audio.MicRecorder
@@ -71,14 +72,16 @@ class Engine private constructor(private val app: Context) {
         private fun hex(bytes: Int) = ByteArray(bytes).also { rnd.nextBytes(it) }.joinToString("") { "%02x".format(it) }
     }
 
+    private val telemetry = Telemetry.get(app)
+
     // ------------------------------------------------------------------ инфраструктура
     private val ex = Executors.newSingleThreadScheduledExecutor { Thread(it, "sf-engine") }
     private val io = Executors.newCachedThreadPool { Thread(it, "sf-io") }
     private fun post(block: () -> Unit) {
-        ex.execute { try { block() } catch (t: Throwable) { Log.e(TAG, "engine", t) } }
+        ex.execute { try { block() } catch (t: Throwable) { Log.e(TAG, "engine", t); telemetry.event("ENGINE_EXCEPTION", error = t) } }
     }
     private fun later(ms: Long, block: () -> Unit): ScheduledFuture<*> =
-        ex.schedule({ try { block() } catch (t: Throwable) { Log.e(TAG, "engine", t) } }, ms, TimeUnit.MILLISECONDS)
+        ex.schedule({ try { block() } catch (t: Throwable) { Log.e(TAG, "engine", t); telemetry.event("ENGINE_EXCEPTION", error = t) } }, ms, TimeUnit.MILLISECONDS)
 
     private val prefs = app.getSharedPreferences("soundfield", Context.MODE_PRIVATE)
     val myId: String = prefs.getString("id", null) ?: hex(4).also { prefs.edit().putString("id", it).apply() }
@@ -114,6 +117,7 @@ class Engine private constructor(private val app: Context) {
 
     // ------------------------------------------------------------------ сессия
     @Volatile private var phase = Phase.IDLE
+        set(value) { if (field != value) telemetry.event("PHASE", "$field -> $value"); field = value }
     @Volatile private var role = Role.SERVER
     private var link: ControlLink? = null
     private var pending: ControlLink? = null
@@ -144,6 +148,12 @@ class Engine private constructor(private val app: Context) {
     /** Приложение на экране. В фоне без пары Android замораживает процесс — такой телефон не должен быть виден. */
     @Volatile private var appVisible = true
     private var inviteRinging = false
+    private val incomingLinks = java.util.Collections.newSetFromMap(java.util.concurrent.ConcurrentHashMap<ControlLink, Boolean>())
+    private var lastTelemetry = 0L
+    private val udpPackets = AtomicLong()
+    private val udpInvalid = AtomicLong()
+    private val udpOtherSession = AtomicLong()
+    private val udpLastRx = AtomicLong()
     private val connLog = ArrayDeque<String>()
     private val logTime = java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.US)
 
@@ -188,7 +198,7 @@ class Engine private constructor(private val app: Context) {
     private fun boot() {
         File(app.filesDir, "audio_queue").listFiles()?.forEach { it.delete() }
         // Стараемся занять тот же TCP-порт, что и в прошлый раз: второй телефон помнит его и подключается напрямую.
-        tcp = try { ServerSocket(prefs.getInt("tcpPort", 0)) } catch (e: Exception) { ServerSocket(0) }
+        tcp = try { ServerSocket(prefs.getInt("tcpPort", 0)) } catch (e: Exception) { telemetry.event("TCP_LISTEN_FALLBACK", error = e); ServerSocket(0) }
         prefs.edit().putInt("tcpPort", tcp.localPort).apply()
         udp = DatagramSocket(0)
         discovery = Discovery(app, myId) { peers -> ui { copy(nearby = peers) } }
@@ -197,8 +207,8 @@ class Engine private constructor(private val app: Context) {
         Thread({ tickLoop() }, "sf-tick").apply { isDaemon = true; priority = Thread.MAX_PRIORITY - 1; start() }
         discovery.advertise(tcp.localPort, myName)
         discovery.startBrowse()
-        ex.scheduleAtFixedRate({ try { heartbeat() } catch (t: Throwable) { Log.e(TAG, "hb", t) } }, 1, 1, TimeUnit.SECONDS)
-        ex.scheduleAtFixedRate({ try { serverTick() } catch (t: Throwable) { Log.e(TAG, "tick", t) } }, 100, 100, TimeUnit.MILLISECONDS)
+        ex.scheduleAtFixedRate({ try { heartbeat() } catch (t: Throwable) { Log.e(TAG, "hb", t); telemetry.event("HEARTBEAT_EXCEPTION", error = t) } }, 1, 1, TimeUnit.SECONDS)
+        ex.scheduleAtFixedRate({ try { serverTick() } catch (t: Throwable) { Log.e(TAG, "tick", t); telemetry.limited("ENGINE_TICK_EXCEPTION", error = t) } }, 100, 100, TimeUnit.MILLISECONDS)
         ui { copy(myId = myId, myName = myName, remembered = record, durationMs = music.totalFrames * 1000 / SF.SAMPLE_RATE,
             title = music.title, artist = music.artist, queueExpanded = prefs.getBoolean("queueExpanded", false)) }
         watchNetwork()
@@ -212,8 +222,13 @@ class Engine private constructor(private val app: Context) {
         val req = NetworkRequest.Builder().addTransportType(NetworkCapabilities.TRANSPORT_WIFI).build()
         try {
             cm.registerNetworkCallback(req, object : ConnectivityManager.NetworkCallback() {
+                override fun onAvailable(network: Network) { telemetry.event("WIFI_AVAILABLE", "network=$network") }
+                override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) {
+                    telemetry.event("WIFI_CAPABILITIES", "network=$network internet=${caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)} validated=${caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)}")
+                }
                 override fun onLinkPropertiesChanged(network: Network, lp: LinkProperties) {
                     val sig = lp.linkAddresses.joinToString { it.address.hostAddress ?: "" }
+                    telemetry.event("WIFI_ADDRESSES", "network=$network interface=${lp.interfaceName} addresses=$sig")
                     post {
                         val prev = lastNetSignature
                         lastNetSignature = sig
@@ -222,18 +237,39 @@ class Engine private constructor(private val app: Context) {
                 }
                 override fun onLost(network: Network) { post { lastNetSignature = ""; log("Wi‑Fi потерян") } }
             })
-        } catch (e: Exception) { Log.w(TAG, "network callback", e) }
+        } catch (e: Exception) { Log.w(TAG, "network callback", e); telemetry.event("NETWORK_CALLBACK_FAILED", error = e) }
     }
 
     private fun onNetworkChanged() {
         log("Сеть изменилась")
         if (discovery.advertising || phase != Phase.IDLE) discovery.advertise(tcp.localPort, myName)
         if (discovery.browsing) { lastBrowseRestart = SystemClock.elapsedRealtime(); discovery.restartBrowse() }
-        if (phase == Phase.RECONNECTING && pending == null) scheduleReconnect(200)
+        when (phase) {
+            Phase.RECONNECTING -> if (pending == null) scheduleReconnect(200)
+            Phase.PAIRED -> {
+                // UDP-адрес второго телефона мог измениться вместе с сетью.
+                // Обновляем из TCP-соединения, которое ядро Linux переключает автоматически.
+                val l = link
+                if (l != null && l.isOpen) {
+                    val addr = l.remoteAddress
+                    if (role == Role.SERVER) {
+                        val old = pointUdp
+                        if (old != null && old.address != addr)
+                            pointUdp = InetSocketAddress(addr, old.port)
+                    } else {
+                        val old = serverUdp
+                        if (old != null && old.address != addr)
+                            serverUdp = InetSocketAddress(addr, old.port)
+                    }
+                }
+            }
+            else -> {}
+        }
     }
 
     private fun log(text: String) {
         Log.i(TAG, text)
+        telemetry.event("CONNECTION", "phase=$phase role=$role visible=$appVisible $text")
         val line = "${logTime.format(java.util.Date())}  $text"
         synchronized(connLog) { connLog.addLast(line); while (connLog.size > 60) connLog.removeFirst() }
         val snapshot = synchronized(connLog) { connLog.toList() }
@@ -286,6 +322,23 @@ class Engine private constructor(private val app: Context) {
         autoResume = on; prefs.edit().putBoolean("autoResume", on).apply()
     }
 
+    /**
+     * Запрашивает исключение из Doze (battery optimization) — без него Xiaomi/Samsung/Huawei замораживают
+     * сокеты через 1–5 мин при выключенном экране. Запрос показывается один раз, при первом создании пары.
+     */
+    private fun requestDozeExemption() {
+        val pm = app.getSystemService(Context.POWER_SERVICE) as android.os.PowerManager
+        if (pm.isIgnoringBatteryOptimizations(app.packageName)) return
+        try {
+            val intent = android.content.Intent(android.provider.Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS)
+                .setData(android.net.Uri.parse("package:${app.packageName}"))
+                .addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+            app.startActivity(intent)
+        } catch (e: Exception) {
+            telemetry.event("DOZE_REQUEST_FAILED", error = e)
+        }
+    }
+
     private fun defaultName(): String {
         val n = try { Settings.Global.getString(app.contentResolver, Settings.Global.DEVICE_NAME) } catch (_: Exception) { null }
         return (n ?: "${Build.MANUFACTURER.replaceFirstChar { it.uppercase() }} ${Build.MODEL}").take(40)
@@ -298,10 +351,79 @@ class Engine private constructor(private val app: Context) {
     }
 
     private fun acceptLoop() {
+        var failCount = 0
         while (true) {
-            val s = try { tcp.accept() } catch (e: Exception) { SystemClock.sleep(200); continue }
+            val s = try {
+                val sock = tcp.accept()
+                failCount = 0
+                sock
+            } catch (e: Exception) {
+                failCount++
+                telemetry.limited("TCP_ACCEPT_FAILED", "fails=$failCount", e)
+                val backoffMs = minOf(200L * (1L shl minOf(failCount, 4)), 3000L)
+                SystemClock.sleep(backoffMs)
+                // Если ServerSocket закрыт или повреждён, пробуем пересоздать
+                if (tcp.isClosed) {
+                    try {
+                        val savedPort = prefs.getInt("tcpPort", 0)
+                        tcp = ServerSocket(savedPort)
+                        prefs.edit().putInt("tcpPort", tcp.localPort).apply()
+                        telemetry.event("TCP_SERVER_RECREATED", "port=${tcp.localPort}")
+                    } catch (ex: Exception) {
+                        telemetry.limited("TCP_RECREATE_FAILED", error = ex)
+                    }
+                }
+                continue
+            }
+            // Защита от исчерпания памяти и потоков: ограничиваем число одновременных необработанных подключений
+            if (incomingLinks.size >= 5) {
+                telemetry.limited("TCP_INCOMING_LIMIT_REACHED", "active=${incomingLinks.size}")
+                try { s.close() } catch (_: Exception) {}
+                continue
+            }
             post { onIncomingSocket(s) }
         }
+    }
+
+    private fun telemetryState(): String {
+        val now = SystemClock.elapsedRealtime()
+        val state = ui.value
+        return "phase=$phase role=$role visible=$appVisible peer=$peerId " +
+            "tcpPort=${if (::tcp.isInitialized) tcp.localPort else 0} udpPort=${if (::udp.isInitialized) udp.localPort else 0} " +
+            "link=${link?.id} lastTcpRxAgoMs=${link?.let { now - it.lastRx }} pending=${pending?.id}:${pending?.tag} " +
+            "autoResume=$autoResume manualResume=$manualResumeActive attempt=$resumeAttempt " +
+            "udpPackets=${udpPackets.get()} udpInvalid=${udpInvalid.get()} udpOtherSession=${udpOtherSession.get()} " +
+            "udpLastRxAgoMs=${udpLastRx.get().takeIf { it > 0 }?.let { now - it }} " +
+            "audioRunning=${audio.isRunning} playing=${state.playing} " +
+            "serverDiag=${state.serverDiag.toJson("sdiag")} pointDiag=${state.pointDiag.toJson("diag")}"
+    }
+
+    fun telemetryPermissionDenied() = post {
+        telemetry.event("EXPORT_PERMISSION_DENIED")
+        toast("Для сохранения в Download разрешите доступ к файлам")
+    }
+
+    fun exportTelemetry() = post {
+        if (ui.value.telemetrySaving) return@post
+        ui { copy(telemetrySaving = true, telemetryFile = null) }
+        val snapshot = buildString {
+            appendLine(telemetryState())
+            appendLine("protocol=${SF.PROTOCOL_VERSION} myId=$myId advertising=${discovery.advertising} browsing=${discovery.browsing}")
+            appendLine("rememberedPeer=${record?.peerId} lastHost=${record?.lastHost} lastPort=${record?.lastPort}")
+            ui.value.nearby.forEach { appendLine("nearby id=${it.id} platform=${it.platform} address=${it.host?.hostAddress}:${it.port} ringing=${it.supportsRinging}") }
+            try {
+                val cm = app.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+                val active = cm.activeNetwork
+                val caps = active?.let { cm.getNetworkCapabilities(it) }
+                appendLine("activeNetwork=$active wifi=${caps?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)} vpn=${caps?.hasTransport(NetworkCapabilities.TRANSPORT_VPN)}")
+                val power = app.getSystemService(Context.POWER_SERVICE) as android.os.PowerManager
+                appendLine("interactive=${power.isInteractive} powerSave=${power.isPowerSaveMode} deviceIdle=${power.isDeviceIdleMode}")
+            } catch (e: Exception) { appendLine("networkSnapshotError=${e.javaClass.simpleName}") }
+        }
+        telemetry.export(snapshot) { result -> post {
+            ui { copy(telemetrySaving = false, telemetryFile = result.getOrNull()) }
+            result.fold({ toast("Телеметрия сохранена: $it") }, { toast("Не удалось сохранить телеметрию: ${it.message ?: it.javaClass.simpleName}") })
+        } }
     }
 
     // ================================================================== публичный API (любой поток)
@@ -319,6 +441,7 @@ class Engine private constructor(private val app: Context) {
      * в списке и ждал ответа «бесконечно». Поэтому без пары в фоне снимаем публикацию и поиск; вернёмся — включим.
      */
     fun onBackground() = post {
+        telemetry.event("APP_BACKGROUND", "phase=$phase")
         appVisible = false
         if (phase == Phase.IDLE) hideWhileBackground()
     }
@@ -331,6 +454,7 @@ class Engine private constructor(private val app: Context) {
 
     /** Приложение снова на экране (разблокировка, возврат из другого приложения). */
     fun onForeground() = post {
+        telemetry.event("APP_FOREGROUND", "phase=$phase")
         appVisible = true
         if (!discovery.advertising) { discovery.advertise(tcp.localPort, myName); log("Телефон снова виден в сети") }
         when (phase) {
@@ -341,8 +465,9 @@ class Engine private constructor(private val app: Context) {
             Phase.RECONNECTING -> if (pending == null) { log("Возврат в приложение — переподключаемся сразу"); scheduleReconnect(0) }
             Phase.PAIRED -> {
                 // Соединение могло «умереть» во сне, а таймаут ещё не истёк — не ждём его.
+                // Порог совпадает с LINK_TIMEOUT_MS: Wi‑Fi после сна просыпается за 2–4 с, и 4 с давали ложные разрывы.
                 val l = link
-                if (l != null && SystemClock.elapsedRealtime() - l.lastRx > 4_000) {
+                if (l != null && SystemClock.elapsedRealtime() - l.lastRx > SF.LINK_TIMEOUT_MS) {
                     log("Связь молчит ${(SystemClock.elapsedRealtime() - l.lastRx) / 1000} с — переподключаемся"); l.close()
                 }
             }
@@ -522,6 +647,8 @@ class Engine private constructor(private val app: Context) {
     private fun doManualResume(auto: Boolean = false) {
         val rec = record ?: return
         if (phase == Phase.IDLE) stopAutoResume()
+        // Ручное действие пользователя перебивает фоновый auto-resume, даже если pending уже есть
+        if (!auto) dropAutoPending()
         if (phase != Phase.IDLE || pending != null) return
         phase = Phase.INVITING
         manualResumeActive = true; manualResumeAuto = auto; resumeAttempt = 0
@@ -549,8 +676,8 @@ class Engine private constructor(private val app: Context) {
     }
 
     /**
-     * Куда стучаться при восстановлении пары: попеременно последний известный адрес (работает без mDNS,
-     * мгновенно после разблокировки) и адрес, найденный через NSD (если IP сменился).
+     * Куда стучаться при восстановлении пары: приоритет актуальному адресу из mDNS (если доступен),
+     * с fallback на прямой адрес из сохранённого профиля.
      */
     private fun resumeTarget(rec: PairRecord): Peer? {
         resumeAttempt++
@@ -558,8 +685,16 @@ class Engine private constructor(private val app: Context) {
         val direct = rec.lastHost?.takeIf { rec.lastPort > 0 }?.let { h ->
             try { Peer(rec.peerId, rec.peerName, rec.peerPlatform, InetAddress.getByName(h), rec.lastPort) } catch (_: Exception) { null }
         }
-        val sameAsFound = found != null && direct != null && found.host == direct.host && found.port == direct.port
-        return if (resumeAttempt % 2 == 1 || sameAsFound) direct ?: found else found ?: direct
+        return when {
+            found != null && direct == null -> found
+            found == null && direct != null -> direct
+            found != null && direct != null -> {
+                // Если хост совпадает, но порт разный — mDNS-порт гарантированно актуальнее, чем сохранённый в кэше direct
+                if (found.host == direct.host && found.port != direct.port) found
+                else if (resumeAttempt % 2 == 1) found else direct
+            }
+            else -> null
+        }
     }
 
     private fun resumeJson(rec: PairRecord) = JSONObject().put("t", "resume").put("id", myId).put("name", myName)
@@ -572,25 +707,34 @@ class Engine private constructor(private val app: Context) {
     private fun connectOutgoing(p: Peer, tag: String, first: JSONObject, timeoutMs: Long) {
         val host = p.host ?: return onConnectFailed(tag)
         pendingPeer = p
+        telemetry.event("TCP_CONNECT_START", "tag=$tag peer=${p.id} host=${host.hostAddress} port=${p.port} ringing=${p.supportsRinging} responseTimeoutMs=$timeoutMs")
         io.execute {
+            val started = SystemClock.elapsedRealtime()
+            val s = Socket()
             try {
-                val s = Socket()
                 s.connect(InetSocketAddress(host, p.port), 2_500)
+                telemetry.event("TCP_CONNECTED", "tag=$tag peer=${p.id} elapsedMs=${SystemClock.elapsedRealtime() - started}")
                 post {
                     val stillWanted = when (tag) {
                         "invite-out" -> phase == Phase.INVITING && pendingPeer?.id == p.id
                         "resume-auto" -> phase == Phase.IDLE && autoResumeUntil != 0L
                         else -> phase == Phase.RECONNECTING || (phase == Phase.INVITING && manualResumeActive)
                     }
-                    if (!stillWanted || pending != null) { try { s.close() } catch (_: Exception) {}; return@post }
+                    if (!stillWanted || pending != null) { telemetry.event("TCP_CONNECT_DISCARDED", "tag=$tag phase=$phase"); try { s.close() } catch (_: Exception) {}; return@post }
                     val l = newLink(s); l.tag = tag
                     pending = l
                     l.send(first)
                     pendingTimeout?.cancel(false)
-                    pendingTimeout = later(timeoutMs) { if (pending === l) l.close() }
+                    pendingTimeout = later(timeoutMs) { if (pending === l) l.close("response timeout ${timeoutMs}ms") }
                 }
             } catch (e: Exception) {
-                post { log("Нет соединения с ${host.hostAddress}:${p.port} — ${e.message}"); onConnectFailed(tag) }
+                try { s.close() } catch (_: Exception) { }
+                telemetry.event("TCP_CONNECT_FAILED", "tag=$tag peer=${p.id} host=${host.hostAddress}:${p.port} elapsedMs=${SystemClock.elapsedRealtime() - started}", e)
+                post {
+                    discovery.invalidatePeer(p.id)
+                    log("Нет соединения с ${host.hostAddress}:${p.port} — ${e.message}")
+                    onConnectFailed(tag)
+                }
             }
         }
     }
@@ -607,15 +751,22 @@ class Engine private constructor(private val app: Context) {
 
     private fun newLink(s: Socket) = ControlLink(s,
         onMessage = { l, o -> post { onMessage(l, o) } },
-        onClosed = { l -> post { onClosed(l) } })
+        onClosed = { l -> post { onClosed(l) } }, telemetry = telemetry)
 
     private fun onIncomingSocket(s: Socket) {
         val l = newLink(s)
         l.tag = "new"
-        later(5_000) { if (l.tag == "new") l.close() }
+        incomingLinks.add(l)
+        later(5_000) {
+            if (l.tag == "new") {
+                incomingLinks.remove(l)
+                l.close("first message timeout 5000ms")
+            }
+        }
     }
 
     private fun doCancelPending() {
+        telemetry.event("INVITE_CANCEL", "phase=$phase")
         manualResumeActive = false
         val l = pending
         pending = null
@@ -627,12 +778,14 @@ class Engine private constructor(private val app: Context) {
         val l = pending ?: return
         val p = pendingPeer ?: return
         if (phase != Phase.INCOMING) return
+        telemetry.event("INVITE_ACCEPT", "peer=${p.id}")
         l.send(acceptJson(pendingKey, Role.POINT))
         peerTcpPortHint = p.port
         becomePaired(l, Role.POINT, p.id, p.name, p.platform, pendingKey, resumed = false)
     }
 
     private fun doReject() {
+        telemetry.event("INVITE_REJECT", "phase=$phase")
         val l = pending ?: return
         pending = null; l.tag = "dead"
         l.sendAndClose(JSONObject().put("t", "reject").put("reason", "declined"))
@@ -649,6 +802,7 @@ class Engine private constructor(private val app: Context) {
     }
 
     private fun onFirstMessage(l: ControlLink, o: JSONObject) {
+        incomingLinks.remove(l)
         val pid = o.optString("id"); val pname = o.optString("name", pid); val pplat = o.optString("platform", "?")
         when (o.optString("t")) {
             "invite" -> {
@@ -662,7 +816,7 @@ class Engine private constructor(private val app: Context) {
                     log("Приглашение от «$pname»")
                     ui { copy(phase = Phase.INCOMING, incomingName = pname) }
                     pendingTimeout?.cancel(false)
-                    pendingTimeout = later(60_000) { if (pending === l) doReject() }
+                    pendingTimeout = later(60_000) { if (pending === l) { telemetry.event("INVITE_DECISION_TIMEOUT"); doReject() } }
                 } else if (phase == Phase.INVITING && pendingPeer?.id == pid) {
                     // Встречные приглашения: уступает телефон с бо́льшим id (детерминированно на обеих сторонах).
                     if (myId > pid) {
@@ -754,7 +908,7 @@ class Engine private constructor(private val app: Context) {
                 inviteRinging = true
                 ui { copy(inviteRinging = true) }
                 pendingTimeout?.cancel(false)
-                pendingTimeout = later(65_000) { if (pending === l) l.close() }   // у второго диалог живёт 60 с
+                pendingTimeout = later(65_000) { if (pending === l) l.close("accept timeout 65000ms") }   // у второго диалог живёт 60 с
                 log("«${pendingPeer?.name ?: "Второй телефон"}» получил приглашение, ждём подтверждения")
             }
             "cancel" -> if (l.tag == "incoming") {
@@ -765,6 +919,8 @@ class Engine private constructor(private val app: Context) {
     }
 
     private fun onClosed(l: ControlLink) {
+        incomingLinks.remove(l)
+        telemetry.event("LINK_ENDED", "link=${l.id} tag=${l.tag} phase=$phase lastRxAgoMs=${SystemClock.elapsedRealtime() - l.lastRx}")
         if (l === link) { onLinkLost(); return }
         if (l === pending) {
             pending = null
@@ -798,6 +954,7 @@ class Engine private constructor(private val app: Context) {
         link = l
         role = r; peerId = pid; peerName = pname; peerPlatform = pplat
         phase = Phase.PAIRED
+        udpLastRx.set(0)
 
         val old = record
         val host = l.remoteAddress.hostAddress
@@ -807,6 +964,7 @@ class Engine private constructor(private val app: Context) {
                  else PairRecord(key, pid, pname, pplat, r, lastHost = host, lastPort = port)
         persistRecord()
         setAutoResume(true)
+        requestDozeExemption()
         if (!discovery.advertising) discovery.advertise(tcp.localPort, myName)
         log("Пара ${if (continuing) "продолжена" else if (resumed) "восстановлена" else "создана"}: «$pname» $host:$port, роль ${r.wire}")
         discovery.stopBrowse()
@@ -837,15 +995,19 @@ class Engine private constructor(private val app: Context) {
             audio.source = pointRenderer
         }
         audio.start()
-        try { PlaybackService.start(app) } catch (e: Exception) { Log.w(TAG, "fgs", e) }
+        try { PlaybackService.start(app) } catch (e: Exception) { Log.w(TAG, "fgs", e); telemetry.event("FOREGROUND_SERVICE_FAILED", error = e) }
         ui { copy(phase = Phase.PAIRED, role = r, peerName = pname, peerPlatform = pplat, linkOk = true, remembered = record, autoResuming = false,
             calib = CalibUi()) }
         PlaybackService.refresh(app)
         toast(if (resumed) "Пара восстановлена" else "Стереопара создана")
     }
 
-    private fun reconnectDelay(): Long =
-        if (SystemClock.elapsedRealtime() - reconnectSince < 60_000) 1_000L else 3_000L
+    /** Экспоненциальный backoff: 1с → 2с → 4с → 8с → 15с (потолок). */
+    private fun reconnectDelay(): Long {
+        val base = 1_000L
+        val exp = minOf(resumeAttempt / 2, 4)
+        return minOf(base shl exp, 15_000L)
+    }
 
     private fun onLinkLost() {
         link = null
@@ -855,7 +1017,8 @@ class Engine private constructor(private val app: Context) {
         log("Связь с «$peerName» потеряна")
         reconnectSince = SystemClock.elapsedRealtime()
         resumeAttempt = 0
-        discovery.startBrowse()
+        // NSD на Samsung/Xiaomi сбоит при быстром stopBrowse→startBrowse — пауза 500 мс.
+        later(500) { if (phase == Phase.RECONNECTING) discovery.startBrowse() }
         // Переподключаются ОБА телефона: кто первым достучится, тот и восстановит пару (встречные попытки
         // разрешаются по id). Раньше это делал только Point — и если он спал, пара не возвращалась.
         if (role == Role.SERVER) {
@@ -871,6 +1034,7 @@ class Engine private constructor(private val app: Context) {
     }
 
     private fun scheduleReconnect(delayMs: Long) {
+        telemetry.event("RECONNECT_SCHEDULED", "delayMs=$delayMs role=$role attempt=$resumeAttempt")
         reconnectTask?.cancel(false)
         reconnectTask = later(delayMs) { attemptResume() }
     }
@@ -1237,9 +1401,14 @@ class Engine private constructor(private val app: Context) {
     // ================================================================== heartbeat + диагностика
     private fun heartbeat() {
         autoResumeTick()
+        val nowMs = SystemClock.elapsedRealtime()
+        if (phase != Phase.IDLE && nowMs - lastTelemetry >= 10_000) {
+            lastTelemetry = nowMs
+            telemetry.event("HEALTH", telemetryState())
+        }
         val l = link ?: return
         if (phase != Phase.PAIRED) return
-        if (SystemClock.elapsedRealtime() - l.lastRx > SF.LINK_TIMEOUT_MS) { log("Нет данных ${SF.LINK_TIMEOUT_MS / 1000} с — соединение закрыто"); l.close(); return }
+        if (SystemClock.elapsedRealtime() - l.lastRx > SF.LINK_TIMEOUT_MS) { log("Нет данных ${SF.LINK_TIMEOUT_MS / 1000} с — соединение закрыто"); l.close("heartbeat timeout"); return }
         l.send(JSONObject().put("t", "hb"))
         if (role == Role.SERVER) {
             val d = Diag(syncErrMs = serverRenderer.corrector.syncErrorMs, latencyMs = audio.latencyMs,
@@ -1270,8 +1439,11 @@ class Engine private constructor(private val app: Context) {
                 pkt.length = buf.size
                 udp.receive(pkt)
                 val now = System.nanoTime()
-                val m = Wire.decode(pkt.data, pkt.length) ?: continue
-                if (m.session != sessionId || sessionId == 0) continue
+                udpPackets.incrementAndGet()
+                val m = Wire.decode(pkt.data, pkt.length)
+                if (m == null) { udpInvalid.incrementAndGet(); telemetry.limited("UDP_INVALID", "bytes=${pkt.length} from=${pkt.socketAddress}"); continue }
+                if (m.session != sessionId || sessionId == 0) { udpOtherSession.incrementAndGet(); continue }
+                if (udpLastRx.getAndSet(SystemClock.elapsedRealtime()) == 0L) telemetry.event("UDP_FIRST_PACKET", "from=${pkt.socketAddress}")
                 when (m) {
                     is UdpMsg.Ping -> if (role == Role.SERVER && phase == Phase.PAIRED) {
                         pointUdp = pkt.socketAddress as InetSocketAddress
@@ -1283,7 +1455,7 @@ class Engine private constructor(private val app: Context) {
                     is UdpMsg.Audio -> if (role == Role.POINT && phase == Phase.PAIRED) rx.onAudio(m, now)
                 }
             } catch (e: Exception) {
-                Log.w(TAG, "udp: ${e.message}"); SystemClock.sleep(10)
+                telemetry.limited("UDP_RECEIVE_FAILED", error = e); Log.w(TAG, "udp: ${e.message}"); SystemClock.sleep(10)
             }
         }
     }
@@ -1293,9 +1465,12 @@ class Engine private constructor(private val app: Context) {
             try {
                 if (phase == Phase.PAIRED) {
                     if (role == Role.SERVER) serverSend() else pointNet()
+                    SystemClock.sleep(5)
+                } else {
+                    // Не в паре — нет смысла крутиться каждые 5 мс, спим 200 мс.
+                    SystemClock.sleep(200)
                 }
-            } catch (e: Exception) { Log.w(TAG, "tick: ${e.message}") }
-            SystemClock.sleep(5)
+            } catch (e: Exception) { telemetry.limited("UDP_SEND_FAILED", error = e); Log.w(TAG, "tick: ${e.message}") }
         }
     }
 

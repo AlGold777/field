@@ -180,6 +180,7 @@ fun PlayerScreen(ui: UiState, engine: Engine, openCalibration: () -> Unit, openD
         SecondaryButton("🎯  Калибровка задержки") { openCalibration() }
         SecondaryButton("📊  Диагностика пары") { openDiagnostics() }
         DangerButton("⛓  Разорвать пару") { confirmDisconnect = true }
+        TelemetryButton(ui, engine)
     }
 
     if (confirmDisconnect) {

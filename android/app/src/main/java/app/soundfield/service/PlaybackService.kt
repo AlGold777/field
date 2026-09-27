@@ -19,6 +19,7 @@ import app.soundfield.core.Role
 import app.soundfield.engine.Engine
 import app.soundfield.engine.Phase
 import app.soundfield.ui.MainActivity
+import app.soundfield.diagnostics.Telemetry
 
 /**
  * Foreground-сервис типа mediaPlayback: держит процесс, Wi‑Fi (low latency) и CPU, пока телефон в паре —
@@ -35,16 +36,29 @@ class PlaybackService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        Telemetry.get(this).event("SERVICE_CREATE")
         ensureChannel(this)
         val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
-        // LOW_LATENCY действует только пока приложение на экране; в фоне и при выключенном экране Wi‑Fi
-        // держит HIGH_PERF (без энергосбережения) — иначе пакеты задерживаются на секунды и пара рвётся.
-        @Suppress("DEPRECATION")
-        wifiLockBg = try { wm.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "soundfield:wifi-bg")
-            .apply { setReferenceCounted(false); acquire() } } catch (_: Exception) { null }
+        // На API 29+ LOW_LATENCY минимизирует jitter и задержку доставки пакетов
         if (Build.VERSION.SDK_INT >= 29) {
-            wifiLock = try { wm.createWifiLock(WifiManager.WIFI_MODE_FULL_LOW_LATENCY, "soundfield:wifi")
-                .apply { setReferenceCounted(false); acquire() } } catch (_: Exception) { null }
+            wifiLock = try {
+                wm.createWifiLock(WifiManager.WIFI_MODE_FULL_LOW_LATENCY, "soundfield:wifi")
+                    .apply { setReferenceCounted(false); acquire() }
+            } catch (e: Exception) {
+                Telemetry.get(this).event("WIFI_LOCK_LOW_LATENCY_FAILED", error = e)
+                null
+            }
+        }
+        // На Android < 34 (или если LOW_LATENCY недоступен) держим HIGH_PERF для защиты от энергосбережения в фоне
+        if (wifiLock == null || Build.VERSION.SDK_INT < 34) {
+            @Suppress("DEPRECATION")
+            wifiLockBg = try {
+                wm.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "soundfield:wifi-bg")
+                    .apply { setReferenceCounted(false); acquire() }
+            } catch (e: Exception) {
+                Telemetry.get(this).event("WIFI_LOCK_HIGH_PERF_FAILED", error = e)
+                null
+            }
         }
         val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
         wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "soundfield:audio").apply { setReferenceCounted(false); acquire() }
@@ -63,12 +77,14 @@ class PlaybackService : Service() {
         } catch (e: Exception) {
             // Android 12+ запрещает запуск foreground-сервиса из фона в некоторых случаях — не падаем.
             android.util.Log.w("SoundField", "startForeground: ${e.message}")
+            Telemetry.get(this).event("SERVICE_START_FAILED", error = e)
             running = false; stopSelf(); return START_NOT_STICKY
         }
         return START_NOT_STICKY
     }
 
     override fun onDestroy() {
+        Telemetry.get(this).event("SERVICE_DESTROY")
         try { wifiLock?.release() } catch (_: Exception) {}
         try { wifiLockBg?.release() } catch (_: Exception) {}
         try { wakeLock?.release() } catch (_: Exception) {}

@@ -6,8 +6,10 @@ import android.net.nsd.NsdServiceInfo
 import android.net.wifi.WifiManager
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.util.Log
 import app.soundfield.core.SF
+import app.soundfield.diagnostics.Telemetry
 
 /**
  * Обнаружение через DNS-SD (NSD) — совместимо с Bonjour на iOS.
@@ -18,14 +20,16 @@ class Discovery(
     private val myId: String,
     private val onPeers: (List<Peer>) -> Unit,
 ) {
+    private val telemetry = Telemetry.get(ctx)
     private val nsd = ctx.getSystemService(Context.NSD_SERVICE) as NsdManager
     private val multicastLock: WifiManager.MulticastLock =
         (ctx.applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager)
             .createMulticastLock("soundfield-mdns").apply { setReferenceCounted(false) }
 
-    private var regListener: NsdManager.RegistrationListener? = null
-    private var discListener: NsdManager.DiscoveryListener? = null
+    @Volatile private var regListener: NsdManager.RegistrationListener? = null
+    @Volatile private var discListener: NsdManager.DiscoveryListener? = null
     private val peers = LinkedHashMap<String, Peer>()      // serviceName → Peer
+    private val resolvedAt = HashMap<String, Long>()       // serviceName → elapsedRealtime
     private val resolveQueue = ArrayDeque<NsdServiceInfo>()
     private var resolving = false
     private var resolveToken = 0
@@ -46,6 +50,7 @@ class Discovery(
      * unregister+register с тем же именем на многих прошивках даёт отказ, и телефон становится невидим.
      */
     fun advertise(port: Int, name: String) {
+        telemetry.event("NSD_ADVERTISE", "port=$port")
         val had = regListener != null
         unadvertise()
         wantAdvertise = true; adPort = port; adName = name; regAttempts = 0
@@ -64,24 +69,25 @@ class Discovery(
             setAttribute("ringing", "1")
         }
         val l = object : NsdManager.RegistrationListener {
-            override fun onServiceRegistered(i: NsdServiceInfo) { Log.i(TAG, "registered ${i.serviceName}"); regAttempts = 0 }
+            override fun onServiceRegistered(i: NsdServiceInfo) { Log.i(TAG, "registered ${i.serviceName}"); telemetry.event("NSD_REGISTERED", i.serviceName); regAttempts = 0 }
             override fun onRegistrationFailed(i: NsdServiceInfo, e: Int) {
-                Log.w(TAG, "register failed $e")
+                Log.w(TAG, "register failed $e"); telemetry.event("NSD_REGISTER_FAILED", "code=$e attempt=$regAttempts")
                 if (regListener !== this) return
                 regListener = null
                 // без повтора телефон остаётся невидимым для второго до перезапуска приложения
                 if (wantAdvertise && regAttempts++ < 6) main.postDelayed({ if (wantAdvertise && regListener == null) register() }, 1_500)
             }
-            override fun onServiceUnregistered(i: NsdServiceInfo) {}
-            override fun onUnregistrationFailed(i: NsdServiceInfo, e: Int) {}
+            override fun onServiceUnregistered(i: NsdServiceInfo) { telemetry.event("NSD_UNREGISTERED", i.serviceName) }
+            override fun onUnregistrationFailed(i: NsdServiceInfo, e: Int) { telemetry.event("NSD_UNREGISTER_FAILED", "code=$e") }
         }
         regListener = l
-        try { nsd.registerService(info, NsdManager.PROTOCOL_DNS_SD, l) } catch (e: Exception) { Log.w(TAG, "register", e) }
+        try { nsd.registerService(info, NsdManager.PROTOCOL_DNS_SD, l) } catch (e: Exception) { Log.w(TAG, "register", e); telemetry.event("NSD_REGISTER_EXCEPTION", error = e) }
     }
 
     fun unadvertise() {
+        telemetry.event("NSD_UNADVERTISE")
         wantAdvertise = false
-        regListener?.let { try { nsd.unregisterService(it) } catch (_: Exception) {} }
+        regListener?.let { try { nsd.unregisterService(it) } catch (e: Exception) { telemetry.event("NSD_UNREGISTER_EXCEPTION", error = e) } }
         regListener = null
     }
 
@@ -89,38 +95,50 @@ class Discovery(
         wantBrowse = true
         if (discListener != null) return
         multicastLock.acquire()
-        synchronized(lock) { peers.clear(); resolveQueue.clear(); resolving = false; resolveToken++ }
+        synchronized(lock) { peers.clear(); resolvedAt.clear(); resolveQueue.clear(); resolving = false; resolveToken++ }
         publish()
         val l = object : NsdManager.DiscoveryListener {
-            override fun onDiscoveryStarted(t: String) {}
-            override fun onDiscoveryStopped(t: String) {}
+            override fun onDiscoveryStarted(t: String) { telemetry.event("NSD_BROWSE_STARTED", t) }
+            override fun onDiscoveryStopped(t: String) { telemetry.event("NSD_BROWSE_STOPPED", t) }
             override fun onStartDiscoveryFailed(t: String, e: Int) {
-                Log.w(TAG, "discovery failed $e")
+                Log.w(TAG, "discovery failed $e"); telemetry.event("NSD_BROWSE_FAILED", "code=$e")
                 if (discListener === this) discListener = null
                 main.postDelayed({ if (wantBrowse && discListener == null) startBrowse() }, 2_000)
             }
-            override fun onStopDiscoveryFailed(t: String, e: Int) {}
+            override fun onStopDiscoveryFailed(t: String, e: Int) { telemetry.event("NSD_STOP_FAILED", "code=$e") }
             override fun onServiceFound(info: NsdServiceInfo) {
                 if (!info.serviceName.startsWith(SF.SERVICE_PREFIX)) return
                 if (info.serviceName == SF.SERVICE_PREFIX + myId) return
-                // NSD часто сообщает об одном и том же сервисе много раз — не копим дубликаты в очереди resolve
-                synchronized(lock) { if (resolveQueue.none { it.serviceName == info.serviceName }) resolveQueue.addLast(info) }
+                telemetry.event("NSD_FOUND", info.serviceName)
+                val now = SystemClock.elapsedRealtime()
+                synchronized(lock) {
+                    val last = resolvedAt[info.serviceName] ?: 0L
+                    val alreadyKnown = peers.containsKey(info.serviceName)
+                    // Не копим дубликаты. Если сервис уже известен, но прошло > 20 с, разрешаем повторный resolve для обновления IP/порта.
+                    if (resolveQueue.none { it.serviceName == info.serviceName } && (!alreadyKnown || now - last > 20_000)) {
+                        resolveQueue.addLast(info)
+                    }
+                }
                 resolveNext()
             }
             override fun onServiceLost(info: NsdServiceInfo) {
-                synchronized(lock) { peers.remove(info.serviceName) }
+                telemetry.event("NSD_LOST", info.serviceName)
+                synchronized(lock) {
+                    peers.remove(info.serviceName)
+                    resolvedAt.remove(info.serviceName)
+                }
                 publish()
             }
         }
         discListener = l
         try { nsd.discoverServices(SF.SERVICE_TYPE, NsdManager.PROTOCOL_DNS_SD, l) } catch (e: Exception) {
-            Log.w(TAG, "discover", e); discListener = null
+            Log.w(TAG, "discover", e); telemetry.event("NSD_BROWSE_EXCEPTION", error = e); discListener = null
         }
     }
 
     fun stopBrowse() {
         wantBrowse = false
-        discListener?.let { try { nsd.stopServiceDiscovery(it) } catch (_: Exception) {} }
+        discListener?.let { try { nsd.stopServiceDiscovery(it) } catch (e: Exception) { telemetry.event("NSD_STOP_EXCEPTION", error = e) } }
         discListener = null
     }
 
@@ -128,6 +146,16 @@ class Discovery(
     fun restartBrowse() { stopBrowse(); startBrowse() }
 
     fun peer(id: String): Peer? = synchronized(lock) { peers.values.firstOrNull { it.id == id } }
+
+    /** Инвалидация устаревшего пира (например, при ошибке TCP-подключения к старому IP/порту). */
+    fun invalidatePeer(id: String) {
+        synchronized(lock) {
+            val key = peers.entries.firstOrNull { it.value.id == id }?.key ?: return
+            peers.remove(key)
+            resolvedAt.remove(key)
+        }
+        publish()
+    }
 
     @Suppress("DEPRECATION")
     private fun resolveNext() {
@@ -139,15 +167,16 @@ class Discovery(
             next = resolveQueue.removeFirst()
             token = ++resolveToken
         }
-        // Известная проблема NSD: колбэк resolve иногда не приходит вовсе, и очередь «застревает» навсегда —
-        // тогда новые адреса не находятся до перезапуска приложения. Сторож снимает блокировку через 5 с.
+        // Сторож снимает зависший resolve через 2.5 с (вместо 5 с), чтобы очередь быстрее двигалась к другим сервисам
         main.postDelayed({
             val stuck = synchronized(lock) { (resolving && resolveToken == token).also { if (it) resolving = false } }
-            if (stuck) { Log.w(TAG, "resolve timeout ${next.serviceName}"); resolveNext() }
-        }, 5_000)
+            if (stuck) { Log.w(TAG, "resolve timeout ${next.serviceName}"); telemetry.event("NSD_RESOLVE_TIMEOUT", next.serviceName); resolveNext() }
+        }, 2_500)
+        telemetry.event("NSD_RESOLVE_START", "service=${next.serviceName} token=$token")
         try {
             nsd.resolveService(next, object : NsdManager.ResolveListener {
                 override fun onResolveFailed(i: NsdServiceInfo, e: Int) {
+                    telemetry.limited("NSD_RESOLVE_FAILED", "service=${i.serviceName} code=$e token=$token")
                     synchronized(lock) {
                         if (resolveToken == token) resolving = false
                         if (e == NsdManager.FAILURE_ALREADY_ACTIVE) resolveQueue.addLast(i)
@@ -162,12 +191,18 @@ class Discovery(
                     // недоступен и соединение висит до таймаута — берём IPv4, если он есть.
                     val host = if (android.os.Build.VERSION.SDK_INT >= 34)
                         (i.hostAddresses.firstOrNull { it is java.net.Inet4Address } ?: i.host) else i.host
+                    telemetry.event("NSD_RESOLVED", "service=${i.serviceName} host=${host?.hostAddress} port=${i.port} platform=${attr("p")} ringing=${attr("ringing")} token=$token")
                     val p = Peer(id, attr("n") ?: id, attr("p") ?: "?", host, i.port, supportsRinging = attr("ringing") == "1")
-                    synchronized(lock) { peers[i.serviceName] = p; if (resolveToken == token) resolving = false }
+                    synchronized(lock) {
+                        peers[i.serviceName] = p
+                        resolvedAt[i.serviceName] = SystemClock.elapsedRealtime()
+                        if (resolveToken == token) resolving = false
+                    }
                     publish(); resolveNext()
                 }
             })
         } catch (e: Exception) {
+            telemetry.event("NSD_RESOLVE_EXCEPTION", next.serviceName, e)
             synchronized(lock) { resolving = false }
         }
     }

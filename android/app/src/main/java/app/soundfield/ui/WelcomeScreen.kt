@@ -78,6 +78,7 @@ fun WelcomeScreen(ui: UiState, engine: Engine) {
                 Text(line, color = SFColors.TextDim, fontSize = 12.sp, lineHeight = 16.sp, modifier = Modifier.padding(vertical = 2.dp))
             }
         }
+        TelemetryButton(ui, engine)
     }
 
     if (renaming) RenameDialog(ui.myName, onDismiss = { renaming = false }) { engine.rename(it); renaming = false }

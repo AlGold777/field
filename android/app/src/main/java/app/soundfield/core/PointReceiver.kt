@@ -31,7 +31,7 @@ class PointReceiver(private val clock: ClockSync, capacityPow2: Int = 17) {
     private val lock = Any()
     private var expectedSeq = -1
     private class Pending(val firstSeen: Long) { var lastNack = 0L; var tries = 0 }
-    private val pending = HashMap<Int, Pending>()
+    private val pending = LinkedHashMap<Int, Pending>()
     private var lastTransit = Long.MIN_VALUE
 
     val bufferMs: Double get() {
@@ -77,8 +77,25 @@ class PointReceiver(private val clock: ClockSync, capacityPow2: Int = 17) {
         } else {
             if (expectedSeq < 0) expectedSeq = p.seq
             if (p.seq >= expectedSeq) {
-                var s = expectedSeq
-                while (s < p.seq && pending.size < 512) { pending[s] = Pending(arrivalLocalNs); s++ }
+                val gap = p.seq - expectedSeq
+                if (gap > 256) {
+                    // Огромный провал в приёме (> 2.5 с звука) — не забиваем очередь безнадёжными NACK
+                    lostFinal += gap
+                } else {
+                    var s = expectedSeq
+                    while (s < p.seq) {
+                        if (pending.size >= 512) {
+                            val it = pending.keys.iterator()
+                            if (it.hasNext()) {
+                                it.next()
+                                it.remove()
+                                lostFinal++
+                            }
+                        }
+                        pending[s] = Pending(arrivalLocalNs)
+                        s++
+                    }
+                }
                 expectedSeq = p.seq + 1
             } else if (pending.remove(p.seq) != null) {
                 recovered++ // переупорядочивание
