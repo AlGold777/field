@@ -24,11 +24,12 @@ class ControlLink(
     private val telemetry: Telemetry,
     initialTag: String = "",
     val localNetwork: String = "unknown",
+    val localNetworkId: String = "unknown",
 ) {
     companion object { private val ids = AtomicLong() }
     val id = ids.incrementAndGet()
     private fun event(kind: String, detail: String = "", error: Throwable? = null) =
-        telemetry.event(kind, "link=$id tag=$tag local=${localAddress.hostAddress}:${socket.localPort} network=$localNetwork remote=${socket.remoteSocketAddress} $detail", error)
+        telemetry.event(kind, "link=$id tag=$tag local=${localAddress.hostAddress}:${socket.localPort} network=$localNetwork networkId=$localNetworkId remote=${socket.remoteSocketAddress} $detail", error)
 
     val remoteAddress: InetAddress = socket.inetAddress
     val localAddress: InetAddress = socket.localAddress

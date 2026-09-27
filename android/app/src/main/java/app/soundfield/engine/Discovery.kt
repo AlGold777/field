@@ -187,12 +187,22 @@ class Discovery(
                     val attrs = i.attributes
                     fun attr(k: String) = attrs[k]?.let { String(it, Charsets.UTF_8) }
                     val id = attr("id") ?: i.serviceName.removePrefix(SF.SERVICE_PREFIX)
-                    // Android 14+: у сервиса может быть несколько адресов; IPv6 link-local без зоны часто
-                    // недоступен и соединение висит до таймаута — берём IPv4, если он есть.
-                    val host = if (android.os.Build.VERSION.SDK_INT >= 34)
-                        (i.hostAddresses.firstOrNull { it is java.net.Inet4Address } ?: i.host) else i.host
-                    telemetry.event("NSD_RESOLVED", "service=${i.serviceName} host=${host?.hostAddress} port=${i.port} platform=${attr("p")} ringing=${attr("ringing")} token=$token")
-                    val p = Peer(id, attr("n") ?: id, attr("p") ?: "?", host, i.port, supportsRinging = attr("ringing") == "1")
+                    // Keep every mDNS address; the engine orders candidates and matches each against
+                    // available local Wi-Fi networks. Link-local IPv6 is omitted because NSD's
+                    // InetAddress value does not retain the interface scope needed by Socket.connect.
+                    val hosts = buildList {
+                        if (android.os.Build.VERSION.SDK_INT >= 34) addAll(i.hostAddresses)
+                        i.host?.let(::add)
+                    }.filterNot { it is java.net.Inet6Address && it.isLinkLocalAddress }
+                        .distinctBy { it.hostAddress }
+                        .sortedBy { if (it is java.net.Inet4Address) 0 else 1 }
+                    val host = hosts.firstOrNull()
+                    val addresses = hosts.mapNotNull { address -> address.hostAddress?.let { PeerAddress(it, "", "") } }
+                    telemetry.record("NSD_RESOLVED", mapOf("service" to i.serviceName,
+                        "hosts" to hosts.mapNotNull { it.hostAddress }, "host" to host?.hostAddress,
+                        "port" to i.port, "platform" to attr("p"), "ringing" to (attr("ringing") == "1"), "token" to token))
+                    val p = Peer(id, attr("n") ?: id, attr("p") ?: "?", host, i.port,
+                        supportsRinging = attr("ringing") == "1", hosts = hosts, addresses = addresses)
                     synchronized(lock) {
                         peers[i.serviceName] = p
                         resolvedAt[i.serviceName] = SystemClock.elapsedRealtime()

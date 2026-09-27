@@ -10,6 +10,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -49,6 +50,12 @@ fun PlayerScreen(ui: UiState, engine: Engine, openCalibration: () -> Unit, openD
             }
             Spacer(Modifier.weight(1f))
             Badge(if (ui.role == Role.SERVER) "SERVER" else "POINT", SFColors.Master)
+        }
+
+        if (ui.multiWifiWarning.isNotBlank()) {
+            Text(ui.multiWifiWarning, color = SFColors.Warn, fontSize = 12.sp, lineHeight = 17.sp,
+                modifier = Modifier.fillMaxWidth().padding(top = 10.dp)
+                    .clip(RoundedCornerShape(10.dp)).background(SFColors.Warn.copy(alpha = 0.12f)).padding(12.dp))
         }
 
         // --- стереосцена ---

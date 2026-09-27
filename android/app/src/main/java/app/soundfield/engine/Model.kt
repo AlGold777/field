@@ -14,7 +14,14 @@ data class Peer(
     val host: InetAddress?,
     val port: Int,
     val supportsRinging: Boolean = false,
+    /** All resolved mDNS addresses; `host` remains the compatibility/preferred address. */
+    val hosts: List<InetAddress> = listOfNotNull(host),
+    val addresses: List<PeerAddress> = emptyList(),
 )
+
+data class PeerAddress(val ip: String, val iface: String, val networkId: String) {
+    fun toJson(): JSONObject = JSONObject().put("ip", ip).put("iface", iface).put("networkId", networkId)
+}
 
 enum class Phase { IDLE, INVITING, INCOMING, PAIRED, RECONNECTING }
 
@@ -33,12 +40,16 @@ data class PairRecord(
     /** Последний известный адрес второго телефона и порт его TCP-сервера — быстрый путь без mDNS. */
     val lastHost: String? = null,
     val lastPort: Int = 0,
+    val peerAddresses: List<PeerAddress> = emptyList(),
+    val lastSuccessfulHost: String? = lastHost,
 ) {
     fun toJson(): String = JSONObject().apply {
         put("key", key); put("peerId", peerId); put("peerName", peerName); put("peerPlatform", peerPlatform)
         put("myRole", myRole.wire); put("pointCh", Ch.name(pointChannel)); put("trimMs", trimMs)
         put("volL", volL.toDouble()); put("volR", volR.toDouble()); put("master", master.toDouble())
         lastHost?.let { put("lastHost", it) }; put("lastPort", lastPort)
+        lastSuccessfulHost?.let { put("lastSuccessfulHost", it) }
+        put("peerAddresses", org.json.JSONArray().also { array -> peerAddresses.forEach { array.put(it.toJson()) } })
     }.toString()
 
     companion object {
@@ -51,6 +62,13 @@ data class PairRecord(
                     it.optDouble("volL", 1.0).toFloat(), it.optDouble("volR", 1.0).toFloat(),
                     it.optDouble("master", 0.8).toFloat(),
                     it.optString("lastHost", "").ifEmpty { null }, it.optInt("lastPort", 0),
+                    it.optJSONArray("peerAddresses")?.let { array ->
+                        (0 until array.length()).mapNotNull { index ->
+                            array.optJSONObject(index)?.let { address -> PeerAddress(address.optString("ip"),
+                                address.optString("iface"), address.optString("networkId")) }
+                                ?.takeIf { address -> address.ip.isNotBlank() }
+                        }
+                    }.orEmpty(), it.optString("lastSuccessfulHost", "").ifEmpty { null },
                 )
             }
         } catch (e: Exception) { null }
@@ -245,6 +263,13 @@ data class UiState(
     val activeIncidents: List<String> = emptyList(),
     val debugUdpAudioStopped: Boolean = false,
     val debugPointOutputSilenced: Boolean = false,
+    val multiWifiWarning: String = "",
+    val pointAudioBufferSeconds: Double = 0.0,
+    val audioPath: String = "udp",
+    val clockPath: String = "udp",
+    val freezeCount: Int = 0,
+    val freezeDurationMs: Long = 0,
+    val showStabilitySettings: Boolean = false,
 ) {
     val myChannel: Int get() = if (role == Role.POINT) pointChannel else Ch.other(pointChannel)
     val inPair: Boolean get() = phase == Phase.PAIRED || phase == Phase.RECONNECTING

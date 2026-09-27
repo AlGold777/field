@@ -96,6 +96,7 @@ class Engine private constructor(private val app: Context) {
     private data class NetworkRoute(val network: Network, val linkProperties: LinkProperties) {
         val interfaceName: String get() = linkProperties.interfaceName ?: "unknown"
         val label: String get() = "$interfaceName@${network}"
+        val networkId: String get() = network.toString()
     }
     private data class UdpBindResult(val success: Boolean, val portChanged: Boolean)
 
@@ -217,6 +218,7 @@ class Engine private constructor(private val app: Context) {
     private var udpFailureNoticeShown = false
     private var sessionSentBaseline = 0L
     private var audioRenewIntervalMs = 5_000L
+    private var lastMultiWifiSignature = ""
     private lateinit var discovery: Discovery
 
     // ------------------------------------------------------------------ сессия
@@ -231,6 +233,7 @@ class Engine private constructor(private val app: Context) {
     private var peerId = ""
     private var peerName = ""
     private var peerPlatform = ""
+    private var peerAddressSnapshot: List<PeerAddress> = emptyList()
     @Volatile private var sessionId = 0
     private var record: PairRecord? = PairRecord.fromJson(prefs.getString("pair", null))
     private var reconnectTask: ScheduledFuture<*>? = null
@@ -243,6 +246,8 @@ class Engine private constructor(private val app: Context) {
     private var resumeAttempt = 0
     /** Порт TCP-сервера второго телефона, полученный в invite/resume/accept, — для быстрого переподключения. */
     private var peerTcpPortHint = 0
+    private var peerCapabilities: Set<String> = emptySet()
+    @Volatile private var negotiatedCapabilities: Set<String> = emptySet()
     /** Пара должна восстанавливаться сама (после запуска/возврата в приложение), пока её явно не разорвали. */
     private var autoResume = prefs.getBoolean("autoResume", false)
     /** До какого момента (elapsedRealtime) в состоянии IDLE тихо пробуем восстановить знакомую пару. */
@@ -388,6 +393,7 @@ class Engine private constructor(private val app: Context) {
                 }
             })
         } catch (e: Exception) { Log.w(TAG, "network callback", e); telemetry.event("NETWORK_CALLBACK_FAILED", error = e) }
+        post { refreshMultiWifiWarning(); sendLocalAddressesIfPaired("initial_network_snapshot") }
     }
 
     private fun networkAddresses(lp: LinkProperties): List<InetAddress> {
@@ -420,6 +426,93 @@ class Engine private constructor(private val app: Context) {
             val lp = cm.getLinkProperties(network) ?: return@mapNotNull null
             NetworkRoute(network, lp)
         }
+    }
+
+    private fun localWifiAddresses(): List<PeerAddress> {
+        val fromNetworks = availableNetworkRoutes(wifiOnly = true).flatMap { route ->
+            networkAddresses(route.linkProperties).filterIsInstance<java.net.Inet4Address>().mapNotNull { address ->
+            address.hostAddress?.let { PeerAddress(it, route.interfaceName, route.networkId) }
+            }
+        }
+        // Some OEM SoftAP implementations expose the tethering IPv4 only through NetworkInterface,
+        // not as a ConnectivityManager Network. Keep it discoverable; a local-address bind still
+        // works for an accepted TCP path even when Android has no Network handle for the AP.
+        val fromInterfaces = try {
+            java.net.NetworkInterface.getNetworkInterfaces()?.toList().orEmpty().flatMap { iface ->
+                val name = iface.name.orEmpty()
+                if (!iface.isUp || !name.startsWith("wlan", true) && !name.startsWith("ap", true) &&
+                    !name.startsWith("swlan", true) && !name.startsWith("p2p", true)) return@flatMap emptyList()
+                iface.inetAddresses.toList().filterIsInstance<java.net.Inet4Address>()
+                    .filter { !it.isLoopbackAddress && it.isSiteLocalAddress }
+                    .mapNotNull { address -> address.hostAddress?.let { PeerAddress(it, name, "iface:$name") } }
+            }
+        } catch (e: Exception) {
+            telemetry.limited("WIFI_INTERFACE_SNAPSHOT_FAILED", error = e)
+            emptyList()
+        }
+        return (fromNetworks + fromInterfaces).distinctBy { it.ip to it.networkId }
+    }
+
+    private fun addressesJson(addresses: List<PeerAddress> = localWifiAddresses()) =
+        org.json.JSONArray().also { array -> addresses.forEach { array.put(it.toJson()) } }
+
+    private fun parsePeerAddresses(o: JSONObject): List<PeerAddress> {
+        val array = o.optJSONArray("addrs") ?: return emptyList()
+        return (0 until array.length()).mapNotNull { index ->
+            val item = array.optJSONObject(index) ?: return@mapNotNull null
+            val ip = item.optString("ip").trim()
+            if (ip.isBlank()) null else PeerAddress(ip, item.optString("iface"), item.optString("networkId"))
+        }.distinctBy { it.ip }
+    }
+
+    private fun parsePeerCaps(o: JSONObject): Set<String> {
+        val caps = o.optJSONArray("caps") ?: return emptySet()
+        return (0 until caps.length()).mapNotNull { caps.optString(it).takeIf(String::isNotBlank) }.toSet()
+    }
+
+    private fun localCapabilitiesJson() = org.json.JSONArray().also { array ->
+        listOf("addrs").forEach(array::put)
+    }
+
+    private fun updatePeerAddressBook(addresses: List<PeerAddress>) {
+        if (addresses.isEmpty()) return
+        val current = record ?: return
+        val merged = TransportPlan.mergeAddresses(addresses, current.peerAddresses)
+        if (merged != current.peerAddresses) {
+            record = current.copy(peerAddresses = merged)
+            persistRecord()
+        }
+    }
+
+    private fun addressMessage(type: String = "network-addresses") = JSONObject()
+        .put("t", type).put("addrs", addressesJson()).put("caps", localCapabilitiesJson())
+
+    private fun sendLocalAddressesIfPaired(reason: String) {
+        if (phase != Phase.PAIRED || link == null) return
+        refreshMultiWifiWarning()
+        if ("addrs" !in negotiatedCapabilities) return
+        link?.send(addressMessage())
+        telemetry.record("LOCAL_ADDRESSES_SENT", mapOf("reason" to reason, "count" to localWifiAddresses().size))
+    }
+
+    private fun refreshMultiWifiWarning() {
+        val routes = availableNetworkRoutes(wifiOnly = true)
+        val addresses = localWifiAddresses()
+        val byNetwork = addresses.groupBy { it.networkId }
+        val signature = routes.map { it.networkId }.sorted().joinToString("|")
+        val warning = if (routes.size >= 2) {
+            "Телефон подключён к двум сетям Wi‑Fi. Если связь нестабильна, отключите «двойной Wi‑Fi» в настройках Wi‑Fi. " +
+                byNetwork.entries.joinToString(", ") { (network, items) ->
+                    val iface = items.firstOrNull()?.iface ?: routes.firstOrNull { it.networkId == network }?.interfaceName ?: "Wi‑Fi"
+                    "$iface (${items.joinToString { it.ip }})"
+                }
+        } else ""
+        ui { copy(multiWifiWarning = warning) }
+        if (routes.size >= 2 && signature != lastMultiWifiSignature) {
+            lastMultiWifiSignature = signature
+            telemetry.record("MULTI_WIFI", mapOf("networks" to routes.map { it.networkId },
+                "addresses" to addresses.map { mapOf("ip" to it.ip, "iface" to it.iface, "networkId" to it.networkId) }))
+        } else if (routes.size < 2) lastMultiWifiSignature = ""
     }
 
     private fun routeForLocalAddress(address: InetAddress): NetworkRoute? =
@@ -456,6 +549,11 @@ class Engine private constructor(private val app: Context) {
                     networkBindError == null -> "ok"
                     else -> "failed_local_address_fallback"
                 }), error = networkBindError)
+            telemetry.record("SOCKET_BOUND", mapOf("kind" to "udp", "networkId" to (route?.networkId ?: "unknown"),
+                "network" to udpBoundNetworkLabel, "interface" to (route?.interfaceName ?: ""),
+                "localAddress" to udpBoundLocalAddress, "localPort" to newSocket.localPort,
+                "tcpLinkId" to activeLink.id, "result" to if (networkBindError == null) "ok" else "local_address_only"),
+                error = networkBindError)
             UdpBindResult(true, newSocket.localPort != oldPort)
         } catch (e: Exception) {
             candidate?.close()
@@ -467,6 +565,8 @@ class Engine private constructor(private val app: Context) {
 
     private fun onNetworkChanged() {
         log("Сеть изменилась")
+        refreshMultiWifiWarning()
+        sendLocalAddressesIfPaired("network_changed")
         if (discovery.advertising || phase != Phase.IDLE) discovery.advertise(tcp.localPort, myName)
         if (discovery.browsing) { lastBrowseRestart = SystemClock.elapsedRealtime(); discovery.restartBrowse() }
         when (phase) {
@@ -1370,6 +1470,7 @@ class Engine private constructor(private val app: Context) {
     // ================================================================== установка пары
     private fun inviteJson(key: String) = JSONObject().put("t", "invite").put("id", myId).put("name", myName)
         .put("platform", "android").put("proto", SF.PROTOCOL_VERSION).put("key", key).put("tcpPort", tcp.localPort)
+        .put("caps", localCapabilitiesJson()).put("addrs", addressesJson())
 
     private fun doInvite(p: Peer) {
         if (phase != Phase.IDLE) return
@@ -1438,10 +1539,11 @@ class Engine private constructor(private val app: Context) {
 
     private fun resumeJson(rec: PairRecord) = JSONObject().put("t", "resume").put("id", myId).put("name", myName)
         .put("platform", "android").put("proto", SF.PROTOCOL_VERSION).put("key", rec.key).put("role", rec.myRole.wire)
-        .put("tcpPort", tcp.localPort)
+        .put("tcpPort", tcp.localPort).put("caps", localCapabilitiesJson()).put("addrs", addressesJson())
 
     private fun acceptJson(key: String, r: Role) = JSONObject().put("t", "accept").put("id", myId).put("name", myName)
         .put("platform", "android").put("key", key).put("role", r.wire).put("tcpPort", tcp.localPort)
+        .put("caps", localCapabilitiesJson()).put("addrs", addressesJson())
 
     private fun connectOutgoing(p: Peer, tag: String, first: JSONObject, timeoutMs: Long) {
         val host = p.host ?: return onConnectFailed(tag)
@@ -1473,6 +1575,7 @@ class Engine private constructor(private val app: Context) {
                 telemetry.record("TCP_CONNECTED", mapOf("tag" to tag, "peer" to p.id,
                     "elapsedMs" to SystemClock.elapsedRealtime() - started, "localAddress" to localAddress,
                     "localPort" to connectedSocket.localPort, "network" to network,
+                    "networkId" to (connectedRoute?.networkId ?: "unknown"),
                     "remoteAddress" to host.hostAddress, "remotePort" to p.port))
                 post {
                     val stillWanted = when (tag) {
@@ -1495,7 +1598,11 @@ class Engine private constructor(private val app: Context) {
                     if (reconnectAttemptOp == attemptOp) reconnectAttemptOp = null
                 }
                 telemetry.record("TCP_CONNECT_FAILED", mapOf("tag" to tag, "peer" to p.id,
-                    "host" to host.hostAddress, "port" to p.port,
+                    "host" to host.hostAddress, "port" to p.port, "remote" to "${host.hostAddress}:${p.port}",
+                    "local" to routes.map { route -> mapOf("addresses" to networkAddresses(route.linkProperties)
+                        .filterIsInstance<java.net.Inet4Address>().mapNotNull { it.hostAddress },
+                        "network" to route.label, "networkId" to route.networkId) },
+                    "errorMessage" to (e.message ?: e.javaClass.simpleName),
                     "elapsedMs" to SystemClock.elapsedRealtime() - started,
                     "wifiNetworks" to routes.map { it.label }), error = e)
                 post {
@@ -1523,14 +1630,18 @@ class Engine private constructor(private val app: Context) {
                 attemptSocket.connect(InetSocketAddress(host, port), 2_500)
                 telemetry.record("TCP_CONNECT_NETWORK_CONNECTED", mapOf("tag" to tag,
                     "attempt" to (index + 1), "network" to (route?.label ?: "process_default"),
+                    "networkId" to (route?.networkId ?: "process_default"),
                     "localAddress" to (attemptSocket.localAddress.hostAddress ?: attemptSocket.localAddress.toString()),
                     "localPort" to attemptSocket.localPort, "remoteAddress" to host.hostAddress, "remotePort" to port))
                 return attemptSocket to route
             } catch (e: Exception) {
                 try { socket?.close() } catch (_: Exception) { }
                 lastFailure = e
+                val localAddress = route?.let { networkAddresses(it.linkProperties).firstOrNull { address -> address is java.net.Inet4Address } }
                 telemetry.record("TCP_CONNECT_NETWORK_FAILED", mapOf("tag" to tag,
                     "attempt" to (index + 1), "network" to (route?.label ?: "process_default"),
+                    "networkId" to (route?.networkId ?: "process_default"),
+                    "localAddress" to (localAddress?.hostAddress ?: "unknown"), "errorMessage" to (e.message ?: e.javaClass.simpleName),
                     "remoteAddress" to host.hostAddress, "remotePort" to port), error = e)
             }
         }
@@ -1550,7 +1661,8 @@ class Engine private constructor(private val app: Context) {
     private fun newLink(s: Socket, tag: String = "") = ControlLink(s,
         onMessage = { l, o -> post { onMessage(l, o) } },
         onClosed = { l -> post { onClosed(l) } }, telemetry = telemetry,
-        initialTag = tag, localNetwork = routeForLocalAddress(s.localAddress)?.label ?: "unknown")
+        initialTag = tag, localNetwork = routeForLocalAddress(s.localAddress)?.label ?: "unknown",
+        localNetworkId = routeForLocalAddress(s.localAddress)?.networkId ?: "unknown")
 
     private fun onIncomingSocket(s: Socket) {
         val l = newLink(s, "new")
@@ -1604,10 +1716,15 @@ class Engine private constructor(private val app: Context) {
         val pid = o.optString("id"); val pname = o.optString("name", pid); val pplat = o.optString("platform", "?")
         when (o.optString("t")) {
             "invite" -> {
+                peerCapabilities = parsePeerCaps(o)
+                val advertised = parsePeerAddresses(o)
+                peerAddressSnapshot = advertised
                 if (phase == Phase.IDLE) stopAutoResume()   // новое приглашение важнее фонового восстановления
                 if (phase == Phase.IDLE && pending == null) {
                     l.tag = "incoming"; pending = l
-                    pendingPeer = Peer(pid, pname, pplat, l.remoteAddress, o.optInt("tcpPort", 0))
+                    pendingPeer = Peer(pid, pname, pplat, l.remoteAddress, o.optInt("tcpPort", 0),
+                        hosts = (listOf(l.remoteAddress) + advertised.mapNotNull { runCatching { InetAddress.getByName(it.ip) }.getOrNull() }).distinct(),
+                        addresses = advertised)
                     pendingKey = o.optString("key")
                     phase = Phase.INCOMING
                     l.send(JSONObject().put("t", "ringing"))
@@ -1620,7 +1737,9 @@ class Engine private constructor(private val app: Context) {
                     if (myId > pid) {
                         pending?.let { it.tag = "dead"; it.close() }
                         l.tag = "incoming"; pending = l
-                        pendingPeer = Peer(pid, pname, pplat, l.remoteAddress, o.optInt("tcpPort", 0))
+                        pendingPeer = Peer(pid, pname, pplat, l.remoteAddress, o.optInt("tcpPort", 0),
+                            hosts = (listOf(l.remoteAddress) + advertised.mapNotNull { runCatching { InetAddress.getByName(it.ip) }.getOrNull() }).distinct(),
+                            addresses = advertised)
                         pendingKey = o.optString("key")
                         phase = Phase.INCOMING
                         doAccept()
@@ -1632,6 +1751,10 @@ class Engine private constructor(private val app: Context) {
                 }
             }
             "resume" -> {
+                peerCapabilities = parsePeerCaps(o)
+                val advertised = parsePeerAddresses(o)
+                peerAddressSnapshot = advertised
+                updatePeerAddressBook(advertised)
                 val rec = record
                 val ok = rec != null && rec.key == o.optString("key") && rec.peerId == pid &&
                     phase != Phase.INCOMING
@@ -1653,7 +1776,8 @@ class Engine private constructor(private val app: Context) {
                 log("Входящее восстановление от «$pname» (${l.remoteAddress.hostAddress})")
                 becomePaired(l, rec.myRole, pid, pname, pplat, rec.key, resumed = true)
             }
-            else -> { l.tag = "dead"; l.close() }
+            else -> telemetry.record("TCP_UNKNOWN_MESSAGE_IGNORED", mapOf("type" to o.optString("t", ""),
+                "linkId" to l.id, "phase" to phase.name))
         }
     }
 
@@ -1662,10 +1786,14 @@ class Engine private constructor(private val app: Context) {
         when (o.optString("t")) {
             "accept" -> when (l.tag) {
                 "invite-out" -> {
+                    peerCapabilities = parsePeerCaps(o)
+                    peerAddressSnapshot = parsePeerAddresses(o)
                     peerTcpPortHint = o.optInt("tcpPort", 0).takeIf { it > 0 } ?: (pendingPeer?.port ?: 0)
                     becomePaired(l, Role.SERVER, pid, pname, pplat, pendingKey, resumed = false)
                 }
                 "resume-out", "resume-auto" -> {
+                    peerCapabilities = parsePeerCaps(o)
+                    peerAddressSnapshot = parsePeerAddresses(o)
                     peerTcpPortHint = o.optInt("tcpPort", 0).takeIf { it > 0 } ?: (pendingPeer?.port ?: 0)
                     val their = Role.fromWire(o.optString("role"))
                     val mine = if (their == Role.SERVER) Role.POINT else Role.SERVER
@@ -1767,6 +1895,7 @@ class Engine private constructor(private val app: Context) {
         l.tag = "paired"
         link = l
         role = r; peerId = pid; peerName = pname; peerPlatform = pplat
+        negotiatedCapabilities = peerCapabilities.intersect(setOf("addrs"))
         phase = Phase.PAIRED
         zeroSendRenewStreak = 0
         udpNetworkRebindAttempted = false
@@ -1784,10 +1913,20 @@ class Engine private constructor(private val app: Context) {
 
         val old = record
         val host = l.remoteAddress.hostAddress
+        val discoveredAddresses = (pendingPeer?.addresses.orEmpty() + peerAddressSnapshot).distinctBy { it.ip }
+        val allPeerAddresses = TransportPlan.mergeAddresses(discoveredAddresses,
+            (pendingPeer?.hosts.orEmpty() + l.remoteAddress).mapNotNull { address ->
+                address.hostAddress?.let { PeerAddress(it, "", "") }
+            })
         val port = if (peerTcpPortHint > 0) peerTcpPortHint else if (old?.key == key) old.lastPort else 0
         peerTcpPortHint = 0
-        record = if (old != null && old.key == key) old.copy(peerName = pname, peerPlatform = pplat, myRole = r, lastHost = host, lastPort = port)
-                 else PairRecord(key, pid, pname, pplat, r, lastHost = host, lastPort = port)
+        record = if (old != null && old.key == key) old.copy(peerName = pname, peerPlatform = pplat, myRole = r,
+            lastHost = host, lastPort = port, peerAddresses = TransportPlan.mergeAddresses(allPeerAddresses, old.peerAddresses),
+            lastSuccessfulHost = host)
+                 else PairRecord(key, pid, pname, pplat, r, lastHost = host, lastPort = port,
+                     peerAddresses = allPeerAddresses, lastSuccessfulHost = host)
+        peerAddressSnapshot = emptyList()
+        peerCapabilities = emptySet()
         persistRecord()
         setAutoResume(true)
         requestDozeExemption()
@@ -1930,6 +2069,9 @@ class Engine private constructor(private val app: Context) {
             }
             // --- на Point ---
             "session" -> if (role == Role.POINT) {
+                peerCapabilities = parsePeerCaps(o)
+                negotiatedCapabilities = peerCapabilities.intersect(setOf("addrs"))
+                updatePeerAddressBook(parsePeerAddresses(o))
                 val newSession = o.getInt("session")
                 if (sessionId != newSession) {
                     sessionId = newSession
@@ -1940,6 +2082,13 @@ class Engine private constructor(private val app: Context) {
                 val l = link ?: return
                 serverUdp = InetSocketAddress(l.remoteAddress, o.getInt("udpPort"))
                 pingBurst = 20
+            }
+            "network-addresses" -> {
+                peerCapabilities = parsePeerCaps(o)
+                negotiatedCapabilities = peerCapabilities.intersect(setOf("addrs"))
+                updatePeerAddressBook(parsePeerAddresses(o))
+                telemetry.record("PEER_ADDRESSES_RECEIVED", mapOf("count" to parsePeerAddresses(o).size,
+                    "networkIds" to parsePeerAddresses(o).map { it.networkId }.distinct()))
             }
             "file-ack", "file-error" -> fileTransferAcks[o.optString("id")]?.complete(o)
             "file-start" -> handleIncomingFileStart(o)
@@ -1997,7 +2146,8 @@ class Engine private constructor(private val app: Context) {
 
     private fun sendSession(target: ControlLink? = link) {
         target?.send(JSONObject().put("t", "session").put("session", sessionId)
-            .put("udpPort", udp.localPort).put("name", myName).put("fileToken", fileTransferToken))
+            .put("udpPort", udp.localPort).put("name", myName).put("fileToken", fileTransferToken)
+            .put("caps", localCapabilitiesJson()).put("addrs", addressesJson()))
     }
 
     /** Replaces only the UDP audio session; TCP pairing and the playback epoch remain intact. */
