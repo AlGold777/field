@@ -48,7 +48,10 @@ final class Engine {
 
     // сеть
     private var discovery: Discovery!
-    private var udp: UdpSocket!
+    private let udpBox = Locked<UdpSocket?>(nil)
+    private var udp: UdpSocket! { udpBox.value }
+    private var pathMonitor: NWPathMonitor?
+    private var lastPathSignature: String?
 
     // сессия (только на q)
     private let phaseBox = Locked<Phase>(.idle)
@@ -60,6 +63,7 @@ final class Engine {
     private var pendingPeer: Peer?
     private var pendingKey = ""
     private var pendingTimeout: DispatchWorkItem?
+    private var pendingInvitePort = 0
     private var peerId = "", peerName = "", peerPlatform = ""
     private let sessionBox = Locked<Int32>(0)
     private var sessionId: Int32 { get { sessionBox.value } set { sessionBox.value = newValue } }
@@ -67,6 +71,20 @@ final class Engine {
     private var reconnectTask: DispatchWorkItem?
     private var lastBrowseRestart = Date.distantPast
     private var manualResumeDeadline = Date.distantPast
+    /// Идёт восстановление сохранённой пары (вручную или автоматически при запуске/возврате в приложение).
+    private var manualResumeActive = false
+    private var manualResumeAuto = false
+    private var resumeAttempt = 0
+    private var reconnectSince = Date()
+    /// Порт TCP-сервера второго телефона из invite/resume/accept — для прямого переподключения.
+    private var peerTcpPortHint = 0
+    /// Пара восстанавливается сама, пока её явно не разорвали.
+    private var autoResume = UserDefaults.standard.bool(forKey: "sf.autoResume")
+    /// До какого момента в состоянии idle тихо пробуем восстановить знакомую пару (nil — не пробуем).
+    private var autoResumeUntil: Date?
+    private var lastAutoAttempt = Date.distantPast
+    private var connLog: [String] = []
+    private let logTime: DateFormatter = { let f = DateFormatter(); f.dateFormat = "HH:mm:ss"; f.locale = Locale(identifier: "en_US_POSIX"); return f }()
 
     // Server
     private let playBox: Locked<ServerPlayState>
@@ -129,9 +147,9 @@ final class Engine {
                     files.forEach { try? FileManager.default.removeItem(at: $0) }
                 }
             }
-            udp = UdpSocket()
-            udp.onPacket = { [weak self] p, from, now in self?.onUdp(p, from, now) }
+            makeUdp()
             discovery = Discovery(queue: q, myId: myId)
+            discovery.onLog = { [weak self] text in self?.log(text) }
             discovery.onPeers = { [weak self] peers in self?.ui { $0.nearby = peers } }
             discovery.onIncoming = { [weak self] c in self?.onIncoming(c) }
             discovery.advertise(name: myName)
@@ -150,7 +168,122 @@ final class Engine {
                 s.title = music.title; s.artist = music.artist
                 s.queueExpanded = defaults.bool(forKey: "sf.queueExpanded")
             }
+            DispatchQueue.main.async { [weak self] in
+                let nc = NotificationCenter.default
+                nc.addObserver(forName: UIApplication.willEnterForegroundNotification, object: nil, queue: .main) { _ in
+                    self?.q.async { self?.onForeground() }
+                }
+                nc.addObserver(forName: UIApplication.didBecomeActiveNotification, object: nil, queue: .main) { _ in
+                    self?.q.async { self?.onForeground() }
+                }
+            }
+            let mon = NWPathMonitor(requiredInterfaceType: .wifi)
+            mon.pathUpdateHandler = { [weak self] path in
+                guard let self else { return }
+                let sig = "\(path.status)|" + path.availableInterfaces.map { $0.name }.joined(separator: ",")
+                let prev = self.lastPathSignature
+                self.lastPathSignature = sig
+                if prev != nil && prev != sig { self.onNetworkChanged(path.status == .satisfied) }
+            }
+            mon.start(queue: q)
+            pathMonitor = mon
+            log("Запуск: UDP \(udpBox.value?.port ?? 0)")
+            if autoResume && record != nil { startAutoResume() }
         }
+    }
+
+    private func makeUdp() {
+        udpBox.value?.close()
+        guard let s = UdpSocket() else { log("Не удалось открыть UDP-сокет"); udpBox.value = nil; return }
+        s.onPacket = { [weak self] p, from, now in self?.onUdp(p, from, now) }
+        udpBox.value = s
+    }
+
+    /// UDP-сокет мог быть закрыт системой, пока приложение спало. Пересоздаём; Server сообщает Point новый порт.
+    private func ensureUdp() {
+        guard udpBox.value?.broken ?? true else { return }
+        log("UDP-сокет недоступен — пересоздаём")
+        makeUdp()
+        guard let u = udpBox.value else { return }
+        if role == .server, phase == .paired, let l = link {
+            l.send(["t": "session", "session": Int(sessionId), "udpPort": Int(u.port), "name": myName])
+        }
+    }
+
+    /// Приложение снова на экране: проверяем сокеты, аудио и связь — не ждём таймаутов.
+    private func onForeground() {
+        discovery.ensureListening()
+        ensureUdp()
+        if state.inPair { DispatchQueue.main.async { self.audio.ensureRunning() } }
+        switch phase {
+        case .idle:
+            if !discovery.browsing { discovery.startBrowse() }
+            if autoResume && record != nil && autoResumeUntil == nil { startAutoResume() }
+        case .reconnecting:
+            if pending == nil { log("Возврат в приложение — переподключаемся сразу"); scheduleReconnect(0) }
+        case .paired:
+            if let l = link, Date().timeIntervalSince(l.lastRx) > 4 {
+                log("Связь молчит \(Int(Date().timeIntervalSince(l.lastRx))) с — переподключаемся"); l.close()
+            }
+        default: break
+        }
+    }
+
+    private func onNetworkChanged(_ up: Bool) {
+        log(up ? "Сеть Wi‑Fi изменилась" : "Wi‑Fi недоступен")
+        guard up else { return }
+        discovery.ensureListening()
+        ensureUdp()
+        if discovery.browsing { lastBrowseRestart = Date(); discovery.restartBrowse() }
+        if phase == .reconnecting && pending == nil { scheduleReconnect(0.2) }
+    }
+
+    private func log(_ text: String) {
+        NSLog("SoundField: \(text)")
+        connLog.append("\(logTime.string(from: Date()))  \(text)")
+        if connLog.count > 60 { connLog.removeFirst(connLog.count - 60) }
+        let snapshot = connLog
+        ui { $0.connLog = snapshot }
+    }
+
+    /// Тихое восстановление: экран обычный (можно создать новую пару), в фоне раз в 3 с — попытка resume.
+    /// Модальный диалог не используется: он блокировал новые приглашения и повторялся при каждом возврате.
+    private func startAutoResume() {
+        guard autoResume, let rec = record, phase == .idle else { return }
+        autoResumeUntil = Date().addingTimeInterval(30)
+        lastAutoAttempt = .distantPast; resumeAttempt = 0
+        if !discovery.browsing { discovery.startBrowse() }
+        log("Фоновое восстановление пары с «\(rec.peerName)»")
+        ui { $0.autoResuming = true }
+        autoResumeTick()
+    }
+
+    private func stopAutoResume() {
+        autoResumeUntil = nil
+        dropAutoPending()
+        ui { $0.autoResuming = false }
+    }
+
+    private func autoResumeTick() {
+        guard let until = autoResumeUntil else { return }
+        guard autoResume, let rec = record, Date() < until else {
+            if phase == .idle { log("Фоновое восстановление: «\(record?.peerName ?? "")» не ответил") }
+            autoResumeUntil = nil; ui { $0.autoResuming = false }; return
+        }
+        guard phase == .idle, pending == nil, Date().timeIntervalSince(lastAutoAttempt) >= 3,
+              let p = resumeTarget(rec) else { return }
+        lastAutoAttempt = Date()
+        connectOutgoing(p, tag: "resume-auto", first: resumeJson(rec), timeout: 3)
+    }
+
+    private func dropAutoPending() {
+        guard let p = pending, p.tag == "resume-auto" else { return }
+        pending = nil; p.tag = "dead"; p.close()
+    }
+
+    private func setAutoResume(_ on: Bool) {
+        guard autoResume != on else { return }
+        autoResume = on; defaults.set(on, forKey: "sf.autoResume")
     }
 
     private var timers: [DispatchSourceTimer] = []
@@ -188,8 +321,8 @@ final class Engine {
     func acceptIncoming() { q.async { self.doAccept() } }
     func rejectIncoming() { q.async { self.doReject() } }
     func resumeRemembered() { q.async { self.doManualResume() } }
-    func forgetPair() { q.async { self.record = nil; self.defaults.removeObject(forKey: "sf.pair"); self.ui { $0.remembered = nil } } }
-    func disconnect() { q.async { self.goIdle(sendBye: true, reason: "Пара разорвана") } }
+    func forgetPair() { q.async { self.record = nil; self.setAutoResume(false); self.stopAutoResume(); self.defaults.removeObject(forKey: "sf.pair"); self.ui { $0.remembered = nil } } }
+    func disconnect() { q.async { self.setAutoResume(false); self.goIdle(sendBye: true, reason: "Пара разорвана") } }
     func rename(_ name: String) {
         q.async {
             let n = String(name.trimmingCharacters(in: .whitespaces).prefix(40))
@@ -315,38 +448,78 @@ final class Engine {
 
     // ================================================================== установка пары
     private func inviteJson(_ key: String) -> [String: Any] {
-        ["t": "invite", "id": myId, "name": myName, "platform": "ios", "proto": Int(SF.protocolVersion), "key": key]
+        ["t": "invite", "id": myId, "name": myName, "platform": "ios", "proto": Int(SF.protocolVersion), "key": key,
+         "tcpPort": Int(discovery.listenPort)]
     }
     private func resumeJson(_ r: PairRecord) -> [String: Any] {
-        ["t": "resume", "id": myId, "name": myName, "platform": "ios", "proto": Int(SF.protocolVersion), "key": r.key, "role": r.myRole]
+        ["t": "resume", "id": myId, "name": myName, "platform": "ios", "proto": Int(SF.protocolVersion), "key": r.key, "role": r.myRole,
+         "tcpPort": Int(discovery.listenPort)]
+    }
+    private func acceptJson(_ key: String, _ role: String) -> [String: Any] {
+        ["t": "accept", "id": myId, "name": myName, "platform": "ios", "key": key, "role": role, "tcpPort": Int(discovery.listenPort)]
     }
 
     private func doInvite(_ p: Peer) {
         guard phase == .idle else { return }
+        stopAutoResume()
         pendingKey = Self.hex(16)
         phase = .inviting
-        ui { $0.phase = .inviting; $0.invitingName = p.name }
+        ui { $0.phase = .inviting; $0.invitingName = p.name; $0.resuming = false }
         connectOutgoing(p, tag: "invite-out", first: inviteJson(pendingKey), timeout: 30)
     }
 
-    private func doManualResume() {
-        guard let rec = record, phase == .idle else { return }
+    private func doManualResume(auto: Bool = false) {
+        if phase == .idle { stopAutoResume() }
+        guard let rec = record, phase == .idle, pending == nil else { return }
         phase = .inviting
-        ui { $0.phase = .inviting; $0.invitingName = rec.peerName }
-        manualResumeDeadline = Date().addingTimeInterval(8)
+        manualResumeActive = true; manualResumeAuto = auto; resumeAttempt = 0
+        ui { $0.phase = .inviting; $0.invitingName = rec.peerName; $0.resuming = true }
+        manualResumeDeadline = Date().addingTimeInterval(auto ? 20 : 15)
         discovery.startBrowse()
+        log(auto ? "Автовосстановление пары с «\(rec.peerName)»" : "Подключение к знакомой паре «\(rec.peerName)»")
         tryManualResume()
     }
 
     private func tryManualResume() {
-        guard phase == .inviting, pending == nil, let rec = record else { return }
-        if let p = discovery.peer(id: rec.peerId) { connectOutgoing(p, tag: "resume-out", first: resumeJson(rec), timeout: 4); return }
+        guard manualResumeActive, phase == .inviting, pending == nil, let rec = record else { return }
         if Date() > manualResumeDeadline {
+            manualResumeActive = false
             phase = .idle; ui { $0.phase = .idle }
-            toast("«\(rec.peerName)» не найден. Откройте SoundField на втором телефоне в той же сети Wi‑Fi")
+            log("«\(rec.peerName)» не ответил")
+            toast(manualResumeAuto ? "«\(rec.peerName)» пока не отвечает. Откройте SoundField на втором телефоне — пара восстановится"
+                  : "«\(rec.peerName)» не найден. Откройте SoundField на втором телефоне в той же сети Wi‑Fi")
             return
         }
+        if let p = resumeTarget(rec) { connectOutgoing(p, tag: "resume-out", first: resumeJson(rec), timeout: 4); return }
         later(0.5) { [weak self] in self?.tryManualResume() }
+    }
+
+    /// Куда стучаться при восстановлении: попеременно последний известный адрес (без Bonjour — мгновенно
+    /// после разблокировки) и сервис, найденный Bonjour (если IP сменился).
+    private func resumeTarget(_ rec: PairRecord) -> Peer? {
+        resumeAttempt += 1
+        let found = discovery.peer(id: rec.peerId)
+        var direct: Peer?
+        if let h = rec.lastHost, let p = rec.lastPort, p > 0, let port = NWEndpoint.Port(rawValue: UInt16(truncatingIfNeeded: p)) {
+            direct = Peer(id: rec.peerId, name: rec.peerName, platform: rec.peerPlatform,
+                          endpoint: .hostPort(host: NWEndpoint.Host(h), port: port))
+        }
+        return resumeAttempt % 2 == 1 ? (direct ?? found) : (found ?? direct)
+    }
+
+    private static func hostString(_ h: NWEndpoint.Host?) -> String? {
+        guard let h else { return nil }
+        var s: String
+        switch h {
+        case .ipv4(let a): s = "\(a)"
+        case .ipv6(let a): s = "\(a)"
+        case .name(let n, _): s = n
+        @unknown default: return nil
+        }
+        if s.hasPrefix("::ffff:"), s.contains(".") {
+            s = String(s.dropFirst(7)); if let pct = s.firstIndex(of: "%") { s = String(s[..<pct]) }
+        }
+        return s
     }
 
     private func connectOutgoing(_ p: Peer, tag: String, first: [String: Any], timeout: Double) {
@@ -378,13 +551,15 @@ final class Engine {
     }
 
     private func doCancelPending() {
+        manualResumeActive = false
         if let l = pending { pending = nil; l.tag = "dead"; l.sendAndClose(["t": "cancel"]) }
         if phase == .inviting || phase == .incoming { phase = .idle; ui { $0.phase = .idle } }
     }
 
     private func doAccept() {
         guard let l = pending, let p = pendingPeer, phase == .incoming else { return }
-        l.send(["t": "accept", "id": myId, "name": myName, "platform": "ios", "key": pendingKey, "role": Role.point.rawValue])
+        l.send(acceptJson(pendingKey, Role.point.rawValue))
+        peerTcpPortHint = pendingInvitePort
         becomePaired(l, .point, p.id, p.name, p.platform, pendingKey, resumed: false)
     }
 
@@ -410,10 +585,13 @@ final class Engine {
         let pid = J.s(o, "id"), pname = J.s(o, "name", pid), pplat = J.s(o, "platform", "?")
         switch J.s(o, "t") {
         case "invite":
+            if phase == .idle { stopAutoResume() }   // новое приглашение важнее фонового восстановления
             if phase == .idle && pending == nil {
                 l.tag = "incoming"; pending = l
                 pendingPeer = dummyPeer(pid, pname, pplat, l)
                 pendingKey = J.s(o, "key")
+                pendingInvitePort = Int(J.i64(o, "tcpPort"))
+                log("Приглашение от «\(pname)»")
                 phase = .incoming
                 ui { $0.phase = .incoming; $0.incomingName = pname }
                 pendingTimeout?.cancel()
@@ -425,6 +603,7 @@ final class Engine {
                     l.tag = "incoming"; pending = l
                     pendingPeer = dummyPeer(pid, pname, pplat, l)
                     pendingKey = J.s(o, "key")
+                    pendingInvitePort = Int(J.i64(o, "tcpPort"))
                     phase = .incoming
                     doAccept()
                 } else {
@@ -435,11 +614,21 @@ final class Engine {
             }
         case "resume":
             guard let rec = record, rec.key == J.s(o, "key"), rec.peerId == pid, phase != .incoming else {
+                log("Отклонён resume от «\(pname)»: пара неизвестна")
                 l.tag = "dead"; l.sendAndClose(["t": "reject", "reason": "unknown"]); return
+            }
+            // Встречные попытки восстановления: входящее принимает телефон с бо́льшим id (как для приглашений).
+            // Отказываем, только если наше встречное соединение уже установлено (его примет второй телефон).
+            // Если наше ещё «висит» (например, старый адрес), принимаем входящее — иначе попытки могли
+            // бесконечно отклонять друг друга.
+            if let mine = pending, mine.tag == "resume-out" || mine.tag == "resume-auto", myId < pid, mine.ready {
+                l.tag = "dead"; l.sendAndClose(["t": "reject", "reason": "crossed"]); return
             }
             if let old = link { link = nil; old.tag = "dead"; old.close() }
             if let p = pending { pending = nil; p.tag = "dead"; p.close() }
-            l.send(["t": "accept", "id": myId, "name": myName, "platform": "ios", "key": rec.key, "role": rec.myRole])
+            l.send(acceptJson(rec.key, rec.myRole))
+            peerTcpPortHint = Int(J.i64(o, "tcpPort"))
+            log("Входящее восстановление от «\(pname)»")
             becomePaired(l, rec.role, pid, pname, pplat, rec.key, resumed: true)
         default:
             l.tag = "dead"; l.close()
@@ -450,19 +639,35 @@ final class Engine {
         let pid = J.s(o, "id"), pname = J.s(o, "name", pid), pplat = J.s(o, "platform", "?")
         switch J.s(o, "t") {
         case "accept":
+            let hinted = Int(J.i64(o, "tcpPort"))
+            peerTcpPortHint = hinted > 0 ? hinted : Self.endpointPort(pendingPeer?.endpoint)
             if l.tag == "invite-out" { becomePaired(l, .server, pid, pname, pplat, pendingKey, resumed: false) }
-            else if l.tag == "resume-out" {
+            else if l.tag == "resume-out" || l.tag == "resume-auto" {
                 let their = Role(rawValue: J.s(o, "role")) ?? .point
                 becomePaired(l, their == .server ? .point : .server, pid, pname, pplat, J.s(o, "key"), resumed: true)
             }
         case "reject", "busy":
-            let reason = J.s(o, "reason")
+            let reason = J.s(o, "reason"), t = J.s(o, "t")
+            let wasAuto = l.tag == "resume-auto"
             pending = nil; l.tag = "dead"; l.close()
-            if phase == .inviting && reason == "crossed" { /* ждём встречный accept */ }
-            else if phase == .inviting {
+            if wasAuto {
+                log("Фоновое восстановление: ответ «\(t)\(reason.isEmpty ? "" : ": " + reason)»")
+                if reason == "unknown" { setAutoResume(false); stopAutoResume() }   // второй телефон забыл пару
+                return
+            }
+            log("Ответ «\(t)\(reason.isEmpty ? "" : ": " + reason)»")
+            if phase == .inviting && reason == "crossed" {
+                // ждём встречный accept; если не придёт — пробуем снова
+                if manualResumeActive { later(1.5) { [weak self] in self?.tryManualResume() } }
+            } else if phase == .inviting && manualResumeActive && reason != "unknown" && t != "busy" {
+                later(1) { [weak self] in self?.tryManualResume() }
+            } else if phase == .inviting {
+                manualResumeActive = false
+                if reason == "unknown" { setAutoResume(false) }
                 phase = .idle; ui { $0.phase = .idle }
-                toast(J.s(o, "t") == "busy" ? "Телефон уже в другой паре" : "Подключение отклонено")
-            } else if phase == .reconnecting { scheduleReconnect(2) }
+                toast(t == "busy" ? "Телефон уже в другой паре"
+                      : reason == "unknown" ? "Второй телефон не помнит эту пару — создайте её заново" : "Подключение отклонено")
+            } else if phase == .reconnecting { scheduleReconnect(reason == "crossed" ? 1.5 : 2) }
         case "cancel":
             if l.tag == "incoming" {
                 pending = nil; l.tag = "dead"; l.close()
@@ -481,9 +686,16 @@ final class Engine {
         case .inviting:
             if l.tag == "resume-out" { later(0.7) { [weak self] in self?.tryManualResume() } }
             else { phase = .idle; ui { $0.phase = .idle }; toast("Нет ответа от второго телефона") }
-        case .reconnecting: scheduleReconnect(1.5)
+        case .reconnecting: scheduleReconnect(reconnectDelay())
         default: break
         }
+    }
+
+    private func reconnectDelay() -> Double { Date().timeIntervalSince(reconnectSince) < 60 ? 1 : 3 }
+
+    private static func endpointPort(_ e: NWEndpoint?) -> Int {
+        if case .hostPort(_, let p)? = e { return Int(p.rawValue) }
+        return 0
     }
 
     // ================================================================== пара
@@ -491,18 +703,30 @@ final class Engine {
         pendingTimeout?.cancel(); reconnectTask?.cancel()
         if pending === l { pending = nil }
         if let p = pending { p.tag = "dead"; p.close(); pending = nil }
-        let continuing = phase == .reconnecting && role == r && peerId == pid
+        manualResumeActive = false
+        autoResumeUntil = nil
+        // Та же пара, новое соединение (после обрыва или когда второй телефон заметил обрыв раньше нас) —
+        // музыка и позиция не сбрасываются.
+        let continuing = (phase == .reconnecting || phase == .paired) && role == r && peerId == pid
         l.tag = "paired"
         link = l
         role = r; peerId = pid; peerName = pname; peerPlatform = pplat
         phase = .paired
 
+        let host = Self.hostString(l.remoteHost)
         if var old = record, old.key == key {
-            old.peerName = pname; old.peerPlatform = pplat; old.myRole = r.rawValue; record = old
+            old.peerName = pname; old.peerPlatform = pplat; old.myRole = r.rawValue
+            if let host { old.lastHost = host }
+            if peerTcpPortHint > 0 { old.lastPort = peerTcpPortHint }
+            record = old
         } else {
-            record = PairRecord(key: key, peerId: pid, peerName: pname, peerPlatform: pplat, myRole: r.rawValue)
+            record = PairRecord(key: key, peerId: pid, peerName: pname, peerPlatform: pplat, myRole: r.rawValue,
+                                lastHost: host, lastPort: peerTcpPortHint > 0 ? peerTcpPortHint : nil)
         }
+        peerTcpPortHint = 0
         persistRecord()
+        setAutoResume(true)
+        log("Пара \(continuing ? "продолжена" : resumed ? "восстановлена" : "создана"): «\(pname)» \(host ?? "?"):\(record?.lastPort ?? 0), роль \(r.rawValue)")
         discovery.stopBrowse()
 
         if r == .server {
@@ -519,7 +743,7 @@ final class Engine {
                 if queue.indices.contains(queueIndex), currentQueueSource == nil { selectQueueTrack(at: queueIndex, forcePaused: true) }
             } else { rebuildPlayState() }
             audio.source = serverRenderer
-            l.send(["t": "session", "session": Int(sessionId), "udpPort": Int(udp.port), "name": myName])
+            l.send(["t": "session", "session": Int(sessionId), "udpPort": Int(udp?.port ?? 0), "name": myName])
             sendTimeline()
             publishState()
             publishQueue()
@@ -531,7 +755,7 @@ final class Engine {
         DispatchQueue.main.async { self.audio.start() }
         ui { s in
             s.phase = .paired; s.role = r; s.peerName = pname; s.peerPlatform = pplat; s.linkOk = true
-            s.remembered = record; s.calib = CalibUi()
+            s.remembered = record; s.calib = CalibUi(); s.autoResuming = false
         }
         toast(resumed ? "Пара восстановлена" : "Стереопара создана")
     }
@@ -541,13 +765,17 @@ final class Engine {
         guard phase == .paired else { return }
         phase = .reconnecting
         ui { $0.phase = .reconnecting; $0.linkOk = false }
+        log("Связь с «\(peerName)» потеряна")
+        reconnectSince = Date(); resumeAttempt = 0
+        discovery.startBrowse()
+        // Переподключаются оба телефона; встречные попытки разрешаются по id.
         if role == .server {
             pointUdpBox.value = nil
+            scheduleReconnect(0.7)
             toast("Нет связи с «\(peerName)». Музыка продолжается, ждём возвращения…")
         } else {
             rx.reset(); serverUdpBox.value = nil; sessionId = 0
-            discovery.startBrowse()
-            scheduleReconnect(0.3)
+            scheduleReconnect(0.2)
             toast("Связь потеряна — переподключаемся…")
         }
     }
@@ -558,9 +786,9 @@ final class Engine {
     }
 
     private func attemptResume() {
-        guard phase == .reconnecting, role == .point, pending == nil, let rec = record else { return }
-        if Date().timeIntervalSince(lastBrowseRestart) > 10 { lastBrowseRestart = Date(); discovery.restartBrowse() }
-        guard let p = discovery.peer(id: rec.peerId) else { scheduleReconnect(1); return }
+        guard phase == .reconnecting, pending == nil, let rec = record else { return }
+        if Date().timeIntervalSince(lastBrowseRestart) > 20 { lastBrowseRestart = Date(); discovery.restartBrowse() }
+        guard let p = resumeTarget(rec) else { scheduleReconnect(reconnectDelay()); return }
         connectOutgoing(p, tag: "resume-out", first: resumeJson(rec), timeout: 4)
     }
 
@@ -569,6 +797,8 @@ final class Engine {
         if let l = link { link = nil; l.tag = "dead"; if sendBye { l.sendAndClose(["t": "bye"]) } else { l.close() } }
         if let p = pending { pending = nil; p.tag = "dead"; p.close() }
         phase = .idle
+        manualResumeActive = false
+        log(reason)
         pendingTrackId = nil
         audio.source = nil
         DispatchQueue.main.async { self.audio.stop() }
@@ -600,7 +830,7 @@ final class Engine {
     private func onPairedMessage(_ o: [String: Any]) {
         switch J.s(o, "t") {
         case "hb": break
-        case "bye": goIdle(sendBye: false, reason: "«\(peerName)» разорвал пару")
+        case "bye": setAutoResume(false); goIdle(sendBye: false, reason: "«\(peerName)» разорвал пару")
         case "name":
             peerName = J.s(o, "name", peerName); ui { $0.peerName = peerName }
             record?.peerName = peerName; persistRecord()
@@ -937,8 +1167,10 @@ final class Engine {
 
     // ================================================================== heartbeat + диагностика
     private func heartbeat() {
+        ensureUdp()
+        autoResumeTick()
         guard let l = link, phase == .paired else { return }
-        if Date().timeIntervalSince(l.lastRx) > SF.linkTimeoutSec { NSLog("SoundField heartbeat timeout"); l.close(); return }
+        if Date().timeIntervalSince(l.lastRx) > SF.linkTimeoutSec { log("Нет данных \(Int(SF.linkTimeoutSec)) с — соединение закрыто"); l.close(); return }
         l.send(["t": "hb"])
         if role == .server {
             let d = Diag(underruns: audio.underruns, syncErrMs: serverRenderer.corrector.syncErrorMs,
@@ -970,7 +1202,7 @@ final class Engine {
         case .ping(_, let t1, let seq):
             guard role == .server, phase == .paired else { return }
             pointUdpBox.value = from
-            udp.send(Wire.pong(session: sid, t1: t1, t2: now, t3: MonoClock.nowNs(), pingSeq: seq), to: from)
+            udp?.send(Wire.pong(session: sid, t1: t1, t2: now, t3: MonoClock.nowNs(), pingSeq: seq), to: from)
         case .nack(_, let ep, let seqs):
             if role == .server { resend(epoch: ep, seqs: seqs) }
         case .pong(_, let t1, let t2, let t3, _):
@@ -1015,7 +1247,7 @@ final class Engine {
             let b = packet(st, tl, seq: seq, start: nextFrame, flags: 0)
             let i = Int(seq & 1023)
             cacheSeq[i] = seq; cacheEpoch[i] = tl.epoch; cacheStart[i] = nextFrame
-            udp.send(b, to: addr)
+            udp?.send(b, to: addr)
             nextFrame += Int64(SF.packetFrames); k += 1
         }
     }
@@ -1030,7 +1262,7 @@ final class Engine {
             let i = Int(seq & 1023)
             guard cacheSeq[i] == seq, cacheEpoch[i] == tl.epoch else { continue }
             if tl.timeOf(cacheStart[i] + Int64(SF.packetFrames)) < now { continue }
-            udp.send(packet(st, tl, seq: seq, start: cacheStart[i], flags: Wire.flagRetransmit), to: addr)
+            udp?.send(packet(st, tl, seq: seq, start: cacheStart[i], flags: Wire.flagRetransmit), to: addr)
             resent += 1
         }
     }
@@ -1044,11 +1276,11 @@ final class Engine {
         if now - lastPing >= interval {
             lastPing = now
             if pingBurst > 0 { pingBurst -= 1 }
-            udp.send(Wire.ping(session: sid, t1: now, pingSeq: pingSeq), to: addr)
+            udp?.send(Wire.ping(session: sid, t1: now, pingSeq: pingSeq), to: addr)
             pingSeq &+= 1
         }
         let nacks = rx.collectNacks(nowLocal: now)
-        if !nacks.isEmpty { udp.send(Wire.nack(session: sid, epoch: rx.timeline.epoch, seqs: nacks), to: addr) }
+        if !nacks.isEmpty { udp?.send(Wire.nack(session: sid, epoch: rx.timeline.epoch, seqs: nacks), to: addr) }
     }
 
     // ================================================================== прерывания

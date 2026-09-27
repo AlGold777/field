@@ -32,6 +32,12 @@ class MainActivity : ComponentActivity() {
         val engine = Engine.get(this)
         setContent { SoundFieldTheme { AppRoot(engine) } }
     }
+
+    override fun onStart() {
+        super.onStart()
+        // Разблокировка / возврат в приложение: сразу проверяем связь и восстанавливаем пару, не дожидаясь таймаутов.
+        Engine.get(this).onForeground()
+    }
 }
 
 private enum class Sub { NONE, CALIBRATION, DIAGNOSTICS }

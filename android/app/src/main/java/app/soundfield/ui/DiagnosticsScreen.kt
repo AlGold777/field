@@ -3,6 +3,8 @@ package app.soundfield.ui
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.Text
+import androidx.compose.ui.unit.sp
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -62,6 +64,14 @@ fun DiagnosticsScreen(ui: UiState, onBack: () -> Unit) {
             DiagRow("Underrun Point", if (p.valid) "${p.underruns}" else "—", if (p.underruns > 0) SFColors.Warn else SFColors.Text)
             DiagRow("Выходная задержка Server", if (s.valid) "%.1f мс".format(s.latencyMs) else "—")
             DiagRow("Выходная задержка Point", if (p.valid) "%.1f мс".format(p.latencyMs) else "—")
+        }
+
+        SFCard {
+            H3("Журнал подключения")
+            if (ui.connLog.isEmpty()) DiagRow("Событий нет", "—")
+            ui.connLog.asReversed().take(30).forEach { line ->
+                Text(line, color = SFColors.TextDim, fontSize = 12.sp, lineHeight = 16.sp, modifier = Modifier.padding(vertical = 3.dp))
+            }
         }
     }
 }

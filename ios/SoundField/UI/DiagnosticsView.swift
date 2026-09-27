@@ -60,6 +60,15 @@ struct DiagnosticsView: View {
                     DiagRow(label: "Выходная задержка Server", value: s.valid ? String(format: "%.1f мс", s.latencyMs) : "—")
                     DiagRow(label: "Выходная задержка Point", value: p.valid ? String(format: "%.1f мс", p.latencyMs) : "—")
                 }
+
+                SFCard {
+                    H3(text: "Журнал подключения")
+                    if ui.connLog.isEmpty { DiagRow(label: "Событий нет", value: "—") }
+                    ForEach(Array(ui.connLog.reversed().prefix(30).enumerated()), id: \.offset) { _, line in
+                        Text(line).font(.system(size: 12)).foregroundColor(SFColor.dim)
+                            .frame(maxWidth: .infinity, alignment: .leading).padding(.vertical, 3)
+                    }
+                }
             }
             .padding(.horizontal, 20).padding(.vertical, 24)
         }

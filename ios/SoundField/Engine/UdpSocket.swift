@@ -8,6 +8,10 @@ final class UdpSocket {
 
     private let fd: Int32
     let port: UInt16
+    /// Сокет «сломан» (iOS закрыла его, пока приложение спало) — Engine создаёт новый.
+    private let brokenBox = Locked(false)
+    var broken: Bool { brokenBox.value }
+    private let closedBox = Locked(false)
     var onPacket: ((UnsafeRawBufferPointer, Addr, Int64) -> Void)?
 
     init?() {
@@ -26,7 +30,7 @@ final class UdpSocket {
         let ok = withUnsafePointer(to: &addr) {
             $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { bind(socketFD, $0, socklen_t(MemoryLayout<sockaddr_in6>.size)) }
         }
-        guard ok == 0 else { close(socketFD); return nil }
+        guard ok == 0 else { Darwin.close(socketFD); return nil }
         var bound = sockaddr_in6(); var len = socklen_t(MemoryLayout<sockaddr_in6>.size)
         _ = withUnsafeMutablePointer(to: &bound) {
             $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { getsockname(socketFD, $0, &len) }
@@ -40,7 +44,8 @@ final class UdpSocket {
 
     private func loop() {
         var buf = [UInt8](repeating: 0, count: 4096)
-        while true {
+        var errors = 0
+        while !closedBox.value {
             var storage = sockaddr_storage()
             var len = socklen_t(MemoryLayout<sockaddr_storage>.size)
             let n = buf.withUnsafeMutableBytes { b -> Int in
@@ -49,10 +54,30 @@ final class UdpSocket {
                 }
             }
             let now = MonoClock.nowNs()
-            if n <= 0 { usleep(10_000); continue }
+            if n < 0 {
+                let e = errno
+                if e == EINTR || e == EAGAIN { continue }
+                errors += 1
+                if e == EBADF || e == ENOTSOCK || e == ENOTCONN || errors > 100 {
+                    NSLog("SoundField udp: сокет недоступен (errno \(e))")
+                    brokenBox.value = true
+                    return
+                }
+                usleep(10_000); continue
+            }
+            errors = 0
+            if n == 0 { continue }
             let from = Addr(storage: storage, len: len)
             buf.withUnsafeBytes { b in onPacket?(UnsafeRawBufferPointer(rebasing: b[0..<n]), from, now) }
         }
+    }
+
+    func close() {
+        guard !closedBox.value else { return }
+        closedBox.value = true
+        brokenBox.value = true
+        Darwin.shutdown(fd, SHUT_RDWR)
+        Darwin.close(fd)
     }
 
     func send(_ bytes: [UInt8], to a: Addr) {

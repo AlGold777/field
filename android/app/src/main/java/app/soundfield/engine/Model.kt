@@ -29,11 +29,15 @@ data class PairRecord(
     val volL: Float = 1f,
     val volR: Float = 1f,
     val master: Float = 0.8f,
+    /** Последний известный адрес второго телефона и порт его TCP-сервера — быстрый путь без mDNS. */
+    val lastHost: String? = null,
+    val lastPort: Int = 0,
 ) {
     fun toJson(): String = JSONObject().apply {
         put("key", key); put("peerId", peerId); put("peerName", peerName); put("peerPlatform", peerPlatform)
         put("myRole", myRole.wire); put("pointCh", Ch.name(pointChannel)); put("trimMs", trimMs)
         put("volL", volL.toDouble()); put("volR", volR.toDouble()); put("master", master.toDouble())
+        lastHost?.let { put("lastHost", it) }; put("lastPort", lastPort)
     }.toString()
 
     companion object {
@@ -45,6 +49,7 @@ data class PairRecord(
                     Ch.parse(it.optString("pointCh", "R")), it.optDouble("trimMs", 0.0),
                     it.optDouble("volL", 1.0).toFloat(), it.optDouble("volR", 1.0).toFloat(),
                     it.optDouble("master", 0.8).toFloat(),
+                    it.optString("lastHost", "").ifEmpty { null }, it.optInt("lastPort", 0),
                 )
             }
         } catch (e: Exception) { null }
@@ -108,6 +113,10 @@ data class UiState(
     val nearby: List<Peer> = emptyList(),
     val remembered: PairRecord? = null,
     val invitingName: String = "",
+    /** true — идёт восстановление знакомой пары (без подтверждения), false — новое приглашение. */
+    val resuming: Boolean = false,
+    /** Фоновое (без диалога) восстановление знакомой пары после запуска/возврата в приложение. */
+    val autoResuming: Boolean = false,
     val incomingName: String = "",
     val linkOk: Boolean = false,
     // плеер
@@ -134,6 +143,8 @@ data class UiState(
     // уведомления
     val message: String = "",
     val messageId: Int = 0,
+    /** Журнал событий подключения (новые — в конце), показывается в «Диагностике». */
+    val connLog: List<String> = emptyList(),
 ) {
     val myChannel: Int get() = if (role == Role.POINT) pointChannel else Ch.other(pointChannel)
     val inPair: Boolean get() = phase == Phase.PAIRED || phase == Phase.RECONNECTING

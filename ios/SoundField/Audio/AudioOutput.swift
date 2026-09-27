@@ -112,6 +112,15 @@ final class AudioOutput {
         try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
     }
 
+    /// Возврат в приложение / конец прерывания: если движок должен играть, но остановлен — запускаем снова.
+    func ensureRunning() {
+        guard running, !engine.isRunning else { return }
+        Self.configurePlaybackSession()
+        updateLatency()
+        engine.prepare()
+        do { try engine.start() } catch { NSLog("SoundField engine restart: \(error)") }
+    }
+
     /// Перезапуск после смены категории сессии (калибровка).
     func restart() {
         guard running else { return }

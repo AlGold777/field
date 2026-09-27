@@ -11,7 +11,8 @@ enum SF {
     static let serviceType = "_soundfield._tcp"
     static let servicePrefix = "SF-"
     static let heartbeatSec = 1.0
-    static let linkTimeoutSec = 4.0
+    // 8 с без данных = разрыв. При выключенном экране Wi‑Fi экономит энергию и TCP может «замирать» на 1–3 с.
+    static let linkTimeoutSec = 8.0
     static let maxTrimMs = 250.0
     static let hardResyncFrames = 960.0            // >20 мс — жёсткий прыжок
     static let slewThresholdFrames = 6.0           // >0.125 мс — плавная подстройка по 1 сэмплу

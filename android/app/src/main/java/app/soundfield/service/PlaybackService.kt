@@ -28,6 +28,7 @@ import app.soundfield.ui.MainActivity
 class PlaybackService : Service() {
 
     private var wifiLock: WifiManager.WifiLock? = null
+    private var wifiLockBg: WifiManager.WifiLock? = null
     private var wakeLock: PowerManager.WakeLock? = null
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -36,9 +37,15 @@ class PlaybackService : Service() {
         super.onCreate()
         ensureChannel(this)
         val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+        // LOW_LATENCY действует только пока приложение на экране; в фоне и при выключенном экране Wi‑Fi
+        // держит HIGH_PERF (без энергосбережения) — иначе пакеты задерживаются на секунды и пара рвётся.
         @Suppress("DEPRECATION")
-        val wifiMode = if (Build.VERSION.SDK_INT >= 29) WifiManager.WIFI_MODE_FULL_LOW_LATENCY else WifiManager.WIFI_MODE_FULL_HIGH_PERF
-        wifiLock = wm.createWifiLock(wifiMode, "soundfield:wifi").apply { setReferenceCounted(false); acquire() }
+        wifiLockBg = try { wm.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "soundfield:wifi-bg")
+            .apply { setReferenceCounted(false); acquire() } } catch (_: Exception) { null }
+        if (Build.VERSION.SDK_INT >= 29) {
+            wifiLock = try { wm.createWifiLock(WifiManager.WIFI_MODE_FULL_LOW_LATENCY, "soundfield:wifi")
+                .apply { setReferenceCounted(false); acquire() } } catch (_: Exception) { null }
+        }
         val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
         wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "soundfield:audio").apply { setReferenceCounted(false); acquire() }
     }
@@ -50,13 +57,20 @@ class PlaybackService : Service() {
             ACTION_DISCONNECT -> engine.disconnect()
         }
         val n = build(this)
-        if (Build.VERSION.SDK_INT >= 29) startForeground(ID, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK)
-        else startForeground(ID, n)
+        try {
+            if (Build.VERSION.SDK_INT >= 29) startForeground(ID, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK)
+            else startForeground(ID, n)
+        } catch (e: Exception) {
+            // Android 12+ запрещает запуск foreground-сервиса из фона в некоторых случаях — не падаем.
+            android.util.Log.w("SoundField", "startForeground: ${e.message}")
+            running = false; stopSelf(); return START_NOT_STICKY
+        }
         return START_NOT_STICKY
     }
 
     override fun onDestroy() {
         try { wifiLock?.release() } catch (_: Exception) {}
+        try { wifiLockBg?.release() } catch (_: Exception) {}
         try { wakeLock?.release() } catch (_: Exception) {}
         super.onDestroy()
     }

@@ -13,7 +13,9 @@ object SF {
     const val SERVICE_TYPE = "_soundfield._tcp"      // Bonjour / NSD
     const val SERVICE_PREFIX = "SF-"
     const val HEARTBEAT_MS = 1_000L
-    const val LINK_TIMEOUT_MS = 4_000L
+    // Разрыв считается по отсутствию данных 8 с: при выключенном экране Wi‑Fi уходит в энергосбережение
+    // и доставка TCP может «замирать» на 1–3 с — 4 с давали ложные разрывы.
+    const val LINK_TIMEOUT_MS = 8_000L
     const val MAX_TRIM_MS = 250
     const val HARD_RESYNC_FRAMES = 960               // >20 мс рассогласования — жёсткий прыжок
     const val SLEW_THRESHOLD_FRAMES = 6.0            // >0.125 мс — плавная подстройка по 1 сэмплу

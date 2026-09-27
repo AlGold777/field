@@ -18,6 +18,7 @@ import app.soundfield.engine.UiState
 @Composable
 fun WelcomeScreen(ui: UiState, engine: Engine) {
     var renaming by remember { mutableStateOf(false) }
+    var showLog by remember { mutableStateOf(false) }
     Column(
         Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 20.dp).padding(top = 48.dp, bottom = 24.dp),
     ) {
@@ -38,6 +39,7 @@ fun WelcomeScreen(ui: UiState, engine: Engine) {
                 trailing = { Text("→", color = SFColors.TextDim) },
                 onClick = { engine.resumeRemembered() },
             )
+            if (ui.autoResuming) Subtitle("Ищем «${rec.peerName}» — пара восстановится автоматически…")
             Row {
                 GhostButton("Подключить снова", Modifier.weight(1f)) { engine.resumeRemembered() }
                 GhostButton("Забыть", Modifier.weight(1f), color = SFColors.TextDim) { engine.forgetPair() }
@@ -69,6 +71,13 @@ fun WelcomeScreen(ui: UiState, engine: Engine) {
 
         Spacer(Modifier.height(24.dp))
         GhostButton("Этот телефон: ${ui.myName}  ✎", color = SFColors.TextDim) { renaming = true }
+        GhostButton(if (showLog) "Скрыть журнал подключения" else "Журнал подключения", color = SFColors.TextDim) { showLog = !showLog }
+        if (showLog) {
+            if (ui.connLog.isEmpty()) Subtitle("Событий нет")
+            ui.connLog.asReversed().take(30).forEach { line ->
+                Text(line, color = SFColors.TextDim, fontSize = 12.sp, lineHeight = 16.sp, modifier = Modifier.padding(vertical = 2.dp))
+            }
+        }
     }
 
     if (renaming) RenameDialog(ui.myName, onDismiss = { renaming = false }) { engine.rename(it); renaming = false }
@@ -81,7 +90,8 @@ fun WelcomeScreen(ui: UiState, engine: Engine) {
                 Column {
                     LinearProgressIndicator(Modifier.fillMaxWidth(), color = SFColors.Accent1)
                     Spacer(Modifier.height(12.dp))
-                    Text("Ждём подтверждения на «${ui.invitingName}».")
+                    Text(if (ui.resuming) "Восстанавливаем пару с «${ui.invitingName}»…"
+                         else "Ждём подтверждения на «${ui.invitingName}».")
                 }
             },
             confirmButton = {},

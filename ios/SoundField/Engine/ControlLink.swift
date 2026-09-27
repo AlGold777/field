@@ -10,6 +10,8 @@ final class ControlLink {
     var onClosed: ((ControlLink) -> Void)?
     var tag = ""
     private(set) var lastRx = Date()
+    /// TCP-соединение установлено (для исходящих — после .ready).
+    private(set) var ready = false
     private var closed = false
 
     init(_ conn: NWConnection, queue: DispatchQueue) {
@@ -21,6 +23,7 @@ final class ControlLink {
         conn.stateUpdateHandler = { [weak self] st in
             guard let self else { return }
             switch st {
+            case .ready: self.ready = true
             case .failed, .cancelled: self.close()
             case .waiting(let e): NSLog("SoundField link waiting: \(e)"); self.close()
             default: break

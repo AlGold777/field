@@ -24,6 +24,10 @@ struct PairRecord: Codable, Equatable {
     var volL: Double = 1
     var volR: Double = 1
     var master: Double = 0.8
+    /// Последний известный адрес второго телефона и порт его TCP-сервера — быстрый путь без Bonjour.
+    /// Optional: старые сохранённые пары без этих полей продолжают читаться.
+    var lastHost: String? = nil
+    var lastPort: Int? = nil
     var role: Role { Role(rawValue: myRole) ?? .point }
 }
 
@@ -77,6 +81,8 @@ struct UiState: Equatable {
     var nearby: [Peer] = []
     var remembered: PairRecord? = nil
     var invitingName = ""
+    var resuming = false          // восстановление знакомой пары, а не новое приглашение
+    var autoResuming = false      // фоновое восстановление знакомой пары (без диалога)
     var incomingName = ""
     var linkOk = false
     var playing = false
@@ -100,6 +106,7 @@ struct UiState: Equatable {
     var pointDiag = Diag()
     var message = ""
     var messageId = 0
+    var connLog: [String] = []    // журнал подключения для «Диагностики»
 
     var myChannel: Int { role == .point ? pointChannel : Ch.other(pointChannel) }
     var inPair: Bool { phase == .paired || phase == .reconnecting }

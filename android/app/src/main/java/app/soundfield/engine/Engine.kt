@@ -6,6 +6,11 @@ import android.content.pm.PackageManager
 import android.media.AudioAttributes
 import android.media.AudioFocusRequest
 import android.media.AudioManager
+import android.net.ConnectivityManager
+import android.net.LinkProperties
+import android.net.Network
+import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
@@ -29,6 +34,7 @@ import kotlinx.coroutines.flow.update
 import org.json.JSONObject
 import java.net.DatagramPacket
 import java.net.DatagramSocket
+import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
@@ -123,6 +129,20 @@ class Engine private constructor(private val app: Context) {
     private var reconnectSince = 0L
     private var lastBrowseRestart = 0L
     private var manualResumeDeadline = 0L
+    /** Идёт восстановление сохранённой пары с экрана «Знакомая пара» (вручную или автоматически). */
+    private var manualResumeActive = false
+    private var manualResumeAuto = false
+    private var resumeAttempt = 0
+    /** Порт TCP-сервера второго телефона, полученный в invite/resume/accept, — для быстрого переподключения. */
+    private var peerTcpPortHint = 0
+    /** Пара должна восстанавливаться сама (после запуска/возврата в приложение), пока её явно не разорвали. */
+    private var autoResume = prefs.getBoolean("autoResume", false)
+    /** До какого момента (elapsedRealtime) в состоянии IDLE тихо пробуем восстановить знакомую пару. */
+    private var autoResumeUntil = 0L
+    private var lastAutoAttempt = 0L
+    private var lastNetSignature: String? = null
+    private val connLog = ArrayDeque<String>()
+    private val logTime = java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.US)
 
     // ------------------------------------------------------------------ Server
     @Volatile private var serverPlay = ServerPlayState(Timeline.NONE, music, Ch.L, 0.8f)
@@ -164,7 +184,9 @@ class Engine private constructor(private val app: Context) {
     // ================================================================== запуск
     private fun boot() {
         File(app.filesDir, "audio_queue").listFiles()?.forEach { it.delete() }
-        tcp = ServerSocket(0)
+        // Стараемся занять тот же TCP-порт, что и в прошлый раз: второй телефон помнит его и подключается напрямую.
+        tcp = try { ServerSocket(prefs.getInt("tcpPort", 0)) } catch (e: Exception) { ServerSocket(0) }
+        prefs.edit().putInt("tcpPort", tcp.localPort).apply()
         udp = DatagramSocket(0)
         discovery = Discovery(app, myId) { peers -> ui { copy(nearby = peers) } }
         Thread({ acceptLoop() }, "sf-accept").apply { isDaemon = true; start() }
@@ -176,6 +198,89 @@ class Engine private constructor(private val app: Context) {
         ex.scheduleAtFixedRate({ try { serverTick() } catch (t: Throwable) { Log.e(TAG, "tick", t) } }, 100, 100, TimeUnit.MILLISECONDS)
         ui { copy(myId = myId, myName = myName, remembered = record, durationMs = music.totalFrames * 1000 / SF.SAMPLE_RATE,
             title = music.title, artist = music.artist, queueExpanded = prefs.getBoolean("queueExpanded", false)) }
+        watchNetwork()
+        log("Запуск: TCP ${tcp.localPort}, UDP ${udp.localPort}")
+        if (autoResume && record != null) post { startAutoResume() }
+    }
+
+    /** Смена сети Wi‑Fi / IP (выход из сна, переподключение к роутеру) — сразу обновляем рекламу и пробуем связь. */
+    private fun watchNetwork() {
+        val cm = app.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        val req = NetworkRequest.Builder().addTransportType(NetworkCapabilities.TRANSPORT_WIFI).build()
+        try {
+            cm.registerNetworkCallback(req, object : ConnectivityManager.NetworkCallback() {
+                override fun onLinkPropertiesChanged(network: Network, lp: LinkProperties) {
+                    val sig = lp.linkAddresses.joinToString { it.address.hostAddress ?: "" }
+                    post {
+                        val prev = lastNetSignature
+                        lastNetSignature = sig
+                        if (prev != null && prev != sig) onNetworkChanged()
+                    }
+                }
+                override fun onLost(network: Network) { post { lastNetSignature = ""; log("Wi‑Fi потерян") } }
+            })
+        } catch (e: Exception) { Log.w(TAG, "network callback", e) }
+    }
+
+    private fun onNetworkChanged() {
+        log("Сеть изменилась")
+        discovery.advertise(tcp.localPort, myName)
+        if (discovery.browsing) { lastBrowseRestart = SystemClock.elapsedRealtime(); discovery.restartBrowse() }
+        if (phase == Phase.RECONNECTING && pending == null) scheduleReconnect(200)
+    }
+
+    private fun log(text: String) {
+        Log.i(TAG, text)
+        val line = "${logTime.format(java.util.Date())}  $text"
+        synchronized(connLog) { connLog.addLast(line); while (connLog.size > 60) connLog.removeFirst() }
+        val snapshot = synchronized(connLog) { connLog.toList() }
+        ui { copy(connLog = snapshot) }
+    }
+
+    /**
+     * Тихое восстановление: экран остаётся обычным (можно создать новую пару), а в фоне раз в 3 с идёт
+     * попытка resume к знакомому телефону. Модальный диалог здесь не используется — он блокировал
+     * новые приглашения и «зацикливался» при каждом возврате в приложение.
+     */
+    private fun startAutoResume() {
+        if (!autoResume || record == null || phase != Phase.IDLE) return
+        autoResumeUntil = SystemClock.elapsedRealtime() + 30_000
+        lastAutoAttempt = 0; resumeAttempt = 0
+        if (!discovery.browsing) discovery.startBrowse()
+        log("Фоновое восстановление пары с «${record?.peerName}»")
+        ui { copy(autoResuming = true) }
+        autoResumeTick()
+    }
+
+    private fun stopAutoResume() {
+        autoResumeUntil = 0
+        dropAutoPending()
+        ui { copy(autoResuming = false) }
+    }
+
+    private fun autoResumeTick() {
+        if (autoResumeUntil == 0L) return
+        val now = SystemClock.elapsedRealtime()
+        if (!autoResume || record == null || now > autoResumeUntil) {
+            if (phase == Phase.IDLE) log("Фоновое восстановление: «${record?.peerName}» не ответил")
+            autoResumeUntil = 0; ui { copy(autoResuming = false) }; return
+        }
+        if (phase != Phase.IDLE || pending != null || now - lastAutoAttempt < 3_000) return
+        val rec = record ?: return
+        val p = resumeTarget(rec) ?: return
+        lastAutoAttempt = now
+        connectOutgoing(p, "resume-auto", resumeJson(rec), 3_000)
+    }
+
+    private fun dropAutoPending() {
+        val p = pending ?: return
+        if (p.tag != "resume-auto") return
+        pending = null; p.tag = "dead"; p.close()
+    }
+
+    private fun setAutoResume(on: Boolean) {
+        if (autoResume == on) return
+        autoResume = on; prefs.edit().putBoolean("autoResume", on).apply()
     }
 
     private fun defaultName(): String {
@@ -202,8 +307,27 @@ class Engine private constructor(private val app: Context) {
     fun acceptIncoming() = post { doAccept() }
     fun rejectIncoming() = post { doReject() }
     fun resumeRemembered() = post { doManualResume() }
-    fun forgetPair() = post { record = null; prefs.edit().remove("pair").apply(); ui { copy(remembered = null) } }
-    fun disconnect() = post { goIdle(sendBye = true, reason = "Пара разорвана") }
+    fun forgetPair() = post { record = null; setAutoResume(false); stopAutoResume(); prefs.edit().remove("pair").apply(); ui { copy(remembered = null) } }
+    fun disconnect() = post { setAutoResume(false); goIdle(sendBye = true, reason = "Пара разорвана") }
+
+    /** Приложение снова на экране (разблокировка, возврат из другого приложения). */
+    fun onForeground() = post {
+        when (phase) {
+            Phase.IDLE -> {
+                if (!discovery.browsing) discovery.startBrowse()
+                if (autoResume && record != null && autoResumeUntil == 0L) startAutoResume()
+            }
+            Phase.RECONNECTING -> if (pending == null) { log("Возврат в приложение — переподключаемся сразу"); scheduleReconnect(0) }
+            Phase.PAIRED -> {
+                // Соединение могло «умереть» во сне, а таймаут ещё не истёк — не ждём его.
+                val l = link
+                if (l != null && SystemClock.elapsedRealtime() - l.lastRx > 4_000) {
+                    log("Связь молчит ${(SystemClock.elapsedRealtime() - l.lastRx) / 1000} с — переподключаемся"); l.close()
+                }
+            }
+            else -> {}
+        }
+    }
     fun rename(name: String) = post {
         val n = name.trim().take(40).ifEmpty { defaultName() }
         myName = n; prefs.edit().putString("name", n).apply()
@@ -360,41 +484,66 @@ class Engine private constructor(private val app: Context) {
 
     // ================================================================== установка пары
     private fun inviteJson(key: String) = JSONObject().put("t", "invite").put("id", myId).put("name", myName)
-        .put("platform", "android").put("proto", SF.PROTOCOL_VERSION).put("key", key)
+        .put("platform", "android").put("proto", SF.PROTOCOL_VERSION).put("key", key).put("tcpPort", tcp.localPort)
 
     private fun doInvite(p: Peer) {
         if (phase != Phase.IDLE) return
+        stopAutoResume()
         pendingKey = hex(16)
         phase = Phase.INVITING
-        ui { copy(phase = Phase.INVITING, invitingName = p.name) }
+        ui { copy(phase = Phase.INVITING, invitingName = p.name, resuming = false) }
         connectOutgoing(p, "invite-out", inviteJson(pendingKey), 30_000)
     }
 
-    private fun doManualResume() {
+    private fun doManualResume(auto: Boolean = false) {
         val rec = record ?: return
-        if (phase != Phase.IDLE) return
+        if (phase == Phase.IDLE) stopAutoResume()
+        if (phase != Phase.IDLE || pending != null) return
         phase = Phase.INVITING
-        ui { copy(phase = Phase.INVITING, invitingName = rec.peerName) }
-        manualResumeDeadline = SystemClock.elapsedRealtime() + 8_000
+        manualResumeActive = true; manualResumeAuto = auto; resumeAttempt = 0
+        ui { copy(phase = Phase.INVITING, invitingName = rec.peerName, resuming = true) }
+        manualResumeDeadline = SystemClock.elapsedRealtime() + (if (auto) 20_000 else 15_000)
         discovery.startBrowse()
+        log(if (auto) "Автовосстановление пары с «${rec.peerName}»" else "Подключение к знакомой паре «${rec.peerName}»")
         tryManualResume()
     }
 
     private fun tryManualResume() {
-        if (phase != Phase.INVITING || pending != null) return
+        if (!manualResumeActive || phase != Phase.INVITING || pending != null) return
         val rec = record ?: return
-        val p = discovery.peer(rec.peerId)
-        if (p?.host != null) { connectOutgoing(p, "resume-out", resumeJson(rec), 4_000); return }
         if (SystemClock.elapsedRealtime() > manualResumeDeadline) {
+            manualResumeActive = false
             phase = Phase.IDLE; ui { copy(phase = Phase.IDLE) }
-            toast("«${rec.peerName}» не найден. Откройте SoundField на втором телефоне в той же сети Wi‑Fi")
+            log("«${rec.peerName}» не ответил")
+            toast(if (manualResumeAuto) "«${rec.peerName}» пока не отвечает. Откройте SoundField на втором телефоне — пара восстановится"
+                  else "«${rec.peerName}» не найден. Откройте SoundField на втором телефоне в той же сети Wi‑Fi")
             return
         }
+        val p = resumeTarget(rec)
+        if (p != null) { connectOutgoing(p, "resume-out", resumeJson(rec), 4_000); return }
         later(500) { tryManualResume() }
+    }
+
+    /**
+     * Куда стучаться при восстановлении пары: попеременно последний известный адрес (работает без mDNS,
+     * мгновенно после разблокировки) и адрес, найденный через NSD (если IP сменился).
+     */
+    private fun resumeTarget(rec: PairRecord): Peer? {
+        resumeAttempt++
+        val found = discovery.peer(rec.peerId)?.takeIf { it.host != null }
+        val direct = rec.lastHost?.takeIf { rec.lastPort > 0 }?.let { h ->
+            try { Peer(rec.peerId, rec.peerName, rec.peerPlatform, InetAddress.getByName(h), rec.lastPort) } catch (_: Exception) { null }
+        }
+        val sameAsFound = found != null && direct != null && found.host == direct.host && found.port == direct.port
+        return if (resumeAttempt % 2 == 1 || sameAsFound) direct ?: found else found ?: direct
     }
 
     private fun resumeJson(rec: PairRecord) = JSONObject().put("t", "resume").put("id", myId).put("name", myName)
         .put("platform", "android").put("proto", SF.PROTOCOL_VERSION).put("key", rec.key).put("role", rec.myRole.wire)
+        .put("tcpPort", tcp.localPort)
+
+    private fun acceptJson(key: String, r: Role) = JSONObject().put("t", "accept").put("id", myId).put("name", myName)
+        .put("platform", "android").put("key", key).put("role", r.wire).put("tcpPort", tcp.localPort)
 
     private fun connectOutgoing(p: Peer, tag: String, first: JSONObject, timeoutMs: Long) {
         val host = p.host ?: return onConnectFailed(tag)
@@ -402,11 +551,12 @@ class Engine private constructor(private val app: Context) {
         io.execute {
             try {
                 val s = Socket()
-                s.connect(InetSocketAddress(host, p.port), 3_000)
+                s.connect(InetSocketAddress(host, p.port), 2_500)
                 post {
                     val stillWanted = when (tag) {
                         "invite-out" -> phase == Phase.INVITING && pendingPeer?.id == p.id
-                        else -> phase == Phase.RECONNECTING || phase == Phase.INVITING
+                        "resume-auto" -> phase == Phase.IDLE && autoResumeUntil != 0L
+                        else -> phase == Phase.RECONNECTING || (phase == Phase.INVITING && manualResumeActive)
                     }
                     if (!stillWanted || pending != null) { try { s.close() } catch (_: Exception) {}; return@post }
                     val l = newLink(s); l.tag = tag
@@ -416,8 +566,7 @@ class Engine private constructor(private val app: Context) {
                     pendingTimeout = later(timeoutMs) { if (pending === l) l.close() }
                 }
             } catch (e: Exception) {
-                Log.i(TAG, "connect $tag failed: ${e.message}")
-                post { onConnectFailed(tag) }
+                post { log("Нет соединения с ${host.hostAddress}:${p.port} — ${e.message}"); onConnectFailed(tag) }
             }
         }
     }
@@ -427,7 +576,7 @@ class Engine private constructor(private val app: Context) {
             tag == "invite-out" && phase == Phase.INVITING -> {
                 phase = Phase.IDLE; ui { copy(phase = Phase.IDLE) }; toast("Не удалось подключиться к телефону")
             }
-            tag == "resume-out" && phase == Phase.RECONNECTING -> scheduleReconnect(1_500)
+            tag == "resume-out" && phase == Phase.RECONNECTING -> scheduleReconnect(reconnectDelay())
             tag == "resume-out" && phase == Phase.INVITING -> later(700) { tryManualResume() }
         }
     }
@@ -443,6 +592,7 @@ class Engine private constructor(private val app: Context) {
     }
 
     private fun doCancelPending() {
+        manualResumeActive = false
         val l = pending
         pending = null
         l?.let { it.tag = "dead"; it.sendAndClose(JSONObject().put("t", "cancel")) }
@@ -453,8 +603,8 @@ class Engine private constructor(private val app: Context) {
         val l = pending ?: return
         val p = pendingPeer ?: return
         if (phase != Phase.INCOMING) return
-        l.send(JSONObject().put("t", "accept").put("id", myId).put("name", myName).put("platform", "android")
-            .put("key", pendingKey).put("role", Role.POINT.wire))
+        l.send(acceptJson(pendingKey, Role.POINT))
+        peerTcpPortHint = p.port
         becomePaired(l, Role.POINT, p.id, p.name, p.platform, pendingKey, resumed = false)
     }
 
@@ -478,11 +628,13 @@ class Engine private constructor(private val app: Context) {
         val pid = o.optString("id"); val pname = o.optString("name", pid); val pplat = o.optString("platform", "?")
         when (o.optString("t")) {
             "invite" -> {
+                if (phase == Phase.IDLE) stopAutoResume()   // новое приглашение важнее фонового восстановления
                 if (phase == Phase.IDLE && pending == null) {
                     l.tag = "incoming"; pending = l
-                    pendingPeer = Peer(pid, pname, pplat, l.remoteAddress, 0)
+                    pendingPeer = Peer(pid, pname, pplat, l.remoteAddress, o.optInt("tcpPort", 0))
                     pendingKey = o.optString("key")
                     phase = Phase.INCOMING
+                    log("Приглашение от «$pname»")
                     ui { copy(phase = Phase.INCOMING, incomingName = pname) }
                     pendingTimeout?.cancel(false)
                     pendingTimeout = later(60_000) { if (pending === l) doReject() }
@@ -491,7 +643,7 @@ class Engine private constructor(private val app: Context) {
                     if (myId > pid) {
                         pending?.let { it.tag = "dead"; it.close() }
                         l.tag = "incoming"; pending = l
-                        pendingPeer = Peer(pid, pname, pplat, l.remoteAddress, 0)
+                        pendingPeer = Peer(pid, pname, pplat, l.remoteAddress, o.optInt("tcpPort", 0))
                         pendingKey = o.optString("key")
                         phase = Phase.INCOMING
                         doAccept()
@@ -506,12 +658,22 @@ class Engine private constructor(private val app: Context) {
                 val rec = record
                 val ok = rec != null && rec.key == o.optString("key") && rec.peerId == pid &&
                     phase != Phase.INCOMING
-                if (!ok) { l.tag = "dead"; l.sendAndClose(JSONObject().put("t", "reject").put("reason", "unknown")); return }
+                if (!ok) {
+                    log("Отклонён resume от «$pname»: пара неизвестна")
+                    l.tag = "dead"; l.sendAndClose(JSONObject().put("t", "reject").put("reason", "unknown")); return
+                }
+                // Оба телефона стучатся друг к другу одновременно — оставляем одно соединение детерминированно:
+                // входящее принимает телефон с бо́льшим id (как и для встречных приглашений).
+                val mine = pending
+                if (mine != null && (mine.tag == "resume-out" || mine.tag == "resume-auto") && myId < pid) {
+                    l.tag = "dead"; l.sendAndClose(JSONObject().put("t", "reject").put("reason", "crossed")); return
+                }
                 // старое (возможно, «мёртвое») соединение заменяется новым
                 link?.let { old -> link = null; old.tag = "dead"; old.close() }
                 pending?.let { p -> pending = null; p.tag = "dead"; p.close() }
-                l.send(JSONObject().put("t", "accept").put("id", myId).put("name", myName).put("platform", "android")
-                    .put("key", rec!!.key).put("role", rec.myRole.wire))
+                l.send(acceptJson(rec!!.key, rec.myRole))
+                peerTcpPortHint = o.optInt("tcpPort", 0)
+                log("Входящее восстановление от «$pname» (${l.remoteAddress.hostAddress})")
                 becomePaired(l, rec.myRole, pid, pname, pplat, rec.key, resumed = true)
             }
             else -> { l.tag = "dead"; l.close() }
@@ -522,8 +684,12 @@ class Engine private constructor(private val app: Context) {
         val pid = o.optString("id"); val pname = o.optString("name", pid); val pplat = o.optString("platform", "?")
         when (o.optString("t")) {
             "accept" -> when (l.tag) {
-                "invite-out" -> becomePaired(l, Role.SERVER, pid, pname, pplat, pendingKey, resumed = false)
-                "resume-out" -> {
+                "invite-out" -> {
+                    peerTcpPortHint = o.optInt("tcpPort", 0).takeIf { it > 0 } ?: (pendingPeer?.port ?: 0)
+                    becomePaired(l, Role.SERVER, pid, pname, pplat, pendingKey, resumed = false)
+                }
+                "resume-out", "resume-auto" -> {
+                    peerTcpPortHint = o.optInt("tcpPort", 0).takeIf { it > 0 } ?: (pendingPeer?.port ?: 0)
                     val their = Role.fromWire(o.optString("role"))
                     val mine = if (their == Role.SERVER) Role.POINT else Role.SERVER
                     becomePaired(l, mine, pid, pname, pplat, o.optString("key"), resumed = true)
@@ -531,14 +697,32 @@ class Engine private constructor(private val app: Context) {
             }
             "reject", "busy" -> {
                 val reason = o.optString("reason")
+                val wasAuto = l.tag == "resume-auto"
                 pending = null; l.tag = "dead"; l.close()
+                if (wasAuto) {
+                    log("Фоновое восстановление: ответ «${o.optString("t")}${if (reason.isNotEmpty()) ": $reason" else ""}»")
+                    if (reason == "unknown") { setAutoResume(false); stopAutoResume() }   // второй телефон забыл пару
+                    return
+                }
+                log("Ответ «${o.optString("t")}${if (reason.isNotEmpty()) ": $reason" else ""}»")
                 when {
-                    phase == Phase.INVITING && reason == "crossed" -> { /* ждём встречного accept от другой стороны */ }
-                    phase == Phase.INVITING -> {
-                        phase = Phase.IDLE; ui { copy(phase = Phase.IDLE) }
-                        toast(if (o.optString("t") == "busy") "Телефон уже в другой паре" else "Подключение отклонено")
+                    phase == Phase.INVITING && reason == "crossed" -> {
+                        // ждём встречного accept от другой стороны; если он не придёт — попробуем снова
+                        if (manualResumeActive) later(1_500) { tryManualResume() }
                     }
-                    phase == Phase.RECONNECTING -> scheduleReconnect(2_000)
+                    phase == Phase.INVITING && manualResumeActive && reason != "unknown" && o.optString("t") != "busy" ->
+                        later(1_000) { tryManualResume() }
+                    phase == Phase.INVITING -> {
+                        manualResumeActive = false
+                        if (reason == "unknown") setAutoResume(false)
+                        phase = Phase.IDLE; ui { copy(phase = Phase.IDLE) }
+                        toast(when {
+                            o.optString("t") == "busy" -> "Телефон уже в другой паре"
+                            reason == "unknown" -> "Второй телефон не помнит эту пару — создайте её заново"
+                            else -> "Подключение отклонено"
+                        })
+                    }
+                    phase == Phase.RECONNECTING -> scheduleReconnect(if (reason == "crossed") 1_500 else 2_000)
                 }
             }
             "cancel" -> if (l.tag == "incoming") {
@@ -557,7 +741,7 @@ class Engine private constructor(private val app: Context) {
                 Phase.INVITING -> if (l.tag == "resume-out") later(700) { tryManualResume() } else {
                     phase = Phase.IDLE; ui { copy(phase = Phase.IDLE) }; toast("Нет ответа от второго телефона")
                 }
-                Phase.RECONNECTING -> scheduleReconnect(1_500)
+                Phase.RECONNECTING -> scheduleReconnect(reconnectDelay())
                 else -> {}
             }
         }
@@ -569,16 +753,25 @@ class Engine private constructor(private val app: Context) {
         reconnectTask?.cancel(false)
         if (pending === l) pending = null
         pending?.let { it.tag = "dead"; it.close() }; pending = null
-        val continuing = phase == Phase.RECONNECTING && role == r && peerId == pid
+        manualResumeActive = false
+        autoResumeUntil = 0
+        // «Продолжение» — пара та же, меняется только соединение (после обрыва, или второй телефон заметил
+        // обрыв раньше нас и прислал resume, пока мы ещё считали связь живой). Музыка при этом не сбрасывается.
+        val continuing = (phase == Phase.RECONNECTING || phase == Phase.PAIRED) && role == r && peerId == pid
         l.tag = "paired"
         link = l
         role = r; peerId = pid; peerName = pname; peerPlatform = pplat
         phase = Phase.PAIRED
 
         val old = record
-        record = if (old != null && old.key == key) old.copy(peerName = pname, peerPlatform = pplat, myRole = r)
-                 else PairRecord(key, pid, pname, pplat, r)
+        val host = l.remoteAddress.hostAddress
+        val port = if (peerTcpPortHint > 0) peerTcpPortHint else if (old?.key == key) old.lastPort else 0
+        peerTcpPortHint = 0
+        record = if (old != null && old.key == key) old.copy(peerName = pname, peerPlatform = pplat, myRole = r, lastHost = host, lastPort = port)
+                 else PairRecord(key, pid, pname, pplat, r, lastHost = host, lastPort = port)
         persistRecord()
+        setAutoResume(true)
+        log("Пара ${if (continuing) "продолжена" else if (resumed) "восстановлена" else "создана"}: «$pname» $host:$port, роль ${r.wire}")
         discovery.stopBrowse()
 
         if (r == Role.SERVER) {
@@ -608,25 +801,33 @@ class Engine private constructor(private val app: Context) {
         }
         audio.start()
         try { PlaybackService.start(app) } catch (e: Exception) { Log.w(TAG, "fgs", e) }
-        ui { copy(phase = Phase.PAIRED, role = r, peerName = pname, peerPlatform = pplat, linkOk = true, remembered = record,
+        ui { copy(phase = Phase.PAIRED, role = r, peerName = pname, peerPlatform = pplat, linkOk = true, remembered = record, autoResuming = false,
             calib = CalibUi()) }
         PlaybackService.refresh(app)
         toast(if (resumed) "Пара восстановлена" else "Стереопара создана")
     }
+
+    private fun reconnectDelay(): Long =
+        if (SystemClock.elapsedRealtime() - reconnectSince < 60_000) 1_000L else 3_000L
 
     private fun onLinkLost() {
         link = null
         if (phase != Phase.PAIRED) return
         phase = Phase.RECONNECTING
         ui { copy(phase = Phase.RECONNECTING, linkOk = false) }
+        log("Связь с «$peerName» потеряна")
+        reconnectSince = SystemClock.elapsedRealtime()
+        resumeAttempt = 0
+        discovery.startBrowse()
+        // Переподключаются ОБА телефона: кто первым достучится, тот и восстановит пару (встречные попытки
+        // разрешаются по id). Раньше это делал только Point — и если он спал, пара не возвращалась.
         if (role == Role.SERVER) {
             pointUdp = null
+            scheduleReconnect(700)
             toast("Нет связи с «$peerName». Музыка продолжается, ждём возвращения…")
         } else {
             rx.reset(); serverUdp = null; sessionId = 0
-            reconnectSince = SystemClock.elapsedRealtime()
-            discovery.startBrowse()
-            scheduleReconnect(300)
+            scheduleReconnect(200)
             toast("Связь потеряна — переподключаемся…")
         }
         PlaybackService.refresh(app)
@@ -638,12 +839,12 @@ class Engine private constructor(private val app: Context) {
     }
 
     private fun attemptResume() {
-        if (phase != Phase.RECONNECTING || role != Role.POINT || pending != null) return
+        if (phase != Phase.RECONNECTING || pending != null) return
         val rec = record ?: return
         val now = SystemClock.elapsedRealtime()
-        if (now - lastBrowseRestart > 10_000) { lastBrowseRestart = now; discovery.restartBrowse() }
-        val p = discovery.peer(rec.peerId)
-        if (p?.host == null) { scheduleReconnect(1_000); return }
+        if (now - lastBrowseRestart > 20_000) { lastBrowseRestart = now; discovery.restartBrowse() }
+        val p = resumeTarget(rec)
+        if (p == null) { scheduleReconnect(reconnectDelay()); return }
         connectOutgoing(p, "resume-out", resumeJson(rec), 4_000)
     }
 
@@ -652,6 +853,8 @@ class Engine private constructor(private val app: Context) {
         link?.let { l -> link = null; l.tag = "dead"; if (sendBye) l.sendAndClose(JSONObject().put("t", "bye")) else l.close() }
         pending?.let { p -> pending = null; p.tag = "dead"; p.close() }
         phase = Phase.IDLE
+        manualResumeActive = false
+        log(reason)
         pendingTrackId = null
         audio.stop(); audio.source = null
         abandonFocus()
@@ -679,7 +882,7 @@ class Engine private constructor(private val app: Context) {
     private fun onPairedMessage(o: JSONObject) {
         when (o.optString("t")) {
             "hb" -> {}
-            "bye" -> goIdle(sendBye = false, reason = "«$peerName» разорвал пару")
+            "bye" -> { setAutoResume(false); goIdle(sendBye = false, reason = "«$peerName» разорвал пару") }
             "name" -> { peerName = o.optString("name", peerName); ui { copy(peerName = peerName) }
                         record = record?.copy(peerName = peerName); persistRecord() }
             // --- на Server ---
@@ -995,9 +1198,10 @@ class Engine private constructor(private val app: Context) {
 
     // ================================================================== heartbeat + диагностика
     private fun heartbeat() {
+        autoResumeTick()
         val l = link ?: return
         if (phase != Phase.PAIRED) return
-        if (SystemClock.elapsedRealtime() - l.lastRx > SF.LINK_TIMEOUT_MS) { Log.i(TAG, "heartbeat timeout"); l.close(); return }
+        if (SystemClock.elapsedRealtime() - l.lastRx > SF.LINK_TIMEOUT_MS) { log("Нет данных ${SF.LINK_TIMEOUT_MS / 1000} с — соединение закрыто"); l.close(); return }
         l.send(JSONObject().put("t", "hb"))
         if (role == Role.SERVER) {
             val d = Diag(syncErrMs = serverRenderer.corrector.syncErrorMs, latencyMs = audio.latencyMs,
