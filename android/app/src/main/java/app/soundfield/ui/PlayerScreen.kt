@@ -2,6 +2,9 @@ package app.soundfield.ui
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectHorizontalDragGestures
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
@@ -34,6 +37,7 @@ fun PlayerScreen(ui: UiState, engine: Engine, openCalibration: () -> Unit, openD
     var confirmDisconnect by remember { mutableStateOf(false) }
     var pos by remember { mutableLongStateOf(0L) }
     var dragging by remember { mutableStateOf<Float?>(null) }
+    val swipeThreshold = with(LocalDensity.current) { 48.dp.toPx() }
     LaunchedEffect(Unit) { while (true) { pos = engine.positionMs(); delay(200) } }
 
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 20.dp).padding(top = 40.dp, bottom = 24.dp)) {
@@ -89,7 +93,18 @@ fun PlayerScreen(ui: UiState, engine: Engine, openCalibration: () -> Unit, openD
 
         // --- трек ---
         Text(ui.title, color = SFColors.Text, fontSize = 20.sp, fontWeight = FontWeight.Bold, textAlign = TextAlign.Center,
-            modifier = Modifier.fillMaxWidth().clickable(onClick = openTrackPicker))
+            modifier = Modifier.fillMaxWidth().pointerInput(engine, swipeThreshold) {
+                var distance = 0f
+                detectHorizontalDragGestures(
+                    onDragStart = { distance = 0f },
+                    onDragCancel = { distance = 0f },
+                    onDragEnd = {
+                        if (distance <= -swipeThreshold) engine.nextTrack()
+                        else if (distance >= swipeThreshold) engine.previousTrack()
+                    },
+                    onHorizontalDrag = { change, amount -> change.consume(); distance += amount },
+                )
+            }.clickable(onClick = openTrackPicker))
         Subtitle(ui.artist, Modifier.fillMaxWidth().padding(top = 4.dp), align = TextAlign.Center)
         Text(
             when {

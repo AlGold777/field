@@ -100,6 +100,8 @@ class Engine private constructor(private val app: Context) {
     private var queueIndex = -1
     private var hasImportedQueue = false
     private var pendingTrackId: String? = null
+    private var pendingShouldPlay = false
+    private var trackLoadGeneration = 0L
     private var currentQueueSource: AudioSource? = null
     private var queueRevision = 0
     private var incomingQueueRevision = -1
@@ -494,10 +496,7 @@ class Engine private constructor(private val app: Context) {
     fun channelTest() = cmd("lrtest")
     fun nextTrack() = cmd("next")
     fun previousTrack() = cmd("previous")
-    fun selectTrack(id: String) {
-        if (role == Role.SERVER) post { selectTrack(queue.indexOfFirst { it.id == id }) }
-        else cmd("select") { put("id", id) }
-    }
+    fun selectTrack(id: String) = cmd("select") { put("id", id) }
     fun setQueueExpanded(expanded: Boolean) = post {
         prefs.edit().putBoolean("queueExpanded", expanded).apply()
         ui { copy(queueExpanded = expanded) }
@@ -1210,9 +1209,9 @@ class Engine private constructor(private val app: Context) {
             "toggle" -> if (serverPlay.timeline.playing && mode != SourceMode.CALIBRATION) cmdPause() else cmdPlay()
             "seek" -> seekFrame(o.optLong("ms") * SF.SAMPLE_RATE / 1000)
             "skip" -> seekFrame(posFrame() + o.optLong("ms") * SF.SAMPLE_RATE / 1000)
-            "next" -> selectTrack(queueIndex + 1)
-            "previous" -> selectTrack((queueIndex - 1).coerceAtLeast(0))
-            "select" -> selectTrack(queue.indexOfFirst { it.id == o.optString("id") })
+            "next" -> selectTrack(navigationIndex() + 1, startPlayback = true)
+            "previous" -> selectTrack(navigationIndex() - 1, startPlayback = true)
+            "select" -> selectTrack(queue.indexOfFirst { it.id == o.optString("id") }, startPlayback = true)
             "vol" -> {
                 val v = o.optDouble("v", 1.0).toFloat().coerceIn(0f, 1f)
                 when (o.optString("ch")) { "L" -> volL = v; "R" -> volR = v; else -> master = v }
@@ -1238,6 +1237,7 @@ class Engine private constructor(private val app: Context) {
 
     private fun cmdPlay() {
         if (calibRunning) return
+        if (pendingTrackId != null) { pendingShouldPlay = true; return }
         if (mode != SourceMode.MUSIC) restoreMusic(false)
         val tl = serverPlay.timeline
         if (tl.playing) return
@@ -1247,6 +1247,7 @@ class Engine private constructor(private val app: Context) {
 
     private fun cmdPause() {
         if (calibRunning) return
+        pendingShouldPlay = false
         if (mode != SourceMode.MUSIC) { restoreMusic(false); return }
         val tl = serverPlay.timeline
         if (!tl.playing) return
@@ -1278,18 +1279,24 @@ class Engine private constructor(private val app: Context) {
         newEpoch(resume, savedFrame, if (resume) now + SF.START_DELAY_NS else now)
     }
 
-    private fun selectTrack(index: Int, forcePaused: Boolean = false) {
+    private fun navigationIndex(): Int = queue.indexOfFirst { it.id == pendingTrackId }.takeIf { it >= 0 } ?: queueIndex
+
+    private fun selectTrack(index: Int, forcePaused: Boolean = false, startPlayback: Boolean = false) {
         if (calibRunning || (phase != Phase.PAIRED && phase != Phase.RECONNECTING) || index !in queue.indices) return
         val item = queue[index]
-        if (queueIndex == index && pendingTrackId == null) return
-        val wasPlaying = !forcePaused && serverPlay.timeline.playing
+        if (queueIndex == index && pendingTrackId == null && currentQueueSource != null) {
+            if (startPlayback) cmdPlay()
+            return
+        }
+        pendingShouldPlay = !forcePaused && (startPlayback || serverPlay.timeline.playing)
+        val generation = ++trackLoadGeneration
         pendingTrackId = item.id
         ui { copy(loadingTracks = true, loadingTrackId = item.id) }
         queueIo.execute {
             val loaded = try { AudioFileDecoder.decode(PreparedAudioFile(item.id, item.file, item.title, item.artist)) }
             catch (e: Exception) { Log.w(TAG, "Could not load ${item.title}", e); null }
             post {
-                if (pendingTrackId != item.id || queue.getOrNull(index)?.id != item.id || role != Role.SERVER || calibRunning) return@post
+                if (generation != trackLoadGeneration || pendingTrackId != item.id || queue.getOrNull(index)?.id != item.id || role != Role.SERVER || calibRunning) return@post
                 pendingTrackId = null
                 if (loaded == null) {
                     ui { copy(loadingTracks = false, loadingTrackId = null) }
@@ -1303,7 +1310,7 @@ class Engine private constructor(private val app: Context) {
                 savedFrame = 0
                 ui { copy(loadingTracks = false, loadingTrackId = null, queueIndex = queueIndex) }
                 val now = System.nanoTime()
-                newEpoch(wasPlaying, 0, if (wasPlaying) now + SF.START_DELAY_NS else now)
+                newEpoch(pendingShouldPlay, 0, if (pendingShouldPlay) now + SF.START_DELAY_NS else now)
             }
         }
     }

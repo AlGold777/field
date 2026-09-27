@@ -38,6 +38,8 @@ final class Engine {
     private var queueIndex = -1
     private var hasImportedQueue = false
     private var pendingTrackId: String?
+    private var pendingShouldPlay = false
+    private var trackLoadGeneration = 0
     private var currentQueueSource: AudioSource?
     private var queueRevision = 0
     private var incomingQueueRevision = -1
@@ -411,6 +413,8 @@ final class Engine {
             }
         }
     }
+    func nextTrack() { cmd("next") }
+    func previousTrack() { cmd("previous") }
     func selectQueueTrack(_ id: String) { cmd("select", ["id": id]) }
     func setQueueExpanded(_ expanded: Bool) {
         q.async { self.defaults.set(expanded, forKey: "sf.queueExpanded"); self.ui { $0.queueExpanded = expanded } }
@@ -957,8 +961,8 @@ final class Engine {
         case "toggle": if playBox.value.timeline.playing && mode != .calib { cmdPause() } else { cmdPlay() }
         case "seek": seekFrame(J.i64(o, "ms") * sr / 1000)
         case "skip": seekFrame(posFrame() + J.i64(o, "ms") * sr / 1000)
-        case "next": selectQueueTrack(at: queueIndex + 1)
-        case "previous": selectQueueTrack(at: max(0, queueIndex - 1))
+        case "next": selectQueueTrack(at: navigationIndex + 1, startPlayback: true)
+        case "previous": selectQueueTrack(at: navigationIndex - 1, startPlayback: true)
         case "select": selectQueueTrack(id: J.s(o, "id"))
         case "vol":
             let v = Float(min(1, max(0, J.d(o, "v", 1))))
@@ -984,6 +988,7 @@ final class Engine {
 
     private func cmdPlay() {
         guard !calibRunning else { return }
+        if pendingTrackId != nil { pendingShouldPlay = true; return }
         if mode != .music { restoreMusic(false) }
         let tl = playBox.value.timeline
         guard !tl.playing else { return }
@@ -993,6 +998,7 @@ final class Engine {
 
     private func cmdPause() {
         guard !calibRunning else { return }
+        pendingShouldPlay = false
         if mode != .music { restoreMusic(false); return }
         guard playBox.value.timeline.playing else { return }
         newEpoch(false, posFrame(), MonoClock.nowNs())
@@ -1025,20 +1031,27 @@ final class Engine {
 
     private func selectQueueTrack(id: String) {
         guard let index = queue.firstIndex(where: { $0.id == id }) else { return }
-        selectQueueTrack(at: index)
+        selectQueueTrack(at: index, startPlayback: true)
     }
 
-    private func selectQueueTrack(at index: Int, forcePaused: Bool = false) {
+    private var navigationIndex: Int { queue.firstIndex { $0.id == pendingTrackId } ?? queueIndex }
+
+    private func selectQueueTrack(at index: Int, forcePaused: Bool = false, startPlayback: Bool = false) {
         guard !calibRunning, (phase == .paired || phase == .reconnecting), queue.indices.contains(index) else { return }
         let item = queue[index]
-        guard queueIndex != index || pendingTrackId != nil else { return }
-        let shouldPlay = !forcePaused && playBox.value.timeline.playing
+        if queueIndex == index, pendingTrackId == nil, currentQueueSource != nil {
+            if startPlayback { cmdPlay() }
+            return
+        }
+        pendingShouldPlay = !forcePaused && (startPlayback || playBox.value.timeline.playing)
+        trackLoadGeneration += 1
+        let generation = trackLoadGeneration
         pendingTrackId = item.id
         ui { $0.loadingTracks = true; $0.loadingTrackId = item.id }
         queueIo.async {
             let loaded = try? AudioFileDecoder.decode(PreparedAudioFile(id: item.id, url: item.fileURL, title: item.title, artist: item.artist))
             self.q.async {
-                guard self.pendingTrackId == item.id, self.queue.indices.contains(index), self.queue[index].id == item.id,
+                guard self.trackLoadGeneration == generation, self.pendingTrackId == item.id, self.queue.indices.contains(index), self.queue[index].id == item.id,
                       self.role == .server, !self.calibRunning else { return }
                 self.pendingTrackId = nil
                 guard let loaded else {
@@ -1049,7 +1062,7 @@ final class Engine {
                 self.queueIndex = index; self.mode = .music; self.source = loaded; self.currentQueueSource = loaded; self.savedFrame = 0
                 self.ui { $0.loadingTracks = false; $0.loadingTrackId = nil; $0.queueIndex = index }
                 let now = MonoClock.nowNs()
-                self.newEpoch(shouldPlay, 0, shouldPlay ? now + SF.startDelayNs : now)
+                self.newEpoch(self.pendingShouldPlay, 0, self.pendingShouldPlay ? now + SF.startDelayNs : now)
             }
         }
     }

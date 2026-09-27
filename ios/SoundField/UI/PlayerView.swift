@@ -47,6 +47,14 @@ struct PlayerView: View {
                         .multilineTextAlignment(.center).frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.plain)
+                .highPriorityGesture(
+                    DragGesture(minimumDistance: 20)
+                        .onEnded { value in
+                            let dx = value.translation.width
+                            guard abs(dx) >= 48, abs(dx) > abs(value.translation.height) else { return }
+                            if dx < 0 { engine.nextTrack() } else { engine.previousTrack() }
+                        }
+                )
                 Subtitle(text: ui.artist, align: .center).frame(maxWidth: .infinity).padding(.top, 4).padding(.bottom, 12)
                 Text(ui.loadingTracks ? "Подготовка аудиофайла…" : (ui.role == .point
                      ? "Нажмите на название, чтобы добавить музыку на Server"
