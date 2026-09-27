@@ -97,7 +97,7 @@ fun AppRoot(engine: Engine) {
             title = { Text("Добавить музыку") },
             text = { Text("Выберите отдельные аудиофайлы или папку. Файлы из папки будут добавлены в очередь по имени.") },
             confirmButton = {
-                TextButton(onClick = { showAudioSourceDialog = false; audioFilesLauncher.launch(arrayOf("audio/*")) }) {
+                TextButton(onClick = { showAudioSourceDialog = false; audioFilesLauncher.launch(arrayOf("audio/*", "application/octet-stream")) }) {
                     Text("Выбрать файлы")
                 }
             },

@@ -376,7 +376,7 @@ final class Engine {
                         candidates = (enumerator?.allObjects as? [URL] ?? []).filter { url in
                             let resource = try? url.resourceValues(forKeys: [.isRegularFileKey, .contentTypeKey])
                             return resource?.isRegularFile == true && (resource?.contentType?.conforms(to: .audio) == true ||
-                                ["aac", "aif", "aiff", "alac", "amr", "flac", "m4a", "m4b", "mp3", "oga", "ogg", "opus", "wav", "weba", "wma"].contains(url.pathExtension.lowercased()))
+                                ["aac", "aif", "aiff", "alac", "amr", "flac", "m4a", "m4b", "mp3", "oga", "ogg", "opus", "wav", "wave", "weba", "wma"].contains(url.pathExtension.lowercased()))
                         }.sorted { $0.path.localizedStandardCompare($1.path) == .orderedAscending }
                     } else { candidates = [selection] }
                     for candidate in candidates {

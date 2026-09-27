@@ -58,7 +58,7 @@ struct PlayerView: View {
                 Subtitle(text: ui.artist, align: .center).frame(maxWidth: .infinity).padding(.top, 4).padding(.bottom, 12)
                 Text(ui.loadingTracks ? "Подготовка аудиофайла…" : (ui.role == .point
                      ? "Нажмите на название, чтобы добавить музыку на Server"
-                     : "Нажмите на название, чтобы добавить файлы или папку"))
+                     : "Нажмите на название, чтобы добавить FLAC, WAV или MP3"))
                     .font(.system(size: 12)).foregroundColor(SFColor.dim).multilineTextAlignment(.center)
                     .frame(maxWidth: .infinity).padding(.bottom, 8)
 

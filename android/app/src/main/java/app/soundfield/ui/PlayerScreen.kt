@@ -110,7 +110,7 @@ fun PlayerScreen(ui: UiState, engine: Engine, openCalibration: () -> Unit, openD
             when {
                 ui.loadingTracks -> "Подготовка аудиофайла…"
                 ui.role == Role.POINT -> "Нажмите на название, чтобы добавить музыку на Server"
-                else -> "Нажмите на название, чтобы добавить файлы или папку"
+                else -> "Нажмите на название, чтобы добавить FLAC, WAV или MP3"
             },
             color = SFColors.TextDim, fontSize = 12.sp, textAlign = TextAlign.Center,
             modifier = Modifier.fillMaxWidth().padding(top = 5.dp, bottom = 8.dp),

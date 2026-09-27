@@ -598,7 +598,7 @@ class Engine private constructor(private val app: Context) {
         return result
     }
 
-    private val audioExtensions = setOf("aac", "aif", "aiff", "alac", "amr", "flac", "m4a", "m4b", "mp3", "oga", "ogg", "opus", "wav", "weba", "wma")
+    private val audioExtensions = setOf("aac", "aif", "aiff", "alac", "amr", "flac", "m4a", "m4b", "mp3", "oga", "ogg", "opus", "wav", "wave", "weba", "wma")
     fun setVolume(ch: String, v: Float) {
         ui { when (ch) { "L" -> copy(volL = v); "R" -> copy(volR = v); else -> copy(master = v) } } // мгновенный отклик UI
         cmd("vol") { put("ch", ch); put("v", v.toDouble()) }

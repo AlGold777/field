@@ -7,6 +7,7 @@ import android.media.MediaExtractor
 import android.media.MediaFormat
 import android.media.MediaMetadataRetriever
 import android.net.Uri
+import android.os.SystemClock
 import app.soundfield.core.PcmSource
 import app.soundfield.core.SF
 import java.io.ByteArrayOutputStream
@@ -68,6 +69,7 @@ object AudioFileDecoder {
                 var outputEnded = false
                 var sampleRate = inputFormat.getInteger(MediaFormat.KEY_SAMPLE_RATE)
                 var channels = inputFormat.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
+                var lastProgressAt = SystemClock.elapsedRealtime()
                 while (!outputEnded) {
                     if (!inputEnded) {
                         val inputIndex = codec.dequeueInputBuffer(10_000)
@@ -81,6 +83,7 @@ object AudioFileDecoder {
                             } else {
                                 codec.queueInputBuffer(inputIndex, 0, size, extractor.sampleTime, 0)
                                 extractor.advance()
+                                lastProgressAt = SystemClock.elapsedRealtime()
                             }
                         }
                     }
@@ -95,6 +98,7 @@ object AudioFileDecoder {
                         }
                         MediaCodec.INFO_TRY_AGAIN_LATER, MediaCodec.INFO_OUTPUT_BUFFERS_CHANGED -> Unit
                         else -> if (outputIndex >= 0) {
+                            lastProgressAt = SystemClock.elapsedRealtime()
                             if (info.size > 0) {
                                 val buffer = codec.getOutputBuffer(outputIndex) ?: error("Пустой аудиобуфер")
                                 buffer.position(info.offset)
@@ -106,6 +110,9 @@ object AudioFileDecoder {
                             outputEnded = info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0
                             codec.releaseOutputBuffer(outputIndex, false)
                         }
+                    }
+                    check(SystemClock.elapsedRealtime() - lastProgressAt < 30_000) {
+                        "Декодер аудио не отвечает"
                     }
                 }
                 require(sampleRate > 0 && channels in 1..8) { "Неподдерживаемые параметры аудио" }
@@ -123,6 +130,11 @@ object AudioFileDecoder {
         val samples = java.nio.ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN).asShortBuffer()
         val inputFrames = samples.remaining() / channels
         require(inputFrames > 0) { "В файле нет аудиоданных" }
+        if (channels == 2 && sampleRate == SF.SAMPLE_RATE) {
+            val stereo = ShortArray(inputFrames * 2)
+            samples.get(stereo)
+            return stereo
+        }
         val outputFrames = (inputFrames.toLong() * SF.SAMPLE_RATE / sampleRate).toInt().coerceAtLeast(1)
         val stereo = ShortArray(outputFrames * 2)
         for (frame in 0 until outputFrames) {
@@ -130,14 +142,14 @@ object AudioFileDecoder {
             val first = position.toInt().coerceIn(0, inputFrames - 1)
             val second = (first + 1).coerceAtMost(inputFrames - 1)
             val fraction = position - first
-            fun sample(channel: Int): Short {
-                val c = if (channels == 1) 0 else channel.coerceAtMost(channels - 1)
-                val a = samples.get(first * channels + c).toInt()
-                val b = samples.get(second * channels + c).toInt()
-                return (a * (1.0 - fraction) + b * fraction).toInt().coerceIn(-32768, 32767).toShort()
-            }
-            stereo[frame * 2] = sample(0)
-            stereo[frame * 2 + 1] = sample(if (channels == 1) 0 else 1)
+            val leftChannel = 0
+            val rightChannel = if (channels == 1) 0 else 1
+            val leftA = samples.get(first * channels + leftChannel).toInt()
+            val leftB = samples.get(second * channels + leftChannel).toInt()
+            val rightA = samples.get(first * channels + rightChannel).toInt()
+            val rightB = samples.get(second * channels + rightChannel).toInt()
+            stereo[frame * 2] = (leftA * (1.0 - fraction) + leftB * fraction).toInt().coerceIn(-32768, 32767).toShort()
+            stereo[frame * 2 + 1] = (rightA * (1.0 - fraction) + rightB * fraction).toInt().coerceIn(-32768, 32767).toShort()
         }
         return stereo
     }
