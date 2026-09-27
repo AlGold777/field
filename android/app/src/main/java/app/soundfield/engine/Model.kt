@@ -13,6 +13,7 @@ data class Peer(
     val platform: String,
     val host: InetAddress?,
     val port: Int,
+    val supportsRinging: Boolean = false,
 )
 
 enum class Phase { IDLE, INVITING, INCOMING, PAIRED, RECONNECTING }

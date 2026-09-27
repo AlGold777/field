@@ -515,9 +515,8 @@ class Engine private constructor(private val app: Context) {
         inviteRinging = false
         ui { copy(phase = Phase.INVITING, invitingName = p.name, resuming = false, inviteRinging = false) }
         log("Приглашение → «${p.name}» ${p.host?.hostAddress}:${p.port}")
-        // 8 с на то, чтобы второй телефон ответил «ringing» (показал диалог). Если он спит/заморожен в фоне,
-        // TCP всё равно соединится (очередь ядра), но ответа не будет — раньше это ожидание длилось 30 с.
-        connectOutgoing(p, "invite-out", inviteJson(pendingKey), 8_000)
+        // Старые Android и iOS не объявляют ringing: отсутствие ответа не означает, что они спят.
+        connectOutgoing(p, "invite-out", inviteJson(pendingKey), if (p.supportsRinging) 8_000 else 65_000)
     }
 
     private fun doManualResume(auto: Boolean = false) {
@@ -751,12 +750,12 @@ class Engine private constructor(private val app: Context) {
                     phase == Phase.RECONNECTING -> scheduleReconnect(if (reason == "crossed") 1_500 else 2_000)
                 }
             }
-            "ringing" -> if (l.tag == "invite-out") {
+            "ringing" -> if (l.tag == "invite-out" && !inviteRinging) {
                 inviteRinging = true
                 ui { copy(inviteRinging = true) }
                 pendingTimeout?.cancel(false)
                 pendingTimeout = later(65_000) { if (pending === l) l.close() }   // у второго диалог живёт 60 с
-                log("«$pname» показал приглашение, ждём подтверждения")
+                log("«${pendingPeer?.name ?: "Второй телефон"}» получил приглашение, ждём подтверждения")
             }
             "cancel" -> if (l.tag == "incoming") {
                 pending = null; l.tag = "dead"; l.close()

@@ -61,6 +61,7 @@ class Discovery(
             setAttribute("n", adName.take(60))
             setAttribute("p", "android")
             setAttribute("id", myId)
+            setAttribute("ringing", "1")
         }
         val l = object : NsdManager.RegistrationListener {
             override fun onServiceRegistered(i: NsdServiceInfo) { Log.i(TAG, "registered ${i.serviceName}"); regAttempts = 0 }
@@ -161,7 +162,7 @@ class Discovery(
                     // недоступен и соединение висит до таймаута — берём IPv4, если он есть.
                     val host = if (android.os.Build.VERSION.SDK_INT >= 34)
                         (i.hostAddresses.firstOrNull { it is java.net.Inet4Address } ?: i.host) else i.host
-                    val p = Peer(id, attr("n") ?: id, attr("p") ?: "?", host, i.port)
+                    val p = Peer(id, attr("n") ?: id, attr("p") ?: "?", host, i.port, supportsRinging = attr("ringing") == "1")
                     synchronized(lock) { peers[i.serviceName] = p; if (resolveToken == token) resolving = false }
                     publish(); resolveNext()
                 }
