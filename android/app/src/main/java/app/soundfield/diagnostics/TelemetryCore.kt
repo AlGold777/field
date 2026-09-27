@@ -123,6 +123,7 @@ internal object AndroidTelemetryRules {
     val all = listOf(
         IncidentRule("POINT_NO_PACKETS", "error", 2_000),
         IncidentRule("POINT_SILENT_OUTPUT", "error", 2_000),
+        IncidentRule("POINT_BUFFER_LOW", "warn", 5_000),
         IncidentRule("SERVER_SILENT_OUTPUT", "error", 2_000),
         IncidentRule("OUTPUT_STALLED", "error", 2_000),
         IncidentRule("OUTPUT_MUTED", "warn", 1_000),

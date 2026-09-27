@@ -47,6 +47,7 @@ fun DiagnosticsScreen(ui: UiState, engine: Engine, onBack: () -> Unit) {
 
         SFCard {
             H3("Сеть (Point ← Server)")
+            DiagRow("Путь аудио / часов", "${p.audioPath} / ${p.clockPath}")
             DiagRow("Аудиопакеты на Point", when {
                 p.audioAgeMs < 0 -> "не поступают"
                 else -> "${p.audioAgeMs} мс назад"
@@ -70,6 +71,9 @@ fun DiagnosticsScreen(ui: UiState, engine: Engine, onBack: () -> Unit) {
             H3("Буфер и часы")
             if (!p.valid) DiagRow("Нет данных", "—") else {
                 DiagRow("Размер буфера Point", "%.0f мс".format(p.bufferMs), if (p.bufferMs < 60) SFColors.Warn else SFColors.Good)
+                DiagRow("Запас аудио Point", "%.1f с".format(p.audioBufferSeconds),
+                    if (p.audioBufferSeconds < 3.0 && p.audioPath == "tcp") SFColors.Warn else SFColors.Good)
+                DiagRow("Скорость заполнения", "%.0f кадров/с".format(p.audioFillFramesPerSec))
                 DiagRow("Clock drift", "%+.1f ppm".format(p.driftPpm))
                 DiagRow("Точность часов", "±%.2f мс".format(p.clockUncMs), c(p.clockUncMs, 1.0, 3.0))
                 DiagRow("Часы синхронизированы", if (p.clockReady) "да" else "нет", if (p.clockReady) SFColors.Good else SFColors.Warn)
@@ -114,7 +118,7 @@ fun DiagnosticsScreen(ui: UiState, engine: Engine, onBack: () -> Unit) {
                             Text("Остановить UDP-аудио", color = SFColors.Text, modifier = Modifier.weight(1f))
                             Switch(checked = ui.debugUdpAudioStopped, onCheckedChange = engine::setDebugUdpAudioStopped)
                         }
-                        Subtitle("TCP останется подключён. Ожидается POINT_NO_PACKETS.")
+                        Subtitle("TCP останется подключён; звук и часы должны перейти на TCP.")
                     }
                     Role.POINT -> {
                         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {

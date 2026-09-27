@@ -87,6 +87,10 @@ data class Diag(
     val late: Long = 0,
     val stale: Long = 0,
     val bufferMs: Double = 0.0,
+    val audioPath: String = "udp",
+    val clockPath: String = "udp",
+    val audioBufferSeconds: Double = 0.0,
+    val audioFillFramesPerSec: Double = 0.0,
     val driftPpm: Double = 0.0,
     val clockUncMs: Double = 0.0,
     val underruns: Long = 0,
@@ -136,6 +140,8 @@ data class Diag(
     fun toJson(t: String): JSONObject = JSONObject().apply {
         put("t", t); put("rtt", rttMs); put("rttJit", rttJitterMs); put("jitter", jitterMs); put("loss", lossPct)
         put("recovered", recovered); put("late", late); put("stale", stale); put("buffer", bufferMs)
+        put("audioPath", audioPath); put("clockPath", clockPath)
+        put("audioBufferSeconds", audioBufferSeconds); put("audioFillFramesPerSec", audioFillFramesPerSec)
         put("drift", driftPpm); put("unc", clockUncMs); put("underruns", underruns); put("syncErr", syncErrMs)
         put("latency", latencyMs); put("resent", resent); put("clockReady", clockReady); put("audioAge", audioAgeMs)
         put("pairTag", pairTag); put("sessionId", sessionId); put("epoch", epoch); put("trackTag", trackTag)
@@ -160,6 +166,9 @@ data class Diag(
             rttMs = o.optDouble("rtt"), rttJitterMs = o.optDouble("rttJit"), jitterMs = o.optDouble("jitter"),
             lossPct = o.optDouble("loss"), recovered = o.optLong("recovered"), late = o.optLong("late"),
             stale = o.optLong("stale"), bufferMs = o.optDouble("buffer"), driftPpm = o.optDouble("drift"),
+            audioPath = o.optString("audioPath", "udp"), clockPath = o.optString("clockPath", "udp"),
+            audioBufferSeconds = o.optDouble("audioBufferSeconds"),
+            audioFillFramesPerSec = o.optDouble("audioFillFramesPerSec"),
             clockUncMs = o.optDouble("unc"), underruns = o.optLong("underruns"), syncErrMs = o.optDouble("syncErr"),
             latencyMs = o.optDouble("latency"), resent = o.optLong("resent"), clockReady = o.optBoolean("clockReady"),
             audioAgeMs = o.optLong("audioAge", -1), valid = true,

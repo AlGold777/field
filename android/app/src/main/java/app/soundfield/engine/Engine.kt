@@ -56,8 +56,11 @@ import java.net.Socket
 import java.security.SecureRandom
 import java.io.File
 import java.io.FileOutputStream
+import java.io.BufferedInputStream
 import java.io.BufferedOutputStream
 import java.io.ByteArrayOutputStream
+import java.io.DataInputStream
+import java.io.DataOutputStream
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
@@ -105,6 +108,10 @@ class Engine private constructor(private val app: Context) {
     private data class ConnectedSocket(val socket: Socket, val route: NetworkRoute?, val host: InetAddress)
     private class ConnectionAttemptsException(val outcomes: List<String>, cause: Throwable?) :
         Exception("All ${outcomes.size} connection candidates failed", cause)
+    private data class AudioPreload(
+        val epoch: Int, val startFrame: Long, val source: AudioSource, val channel: Int,
+        val trackId: String, val startedAtMs: Long,
+    )
 
     companion object {
         const val TAG = "SoundField"
@@ -117,6 +124,9 @@ class Engine private constructor(private val app: Context) {
         private const val TRANSFER_CHUNK_BYTES = 48 * 1024
         private const val TELEMETRY_MAX_BYTES = 8L * 1024 * 1024
         private const val CONNECT_STAGGER_MS = 200L
+        private const val TCP_AUDIO_TARGET_FRAMES = 30L * SF.SAMPLE_RATE
+        private const val TCP_AUDIO_MIN_START_FRAMES = SF.SAMPLE_RATE / 2
+        private const val TCP_AUDIO_MAX_WAIT_MS = 2_000L
         private const val MAX_TRANSFER_FILE_BYTES = 512L * 1024 * 1024
         private const val MAX_TRANSFER_BATCH_BYTES = 1024L * 1024 * 1024
         private val PROGRESSIVE_LOOKAHEAD_FRAMES =
@@ -216,6 +226,7 @@ class Engine private constructor(private val app: Context) {
 
     // ------------------------------------------------------------------ сеть
     private lateinit var tcp: ServerSocket
+    private lateinit var tcpAudioServer: ServerSocket
     @Volatile private lateinit var udp: DatagramSocket
     private val udpRebindLock = Any()
     @Volatile private var udpBoundNetworkLabel: String = "unbound"
@@ -228,6 +239,29 @@ class Engine private constructor(private val app: Context) {
     private var sessionSentBaseline = 0L
     private var audioRenewIntervalMs = 5_000L
     private var lastMultiWifiSignature = ""
+    private val tcpAudioBuffer = TcpAudioBuffer()
+    private val pointAudioConnecting = AtomicBoolean(false)
+    @Volatile private var currentAudioPath = "udp"
+    @Volatile private var currentClockPath = "udp"
+    @Volatile private var serverTcpAudioSocket: Socket? = null
+    @Volatile private var pointTcpAudioSocket: Socket? = null
+    @Volatile private var pointAudioPort = 0
+    @Volatile private var tcpAudioPreload: AudioPreload? = null
+    private var tcpAudioPreloadTask: ScheduledFuture<*>? = null
+    @Volatile private var pointAudioPreloadEpoch = Int.MIN_VALUE
+    @Volatile private var pointAudioPreloadFrame = 0L
+    private val pointAudioReadyEpoch = AtomicLong(Int.MIN_VALUE.toLong())
+    private val tcpAudioFramesSent = AtomicLong()
+    private val tcpAudioFramesReceived = AtomicLong()
+    private val lastTcpAudioRxAt = AtomicLong()
+    private val tcpAudioFramesSinceMetric = AtomicLong()
+    private var previousTcpAudioFrames = 0L
+    @Volatile private var tcpAudioFillFramesPerSec = 0.0
+    private var lastTcpAudioMetricAtMs = 0L
+    private val lastUdpPongAtMs = AtomicLong()
+    private var lastTcpClockPingAtNs = 0L
+    private var tcpClockPingSeq = 0
+    @Volatile private var debugStopUdpTraffic = false
     private lateinit var discovery: Discovery
 
     // ------------------------------------------------------------------ сессия
@@ -285,6 +319,7 @@ class Engine private constructor(private val app: Context) {
     // ------------------------------------------------------------------ Server
     @Volatile private var serverPlay = ServerPlayState(Timeline.NONE, music, Ch.L, 0.8f)
     private var epoch = 0
+    private var preloadEpochCounter = 0
     private var mode = SourceMode.MUSIC
     private var source: AudioSource = music
     private var savedFrame = 0L
@@ -317,7 +352,7 @@ class Engine private constructor(private val app: Context) {
     private val clock = ClockSync()
     private val rx = PointReceiver(clock)
     @Volatile private var pointParams = PointParams(0.8f, 0, 0)
-    private val pointRenderer = PointRenderer(rx, clock) { pointParams }
+    private val pointRenderer = PointRenderer(rx, clock, tcpAudioBuffer, { currentAudioPath }) { pointParams }
     @Volatile private var serverUdp: InetSocketAddress? = null
     private var pingSeq = 0
     @Volatile private var pingBurst = 0
@@ -351,6 +386,7 @@ class Engine private constructor(private val app: Context) {
         // Стараемся занять тот же TCP-порт, что и в прошлый раз: второй телефон помнит его и подключается напрямую.
         tcp = try { ServerSocket(prefs.getInt("tcpPort", 0)) } catch (e: Exception) { telemetry.event("TCP_LISTEN_FALLBACK", error = e); ServerSocket(0) }
         prefs.edit().putInt("tcpPort", tcp.localPort).apply()
+        tcpAudioServer = ServerSocket(0)
         udp = DatagramSocket(0)
         discovery = Discovery(app, myId) { peers ->
             ui { copy(nearby = peers) }
@@ -363,6 +399,7 @@ class Engine private constructor(private val app: Context) {
             }
         }
         Thread({ acceptLoop() }, "sf-accept").apply { isDaemon = true; start() }
+        Thread({ tcpAudioAcceptLoop() }, "sf-tcp-audio-accept").apply { isDaemon = true; start() }
         Thread({ udpLoop() }, "sf-udp").apply { isDaemon = true; priority = Thread.MAX_PRIORITY - 1; start() }
         Thread({ tickLoop() }, "sf-tick").apply { isDaemon = true; priority = Thread.MAX_PRIORITY - 1; start() }
         discovery.advertise(tcp.localPort, myName)
@@ -489,7 +526,7 @@ class Engine private constructor(private val app: Context) {
     }
 
     private fun localCapabilitiesJson() = org.json.JSONArray().also { array ->
-        listOf("addrs").forEach(array::put)
+        listOf("addrs", "tcpClock", "tcpAudio").forEach(array::put)
     }
 
     private fun updatePeerAddressBook(addresses: List<PeerAddress>) {
@@ -742,6 +779,229 @@ class Engine private constructor(private val app: Context) {
         }
     }
 
+    private fun tcpAudioAcceptLoop() {
+        while (!tcpAudioServer.isClosed) {
+            val socket = try { tcpAudioServer.accept() } catch (e: Exception) {
+                if (!tcpAudioServer.isClosed) telemetry.limited("TCP_AUDIO_ACCEPT_FAILED", error = e)
+                continue
+            }
+            io.execute { acceptTcpAudioSocket(socket) }
+        }
+    }
+
+    private fun closeServerTcpAudio(reason: String) {
+        val socket = serverTcpAudioSocket
+        serverTcpAudioSocket = null
+        try { socket?.close() } catch (_: Exception) {}
+        if (currentAudioPath == "tcp") setAudioPath("udp", reason)
+    }
+
+    private fun acceptTcpAudioSocket(socket: Socket) {
+        try {
+            socket.tcpNoDelay = true
+            socket.keepAlive = true
+            socket.soTimeout = 5_000
+            val input = DataInputStream(BufferedInputStream(socket.getInputStream()))
+            val (remoteId, remoteSession) = TcpAudioWire.readHello(input)
+            socket.soTimeout = 0
+            val accepted = phase == Phase.PAIRED && role == Role.SERVER && peerId == remoteId &&
+                remoteSession == sessionId && "tcpAudio" in negotiatedCapabilities
+            if (!accepted) {
+                telemetry.record("TCP_AUDIO_REJECTED", mapOf("peer" to remoteId, "session" to remoteSession,
+                    "expectedPeer" to peerId, "expectedSession" to sessionId, "phase" to phase.name,
+                    "capability" to ("tcpAudio" in negotiatedCapabilities)))
+                socket.close(); return
+            }
+            val route = routeForLocalAddress(socket.localAddress)
+            telemetry.record("SOCKET_BOUND", mapOf("kind" to "tcp-audio", "networkId" to (route?.networkId ?: "unknown"),
+                "network" to (route?.label ?: "unmatched"), "interface" to (route?.interfaceName ?: ""),
+                "localAddress" to socket.localAddress.hostAddress, "localPort" to socket.localPort,
+                "remoteAddress" to socket.inetAddress.hostAddress, "remotePort" to socket.port, "result" to "accepted"))
+            val old = serverTcpAudioSocket
+            serverTcpAudioSocket = socket
+            try { old?.close() } catch (_: Exception) {}
+            io.execute { tcpAudioSendLoop(socket) }
+            telemetry.record("TCP_AUDIO_CONNECTED", mapOf("network" to (route?.label ?: "unmatched"),
+                "networkId" to (route?.networkId ?: "unknown"), "localAddress" to socket.localAddress.hostAddress,
+                "localPort" to socket.localPort, "remoteAddress" to socket.inetAddress.hostAddress,
+                "remotePort" to socket.port))
+        } catch (e: Exception) {
+            telemetry.record("TCP_AUDIO_OPEN_FAILED", mapOf("localAddress" to socket.localAddress?.hostAddress,
+                "remoteAddress" to socket.inetAddress?.hostAddress), error = e)
+            try { socket.close() } catch (_: Exception) {}
+        }
+    }
+
+    private fun tcpAudioSendLoop(socket: Socket) {
+        var epochOnWire = Int.MIN_VALUE
+        var startFrameOnWire = Long.MIN_VALUE
+        var trackOnWire = ""
+        var cursor = 0L
+        try {
+            val out = DataOutputStream(BufferedOutputStream(socket.getOutputStream(), 64 * 1024))
+            while (!socket.isClosed && serverTcpAudioSocket === socket && phase == Phase.PAIRED) {
+                val preload = tcpAudioPreload
+                val timeline = serverPlay.timeline
+                val isPreload = preload != null
+                val activeEpoch = preload?.epoch ?: timeline.epoch
+                val audioSource = preload?.source ?: serverPlay.source
+                val channel = preload?.channel ?: pointChannel
+                val trackId = preload?.trackId ?: queue.getOrNull(queueIndex)?.id.orEmpty()
+                val start = preload?.startFrame ?: timeline.anchorFrame
+                if (activeEpoch != epochOnWire || (isPreload &&
+                        (start != startFrameOnWire || trackId != trackOnWire))) {
+                    epochOnWire = activeEpoch
+                    startFrameOnWire = start
+                    trackOnWire = trackId
+                    cursor = if (isPreload) start else if (timeline.playing)
+                        maxOf(start, timeline.positionFrame(System.nanoTime()).toLong().coerceAtLeast(0)) else start
+                }
+                if (!isPreload && !timeline.playing) {
+                    Thread.sleep(40)
+                    continue
+                }
+                val now = System.nanoTime()
+                val playback = if (timeline.playing && timeline.epoch == activeEpoch)
+                    timeline.positionFrame(now).toLong().coerceAtLeast(start) else start
+                val target = minOf(audioSource.totalFrames, (if (isPreload) start else playback) + TCP_AUDIO_TARGET_FRAMES)
+                val ready = (audioSource as? SegmentedPcmSource)?.readyFrames ?: audioSource.totalFrames
+                val limit = minOf(target, ready, audioSource.totalFrames)
+                if (cursor >= limit) {
+                    Thread.sleep(30)
+                    continue
+                }
+                val count = minOf(TcpAudioWire.CHUNK_FRAMES.toLong(), limit - cursor).toInt()
+                if (count <= 0) { Thread.sleep(20); continue }
+                val samples = ShortArray(count) { index ->
+                    (audioSource.sample(cursor + index, channel) * 32767f).roundToInt().coerceIn(-32768, 32767).toShort()
+                }
+                TcpAudioWire.writeChunk(out, TcpAudioChunk(activeEpoch, trackId, cursor, samples))
+                cursor += count
+                tcpAudioFramesSent.addAndGet(count.toLong())
+                // Fill at up to 4× real time, leaving capacity for control and other network traffic.
+                Thread.sleep(25)
+            }
+        } catch (e: Exception) {
+            if (serverTcpAudioSocket === socket) {
+                telemetry.record("TCP_AUDIO_SEND_FAILED", mapOf("framesSent" to tcpAudioFramesSent.get()), error = e)
+                serverTcpAudioSocket = null
+                try { socket.close() } catch (_: Exception) {}
+                setAudioPath("udp", "tcp_audio_send_failed")
+            }
+        }
+    }
+
+    private fun startPointTcpAudioConnection(port: Int) {
+        if (port <= 0 || "tcpAudio" !in negotiatedCapabilities || phase != Phase.PAIRED || role != Role.POINT) return
+        pointAudioPort = port
+        if (!pointAudioConnecting.compareAndSet(false, true)) return
+        io.execute {
+            var ownedSocket: Socket? = null
+            var existingSocket = false
+            try {
+                if (pointTcpAudioSocket?.let { it.isConnected && !it.isClosed } == true) {
+                    existingSocket = true
+                    return@execute
+                }
+                val activeLink = link?.takeIf { it.isOpen } ?: return@execute
+                val activeRoute = routeForLocalAddress(activeLink.localAddress)
+                val routes = (listOfNotNull(activeRoute) + availableNetworkRoutes(wifiOnly = true))
+                    .distinctBy { it.networkId }
+                val networkIds = routes.map { it.networkId }.ifEmpty { listOf("process_default") }
+                val routeById = routes.associateBy { it.networkId }
+                val destinations = (listOfNotNull(activeLink.remoteAddress.hostAddress) +
+                    record?.peerAddresses.orEmpty().map { it.ip } + listOfNotNull(record?.lastSuccessfulHost, record?.lastHost)).distinct()
+                val candidates = destinations.flatMap { ip ->
+                    val address = runCatching { InetAddress.getByName(ip) }.getOrNull() ?: return@flatMap emptyList()
+                    networkIds.map { id -> ConnectionCandidate(address, routeById[id]) }
+                }.distinctBy { it.route?.networkId to it.host.hostAddress }
+                val connected = connectAcrossWifi(candidates, port, "tcp-audio")
+                val socket = connected.socket
+                ownedSocket = socket
+                socket.soTimeout = 0
+                val route = routeForLocalAddress(socket.localAddress) ?: connected.route
+                telemetry.record("SOCKET_BOUND", mapOf("kind" to "tcp-audio-client", "networkId" to (route?.networkId ?: "unknown"),
+                    "network" to (route?.label ?: "process_default"), "interface" to (route?.interfaceName ?: ""),
+                    "localAddress" to socket.localAddress.hostAddress, "localPort" to socket.localPort,
+                    "remoteAddress" to socket.inetAddress.hostAddress, "remotePort" to socket.port, "result" to "connected"))
+                val out = DataOutputStream(BufferedOutputStream(socket.getOutputStream()))
+                TcpAudioWire.writeHello(out, myId, sessionId)
+                pointTcpAudioSocket = socket
+                telemetry.record("TCP_AUDIO_CONNECTED", mapOf("network" to (route?.label ?: "process_default"),
+                    "networkId" to (route?.networkId ?: "unknown"), "localAddress" to socket.localAddress.hostAddress,
+                    "localPort" to socket.localPort, "remoteAddress" to socket.inetAddress.hostAddress,
+                    "remotePort" to socket.port))
+                val input = DataInputStream(BufferedInputStream(socket.getInputStream(), 64 * 1024))
+                while (phase == Phase.PAIRED && pointTcpAudioSocket === socket && !socket.isClosed) {
+                    val chunk = TcpAudioWire.readChunk(input)
+                    tcpAudioBuffer.write(chunk)
+                    tcpAudioFramesReceived.addAndGet(chunk.samples.size.toLong())
+                    tcpAudioFramesSinceMetric.addAndGet(chunk.samples.size.toLong())
+                    val nowMs = SystemClock.elapsedRealtime()
+                    lastTcpAudioRxAt.set(nowMs)
+                    lastAudioRxAt.set(nowMs)
+                    if (rx.timeline.epoch == chunk.epoch && tcpAudioBuffer.activeEpoch != chunk.epoch)
+                        tcpAudioBuffer.activate(chunk.epoch)
+                    maybeSendAudioReady(chunk.epoch)
+                    maybeActivateTcpAudio(chunk.epoch)
+                }
+            } catch (e: Exception) {
+                if (phase == Phase.PAIRED) telemetry.record("TCP_AUDIO_RECEIVE_FAILED", mapOf("port" to port,
+                    "audioFramesReceived" to tcpAudioFramesReceived.get()), error = e)
+            } finally {
+                val socket = ownedSocket
+                if (socket != null) {
+                    if (pointTcpAudioSocket === socket) pointTcpAudioSocket = null
+                    try { socket.close() } catch (_: Exception) {}
+                }
+                if (!existingSocket && phase == Phase.PAIRED && role == Role.POINT) {
+                    if (currentAudioPath == "tcp")
+                        link?.send(JSONObject().put("t", "audio-path").put("path", "udp").put("reason", "tcp_audio_disconnected"))
+                    later(3_000) { if (phase == Phase.PAIRED && role == Role.POINT) startPointTcpAudioConnection(pointAudioPort) }
+                }
+                pointAudioConnecting.set(false)
+            }
+        }
+    }
+
+    private fun maybeSendAudioReady(epoch: Int) {
+        if (pointAudioPreloadEpoch != epoch || pointAudioReadyEpoch.get() == epoch.toLong()) return
+        val contiguous = tcpAudioBuffer.contiguousFrames(epoch, pointAudioPreloadFrame, TCP_AUDIO_MIN_START_FRAMES)
+        if (!TcpAudioStartPolicy.ready(contiguous, TCP_AUDIO_MIN_START_FRAMES)) return
+        if (!pointAudioReadyEpoch.compareAndSet(Int.MIN_VALUE.toLong(), epoch.toLong())) return
+        telemetry.record("START_WAIT", mapOf("epoch" to epoch, "ready" to true, "bufferedFrames" to contiguous,
+            "audioPath" to "tcp", "state" to "ready"))
+        link?.send(JSONObject().put("t", "audio-ready").put("epoch", epoch).put("bufferedFrames", contiguous))
+    }
+
+    private fun maybeActivateTcpAudio(epoch: Int) {
+        if (currentAudioPath == "tcp" || rx.timeline.epoch != epoch || !rx.timeline.playing) return
+        val position = if (clock.ready) rx.timeline.positionFrame(clock.toServer(System.nanoTime()) - pointParams.trimNs)
+            .toLong().coerceAtLeast(0) else rx.timeline.anchorFrame
+        val readyFrames = tcpAudioBuffer.contiguousFrames(epoch, position, TCP_AUDIO_MIN_START_FRAMES)
+        if (TcpAudioStartPolicy.ready(readyFrames, TCP_AUDIO_MIN_START_FRAMES))
+            setAudioPath("tcp", "tcp_audio_buffered")
+    }
+
+    private fun setAudioPath(path: String, reason: String, notifyPeer: Boolean = true) {
+        if (currentAudioPath == path) return
+        currentAudioPath = path
+        val socket = if (role == Role.SERVER) serverTcpAudioSocket else pointTcpAudioSocket
+        val route = socket?.let { routeForLocalAddress(it.localAddress) }
+        telemetry.record("AUDIO_PATH", mapOf("path" to path, "reason" to reason,
+            "network" to (route?.label ?: udpBoundNetworkLabel),
+            "networkId" to (route?.networkId ?: "unknown"),
+            "localAddress" to (socket?.localAddress?.hostAddress ?: udpBoundLocalAddress)))
+        ui { copy(audioPath = path) }
+        if (notifyPeer && phase == Phase.PAIRED) link?.send(JSONObject().put("t", "audio-path").put("path", path).put("reason", reason))
+    }
+
+    private fun setClockPath(path: String, reason: String) {
+        if (currentClockPath == path) return
+        currentClockPath = path
+        telemetry.record("CLOCK_PATH", mapOf("path" to path, "reason" to reason))
+    }
+
     private fun telemetryStateSnapshot(): String {
         val now = SystemClock.elapsedRealtime()
         val state = ui.value
@@ -751,6 +1011,7 @@ class Engine private constructor(private val app: Context) {
             put("device", JSONObject().put("id", myId).put("manufacturer", Build.MANUFACTURER).put("model", Build.MODEL)
                 .put("android", Build.VERSION.RELEASE).put("sdk", Build.VERSION.SDK_INT))
             put("role", role.name.lowercase()); put("phase", phase.name); put("visible", appVisible)
+            put("audioPath", currentAudioPath); put("clockPath", currentClockPath)
             put("pair", pairTag); put("session", sessionId); put("epoch", if (role == Role.SERVER) serverPlay.timeline.epoch else rx.timeline.epoch)
             put("track", (if (role == Role.SERVER) queue.getOrNull(queueIndex)?.id else state.queueTracks.getOrNull(state.queueIndex)?.id)
                 ?.let(TelemetryIdentifiers::hash) ?: "")
@@ -1455,9 +1716,11 @@ class Engine private constructor(private val app: Context) {
         if (!BuildConfig.DEBUG || role != Role.SERVER) return@post
         if (debugUdpAudioStopped == enabled) return@post
         debugUdpAudioStopped = enabled
+        debugStopUdpTraffic = enabled
+        link?.send(JSONObject().put("t", "debug-stop-udp").put("enabled", enabled))
         ui { copy(debugUdpAudioStopped = enabled) }
         telemetry.record(if (enabled) "DEBUG_FAILURE_START" else "DEBUG_FAILURE_END", mapOf(
-            "failure" to "stop_udp_audio", "expectedRule" to "POINT_NO_PACKETS"))
+            "failure" to "stop_udp_traffic", "expectedPath" to "tcp", "expectedRule" to "POINT_BUFFER_LOW"))
     }
 
     fun setDebugPointOutputSilenced(enabled: Boolean) = post {
@@ -1973,7 +2236,7 @@ class Engine private constructor(private val app: Context) {
         l.tag = "paired"
         link = l
         role = r; peerId = pid; peerName = pname; peerPlatform = pplat
-        negotiatedCapabilities = peerCapabilities.intersect(setOf("addrs"))
+        negotiatedCapabilities = peerCapabilities.intersect(setOf("addrs", "tcpClock", "tcpAudio"))
         phase = Phase.PAIRED
         zeroSendRenewStreak = 0
         udpNetworkRebindAttempted = false
@@ -2021,6 +2284,7 @@ class Engine private constructor(private val app: Context) {
             }
             sessionId = rnd.nextInt().let { if (it == 0) 1 else it }
             pointUdp = null; pointClockReady = false
+            closeServerTcpAudio("control_pair_reset")
             if (!continuing) {
                 mode = SourceMode.MUSIC
                 source = if (queueIndex in queue.indices) currentQueueSource ?: music else music
@@ -2037,7 +2301,7 @@ class Engine private constructor(private val app: Context) {
         } else {
             sessionId = 0; serverUdp = null
             serverFileTransferToken = ""
-            clock.reset(); rx.reset()
+            if (!continuing) { clock.reset(); rx.reset(); tcpAudioBuffer.clear() }
             audio.source = pointRenderer
         }
         audio.start()
@@ -2078,7 +2342,7 @@ class Engine private constructor(private val app: Context) {
             scheduleReconnect(700)
             toast("Нет связи с «$peerName». Музыка продолжается, ждём возвращения…")
         } else {
-            rx.reset(); serverUdp = null; sessionId = 0
+            serverUdp = null; sessionId = 0
             scheduleReconnect(200)
             toast("Связь потеряна — переподключаемся…")
         }
@@ -2124,6 +2388,12 @@ class Engine private constructor(private val app: Context) {
         try { PlaybackService.stop(app) } catch (_: Exception) {}
         serverPlay = ServerPlayState(Timeline.NONE, source, Ch.L, 0f)
         pointUdp = null; serverUdp = null; sessionId = 0
+        closeServerTcpAudio("pair_disconnected")
+        pointTcpAudioSocket?.let { try { it.close() } catch (_: Exception) {} }
+        pointTcpAudioSocket = null
+        tcpAudioBuffer.clear(); cancelTcpAudioPreload()
+        setAudioPath("udp", "pair_disconnected", notifyPeer = false)
+        setClockPath("udp", "pair_disconnected")
         rx.reset(); clock.reset()
         calibRunning = false
         discovery.startBrowse()
@@ -2157,22 +2427,67 @@ class Engine private constructor(private val app: Context) {
             // --- на Point ---
             "session" -> if (role == Role.POINT) {
                 peerCapabilities = parsePeerCaps(o)
-                negotiatedCapabilities = peerCapabilities.intersect(setOf("addrs"))
+                negotiatedCapabilities = peerCapabilities.intersect(setOf("addrs", "tcpClock", "tcpAudio"))
                 updatePeerAddressBook(parsePeerAddresses(o))
                 val newSession = o.getInt("session")
                 if (sessionId != newSession) {
                     sessionId = newSession
                     lastAudioRxAt.set(0)
-                    clock.reset(); rx.reset()
+                    if (!clock.ready) { clock.reset(); rx.reset() }
                 }
                 serverFileTransferToken = o.optString("fileToken")
                 val l = link ?: return
                 serverUdp = InetSocketAddress(l.remoteAddress, o.getInt("udpPort"))
                 pingBurst = 20
+                val audioPort = o.optInt("audioPort", 0)
+                if ("tcpAudio" in negotiatedCapabilities && audioPort > 0) startPointTcpAudioConnection(audioPort)
+            }
+            "audio-preload" -> if (role == Role.POINT && "tcpAudio" in negotiatedCapabilities) {
+                val preloadEpoch = o.optInt("epoch", Int.MIN_VALUE)
+                pointAudioPreloadEpoch = preloadEpoch
+                pointAudioPreloadFrame = o.optString("startFrame", "0").toLongOrNull() ?: 0L
+                pointAudioReadyEpoch.set(Int.MIN_VALUE.toLong())
+                tcpAudioBuffer.prepare(preloadEpoch)
+                telemetry.record("START_WAIT", mapOf("epoch" to preloadEpoch, "startFrame" to pointAudioPreloadFrame,
+                    "targetBufferFrames" to TCP_AUDIO_MIN_START_FRAMES, "audioPath" to "tcp", "state" to "waiting"))
+                maybeSendAudioReady(preloadEpoch)
+            }
+            "audio-ready" -> if (role == Role.SERVER) finishTcpAudioPreload(o.optInt("epoch", Int.MIN_VALUE), true,
+                o.optInt("bufferedFrames", 0))
+            "audio-path" -> {
+                val path = o.optString("path", "udp")
+                val reason = o.optString("reason", "peer_update")
+                if (role == Role.POINT && path == "udp" && currentAudioPath == "tcp") {
+                    telemetry.record("AUDIO_PATH_FALLBACK_WAIT", mapOf("path" to "udp", "reason" to reason,
+                        "tcpBufferSeconds" to tcpAudioBuffer.bufferedSeconds(rx.timeline.epoch, positionFrameSnapshot())))
+                } else setAudioPath(path, reason, notifyPeer = role == Role.POINT)
+            }
+            "clock-ping" -> if (role == Role.SERVER && "tcpClock" in negotiatedCapabilities) {
+                val t1 = o.optString("t1", "0").toLongOrNull() ?: 0L
+                val t2 = System.nanoTime()
+                val t3 = System.nanoTime()
+                link?.send(JSONObject().put("t", "clock-pong").put("seq", o.optInt("seq")).put("t1", t1.toString())
+                    .put("t2", t2.toString()).put("t3", t3.toString()))
+            }
+            "clock-pong" -> if (role == Role.POINT && "tcpClock" in negotiatedCapabilities) {
+                val t4 = System.nanoTime()
+                val t1 = o.optString("t1", "0").toLongOrNull() ?: return
+                val t2 = o.optString("t2", "0").toLongOrNull() ?: return
+                val t3 = o.optString("t3", "0").toLongOrNull() ?: return
+                clock.addPong(t1, t2, t3, t4)
+                if (SystemClock.elapsedRealtime() - lastUdpPongAtMs.get() >= 1_500L)
+                    setClockPath("tcp", "udp_pong_timeout")
+            }
+            "debug-stop-udp" -> {
+                debugStopUdpTraffic = o.optBoolean("enabled")
+                debugUdpAudioStopped = debugStopUdpTraffic
+                ui { copy(debugUdpAudioStopped = debugStopUdpTraffic) }
+                telemetry.record("DEBUG_UDP_TRAFFIC", mapOf("enabled" to debugStopUdpTraffic,
+                    "role" to role.name.lowercase()))
             }
             "network-addresses" -> {
                 peerCapabilities = parsePeerCaps(o)
-                negotiatedCapabilities = peerCapabilities.intersect(setOf("addrs"))
+                negotiatedCapabilities = peerCapabilities.intersect(setOf("addrs", "tcpClock", "tcpAudio"))
                 updatePeerAddressBook(parsePeerAddresses(o))
                 telemetry.record("PEER_ADDRESSES_RECEIVED", mapOf("count" to parsePeerAddresses(o).size,
                     "networkIds" to parsePeerAddresses(o).map { it.networkId }.distinct()))
@@ -2186,9 +2501,11 @@ class Engine private constructor(private val app: Context) {
             "queue" -> if (role == Role.POINT) applyQueue(o)
             "timeline" -> if (role == Role.POINT) {
                 observeCommand(o)
-                rx.onTimeline(Timeline(o.getInt("epoch"), o.getBoolean("playing"),
+                val timeline = Timeline(o.getInt("epoch"), o.getBoolean("playing"),
                     o.getString("anchorFrame").toLong(), o.getString("anchorNs").toLong(),
-                    o.optString("stopFrame", "-1").toLongOrNull() ?: -1L))
+                    o.optString("stopFrame", "-1").toLongOrNull() ?: -1L)
+                rx.onTimeline(timeline)
+                if (currentAudioPath == "tcp") tcpAudioBuffer.activate(timeline.epoch)
             }
             "sdiag" -> if (role == Role.POINT) ui { copy(serverDiag = Diag.fromJson(o)) }
             "calib" -> if (role == Role.POINT) applyCalib(o)
@@ -2234,7 +2551,8 @@ class Engine private constructor(private val app: Context) {
     private fun sendSession(target: ControlLink? = link) {
         target?.send(JSONObject().put("t", "session").put("session", sessionId)
             .put("udpPort", udp.localPort).put("name", myName).put("fileToken", fileTransferToken)
-            .put("caps", localCapabilitiesJson()).put("addrs", addressesJson()))
+            .put("caps", localCapabilitiesJson()).put("addrs", addressesJson())
+            .put("audioPort", if ("tcpAudio" in negotiatedCapabilities) tcpAudioServer.localPort else 0))
     }
 
     /** Replaces only the UDP audio session; TCP pairing and the playback epoch remain intact. */
@@ -2297,10 +2615,58 @@ class Engine private constructor(private val app: Context) {
     }
 
     private fun newEpoch(playing: Boolean, frame: Long, anchorNs: Long) {
-        epoch++
+        if (playing && phase == Phase.PAIRED && role == Role.SERVER &&
+            "tcpAudio" in negotiatedCapabilities && serverTcpAudioSocket?.let { it.isConnected && !it.isClosed } == true) {
+            beginTcpAudioPreload(frame)
+            return
+        }
+        cancelTcpAudioPreload()
+        commitEpoch(playing, frame, anchorNs, epoch + 1)
+    }
+
+    private fun commitEpoch(playing: Boolean, frame: Long, anchorNs: Long, newEpoch: Int) {
+        epoch = newEpoch
+        preloadEpochCounter = maxOf(preloadEpochCounter, newEpoch)
         serverPlay = ServerPlayState(Timeline(epoch, playing, frame, anchorNs), source, serverChannel(), serverGain())
+        if (role == Role.POINT) tcpAudioBuffer.activate(epoch)
         sendTimeline()
         publishState()
+    }
+
+    private fun beginTcpAudioPreload(frame: Long) {
+        tcpAudioPreloadTask?.cancel(false)
+        val targetEpoch = maxOf(epoch + 1, preloadEpochCounter + 1).also { preloadEpochCounter = it }
+        val itemId = queue.getOrNull(queueIndex)?.id.orEmpty()
+        val preload = AudioPreload(targetEpoch, frame.coerceAtLeast(0), source, pointChannel, itemId,
+            SystemClock.elapsedRealtime())
+        tcpAudioPreload = preload
+        telemetry.record("START_WAIT", mapOf("epoch" to targetEpoch, "startFrame" to preload.startFrame,
+            "track" to itemId.takeIf { it.isNotBlank() }?.let(TelemetryIdentifiers::hash),
+            "targetBufferFrames" to TCP_AUDIO_MIN_START_FRAMES, "timeoutMs" to TCP_AUDIO_MAX_WAIT_MS,
+            "audioPath" to "tcp", "state" to "waiting"))
+        link?.send(JSONObject().put("t", "audio-preload").put("epoch", targetEpoch)
+            .put("startFrame", preload.startFrame.toString()).put("trackId", itemId)
+            .put("minFrames", TCP_AUDIO_MIN_START_FRAMES))
+        tcpAudioPreloadTask = later(TCP_AUDIO_MAX_WAIT_MS) {
+            if (tcpAudioPreload?.epoch == targetEpoch) finishTcpAudioPreload(targetEpoch, false, 0)
+        }
+    }
+
+    private fun finishTcpAudioPreload(targetEpoch: Int, ready: Boolean, bufferedFrames: Int) {
+        val preload = tcpAudioPreload?.takeIf { it.epoch == targetEpoch } ?: return
+        tcpAudioPreload = null
+        tcpAudioPreloadTask?.cancel(false); tcpAudioPreloadTask = null
+        val waited = SystemClock.elapsedRealtime() - preload.startedAtMs
+        telemetry.record("START_WAIT", mapOf("epoch" to targetEpoch, "startFrame" to preload.startFrame,
+            "durationMs" to waited, "ready" to ready, "bufferedFrames" to bufferedFrames,
+            "audioPath" to currentAudioPath, "state" to if (ready) "ready" else "timeout"))
+        if (ready) setAudioPath("tcp", "preload_ready")
+        commitEpoch(true, preload.startFrame, System.nanoTime() + SF.START_DELAY_NS, targetEpoch)
+    }
+
+    private fun cancelTcpAudioPreload() {
+        tcpAudioPreload = null
+        tcpAudioPreloadTask?.cancel(false); tcpAudioPreloadTask = null
     }
 
     private fun sendTimeline() {
@@ -3128,6 +3494,9 @@ class Engine private constructor(private val app: Context) {
                 underruns = audioUnderruns + serverRenderer.underruns.get(), syncErrMs = serverRenderer.corrector.syncErrorMs,
                 latencyMs = audio.latencyMs, resent = resent.get(), clockReady = pointClockReady,
                 audioAgeMs = currentUi.pointDiag.audioAgeMs, valid = true,
+                audioPath = currentAudioPath, clockPath = currentClockPath,
+                audioBufferSeconds = currentUi.pointDiag.audioBufferSeconds,
+                audioFillFramesPerSec = currentUi.pointDiag.audioFillFramesPerSec,
                 pairTag = pairTag, sessionId = sessionId, epoch = serverPlay.timeline.epoch, trackTag = trackTag,
                 playbackPhase = phase.name, playing = playing,
                 outputRmsDbfs = output.signal.rmsDbfs, outputPeakDbfs = output.signal.peakDbfs,
@@ -3149,6 +3518,13 @@ class Engine private constructor(private val app: Context) {
             val dR = recv - lastRecv; val dL = lost - lastLost
             lastRecv = recv; lastLost = lost
             val loss = if (dR + dL > 0) dL * 100.0 / (dR + dL) else 0.0
+            val tcpPosition = if (clock.ready) rx.timeline.positionFrame(clock.toServer(System.nanoTime()) - pointParams.trimNs)
+                .toLong().coerceAtLeast(0) else 0L
+            val tcpBufferSeconds = tcpAudioBuffer.bufferedSeconds(rx.timeline.epoch, tcpPosition)
+            val fillFrames = tcpAudioFramesSinceMetric.getAndSet(0)
+            val metricElapsed = if (lastTcpAudioMetricAtMs == 0L) 1L else (nowMs - lastTcpAudioMetricAtMs).coerceAtLeast(1)
+            lastTcpAudioMetricAtMs = nowMs
+            tcpAudioFillFramesPerSec = fillFrames * 1_000.0 / metricElapsed
             Diag(
                 rttMs = clock.rttAvgMs, rttJitterMs = clock.rttJitterMs, jitterMs = rx.jitterMs, lossPct = loss,
                 recovered = rx.recovered, late = rx.late, stale = rx.stale, bufferMs = rx.bufferMs,
@@ -3156,6 +3532,9 @@ class Engine private constructor(private val app: Context) {
                 underruns = pointRenderer.underrunEvents.get() + audioUnderruns, syncErrMs = pointRenderer.corrector.syncErrorMs,
                 latencyMs = audio.latencyMs, clockReady = clock.ready, resent = currentUi.serverDiag.resent,
                 audioAgeMs = lastAudioRxAt.get().let { if (it == 0L) -1 else nowMs - it }, valid = true,
+                audioPath = currentAudioPath, clockPath = currentClockPath,
+                audioBufferSeconds = if (currentAudioPath == "tcp") tcpBufferSeconds else rx.bufferMs / 1000.0,
+                audioFillFramesPerSec = tcpAudioFillFramesPerSec,
                 pairTag = pairTag, sessionId = sessionId, epoch = rx.timeline.epoch, trackTag = trackTag,
                 playbackPhase = phase.name, playing = playing,
                 outputRmsDbfs = output.signal.rmsDbfs, outputPeakDbfs = output.signal.peakDbfs,
@@ -3222,7 +3601,7 @@ class Engine private constructor(private val app: Context) {
             activeLink.send(localDiag.toJson("sdiag"))
             val pointAge = ui.value.pointDiag.audioAgeMs
             val audioMissing = serverPlay.timeline.running && nowMs - pairedAtMs > 5_000 &&
-                (pointUdp == null || pointAge < 0 || pointAge >= 5_000)
+                currentAudioPath != "tcp" && (pointUdp == null || pointAge < 0 || pointAge >= 5_000)
             ui { copy(audioMissing = audioMissing) }
             if (audioMissing && nowMs - lastAudioSessionResetMs >= audioRenewIntervalMs) {
                 renewAudioSession("Point не получает аудиопакеты")
@@ -3271,6 +3650,7 @@ class Engine private constructor(private val app: Context) {
                 else if (clock.ready) clock.toServer(System.nanoTime()) else null,
             "device" to myId, "role" to role.name.lowercase(), "phase" to phase.name,
             "network" to mapOf(
+                "audioPath" to pointDiag.audioPath, "clockPath" to pointDiag.clockPath,
                 "rttMs" to pointDiag.rttMs, "rttJitterMs" to pointDiag.rttJitterMs,
                 "jitterMs" to pointDiag.jitterMs, "lossPct" to pointDiag.lossPct,
                 "nacksSent" to pointDiag.nacksSent, "resent" to serverDiag.resent,
@@ -3294,6 +3674,8 @@ class Engine private constructor(private val app: Context) {
             "buffers" to mapOf(
                 "jitterBufferMs" to pointDiag.bufferMs, "decodeLeadFrames" to serverDiag.decodeLeadFrames,
                 "decodeReadyFrames" to serverDiag.decodeReadyFrames, "decodePositionFrame" to serverDiag.decodePositionFrame,
+                "pointAudioBufferSeconds" to pointDiag.audioBufferSeconds,
+                "audioFillFramesPerSec" to pointDiag.audioFillFramesPerSec,
                 "pointUnderrunFrames" to pointDiag.outputSilentFrames, "serverUnderrunFrames" to serverDiag.outputSilentFrames,
             ),
             "sound" to mapOf(
@@ -3335,6 +3717,10 @@ class Engine private constructor(private val app: Context) {
         }
         if (phase == Phase.PAIRED && playing && (pointDiag.audioAgeMs < 0 || pointDiag.audioAgeMs >= 1_000)) {
             violation("POINT_NO_PACKETS", mapOf("audioAgeMs" to pointDiag.audioAgeMs, "sessionId" to pointDiag.sessionId))
+        }
+        if (phase == Phase.PAIRED && playing && pointDiag.audioPath == "tcp" && pointDiag.audioBufferSeconds < 3.0) {
+            violation("POINT_BUFFER_LOW", mapOf("audioBufferSeconds" to pointDiag.audioBufferSeconds,
+                "audioFillFramesPerSec" to pointDiag.audioFillFramesPerSec, "audioPath" to pointDiag.audioPath))
         }
         if (phase == Phase.PAIRED && playing && serverDiag.serverChannelRmsDbfs > -50.0 && pointDiag.outputRmsDbfs < -70.0) {
             violation("POINT_SILENT_OUTPUT", mapOf("serverChannelRmsDbfs" to serverDiag.serverChannelRmsDbfs,
@@ -3421,16 +3807,22 @@ class Engine private constructor(private val app: Context) {
                     udpFirstPacketPending.set(true)
                 }
                 when (m) {
-                    is UdpMsg.Ping -> if (role == Role.SERVER && phase == Phase.PAIRED) {
+                    is UdpMsg.Ping -> if (role == Role.SERVER && phase == Phase.PAIRED && !debugStopUdpTraffic) {
                         pointUdp = pkt.socketAddress as InetSocketAddress
                         val b = Wire.pong(sessionId, m.t1, now, System.nanoTime(), m.pingSeq)
                         udp.send(DatagramPacket(b, b.size, pkt.socketAddress))
                     }
                     is UdpMsg.Nack -> if (role == Role.SERVER) resend(m)
-                    is UdpMsg.Pong -> if (role == Role.POINT) clock.addPong(m.t1, m.t2, m.t3, now)
+                    is UdpMsg.Pong -> if (role == Role.POINT) {
+                        lastUdpPongAtMs.set(SystemClock.elapsedRealtime())
+                        clock.addPong(m.t1, m.t2, m.t3, now)
+                        setClockPath("udp", "udp_pong_received")
+                    }
                     is UdpMsg.Audio -> if (role == Role.POINT && phase == Phase.PAIRED) {
                         lastAudioRxAt.set(SystemClock.elapsedRealtime())
                         rx.onAudio(m, now)
+                        if (currentAudioPath == "tcp" && rx.bufferMs >= 100.0)
+                            setAudioPath("udp", "udp_audio_buffered")
                     }
                 }
             } catch (e: Exception) {
@@ -3483,7 +3875,7 @@ class Engine private constructor(private val app: Context) {
     }
 
     private fun serverSend() { synchronized(sendLock) {
-        if (debugUdpAudioStopped) return
+        if (debugStopUdpTraffic || currentAudioPath == "tcp") return
         val addr = pointUdp ?: return
         val st = serverPlay
         val tl = st.timeline
@@ -3517,26 +3909,40 @@ class Engine private constructor(private val app: Context) {
     } }
 
     private fun pointNet() {
-        val addr = serverUdp ?: return
         if (sessionId == 0) return
         val now = System.nanoTime()
-        val interval = if (pingBurst > 0) 50_000_000L else 200_000_000L
-        if (now - lastPing >= interval) {
-            lastPing = now
-            if (pingBurst > 0) pingBurst--
-            val b = Wire.ping(sessionId, now, pingSeq++)
-            try {
-                udp.send(DatagramPacket(b, b.size, addr))
-                pointPingPacketsSent.incrementAndGet()
-            } catch (e: Exception) {
-                pointPingSendErrors.incrementAndGet()
-                telemetry.limited("UDP_POINT_PING_SEND_FAILED", "network=$udpBoundNetworkLabel localAddress=$udpBoundLocalAddress target=${addr.address.hostAddress}:${addr.port}", e)
+        val nowMs = SystemClock.elapsedRealtime()
+        if (!debugStopUdpTraffic) {
+            val addr = serverUdp
+            val interval = if (pingBurst > 0) 50_000_000L else 200_000_000L
+            if (addr != null && now - lastPing >= interval) {
+                lastPing = now
+                if (pingBurst > 0) pingBurst--
+                val b = Wire.ping(sessionId, now, pingSeq++)
+                try {
+                    udp.send(DatagramPacket(b, b.size, addr))
+                    pointPingPacketsSent.incrementAndGet()
+                } catch (e: Exception) {
+                    pointPingSendErrors.incrementAndGet()
+                    telemetry.limited("UDP_POINT_PING_SEND_FAILED", "network=$udpBoundNetworkLabel localAddress=$udpBoundLocalAddress target=${addr.address.hostAddress}:${addr.port}", e)
+                }
+            }
+            if (currentAudioPath != "tcp") {
+                val nacks = rx.collectNacks(now)
+                if (nacks.isNotEmpty() && addr != null) {
+                    val b = Wire.nack(sessionId, rx.timeline.epoch, nacks)
+                    udp.send(DatagramPacket(b, b.size, addr))
+                }
             }
         }
-        val nacks = rx.collectNacks(now)
-        if (nacks.isNotEmpty()) {
-            val b = Wire.nack(sessionId, rx.timeline.epoch, nacks)
-            udp.send(DatagramPacket(b, b.size, addr))
+        if ("tcpClock" in negotiatedCapabilities && nowMs - lastUdpPongAtMs.get() >= 1_500L &&
+            now - lastTcpClockPingAtNs >= 200_000_000L) {
+            lastTcpClockPingAtNs = now
+            tcpClockPingSeq++
+            link?.send(JSONObject().put("t", "clock-ping").put("seq", tcpClockPingSeq).put("t1", now.toString()))
+            setClockPath("tcp", if (debugStopUdpTraffic) "debug_udp_stopped" else "udp_pong_timeout")
+        } else if (lastUdpPongAtMs.get() > 0 && nowMs - lastUdpPongAtMs.get() < 1_500L) {
+            setClockPath("udp", "udp_pong_received")
         }
     }
 

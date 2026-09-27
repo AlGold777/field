@@ -63,6 +63,8 @@ class ServerPlayState(
 class PointRenderer(
     private val rx: PointReceiver,
     private val clock: ClockSync,
+    private val tcpAudio: TcpAudioBuffer,
+    private val audioPath: () -> String,
     private val params: () -> PointParams,
 ) : RenderSource {
     val corrector = PlayoutCorrector()
@@ -86,7 +88,7 @@ class PointRenderer(
             val f = corrector.frame(i, n)
             val g = tl.envelope(f)
             if (g == 0f) { out[i] = 0f; continue }
-            val s = rx.read(f)
+            val s = if (audioPath() == "tcp") tcpAudio.read(tl.epoch, f) else rx.read(f)
             if (s.isNaN()) {
                 out[i] = 0f
                 if (p.totalFrames <= 0 || f < p.totalFrames) missing++
