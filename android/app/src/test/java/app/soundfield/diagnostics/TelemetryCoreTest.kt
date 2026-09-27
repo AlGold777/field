@@ -58,10 +58,14 @@ class TelemetryCoreTest {
             "data" to mapOf("rule" to "POINT_NO_PACKETS", "incidentId" to "incident-1", "durMs" to 4_000),
         ))
         val point = TelemetryJson.encode(mapOf(
-            "ts" to "2026-09-27T10:01:00Z", "sev" to "info", "ev" to "USER_MARK",
+            "ts" to "2026-09-27T10:00:30Z", "dev" to "point-id", "role" to "server",
+            "sev" to "info", "ev" to "DEVICE_INFO", "data" to mapOf("manufacturer" to "Test"),
+        )) + "\n" + TelemetryJson.encode(mapOf(
+            "ts" to "2026-09-27T10:01:00Z", "dev" to "point-id", "role" to "point", "sev" to "info", "ev" to "USER_MARK",
             "data" to mapOf("markId" to "mark-1"),
         )) + "\n" + TelemetryJson.encode(mapOf(
-            "ts" to "2026-09-27T10:02:00Z", "sev" to "error", "ev" to "AUDIO_DECODE_FAILED",
+            "ts" to "2026-09-27T10:02:00Z", "dev" to "point-id", "role" to "point",
+            "sev" to "error", "ev" to "AUDIO_DECODE_FAILED",
         ))
         val summary = TelemetrySummary.create(server, point, "iOS peer does not support export", 1.25, 2, 1)
         assertTrue(summary.contains("POINT_NO_PACKETS"))
@@ -72,6 +76,8 @@ class TelemetryCoreTest {
         assertTrue(summary.contains("1.250 ms"))
         assertTrue(summary.contains("dropped queue events=2"))
         assertTrue(summary.contains("Other phone journal missing"))
+        assertTrue(summary.contains("Phones: server ("))
+        assertTrue(summary.contains("; point ("))
     }
 
     @Test fun signalMeterComputesOneSecondRmsAndPeak() {

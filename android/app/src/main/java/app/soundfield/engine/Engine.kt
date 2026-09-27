@@ -93,6 +93,11 @@ class Engine private constructor(private val app: Context) {
         val id: String, val temporaryFile: File, var received: Long = 0,
     )
     private data class RemoteTelemetryExport(val journal: String, val state: String)
+    private data class NetworkRoute(val network: Network, val linkProperties: LinkProperties) {
+        val interfaceName: String get() = linkProperties.interfaceName ?: "unknown"
+        val label: String get() = "$interfaceName@${network}"
+    }
+    private data class UdpBindResult(val success: Boolean, val portChanged: Boolean)
 
     companion object {
         const val TAG = "SoundField"
@@ -201,7 +206,17 @@ class Engine private constructor(private val app: Context) {
 
     // ------------------------------------------------------------------ сеть
     private lateinit var tcp: ServerSocket
-    private lateinit var udp: DatagramSocket
+    @Volatile private lateinit var udp: DatagramSocket
+    private val udpRebindLock = Any()
+    @Volatile private var udpBoundNetworkLabel: String = "unbound"
+    @Volatile private var udpBoundLocalAddress: String = ""
+    private val pointPingPacketsSent = AtomicLong()
+    private val pointPingSendErrors = AtomicLong()
+    private var zeroSendRenewStreak = 0
+    private var udpNetworkRebindAttempted = false
+    private var udpFailureNoticeShown = false
+    private var sessionSentBaseline = 0L
+    private var audioRenewIntervalMs = 5_000L
     private lateinit var discovery: Discovery
 
     // ------------------------------------------------------------------ сессия
@@ -233,7 +248,7 @@ class Engine private constructor(private val app: Context) {
     /** До какого момента (elapsedRealtime) в состоянии IDLE тихо пробуем восстановить знакомую пару. */
     private var autoResumeUntil = 0L
     private var lastAutoAttempt = 0L
-    private var lastNetSignature: String? = null
+    private val networkLinks = ConcurrentHashMap<Network, String>()
     /** Приложение на экране. В фоне без пары Android замораживает процесс — такой телефон не должен быть виден. */
     @Volatile private var appVisible = true
     private var inviteRinging = false
@@ -344,22 +359,110 @@ class Engine private constructor(private val app: Context) {
         val req = NetworkRequest.Builder().addTransportType(NetworkCapabilities.TRANSPORT_WIFI).build()
         try {
             cm.registerNetworkCallback(req, object : ConnectivityManager.NetworkCallback() {
-                override fun onAvailable(network: Network) { telemetry.event("WIFI_AVAILABLE", "network=$network") }
+                override fun onAvailable(network: Network) {
+                    telemetry.record("WIFI_AVAILABLE", mapOf("network" to network.toString()))
+                }
                 override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) {
-                    telemetry.event("WIFI_CAPABILITIES", "network=$network internet=${caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)} validated=${caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)}")
+                    telemetry.record("WIFI_CAPABILITIES", mapOf("network" to network.toString(),
+                        "internet" to caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET),
+                        "validated" to caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)))
                 }
                 override fun onLinkPropertiesChanged(network: Network, lp: LinkProperties) {
-                    val sig = lp.linkAddresses.joinToString { it.address.hostAddress ?: "" }
-                    telemetry.event("WIFI_ADDRESSES", "network=$network interface=${lp.interfaceName} addresses=$sig")
+                    val addresses = networkAddresses(lp)
+                    val ipv4 = addresses.filterIsInstance<java.net.Inet4Address>().mapNotNull { it.hostAddress }
+                    val ipv6 = addresses.filterIsInstance<java.net.Inet6Address>().mapNotNull { it.hostAddress }
+                    telemetry.record("WIFI_ADDRESSES", mapOf("network" to network.toString(),
+                        "interface" to (lp.interfaceName ?: ""), "ipv4" to ipv4, "ipv6" to ipv6,
+                        "addresses" to (ipv4 + ipv6)))
+                    val signature = networkSignature(lp)
+                    val previous = networkLinks.put(network, signature)
+                    if (previous == null || previous != signature) post { onNetworkChanged() }
+                }
+                override fun onLost(network: Network) {
+                    val existed = networkLinks.remove(network) != null
+                    telemetry.record("WIFI_LOST", mapOf("network" to network.toString()))
                     post {
-                        val prev = lastNetSignature
-                        lastNetSignature = sig
-                        if (prev != null && prev != sig) onNetworkChanged()
+                        log("Wi‑Fi потерян: $network")
+                        if (existed) onNetworkChanged()
                     }
                 }
-                override fun onLost(network: Network) { post { lastNetSignature = ""; log("Wi‑Fi потерян") } }
             })
         } catch (e: Exception) { Log.w(TAG, "network callback", e); telemetry.event("NETWORK_CALLBACK_FAILED", error = e) }
+    }
+
+    private fun networkAddresses(lp: LinkProperties): List<InetAddress> {
+        val result = linkedMapOf<String, InetAddress>()
+        lp.linkAddresses.forEach { address -> result[address.address.hostAddress ?: address.address.toString()] = address.address }
+        try {
+            lp.interfaceName?.let { name ->
+                java.net.NetworkInterface.getByName(name)?.inetAddresses?.toList()?.forEach { address ->
+                    result[address.hostAddress ?: address.toString()] = address
+                }
+            }
+        } catch (e: Exception) { telemetry.limited("WIFI_INTERFACE_ADDRESSES_FAILED", "interface=${lp.interfaceName}", e) }
+        return result.values.toList()
+    }
+
+    private fun networkSignature(lp: LinkProperties): String = buildString {
+        append(lp.interfaceName.orEmpty()).append(':')
+        append(networkAddresses(lp).mapNotNull { it.hostAddress }.sorted().joinToString(","))
+        append(':').append(lp.routes.joinToString(",") { "${it.destination}-${it.gateway?.hostAddress.orEmpty()}" })
+        append(':').append(lp.dnsServers.mapNotNull { it.hostAddress }.sorted().joinToString(","))
+    }
+
+    @Suppress("DEPRECATION")
+    private fun availableNetworkRoutes(wifiOnly: Boolean = false): List<NetworkRoute> {
+        val cm = app.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        return cm.allNetworks.mapNotNull { network ->
+            val caps = cm.getNetworkCapabilities(network) ?: return@mapNotNull null
+            val wifi = caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)
+            if (wifiOnly && !wifi) return@mapNotNull null
+            val lp = cm.getLinkProperties(network) ?: return@mapNotNull null
+            NetworkRoute(network, lp)
+        }
+    }
+
+    private fun routeForLocalAddress(address: InetAddress): NetworkRoute? =
+        availableNetworkRoutes().firstOrNull { route -> networkAddresses(route.linkProperties).any { it == address } }
+
+    /** Bind a fresh UDP socket to the exact interface used by the current TCP control link. */
+    private fun bindUdpToControlLink(reason: String): UdpBindResult = synchronized(udpRebindLock) {
+        val activeLink = link?.takeIf { it.isOpen } ?: return@synchronized UdpBindResult(false, false)
+        val localAddress = activeLink.localAddress
+        val route = routeForLocalAddress(localAddress)
+        var candidate: DatagramSocket? = null
+        var networkBindError: Throwable? = null
+        try {
+            val newSocket = DatagramSocket(null)
+            candidate = newSocket
+            newSocket.bind(InetSocketAddress(localAddress, 0))
+            if (route != null) {
+                try { route.network.bindSocket(newSocket) }
+                catch (e: Exception) { networkBindError = e }
+            }
+            val old = udp
+            val oldPort = old.localPort
+            udp = newSocket
+            udpBoundNetworkLabel = if (route == null) "unmatched" else if (networkBindError == null) route.label else "${route.label}:local_bind_only"
+            udpBoundLocalAddress = localAddress.hostAddress ?: localAddress.toString()
+            old.close()
+            telemetry.record("UDP_SOCKET_BOUND", mapOf(
+                "reason" to reason, "role" to role.name.lowercase(), "network" to udpBoundNetworkLabel,
+                "interface" to (route?.interfaceName ?: ""), "localAddress" to udpBoundLocalAddress,
+                "port" to newSocket.localPort, "previousPort" to oldPort,
+                "tcpLocalAddress" to (activeLink.localAddress.hostAddress ?: activeLink.localAddress.toString()),
+                "tcpLinkId" to activeLink.id, "networkBind" to when {
+                    route == null -> "no_matching_network"
+                    networkBindError == null -> "ok"
+                    else -> "failed_local_address_fallback"
+                }), error = networkBindError)
+            UdpBindResult(true, newSocket.localPort != oldPort)
+        } catch (e: Exception) {
+            candidate?.close()
+            telemetry.record("UDP_SOCKET_BIND_FAILED", mapOf("reason" to reason, "role" to role.name.lowercase(),
+                "network" to (route?.label ?: "unmatched"), "localAddress" to (localAddress.hostAddress ?: "")), error = e)
+            UdpBindResult(false, false)
+        }
     }
 
     private fun onNetworkChanged() {
@@ -373,6 +476,10 @@ class Engine private constructor(private val app: Context) {
                 // Обновляем из TCP-соединения, которое ядро Linux переключает автоматически.
                 val l = link
                 if (l != null && l.isOpen) {
+                    zeroSendRenewStreak = 0
+                    udpNetworkRebindAttempted = false
+                    udpFailureNoticeShown = false
+                    audioRenewIntervalMs = 5_000L
                     val addr = l.remoteAddress
                     if (role == Role.SERVER) {
                         val old = pointUdp
@@ -383,6 +490,8 @@ class Engine private constructor(private val app: Context) {
                         if (old != null && old.address != addr)
                             serverUdp = InetSocketAddress(addr, old.port)
                     }
+                    val bindResult = bindUdpToControlLink("network_changed")
+                    if (bindResult.portChanged && role == Role.SERVER) sendSession(l)
                 }
             }
             else -> {}
@@ -522,7 +631,10 @@ class Engine private constructor(private val app: Context) {
             put("mode", state.mode.wire); put("playing", state.playing); put("positionMs", positionMs())
             put("link", JSONObject().put("id", link?.id ?: 0).put("lastRxAgoMs", link?.let { now - it.lastRx } ?: -1))
             put("udp", JSONObject().put("packets", udpPackets.get()).put("invalid", udpInvalid.get())
-                .put("otherSession", udpOtherSession.get()).put("lastRxAgoMs", udpLastRx.get().takeIf { it > 0 }?.let { now - it } ?: -1))
+                .put("otherSession", udpOtherSession.get()).put("lastRxAgoMs", udpLastRx.get().takeIf { it > 0 }?.let { now - it } ?: -1)
+                .put("localAddress", udpBoundLocalAddress).put("network", udpBoundNetworkLabel)
+                .put("port", udp.localPort).put("pointPingSent", pointPingPacketsSent.get())
+                .put("pointPingSendErrors", pointPingSendErrors.get()))
             put("serverDiag", state.serverDiag.toJson("sdiag")); put("pointDiag", state.pointDiag.toJson("diag"))
             put("activeIncidents", org.json.JSONArray().apply { state.activeIncidents.forEach(::put) })
         }.toString()
@@ -585,32 +697,10 @@ class Engine private constructor(private val app: Context) {
         activeLink.send(JSONObject().put("t", "telemetry-request").put("id", id))
         io.execute {
             try {
-                val accepted = ready.get(15, TimeUnit.SECONDS)
-                val size = accepted.optLong("bytes", -1)
-                require(size in 0..TELEMETRY_MAX_BYTES) { "Peer journal exceeds the 8 MiB export limit" }
-                pendingRemoteStates[id] = accepted.optString("state", "{}")
-                var offset = 0L
-                while (offset < size) {
-                    check(activeLink.isOpen && activeLink === link) { "Peer TCP link closed during telemetry transfer" }
-                    val count = minOf(TRANSFER_CHUNK_BYTES.toLong(), size - offset).toInt()
-                    val chunk = ByteArray(count)
-                    java.io.RandomAccessFile(file, "r").use { input -> input.seek(offset); input.readFully(chunk) }
-                    val ackId = "$id:$offset"
-                    val ack = CompletableFuture<JSONObject>()
-                    telemetryAcks[ackId] = ack
-                    activeLink.send(JSONObject().put("t", "telemetry-chunk").put("id", id).put("ackId", ackId)
-                        .put("offset", offset).put("data", Base64.encodeToString(chunk, Base64.NO_WRAP)))
-                    val response = ack.get(20, TimeUnit.SECONDS)
-                    check(response.optLong("offset", -1L) == offset + count) { "Peer confirmed an invalid telemetry offset" }
-                    offset += count
-                    telemetryAcks.remove(ackId, ack)
-                }
-                val doneAckId = "$id:done"
-                val doneAck = CompletableFuture<JSONObject>()
-                telemetryAcks[doneAckId] = doneAck
-                activeLink.send(JSONObject().put("t", "telemetry-end").put("id", id).put("bytes", size).put("ackId", doneAckId))
-                doneAck.get(20, TimeUnit.SECONDS)
-                result.get(1, TimeUnit.SECONDS)
+                ready.get(15, TimeUnit.SECONDS)
+                // The peer streams its journal to us after telemetry-ready. Chunks are written by
+                // receiveTelemetryChunk; this side only waits for telemetry-end to complete it.
+                result.get(90, TimeUnit.SECONDS)
             } catch (e: Exception) {
                 result.completeExceptionally(e)
             } finally {
@@ -1362,36 +1452,52 @@ class Engine private constructor(private val app: Context) {
             telemetry.record("RECONNECT_ATTEMPT_START", mapOf("parentOp" to reconnectSeriesOp,
                 "attempt" to resumeAttempt, "method" to "last_ip_or_mdns"), op = attemptOp)
         }
-        telemetry.event("TCP_CONNECT_START", "tag=$tag peer=${p.id} host=${host.hostAddress} port=${p.port} ringing=${p.supportsRinging} responseTimeoutMs=$timeoutMs")
+        val routes = availableNetworkRoutes(wifiOnly = true)
+        telemetry.record("TCP_CONNECT_START", mapOf("tag" to tag, "peer" to p.id, "host" to host.hostAddress,
+            "port" to p.port, "ringing" to p.supportsRinging, "responseTimeoutMs" to timeoutMs,
+            "wifiNetworks" to routes.map { it.label }))
         io.execute {
             val started = SystemClock.elapsedRealtime()
-            val s = Socket()
+            var s: Socket? = null
             try {
-                s.connect(InetSocketAddress(host, p.port), 2_500)
+                val connected = connectAcrossWifi(host, p.port, tag, routes)
+                val connectedSocket = connected.first
+                s = connectedSocket
+                val connectedRoute = routeForLocalAddress(connectedSocket.localAddress) ?: connected.second
+                val localAddress = connectedSocket.localAddress.hostAddress ?: connectedSocket.localAddress.toString()
+                val network = connectedRoute?.label ?: "process_default"
                 if (attemptOp != null) telemetry.record("RECONNECT_TCP_CONNECTED", mapOf(
-                    "elapsedMs" to SystemClock.elapsedRealtime() - started, "result" to "ok"), op = attemptOp)
-                telemetry.event("TCP_CONNECTED", "tag=$tag peer=${p.id} elapsedMs=${SystemClock.elapsedRealtime() - started}")
+                    "elapsedMs" to SystemClock.elapsedRealtime() - started, "result" to "ok",
+                    "localAddress" to localAddress, "localPort" to connectedSocket.localPort,
+                    "network" to network), op = attemptOp)
+                telemetry.record("TCP_CONNECTED", mapOf("tag" to tag, "peer" to p.id,
+                    "elapsedMs" to SystemClock.elapsedRealtime() - started, "localAddress" to localAddress,
+                    "localPort" to connectedSocket.localPort, "network" to network,
+                    "remoteAddress" to host.hostAddress, "remotePort" to p.port))
                 post {
                     val stillWanted = when (tag) {
                         "invite-out" -> phase == Phase.INVITING && pendingPeer?.id == p.id
                         "resume-auto" -> phase == Phase.IDLE && autoResumeUntil != 0L
                         else -> phase == Phase.RECONNECTING || (phase == Phase.INVITING && manualResumeActive)
                     }
-                    if (!stillWanted || pending != null) { telemetry.event("TCP_CONNECT_DISCARDED", "tag=$tag phase=$phase"); try { s.close() } catch (_: Exception) {}; return@post }
-                    val l = newLink(s); l.tag = tag
+                    if (!stillWanted || pending != null) { telemetry.event("TCP_CONNECT_DISCARDED", "tag=$tag phase=$phase"); try { connectedSocket.close() } catch (_: Exception) {}; return@post }
+                    val l = newLink(connectedSocket, tag)
                     pending = l
                     l.send(first)
                     pendingTimeout?.cancel(false)
                     pendingTimeout = later(timeoutMs) { if (pending === l) l.close("response timeout ${timeoutMs}ms") }
                 }
             } catch (e: Exception) {
-                try { s.close() } catch (_: Exception) { }
+                try { s?.close() } catch (_: Exception) { }
                 if (attemptOp != null) {
                     telemetry.record("RECONNECT_ATTEMPT_END", mapOf("elapsedMs" to SystemClock.elapsedRealtime() - started,
                         "result" to "error"), op = attemptOp, error = e)
                     if (reconnectAttemptOp == attemptOp) reconnectAttemptOp = null
                 }
-                telemetry.event("TCP_CONNECT_FAILED", "tag=$tag peer=${p.id} host=${host.hostAddress}:${p.port} elapsedMs=${SystemClock.elapsedRealtime() - started}", e)
+                telemetry.record("TCP_CONNECT_FAILED", mapOf("tag" to tag, "peer" to p.id,
+                    "host" to host.hostAddress, "port" to p.port,
+                    "elapsedMs" to SystemClock.elapsedRealtime() - started,
+                    "wifiNetworks" to routes.map { it.label }), error = e)
                 post {
                     discovery.invalidatePeer(p.id)
                     log("Нет соединения с ${host.hostAddress}:${p.port} — ${e.message}")
@@ -1399,6 +1505,36 @@ class Engine private constructor(private val app: Context) {
                 }
             }
         }
+    }
+
+    private fun connectAcrossWifi(
+        host: InetAddress,
+        port: Int,
+        tag: String,
+        routes: List<NetworkRoute>,
+    ): Pair<Socket, NetworkRoute?> {
+        val candidates = routes.ifEmpty { listOf(null) }
+        var lastFailure: Exception? = null
+        candidates.forEachIndexed { index, route ->
+            var socket: Socket? = null
+            try {
+                val attemptSocket = route?.network?.socketFactory?.createSocket() ?: Socket()
+                socket = attemptSocket
+                attemptSocket.connect(InetSocketAddress(host, port), 2_500)
+                telemetry.record("TCP_CONNECT_NETWORK_CONNECTED", mapOf("tag" to tag,
+                    "attempt" to (index + 1), "network" to (route?.label ?: "process_default"),
+                    "localAddress" to (attemptSocket.localAddress.hostAddress ?: attemptSocket.localAddress.toString()),
+                    "localPort" to attemptSocket.localPort, "remoteAddress" to host.hostAddress, "remotePort" to port))
+                return attemptSocket to route
+            } catch (e: Exception) {
+                try { socket?.close() } catch (_: Exception) { }
+                lastFailure = e
+                telemetry.record("TCP_CONNECT_NETWORK_FAILED", mapOf("tag" to tag,
+                    "attempt" to (index + 1), "network" to (route?.label ?: "process_default"),
+                    "remoteAddress" to host.hostAddress, "remotePort" to port), error = e)
+            }
+        }
+        throw lastFailure ?: java.net.ConnectException("No available network route")
     }
 
     private fun onConnectFailed(tag: String) {
@@ -1411,13 +1547,13 @@ class Engine private constructor(private val app: Context) {
         }
     }
 
-    private fun newLink(s: Socket) = ControlLink(s,
+    private fun newLink(s: Socket, tag: String = "") = ControlLink(s,
         onMessage = { l, o -> post { onMessage(l, o) } },
-        onClosed = { l -> post { onClosed(l) } }, telemetry = telemetry)
+        onClosed = { l -> post { onClosed(l) } }, telemetry = telemetry,
+        initialTag = tag, localNetwork = routeForLocalAddress(s.localAddress)?.label ?: "unknown")
 
     private fun onIncomingSocket(s: Socket) {
-        val l = newLink(s)
-        l.tag = "new"
+        val l = newLink(s, "new")
         incomingLinks.add(l)
         later(5_000) {
             if (l.tag == "new") {
@@ -1632,6 +1768,12 @@ class Engine private constructor(private val app: Context) {
         link = l
         role = r; peerId = pid; peerName = pname; peerPlatform = pplat
         phase = Phase.PAIRED
+        zeroSendRenewStreak = 0
+        udpNetworkRebindAttempted = false
+        udpFailureNoticeShown = false
+        audioRenewIntervalMs = 5_000L
+        sessionSentBaseline = sentAudioPackets.get()
+        bindUdpToControlLink("paired")
         pairedAtMs = SystemClock.elapsedRealtime()
         lastAudioSessionResetMs = pairedAtMs
         udpLastRx.set(0)
@@ -1814,9 +1956,23 @@ class Engine private constructor(private val app: Context) {
             }
             "sdiag" -> if (role == Role.POINT) ui { copy(serverDiag = Diag.fromJson(o)) }
             "calib" -> if (role == Role.POINT) applyCalib(o)
+            "network-warning" -> if (role == Role.POINT) toast(o.optString("message").take(500))
             "mark" -> receiveUserMark(o)
             "telemetry-request" -> link?.let { receiveTelemetryRequest(it, o) }
-            "telemetry-ready" -> telemetryReady[o.optString("id")]?.complete(o)
+            "telemetry-ready" -> {
+                val id = o.optString("id")
+                val ready = telemetryReady[id]
+                if (ready != null) {
+                    val size = o.optLong("bytes", -1L)
+                    if (size !in 0..TELEMETRY_MAX_BYTES) {
+                        ready.completeExceptionally(IllegalStateException("Peer journal exceeds the 8 MiB export limit"))
+                        telemetryExports[id]?.completeExceptionally(IllegalStateException("Peer journal exceeds the 8 MiB export limit"))
+                    } else {
+                        pendingRemoteStates[id] = o.optString("state", "{}")
+                        ready.complete(o)
+                    }
+                }
+            }
             "telemetry-chunk" -> link?.let { receiveTelemetryChunk(it, o) }
             "telemetry-ack" -> telemetryAcks[o.optString("ackId")]?.complete(o)
             "telemetry-end" -> link?.let { finishTelemetryReceive(it, o) }
@@ -1848,16 +2004,59 @@ class Engine private constructor(private val app: Context) {
     private fun renewAudioSession(reason: String) {
         if (phase != Phase.PAIRED || role != Role.SERVER) return
         val now = SystemClock.elapsedRealtime()
+        val sentTotal = sentAudioPackets.get()
+        val sentSinceRenew = (sentTotal - sessionSentBaseline).coerceAtLeast(0)
+        sessionSentBaseline = sentTotal
+        if (sentSinceRenew == 0L) zeroSendRenewStreak++ else {
+            zeroSendRenewStreak = 0
+            udpNetworkRebindAttempted = false
+            udpFailureNoticeShown = false
+            audioRenewIntervalMs = 5_000L
+        }
         sessionId = rnd.nextInt().let { if (it == 0) 1 else it }
         pointUdp = null
         pointClockReady = false
         fileTransferToken = hex(24)
         abortIncomingFileTransfer("audio session changed")
         lastAudioSessionResetMs = now
-        telemetry.event("AUDIO_SESSION_RENEW", "reason=$reason session=$sessionId sent=${sentAudioPackets.get()} point=${ui.value.pointDiag.audioAgeMs}ms")
+        telemetry.record("AUDIO_SESSION_RENEW", mapOf("reason" to reason, "session" to sessionId,
+            "sent" to sentTotal, "sentSincePreviousRenew" to sentSinceRenew,
+            "zeroSendRenewStreak" to zeroSendRenewStreak, "pointAudioAgeMs" to ui.value.pointDiag.audioAgeMs))
         log("UDP-аудиосессия пересоздана: $reason")
         sendSession()
         sendTimeline()
+
+        if (sentSinceRenew == 0L && zeroSendRenewStreak >= 3) {
+            if (!udpNetworkRebindAttempted) {
+                udpNetworkRebindAttempted = true
+                zeroSendRenewStreak = 0
+                val bindResult = bindUdpToControlLink("three_zero_send_renewals")
+                telemetry.record("UDP_ROUTE_REPAIR", mapOf("result" to if (bindResult.success) "bound" else "failed",
+                    "portChanged" to bindResult.portChanged,
+                    "network" to udpBoundNetworkLabel, "localAddress" to udpBoundLocalAddress, "port" to udp.localPort))
+                if (bindResult.portChanged) sendSession()
+            } else if (!udpFailureNoticeShown) {
+                udpFailureNoticeShown = true
+                audioRenewIntervalMs = 30_000L
+                val routes = availableNetworkRoutes(wifiOnly = true)
+                val wifiNetworks = wifiNetworkSummary()
+                val attachedTo = if (routes.size > 1) "нескольким сетям Wi‑Fi" else "сети Wi‑Fi"
+                val message = "UDP не проходит между телефонами. Телефон подключён к $attachedTo: $wifiNetworks. Проверьте, что оба телефона доступны друг другу в одной сети."
+                telemetry.record("UDP_ROUTE_UNAVAILABLE", mapOf("message" to message,
+                    "wifiNetworks" to wifiNetworks, "renewIntervalMs" to audioRenewIntervalMs))
+                link?.send(JSONObject().put("t", "network-warning").put("message", message))
+                toast(message)
+            }
+        }
+    }
+
+    private fun wifiNetworkSummary(): String {
+        val descriptions = availableNetworkRoutes(wifiOnly = true).map { route ->
+            val addresses = networkAddresses(route.linkProperties).filterIsInstance<java.net.Inet4Address>()
+                .mapNotNull { it.hostAddress }
+            "${route.interfaceName} (${addresses.joinToString().ifEmpty { "IPv4 неизвестен" }})"
+        }
+        return descriptions.ifEmpty { listOf("сеть Wi‑Fi не определена") }.joinToString(", ")
     }
 
     private fun newEpoch(playing: Boolean, frame: Long, anchorNs: Long) {
@@ -2660,6 +2859,7 @@ class Engine private constructor(private val app: Context) {
         val audioUnderruns = audio.underruns
         val sourceMissing = if (role == Role.SERVER) serverRenderer.windowSourceMissingFrames.getAndSet(0) else 0
         val pointMissing = if (role == Role.POINT) pointRenderer.windowUnderrunFrames.getAndSet(0) else 0
+        if (role == Role.SERVER) measurePointChannelSignal()
         val channelSignal = if (role == Role.SERVER) pointChannelSignal.take() else null
         val serverSignalDbfs = channelSignal?.rmsDbfs ?: currentUi.serverDiag.serverChannelRmsDbfs
         val currentSlew = if (role == Role.SERVER) serverRenderer.corrector.slewEvents else pointRenderer.corrector.slewEvents
@@ -2787,8 +2987,13 @@ class Engine private constructor(private val app: Context) {
             val audioMissing = serverPlay.timeline.running && nowMs - pairedAtMs > 5_000 &&
                 (pointUdp == null || pointAge < 0 || pointAge >= 5_000)
             ui { copy(audioMissing = audioMissing) }
-            if (audioMissing && nowMs - lastAudioSessionResetMs >= 5_000) {
+            if (audioMissing && nowMs - lastAudioSessionResetMs >= audioRenewIntervalMs) {
                 renewAudioSession("Point не получает аудиопакеты")
+            } else if (!audioMissing && (udpFailureNoticeShown || udpNetworkRebindAttempted)) {
+                udpFailureNoticeShown = false
+                udpNetworkRebindAttempted = false
+                zeroSendRenewStreak = 0
+                audioRenewIntervalMs = 5_000L
             }
         } else {
             val audioMissing = rx.timeline.playing && nowMs - pairedAtMs > 5_000 &&
@@ -2836,6 +3041,10 @@ class Engine private constructor(private val app: Context) {
                 "udpPacketsPerSec" to serverDiag.udpPacketsPerSec,
                 "audioPacketsSentPerSec" to serverDiag.sentAudioPacketsPerSec,
                 "audioPacketsReceivedPerSec" to pointAudioRate,
+                "pointPingPacketsSent" to pointPingPacketsSent.get(),
+                "pointPingSendErrors" to pointPingSendErrors.get(),
+                "udpLocalAddress" to udpBoundLocalAddress, "udpNetwork" to udpBoundNetworkLabel,
+                "udpLocalPort" to udp.localPort,
                 "udpInvalidDelta" to invalidDelta, "udpOtherSessionDelta" to otherSessionDelta,
                 "audioAgeMs" to pointDiag.audioAgeMs, "tcpRxAgeMs" to (link?.let { nowMs - it.lastRx } ?: -1),
             ),
@@ -2955,9 +3164,10 @@ class Engine private constructor(private val app: Context) {
         val buf = ByteArray(4096)
         val pkt = DatagramPacket(buf, buf.size)
         while (true) {
+            val socket = udp
             try {
                 pkt.length = buf.size
-                udp.receive(pkt)
+                socket.receive(pkt)
                 val now = System.nanoTime()
                 udpPackets.incrementAndGet()
                 val m = Wire.decode(pkt.data, pkt.length)
@@ -2983,7 +3193,9 @@ class Engine private constructor(private val app: Context) {
                     }
                 }
             } catch (e: Exception) {
-                udpReceiveFailures.incrementAndGet(); udpReceiveError.set(e); SystemClock.sleep(10)
+                if (socket === udp) {
+                    udpReceiveFailures.incrementAndGet(); udpReceiveError.set(e); SystemClock.sleep(10)
+                }
             }
         }
     }
@@ -3006,11 +3218,26 @@ class Engine private constructor(private val app: Context) {
         }
     }
 
+    private fun measurePointChannelSignal() {
+        val st = serverPlay
+        val tl = st.timeline
+        if (!tl.playing) return
+        val start = tl.frameAt(System.nanoTime() + SF.LEAD_NS).toLong().coerceAtLeast(0)
+        if (start >= st.source.totalFrames) return
+        val count = minOf((SF.SAMPLE_RATE / 10).toLong(), st.source.totalFrames - start).toInt()
+        if (count <= 0) return
+        val channel = Ch.other(st.channel)
+        val samples = FloatArray(count) { index ->
+            val frame = start + index
+            st.source.sample(frame, channel) * tl.envelope(frame)
+        }
+        pointChannelSignal.add(samples, 0, samples.size)
+    }
+
     private fun packet(st: ServerPlayState, tl: Timeline, seq: Int, start: Long, flags: Int): ByteArray {
         val count = minOf(SF.PACKET_FRAMES.toLong(), st.source.totalFrames - start).toInt().coerceAtLeast(0)
         val pCh = Ch.other(st.channel)
         val s = ShortArray(count) { i -> (st.source.sample(start + i, pCh) * 32767f).roundToInt().coerceIn(-32768, 32767).toShort() }
-        if (flags == 0) pointChannelSignal.addPcm16(s, count)
         return Wire.audio(sessionId, tl.epoch, seq, start, tl.timeOf(start), System.nanoTime(), flags, s, count)
     }
 
@@ -3057,7 +3284,13 @@ class Engine private constructor(private val app: Context) {
             lastPing = now
             if (pingBurst > 0) pingBurst--
             val b = Wire.ping(sessionId, now, pingSeq++)
-            udp.send(DatagramPacket(b, b.size, addr))
+            try {
+                udp.send(DatagramPacket(b, b.size, addr))
+                pointPingPacketsSent.incrementAndGet()
+            } catch (e: Exception) {
+                pointPingSendErrors.incrementAndGet()
+                telemetry.limited("UDP_POINT_PING_SEND_FAILED", "network=$udpBoundNetworkLabel localAddress=$udpBoundLocalAddress target=${addr.address.hostAddress}:${addr.port}", e)
+            }
         }
         val nacks = rx.collectNacks(now)
         if (nacks.isNotEmpty()) {

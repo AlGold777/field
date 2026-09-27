@@ -252,7 +252,9 @@ internal object TelemetrySummary {
         val records = journal.lineSequence().filter { it.isNotBlank() }.toList()
         if (records.isEmpty()) return "$label=missing"
         val deviceRecord = records.firstOrNull { event(it) == "DEVICE_INFO" }.orEmpty()
-        val identityRecord = records.firstOrNull {
+        // Engine starts with Role.SERVER before pairing is established. Use the latest identity
+        // record so a phone that becomes Point is not mislabeled from its startup events.
+        val identityRecord = records.lastOrNull {
             rolePattern.find(it)?.groupValues?.get(1)?.isNotBlank() == true &&
                 devicePattern.find(it)?.groupValues?.get(1)?.isNotBlank() == true
         } ?: records.first()

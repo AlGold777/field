@@ -22,20 +22,23 @@ class ControlLink(
     private val onMessage: (ControlLink, JSONObject) -> Unit,
     private val onClosed: (ControlLink) -> Unit,
     private val telemetry: Telemetry,
+    initialTag: String = "",
+    val localNetwork: String = "unknown",
 ) {
     companion object { private val ids = AtomicLong() }
     val id = ids.incrementAndGet()
     private fun event(kind: String, detail: String = "", error: Throwable? = null) =
-        telemetry.event(kind, "link=$id tag=$tag remote=${socket.remoteSocketAddress} $detail", error)
+        telemetry.event(kind, "link=$id tag=$tag local=${localAddress.hostAddress}:${socket.localPort} network=$localNetwork remote=${socket.remoteSocketAddress} $detail", error)
 
     val remoteAddress: InetAddress = socket.inetAddress
+    val localAddress: InetAddress = socket.localAddress
     @Volatile var lastRx = SystemClock.elapsedRealtime(); private set
     private val closed = AtomicBoolean(false)
     private val out = DataOutputStream(BufferedOutputStream(socket.getOutputStream()))
     private val writer = Executors.newSingleThreadExecutor { Thread(it, "sf-tcp-write") }
 
     /** Произвольная метка, которую Engine использует для сопоставления (invite/resume/paired). */
-    @Volatile var tag: String = ""
+    @Volatile var tag: String = initialTag
 
     init {
         event("TCP_OPEN")
@@ -48,7 +51,7 @@ class ControlLink(
 
     private fun message(direction: String, o: JSONObject) {
         val type = o.optString("t")
-        if (type in setOf("invite", "resume", "accept", "reject", "busy", "cancel", "ringing", "session", "bye"))
+        if (type in setOf("invite", "resume", "accept", "reject", "busy", "cancel", "ringing", "session", "bye", "network-warning"))
             event(direction, "type=$type reason=${o.optString("reason")} tcpPort=${o.optInt("tcpPort")} udpPort=${o.optInt("udpPort")}")
     }
 
