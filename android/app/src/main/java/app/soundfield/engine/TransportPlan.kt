@@ -35,3 +35,15 @@ object TransportPlan {
         return hosts.flatMap { host -> networks.map { network -> PlannedConnection(host, network) } }
     }
 }
+
+/** Deterministic tie-breaker for crossed invite/resume attempts: the larger ID accepts inbound. */
+object CrossedConnectionPolicy {
+    fun acceptInbound(localId: String, peerId: String): Boolean = localId > peerId
+}
+
+object ReconnectBackoff {
+    fun delayMs(attempt: Int, hasWifi: Boolean): Long {
+        val exponential = 1_000L shl (attempt.coerceAtLeast(0) / 2).coerceAtMost(4)
+        return exponential.coerceAtMost(if (hasWifi) 3_000L else 15_000L)
+    }
+}

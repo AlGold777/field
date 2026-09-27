@@ -99,6 +99,12 @@ class Engine private constructor(private val app: Context) {
         val networkId: String get() = network.toString()
     }
     private data class UdpBindResult(val success: Boolean, val portChanged: Boolean)
+    private data class ConnectionCandidate(val host: InetAddress, val route: NetworkRoute?) {
+        fun label() = "${route?.label ?: "process_default"} → ${host.hostAddress}"
+    }
+    private data class ConnectedSocket(val socket: Socket, val route: NetworkRoute?, val host: InetAddress)
+    private class ConnectionAttemptsException(val outcomes: List<String>, cause: Throwable?) :
+        Exception("All ${outcomes.size} connection candidates failed", cause)
 
     companion object {
         const val TAG = "SoundField"
@@ -110,6 +116,7 @@ class Engine private constructor(private val app: Context) {
         private fun hex(bytes: Int) = ByteArray(bytes).also { rnd.nextBytes(it) }.joinToString("") { "%02x".format(it) }
         private const val TRANSFER_CHUNK_BYTES = 48 * 1024
         private const val TELEMETRY_MAX_BYTES = 8L * 1024 * 1024
+        private const val CONNECT_STAGGER_MS = 200L
         private const val MAX_TRANSFER_FILE_BYTES = 512L * 1024 * 1024
         private const val MAX_TRANSFER_BATCH_BYTES = 1024L * 1024 * 1024
         private val PROGRESSIVE_LOOKAHEAD_FRAMES =
@@ -149,6 +156,8 @@ class Engine private constructor(private val app: Context) {
     private var previousPointAudioPackets = 0L
     private var reconnectSeriesOp: String? = null
     private var reconnectAttemptOp: String? = null
+    private val reconnectCandidateHistory = java.util.concurrent.ConcurrentLinkedQueue<String>()
+    private var peerUnreachableReported = false
     private var lastCommandOp: String? = null
     private var lastCommandAppliedSrvNs = 0L
     private var lastCommandIssuedSrvNs = 0L
@@ -343,7 +352,16 @@ class Engine private constructor(private val app: Context) {
         tcp = try { ServerSocket(prefs.getInt("tcpPort", 0)) } catch (e: Exception) { telemetry.event("TCP_LISTEN_FALLBACK", error = e); ServerSocket(0) }
         prefs.edit().putInt("tcpPort", tcp.localPort).apply()
         udp = DatagramSocket(0)
-        discovery = Discovery(app, myId) { peers -> ui { copy(nearby = peers) } }
+        discovery = Discovery(app, myId) { peers ->
+            ui { copy(nearby = peers) }
+            post {
+                val knownPeer = record?.peerId
+                if (knownPeer != null && peers.any { it.id == knownPeer }) {
+                    if (phase == Phase.RECONNECTING && pending == null) scheduleReconnect(0)
+                    else if (manualResumeActive && phase == Phase.INVITING && pending == null) tryManualResume()
+                }
+            }
+        }
         Thread({ acceptLoop() }, "sf-accept").apply { isDaemon = true; start() }
         Thread({ udpLoop() }, "sf-udp").apply { isDaemon = true; priority = Thread.MAX_PRIORITY - 1; start() }
         Thread({ tickLoop() }, "sf-tick").apply { isDaemon = true; priority = Thread.MAX_PRIORITY - 1; start() }
@@ -576,6 +594,14 @@ class Engine private constructor(private val app: Context) {
                 // Обновляем из TCP-соединения, которое ядро Linux переключает автоматически.
                 val l = link
                 if (l != null && l.isOpen) {
+                    val activeRoute = routeForLocalAddress(l.localAddress)
+                    if (l.localNetworkId != "unknown" && activeRoute?.networkId != l.localNetworkId) {
+                        telemetry.record("TCP_PATH_LOST", mapOf("localAddress" to l.localAddress.hostAddress,
+                            "oldNetworkId" to l.localNetworkId, "newNetworkId" to (activeRoute?.networkId ?: "unavailable"),
+                            "availableWifiNetworks" to availableNetworkRoutes(wifiOnly = true).map { it.label }))
+                        l.close("control network changed")
+                        return
+                    }
                     zeroSendRenewStreak = 0
                     udpNetworkRebindAttempted = false
                     udpFailureNoticeShown = false
@@ -1522,19 +1548,21 @@ class Engine private constructor(private val app: Context) {
     private fun resumeTarget(rec: PairRecord): Peer? {
         resumeAttempt++
         val found = discovery.peer(rec.peerId)?.takeIf { it.host != null }
-        val direct = rec.lastHost?.takeIf { rec.lastPort > 0 }?.let { h ->
-            try { Peer(rec.peerId, rec.peerName, rec.peerPlatform, InetAddress.getByName(h), rec.lastPort) } catch (_: Exception) { null }
+        val storedHosts = rec.peerAddresses.mapNotNull { address ->
+            runCatching { InetAddress.getByName(address.ip) }.getOrNull()
         }
-        return when {
-            found != null && direct == null -> found
-            found == null && direct != null -> direct
-            found != null && direct != null -> {
-                // Если хост совпадает, но порт разный — mDNS-порт гарантированно актуальнее, чем сохранённый в кэше direct
-                if (found.host == direct.host && found.port != direct.port) found
-                else if (resumeAttempt % 2 == 1) found else direct
-            }
-            else -> null
-        }
+        val successful = rec.lastSuccessfulHost ?: rec.lastHost
+        val preferred = successful?.let { runCatching { InetAddress.getByName(it) }.getOrNull() }
+        val mdnsHosts = found?.hosts.orEmpty().ifEmpty { listOfNotNull(found?.host) }
+        val allHosts = (listOfNotNull(preferred) + mdnsHosts + storedHosts).distinctBy { it.hostAddress }
+        if (allHosts.isEmpty()) return null
+        val port = found?.port?.takeIf { it > 0 } ?: rec.lastPort
+        if (port <= 0) return null
+        return Peer(rec.peerId, rec.peerName, rec.peerPlatform, preferred ?: mdnsHosts.firstOrNull() ?: storedHosts.firstOrNull(),
+            port, found?.supportsRinging ?: false, hosts = mdnsHosts.ifEmpty { allHosts },
+            addresses = TransportPlan.mergeAddresses(found?.addresses.orEmpty(), rec.peerAddresses),
+            lastSuccessfulHost = successful,
+            historyHosts = listOfNotNull(rec.lastHost) + rec.peerAddresses.map { it.ip })
     }
 
     private fun resumeJson(rec: PairRecord) = JSONObject().put("t", "resume").put("id", myId).put("name", myName)
@@ -1546,7 +1574,22 @@ class Engine private constructor(private val app: Context) {
         .put("caps", localCapabilitiesJson()).put("addrs", addressesJson())
 
     private fun connectOutgoing(p: Peer, tag: String, first: JSONObject, timeoutMs: Long) {
-        val host = p.host ?: return onConnectFailed(tag)
+        val routes = availableNetworkRoutes(wifiOnly = true)
+        val networks = routes.map { it.networkId }.ifEmpty { listOf("process_default") }
+        val planned = TransportPlan.candidates(
+            lastSuccessfulHost = p.lastSuccessfulHost,
+            mdns = p.hosts.mapNotNull { it.hostAddress },
+            exchanged = p.addresses.map { it.ip },
+            history = p.historyHosts + listOfNotNull(p.host?.hostAddress),
+            networkIds = networks,
+        )
+        val routeById = routes.associateBy { it.networkId }
+        val candidates = planned.mapNotNull { plannedCandidate ->
+            val host = runCatching { InetAddress.getByName(plannedCandidate.host) }.getOrNull() ?: return@mapNotNull null
+            ConnectionCandidate(host, routeById[plannedCandidate.networkId])
+        }.distinctBy { it.route?.networkId to it.host.hostAddress }
+        if (candidates.isEmpty()) return onConnectFailed(tag)
+        val firstHost = candidates.first().host
         pendingPeer = p
         val attemptOp = if (tag == "resume-out" && phase == Phase.RECONNECTING) java.util.UUID.randomUUID().toString() else null
         if (attemptOp != null) {
@@ -1554,18 +1597,25 @@ class Engine private constructor(private val app: Context) {
             telemetry.record("RECONNECT_ATTEMPT_START", mapOf("parentOp" to reconnectSeriesOp,
                 "attempt" to resumeAttempt, "method" to "last_ip_or_mdns"), op = attemptOp)
         }
-        val routes = availableNetworkRoutes(wifiOnly = true)
-        telemetry.record("TCP_CONNECT_START", mapOf("tag" to tag, "peer" to p.id, "host" to host.hostAddress,
+        telemetry.record("CONNECT_CANDIDATES", mapOf("tag" to tag, "peer" to p.id,
+            "candidates" to candidates.mapIndexed { index, candidate -> mapOf("index" to index,
+                "network" to (candidate.route?.label ?: "process_default"),
+                "networkId" to (candidate.route?.networkId ?: "process_default"),
+                "localAddresses" to candidate.route?.let { networkAddresses(it.linkProperties)
+                    .filterIsInstance<java.net.Inet4Address>().mapNotNull { address -> address.hostAddress } }.orEmpty(),
+                "remoteAddress" to candidate.host.hostAddress, "remotePort" to p.port) }))
+        telemetry.record("TCP_CONNECT_START", mapOf("tag" to tag, "peer" to p.id,
+            "host" to firstHost.hostAddress, "hosts" to candidates.map { it.host.hostAddress },
             "port" to p.port, "ringing" to p.supportsRinging, "responseTimeoutMs" to timeoutMs,
             "wifiNetworks" to routes.map { it.label }))
         io.execute {
             val started = SystemClock.elapsedRealtime()
             var s: Socket? = null
             try {
-                val connected = connectAcrossWifi(host, p.port, tag, routes)
-                val connectedSocket = connected.first
+                val connected = connectAcrossWifi(candidates, p.port, tag)
+                val connectedSocket = connected.socket
                 s = connectedSocket
-                val connectedRoute = routeForLocalAddress(connectedSocket.localAddress) ?: connected.second
+                val connectedRoute = routeForLocalAddress(connectedSocket.localAddress) ?: connected.route
                 val localAddress = connectedSocket.localAddress.hostAddress ?: connectedSocket.localAddress.toString()
                 val network = connectedRoute?.label ?: "process_default"
                 if (attemptOp != null) telemetry.record("RECONNECT_TCP_CONNECTED", mapOf(
@@ -1576,7 +1626,7 @@ class Engine private constructor(private val app: Context) {
                     "elapsedMs" to SystemClock.elapsedRealtime() - started, "localAddress" to localAddress,
                     "localPort" to connectedSocket.localPort, "network" to network,
                     "networkId" to (connectedRoute?.networkId ?: "unknown"),
-                    "remoteAddress" to host.hostAddress, "remotePort" to p.port))
+                    "remoteAddress" to connected.host.hostAddress, "remotePort" to p.port))
                 post {
                     val stillWanted = when (tag) {
                         "invite-out" -> phase == Phase.INVITING && pendingPeer?.id == p.id
@@ -1592,22 +1642,28 @@ class Engine private constructor(private val app: Context) {
                 }
             } catch (e: Exception) {
                 try { s?.close() } catch (_: Exception) { }
+                val candidateResults = (e as? ConnectionAttemptsException)?.outcomes.orEmpty()
+                if (tag == "resume-out" && phase == Phase.RECONNECTING) {
+                    candidateResults.forEach(reconnectCandidateHistory::add)
+                    while (reconnectCandidateHistory.size > 400) reconnectCandidateHistory.poll()
+                }
                 if (attemptOp != null) {
                     telemetry.record("RECONNECT_ATTEMPT_END", mapOf("elapsedMs" to SystemClock.elapsedRealtime() - started,
                         "result" to "error"), op = attemptOp, error = e)
                     if (reconnectAttemptOp == attemptOp) reconnectAttemptOp = null
                 }
                 telemetry.record("TCP_CONNECT_FAILED", mapOf("tag" to tag, "peer" to p.id,
-                    "host" to host.hostAddress, "port" to p.port, "remote" to "${host.hostAddress}:${p.port}",
+                    "host" to firstHost.hostAddress, "hosts" to candidates.map { it.host.hostAddress },
+                    "port" to p.port, "remote" to candidates.map { "${it.host.hostAddress}:${p.port}" },
                     "local" to routes.map { route -> mapOf("addresses" to networkAddresses(route.linkProperties)
                         .filterIsInstance<java.net.Inet4Address>().mapNotNull { it.hostAddress },
                         "network" to route.label, "networkId" to route.networkId) },
                     "errorMessage" to (e.message ?: e.javaClass.simpleName),
                     "elapsedMs" to SystemClock.elapsedRealtime() - started,
-                    "wifiNetworks" to routes.map { it.label }), error = e)
+                    "wifiNetworks" to routes.map { it.label },
+                    "candidateResults" to candidateResults), error = e)
                 post {
-                    discovery.invalidatePeer(p.id)
-                    log("Нет соединения с ${host.hostAddress}:${p.port} — ${e.message}")
+                    log("Нет соединения с ${candidateResults.joinToString()} — ${e.cause?.message ?: e.message}")
                     onConnectFailed(tag)
                 }
             }
@@ -1615,37 +1671,58 @@ class Engine private constructor(private val app: Context) {
     }
 
     private fun connectAcrossWifi(
-        host: InetAddress,
+        candidates: List<ConnectionCandidate>,
         port: Int,
         tag: String,
-        routes: List<NetworkRoute>,
-    ): Pair<Socket, NetworkRoute?> {
-        val candidates = routes.ifEmpty { listOf(null) }
-        var lastFailure: Exception? = null
-        candidates.forEachIndexed { index, route ->
-            var socket: Socket? = null
-            try {
-                val attemptSocket = route?.network?.socketFactory?.createSocket() ?: Socket()
-                socket = attemptSocket
-                attemptSocket.connect(InetSocketAddress(host, port), 2_500)
-                telemetry.record("TCP_CONNECT_NETWORK_CONNECTED", mapOf("tag" to tag,
-                    "attempt" to (index + 1), "network" to (route?.label ?: "process_default"),
-                    "networkId" to (route?.networkId ?: "process_default"),
-                    "localAddress" to (attemptSocket.localAddress.hostAddress ?: attemptSocket.localAddress.toString()),
-                    "localPort" to attemptSocket.localPort, "remoteAddress" to host.hostAddress, "remotePort" to port))
-                return attemptSocket to route
-            } catch (e: Exception) {
-                try { socket?.close() } catch (_: Exception) { }
-                lastFailure = e
-                val localAddress = route?.let { networkAddresses(it.linkProperties).firstOrNull { address -> address is java.net.Inet4Address } }
-                telemetry.record("TCP_CONNECT_NETWORK_FAILED", mapOf("tag" to tag,
-                    "attempt" to (index + 1), "network" to (route?.label ?: "process_default"),
-                    "networkId" to (route?.networkId ?: "process_default"),
-                    "localAddress" to (localAddress?.hostAddress ?: "unknown"), "errorMessage" to (e.message ?: e.javaClass.simpleName),
-                    "remoteAddress" to host.hostAddress, "remotePort" to port), error = e)
+    ): ConnectedSocket {
+        val sockets = java.util.concurrent.CopyOnWriteArrayList<Socket>()
+        val socketsByCandidate = ConcurrentHashMap<ConnectionCandidate, Socket>()
+        val winningSocket = AtomicReference<Socket?>(null)
+        val race = try {
+            HappyEyeballs.connect(candidates, CONNECT_STAGGER_MS,
+                cancelInFlight = { sockets.forEach { socket ->
+                    if (socket !== winningSocket.get()) try { socket.close() } catch (_: Exception) { }
+                } },
+                onAttempt = { index, candidate, status, error ->
+                    val socket = socketsByCandidate[candidate]
+                    if (status == "connected" && socket != null) winningSocket.set(socket)
+                    val localAddress = socket?.localAddress?.hostAddress ?: candidate.route?.let { route ->
+                        networkAddresses(route.linkProperties).firstOrNull { it is java.net.Inet4Address }?.hostAddress
+                    } ?: "unknown"
+                    val event = when {
+                        status == "connected" -> "TCP_CONNECT_NETWORK_CONNECTED"
+                        status.startsWith("failed:") -> "TCP_CONNECT_NETWORK_FAILED"
+                        else -> "TCP_CONNECT_NETWORK_CANCELLED"
+                    }
+                    telemetry.record(event,
+                        mapOf("tag" to tag, "attempt" to (index + 1), "network" to (candidate.route?.label ?: "process_default"),
+                            "networkId" to (candidate.route?.networkId ?: "process_default"), "localAddress" to localAddress,
+                            "localPort" to (socket?.localPort ?: 0), "remoteAddress" to candidate.host.hostAddress,
+                            "remotePort" to port, "result" to status, "errorMessage" to error?.message), error = error)
+                }) { candidate ->
+                val socket = candidate.route?.network?.socketFactory?.createSocket() ?: Socket()
+                sockets += socket
+                socketsByCandidate[candidate] = socket
+                try {
+                    socket.connect(InetSocketAddress(candidate.host, port), 2_500)
+                    socket
+                } catch (e: Exception) {
+                    try { socket.close() } catch (_: Exception) { }
+                    throw e
+                }
             }
+        } catch (e: AllCandidatesFailed) {
+            val outcomes = e.attempts.map { attempt ->
+                val candidate = attempt.candidate as? ConnectionCandidate
+                "${candidate?.label() ?: attempt.candidate}=${attempt.result}"
+            }
+            telemetry.record("CONNECT_CANDIDATES", mapOf("tag" to tag, "result" to "failed", "routes" to outcomes))
+            throw ConnectionAttemptsException(outcomes, e)
         }
-        throw lastFailure ?: java.net.ConnectException("No available network route")
+        val outcomes = race.attempts.map { attempt -> "${attempt.candidate.label()}=${attempt.result}" }
+        telemetry.record("CONNECT_CANDIDATES", mapOf("tag" to tag, "result" to "connected",
+            "winner" to race.candidate.host.hostAddress, "routes" to outcomes))
+        return ConnectedSocket(race.connection, race.candidate.route, race.candidate.host)
     }
 
     private fun onConnectFailed(tag: String) {
@@ -1734,7 +1811,7 @@ class Engine private constructor(private val app: Context) {
                     pendingTimeout = later(60_000) { if (pending === l) { telemetry.event("INVITE_DECISION_TIMEOUT"); doReject() } }
                 } else if (phase == Phase.INVITING && pendingPeer?.id == pid) {
                     // Встречные приглашения: уступает телефон с бо́льшим id (детерминированно на обеих сторонах).
-                    if (myId > pid) {
+                    if (CrossedConnectionPolicy.acceptInbound(myId, pid)) {
                         pending?.let { it.tag = "dead"; it.close() }
                         l.tag = "incoming"; pending = l
                         pendingPeer = Peer(pid, pname, pplat, l.remoteAddress, o.optInt("tcpPort", 0),
@@ -1765,7 +1842,8 @@ class Engine private constructor(private val app: Context) {
                 // Оба телефона стучатся друг к другу одновременно — оставляем одно соединение детерминированно:
                 // входящее принимает телефон с бо́льшим id (как и для встречных приглашений).
                 val mine = pending
-                if (mine != null && (mine.tag == "resume-out" || mine.tag == "resume-auto") && myId < pid) {
+                if (mine != null && (mine.tag == "resume-out" || mine.tag == "resume-auto") &&
+                    !CrossedConnectionPolicy.acceptInbound(myId, pid)) {
                     l.tag = "dead"; l.sendAndClose(JSONObject().put("t", "reject").put("reason", "crossed")); return
                 }
                 // старое (возможно, «мёртвое») соединение заменяется новым
@@ -1927,6 +2005,8 @@ class Engine private constructor(private val app: Context) {
                      peerAddresses = allPeerAddresses, lastSuccessfulHost = host)
         peerAddressSnapshot = emptyList()
         peerCapabilities = emptySet()
+        peerUnreachableReported = false
+        reconnectCandidateHistory.clear()
         persistRecord()
         setAutoResume(true)
         requestDozeExemption()
@@ -1970,9 +2050,7 @@ class Engine private constructor(private val app: Context) {
 
     /** Экспоненциальный backoff: 1с → 2с → 4с → 8с → 15с (потолок). */
     private fun reconnectDelay(): Long {
-        val base = 1_000L
-        val exp = minOf(resumeAttempt / 2, 4)
-        return minOf(base shl exp, 15_000L)
+        return ReconnectBackoff.delayMs(resumeAttempt, availableNetworkRoutes(wifiOnly = true).isNotEmpty())
     }
 
     private fun onLinkLost() {
@@ -1985,6 +2063,8 @@ class Engine private constructor(private val app: Context) {
         ui { copy(phase = Phase.RECONNECTING, linkOk = false, audioMissing = false) }
         log("Связь с «$peerName» потеряна")
         reconnectSince = SystemClock.elapsedRealtime()
+        peerUnreachableReported = false
+        reconnectCandidateHistory.clear()
         reconnectSeriesOp = java.util.UUID.randomUUID().toString()
         telemetry.record("RECONNECT_START", mapOf("reason" to "tcp_link_lost", "role" to role.name.lowercase()),
             op = reconnectSeriesOp)
@@ -2015,6 +2095,13 @@ class Engine private constructor(private val app: Context) {
         if (phase != Phase.RECONNECTING || pending != null) return
         val rec = record ?: return
         val now = SystemClock.elapsedRealtime()
+        if (!peerUnreachableReported && now - reconnectSince >= 60_000L) {
+            peerUnreachableReported = true
+            val attempts = reconnectCandidateHistory.toList()
+            telemetry.record("PEER_UNREACHABLE", mapOf("peer" to rec.peerId, "peerName" to rec.peerName,
+                "elapsedMs" to now - reconnectSince, "attemptedRoutes" to attempts))
+            toast("Не удаётся найти «${rec.peerName}» больше минуты. Проверьте Wi‑Fi на обоих телефонах; при двойном Wi‑Fi попробуйте оставить одну сеть.")
+        }
         if (now - lastBrowseRestart > 20_000) { lastBrowseRestart = now; discovery.restartBrowse() }
         val p = resumeTarget(rec)
         if (p == null) { scheduleReconnect(reconnectDelay()); return }
@@ -3242,6 +3329,10 @@ class Engine private constructor(private val app: Context) {
         val result = linkedMapOf<String, Map<String, Any?>>()
         val playing = serverDiag.playing || pointDiag.playing
         fun violation(name: String, values: Map<String, Any?>) { result[name] = values }
+        if (phase == Phase.RECONNECTING && reconnectSince > 0 && nowMs - reconnectSince >= 60_000L) {
+            violation("PEER_UNREACHABLE", mapOf("peer" to peerId, "peerName" to peerName,
+                "elapsedMs" to nowMs - reconnectSince, "attemptedRoutes" to reconnectCandidateHistory.toList()))
+        }
         if (phase == Phase.PAIRED && playing && (pointDiag.audioAgeMs < 0 || pointDiag.audioAgeMs >= 1_000)) {
             violation("POINT_NO_PACKETS", mapOf("audioAgeMs" to pointDiag.audioAgeMs, "sessionId" to pointDiag.sessionId))
         }

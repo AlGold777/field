@@ -1,6 +1,7 @@
 package app.soundfield.engine
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class TransportPlanTest {
@@ -33,5 +34,17 @@ class TransportPlanTest {
     @Test fun missingWifiStillHasProcessDefaultCandidate() {
         assertEquals(listOf(PlannedConnection("192.168.1.9", "process_default")),
             TransportPlan.candidates(null, listOf("192.168.1.9"), emptyList(), emptyList(), emptyList()))
+    }
+
+    @Test fun crossedConnectionsHaveExactlyOneInboundWinner() {
+        assertTrue(CrossedConnectionPolicy.acceptInbound("b", "a"))
+        assertEquals(false, CrossedConnectionPolicy.acceptInbound("a", "b"))
+        assertEquals(false, CrossedConnectionPolicy.acceptInbound("same", "same"))
+    }
+
+    @Test fun reconnectBackoffIsShortWhileWifiExists() {
+        assertTrue((0..20).all { ReconnectBackoff.delayMs(it, hasWifi = true) <= 3_000L })
+        assertEquals(15_000L, ReconnectBackoff.delayMs(20, hasWifi = false))
+        assertEquals(1_000L, ReconnectBackoff.delayMs(0, hasWifi = false))
     }
 }

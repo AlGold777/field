@@ -133,6 +133,7 @@ internal object AndroidTelemetryRules {
         IncidentRule("STATE_MISMATCH", "warn", 3_000),
         IncidentRule("LOOP_LATENCY", "warn", 5_000),
         IncidentRule("LINK_SILENT", "error", 0),
+        IncidentRule("PEER_UNREACHABLE", "error", 0),
     )
 }
 

@@ -17,6 +17,8 @@ data class Peer(
     /** All resolved mDNS addresses; `host` remains the compatibility/preferred address. */
     val hosts: List<InetAddress> = listOfNotNull(host),
     val addresses: List<PeerAddress> = emptyList(),
+    val lastSuccessfulHost: String? = null,
+    val historyHosts: List<String> = emptyList(),
 )
 
 data class PeerAddress(val ip: String, val iface: String, val networkId: String) {
