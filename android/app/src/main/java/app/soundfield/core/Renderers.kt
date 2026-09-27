@@ -1,5 +1,7 @@
 package app.soundfield.core
 
+import java.util.concurrent.atomic.AtomicLong
+
 /**
  * Рендер на Server: канал serverCh текущего источника, по общей временной шкале.
  * Часы Server — эталон, поэтому presentLocalNs уже в «часах Server».
@@ -9,7 +11,10 @@ class ServerRenderer(
 ) : RenderSource {
     val corrector = PlayoutCorrector()
     private val ramp = GainRamp()
-    @Volatile var underruns = 0L; private set
+    val underruns = AtomicLong()
+    val sourceMissingFrames = AtomicLong()
+    val windowSourceMissingFrames = AtomicLong()
+    private var inSourceUnderrun = false
     @Volatile var positionFrame = 0L; private set
 
     override fun render(out: FloatArray, n: Int, presentLocalNs: Long) {
@@ -20,11 +25,24 @@ class ServerRenderer(
         }
         corrector.plan(tl.frameAt(presentLocalNs), n)
         val src = st.source
+        var sourceMissing = 0L
+        val progressive = src as? SegmentedPcmSource
         for (i in 0 until n) {
             val f = corrector.frame(i, n)
             val g = tl.envelope(f)
-            out[i] = if (g == 0f) 0f else src.sample(f, st.channel) * g
+            if (g == 0f) out[i] = 0f else {
+                out[i] = src.sample(f, st.channel) * g
+                if (progressive != null && !progressive.complete && f < progressive.totalFrames && f >= progressive.readyFrames) {
+                    sourceMissing++
+                }
+            }
         }
+        if (sourceMissing > 0) {
+            sourceMissingFrames.addAndGet(sourceMissing)
+            windowSourceMissingFrames.addAndGet(sourceMissing)
+            if (!inSourceUnderrun) underruns.incrementAndGet()
+            inSourceUnderrun = true
+        } else inSourceUnderrun = false
         positionFrame = corrector.frame(n - 1, n)
         ramp.apply(out, n, st.gain)
     }
@@ -49,8 +67,10 @@ class PointRenderer(
 ) : RenderSource {
     val corrector = PlayoutCorrector()
     private val ramp = GainRamp()
-    @Volatile var underrunFrames = 0L; private set
-    @Volatile var underrunEvents = 0L; private set
+    val underrunFrames = AtomicLong()
+    val windowUnderrunFrames = AtomicLong()
+    val underrunEvents = AtomicLong()
+    @Volatile var debugSilence = false
     private var inUnderrun = false
 
     override fun render(out: FloatArray, n: Int, presentLocalNs: Long) {
@@ -73,11 +93,13 @@ class PointRenderer(
             } else out[i] = s * g
         }
         if (missing > 0) {
-            underrunFrames += missing
-            if (!inUnderrun) { underrunEvents++; inUnderrun = true }
+            underrunFrames.addAndGet(missing.toLong())
+            windowUnderrunFrames.addAndGet(missing.toLong())
+            if (!inUnderrun) { underrunEvents.incrementAndGet(); inUnderrun = true }
         } else inUnderrun = false
         rx.lastRenderedFrame = corrector.frame(n - 1, n)
         ramp.apply(out, n, p.gain)
+        if (debugSilence) java.util.Arrays.fill(out, 0, n, 0f)
     }
 }
 

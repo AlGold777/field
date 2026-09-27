@@ -86,7 +86,7 @@ fun AppRoot(engine: Engine) {
             !ui.inPair -> WelcomeScreen(ui, engine)
             sub == Sub.CALIBRATION -> CalibrationScreen(ui, engine,
                 requestMic = { micLauncher.launch(Manifest.permission.RECORD_AUDIO) }, onBack = { sub = Sub.NONE })
-            sub == Sub.DIAGNOSTICS -> DiagnosticsScreen(ui, onBack = { sub = Sub.NONE })
+            sub == Sub.DIAGNOSTICS -> DiagnosticsScreen(ui, engine, onBack = { sub = Sub.NONE })
             else -> PlayerScreen(ui, engine, openCalibration = { sub = Sub.CALIBRATION }, openDiagnostics = { sub = Sub.DIAGNOSTICS },
                 openTrackPicker = { engine.requestTrackPicker() })
         }

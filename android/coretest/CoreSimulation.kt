@@ -167,7 +167,7 @@ fun testEndToEnd(lossPct: Double, jitterMs: Double, spikePct: Double, limitP95: 
     check("sync p95 < $limitP95 ms", p95 < limitP95, "p95=%.3f ms mean=%.3f ms, n=%d".format(p95, mean, errs.size))
     val totalPk = seq.toDouble()
     println("  received=${rx.received} lostFinal=${rx.lostFinal} recovered=${rx.recovered} late=${rx.late} " +
-        "underrunEvents=${renderer.underrunEvents} jitter=%.2f ms buffer=%.0f ms drift=%.1f ppm hardJumps=${renderer.corrector.hardJumps}"
+        "underrunEvents=${renderer.underrunEvents.get()} jitter=%.2f ms buffer=%.0f ms drift=%.1f ppm hardJumps=${renderer.corrector.hardJumps}"
             .format(rx.jitterMs, rx.bufferMs, cs.driftPpm))
     check("unrecovered loss < 0.5%", rx.lostFinal / totalPk < 0.005, "${rx.lostFinal}/${totalPk.toInt()}")
     check("hard jumps ≤ 1", renderer.corrector.hardJumps <= 1, "${renderer.corrector.hardJumps}")

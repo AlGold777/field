@@ -1,7 +1,6 @@
 package app.soundfield.audio
 
 import android.content.Context
-import app.soundfield.diagnostics.Telemetry
 import android.media.AudioAttributes
 import android.media.AudioDeviceCallback
 import android.media.AudioDeviceInfo
@@ -13,10 +12,13 @@ import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.os.Process
-import android.util.Log
 import app.soundfield.core.AudioPlayoutClock
 import app.soundfield.core.RenderSource
 import app.soundfield.core.SF
+import app.soundfield.diagnostics.AtomicSignalMeter
+import app.soundfield.diagnostics.SignalWindow
+import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicReference
 
 /**
  * Аудиовыход: AudioTrack (моно, float, 48 кГц) с собственным потоком записи.
@@ -32,6 +34,14 @@ class AudioOutput(private val ctx: Context) {
     @Volatile var latencyMs = 0.0; private set
     @Volatile var underruns = 0L; private set
     @Volatile var timestampOk = false; private set
+    private val outputSignal = AtomicSignalMeter()
+    private val timestampFrames = AtomicLong()
+    private val timestampGeneration = AtomicLong()
+    private val recoveryCount = AtomicLong()
+    private val recoveryError = AtomicReference<Throwable?>(null)
+    private var lastMetricsAtMs = 0L
+    private var lastMetricsFrames = 0L
+    private var lastMetricsGeneration = -1L
 
     @Volatile private var thread: Thread? = null
     private val am = ctx.getSystemService(Context.AUDIO_SERVICE) as AudioManager
@@ -43,6 +53,52 @@ class AudioOutput(private val ctx: Context) {
     }
 
     val isRunning get() = thread?.isAlive == true
+
+    internal data class Window(
+        val signal: SignalWindow,
+        val framesPerSecond: Double,
+        val timestampValid: Boolean,
+        val streamVolume: Int,
+        val streamMinVolume: Int,
+        val streamMaxVolume: Int,
+        val streamMuted: Boolean,
+        val route: String,
+        val audioFocus: Boolean,
+        val recoveryCount: Long,
+        val recoveryError: Throwable?,
+    )
+
+    /** Called by heartbeat only. Audio processing updates the raw signal and timestamp counters atomically. */
+    @Suppress("DEPRECATION")
+    internal fun takeWindow(audioFocus: Boolean): Window {
+        val now = android.os.SystemClock.elapsedRealtime()
+        val generation = timestampGeneration.get()
+        val frames = timestampFrames.get()
+        val elapsed = if (lastMetricsAtMs == 0L || generation != lastMetricsGeneration) 0L else now - lastMetricsAtMs
+        val advanced = if (generation != lastMetricsGeneration) 0L else (frames - lastMetricsFrames).coerceAtLeast(0L)
+        val fps = if (elapsed > 0) advanced * 1000.0 / elapsed else 0.0
+        lastMetricsAtMs = now
+        lastMetricsFrames = frames
+        lastMetricsGeneration = generation
+        val device = if (Build.VERSION.SDK_INT >= 23) track?.routedDevice else null
+        return Window(
+            outputSignal.take(), fps, timestampOk,
+            am.getStreamVolume(AudioManager.STREAM_MUSIC),
+            if (Build.VERSION.SDK_INT >= 28) am.getStreamMinVolume(AudioManager.STREAM_MUSIC) else 0,
+            am.getStreamMaxVolume(AudioManager.STREAM_MUSIC), am.isStreamMute(AudioManager.STREAM_MUSIC),
+            route(device), audioFocus, recoveryCount.getAndSet(0), recoveryError.getAndSet(null),
+        )
+    }
+
+    private fun route(device: AudioDeviceInfo?): String = when (device?.type) {
+        AudioDeviceInfo.TYPE_BUILTIN_SPEAKER -> "speaker"
+        AudioDeviceInfo.TYPE_BUILTIN_SPEAKER_SAFE -> "speaker_safe"
+        AudioDeviceInfo.TYPE_WIRED_HEADSET, AudioDeviceInfo.TYPE_WIRED_HEADPHONES -> "wired"
+        AudioDeviceInfo.TYPE_BLUETOOTH_A2DP, AudioDeviceInfo.TYPE_BLUETOOTH_SCO,
+        AudioDeviceInfo.TYPE_BLE_HEADSET, AudioDeviceInfo.TYPE_BLE_SPEAKER -> "bluetooth"
+        null -> "unknown"
+        else -> "other:${device.type}"
+    }
 
     @Synchronized fun start() {
         if (isRunning) return
@@ -80,8 +136,8 @@ class AudioOutput(private val ctx: Context) {
                 } catch (_: InterruptedException) {
                     break
                 } catch (e: Exception) {
-                    Log.w("SoundField", "Recreating audio output", e)
-                    Telemetry.get(ctx).limited("AUDIO_RECOVERY", error = e)
+                    recoveryCount.incrementAndGet()
+                    recoveryError.set(e)
                     if (active()) Thread.sleep(250)
                 }
             }
@@ -107,6 +163,7 @@ class AudioOutput(private val ctx: Context) {
         try {
             check(t.state == AudioTrack.STATE_INITIALIZED) { "AudioTrack is not initialized" }
             track = t
+            timestampGeneration.incrementAndGet()
             pinSpeaker()
             val n = 240 // 5 мс на блок
             val buf = FloatArray(n)
@@ -120,7 +177,10 @@ class AudioOutput(private val ctx: Context) {
                 val now = System.nanoTime()
                 if (lastPoll == Long.MIN_VALUE || now - lastPoll >= 100_000_000L) {
                     lastPoll = now
-                    if (t.getTimestamp(ts)) timing.timestamp(ts.framePosition, ts.nanoTime)
+                    if (t.getTimestamp(ts)) {
+                        timing.timestamp(ts.framePosition, ts.nanoTime)
+                        timestampFrames.set(ts.framePosition)
+                    }
                     else timing.invalidateTimestamp()
                 }
                 val head = t.playbackHeadPosition.toLong() and 0xFFFFFFFFL
@@ -140,6 +200,7 @@ class AudioOutput(private val ctx: Context) {
                         check(System.nanoTime() - lastWrite < 2_000_000_000L) { "AudioTrack.write stalled" }
                         Thread.sleep(2)
                     } else {
+                        outputSignal.add(buf, off, r)
                         off += r
                         timing.accepted(r)
                         lastWrite = System.nanoTime()

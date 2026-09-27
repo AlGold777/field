@@ -77,20 +77,89 @@ data class Diag(
     /** Сколько мс назад Point принял последний audio-пакет; −1 означает, что аудио ещё не приходило. */
     val audioAgeMs: Long = -1,
     val valid: Boolean = false,
+    val pairTag: String = "",
+    val sessionId: Int = 0,
+    val epoch: Int = 0,
+    val trackTag: String = "",
+    val playbackPhase: String = "",
+    val playing: Boolean = false,
+    val outputRmsDbfs: Double = -120.0,
+    val outputPeakDbfs: Double = -120.0,
+    val outputSilentFrames: Long = 0,
+    val outputFramesPerSecond: Double = 0.0,
+    val outputTimestampValid: Boolean = false,
+    val musicVolume: Int = -1,
+    val musicVolumeMin: Int = 0,
+    val musicVolumeMax: Int = 0,
+    val musicMuted: Boolean = false,
+    val audioRoute: String = "unknown",
+    val audioFocus: Boolean = false,
+    val serverChannelRmsDbfs: Double = -120.0,
+    val decodeLeadFrames: Long = -1,
+    val decodeReadyFrames: Long = -1,
+    val decodePositionFrame: Long = -1,
+    val tickP95Ms: Double = 0.0,
+    val heartbeatIntervalMs: Double = 0.0,
+    val tcpRxAgeMs: Long = -1,
+    val udpPacketsPerSec: Long = 0,
+    val sentAudioPacketsPerSec: Long = 0,
+    val udpInvalid: Long = 0,
+    val udpOtherSession: Long = 0,
+    val nacksSent: Long = 0,
+    val offsetMs: Double = 0.0,
+    val trimMs: Double = 0.0,
+    val hardJumps: Int = 0,
+    val slewEvents: Long = 0,
+    val decodeComplete: Boolean = true,
+    val decodeTotalFrames: Long = -1,
 ) {
     fun toJson(t: String): JSONObject = JSONObject().apply {
         put("t", t); put("rtt", rttMs); put("rttJit", rttJitterMs); put("jitter", jitterMs); put("loss", lossPct)
         put("recovered", recovered); put("late", late); put("stale", stale); put("buffer", bufferMs)
         put("drift", driftPpm); put("unc", clockUncMs); put("underruns", underruns); put("syncErr", syncErrMs)
         put("latency", latencyMs); put("resent", resent); put("clockReady", clockReady); put("audioAge", audioAgeMs)
+        put("pairTag", pairTag); put("sessionId", sessionId); put("epoch", epoch); put("trackTag", trackTag)
+        put("playbackPhase", playbackPhase); put("playing", playing)
+        put("outputRmsDbfs", outputRmsDbfs); put("outputPeakDbfs", outputPeakDbfs)
+        put("outputSilentFrames", outputSilentFrames); put("outputFps", outputFramesPerSecond)
+        put("outputTimestampValid", outputTimestampValid); put("musicVolume", musicVolume)
+        put("musicVolumeMin", musicVolumeMin); put("musicVolumeMax", musicVolumeMax); put("musicMuted", musicMuted)
+        put("audioRoute", audioRoute); put("audioFocus", audioFocus); put("serverChannelRmsDbfs", serverChannelRmsDbfs)
+        put("decodeLeadFrames", decodeLeadFrames); put("decodeReadyFrames", decodeReadyFrames)
+        put("decodePositionFrame", decodePositionFrame); put("tickP95Ms", tickP95Ms)
+        put("heartbeatIntervalMs", heartbeatIntervalMs); put("tcpRxAgeMs", tcpRxAgeMs)
+        put("udpPacketsPerSec", udpPacketsPerSec); put("sentAudioPacketsPerSec", sentAudioPacketsPerSec)
+        put("udpInvalid", udpInvalid); put("udpOtherSession", udpOtherSession); put("nacksSent", nacksSent)
+        put("offsetMs", offsetMs); put("trimMs", trimMs); put("hardJumps", hardJumps); put("slewEvents", slewEvents)
+        put("decodeComplete", decodeComplete)
+        put("decodeTotalFrames", decodeTotalFrames)
     }
 
     companion object {
         fun fromJson(o: JSONObject) = Diag(
-            o.optDouble("rtt"), o.optDouble("rttJit"), o.optDouble("jitter"), o.optDouble("loss"),
-            o.optLong("recovered"), o.optLong("late"), o.optLong("stale"), o.optDouble("buffer"),
-            o.optDouble("drift"), o.optDouble("unc"), o.optLong("underruns"), o.optDouble("syncErr"),
-            o.optDouble("latency"), o.optLong("resent"), o.optBoolean("clockReady"), o.optLong("audioAge", -1), true,
+            rttMs = o.optDouble("rtt"), rttJitterMs = o.optDouble("rttJit"), jitterMs = o.optDouble("jitter"),
+            lossPct = o.optDouble("loss"), recovered = o.optLong("recovered"), late = o.optLong("late"),
+            stale = o.optLong("stale"), bufferMs = o.optDouble("buffer"), driftPpm = o.optDouble("drift"),
+            clockUncMs = o.optDouble("unc"), underruns = o.optLong("underruns"), syncErrMs = o.optDouble("syncErr"),
+            latencyMs = o.optDouble("latency"), resent = o.optLong("resent"), clockReady = o.optBoolean("clockReady"),
+            audioAgeMs = o.optLong("audioAge", -1), valid = true,
+            pairTag = o.optString("pairTag"), sessionId = o.optInt("sessionId"), epoch = o.optInt("epoch"),
+            trackTag = o.optString("trackTag"), playbackPhase = o.optString("playbackPhase"), playing = o.optBoolean("playing"),
+            outputRmsDbfs = o.optDouble("outputRmsDbfs", -120.0), outputPeakDbfs = o.optDouble("outputPeakDbfs", -120.0),
+            outputSilentFrames = o.optLong("outputSilentFrames"), outputFramesPerSecond = o.optDouble("outputFps"),
+            outputTimestampValid = o.optBoolean("outputTimestampValid"), musicVolume = o.optInt("musicVolume", -1),
+            musicVolumeMin = o.optInt("musicVolumeMin"), musicVolumeMax = o.optInt("musicVolumeMax"), musicMuted = o.optBoolean("musicMuted"),
+            audioRoute = o.optString("audioRoute", "unknown"), audioFocus = o.optBoolean("audioFocus"),
+            serverChannelRmsDbfs = o.optDouble("serverChannelRmsDbfs", -120.0), decodeLeadFrames = o.optLong("decodeLeadFrames", -1),
+            decodeReadyFrames = o.optLong("decodeReadyFrames", -1), decodePositionFrame = o.optLong("decodePositionFrame", -1),
+            tickP95Ms = o.optDouble("tickP95Ms"), heartbeatIntervalMs = o.optDouble("heartbeatIntervalMs"),
+            tcpRxAgeMs = o.optLong("tcpRxAgeMs", -1), udpPacketsPerSec = o.optLong("udpPacketsPerSec"),
+            sentAudioPacketsPerSec = o.optLong("sentAudioPacketsPerSec"), udpInvalid = o.optLong("udpInvalid"),
+            udpOtherSession = o.optLong("udpOtherSession"), nacksSent = o.optLong("nacksSent"),
+            offsetMs = o.optDouble("offsetMs"), trimMs = o.optDouble("trimMs"), hardJumps = o.optInt("hardJumps"),
+            slewEvents = o.optLong("slewEvents"),
+            decodeComplete = o.optBoolean("decodeComplete", true),
+            decodeTotalFrames = o.optLong("decodeTotalFrames", -1),
         )
     }
 }
@@ -173,6 +242,9 @@ data class UiState(
     val connLog: List<String> = emptyList(),
     val telemetrySaving: Boolean = false,
     val telemetryFile: String? = null,
+    val activeIncidents: List<String> = emptyList(),
+    val debugUdpAudioStopped: Boolean = false,
+    val debugPointOutputSilenced: Boolean = false,
 ) {
     val myChannel: Int get() = if (role == Role.POINT) pointChannel else Ch.other(pointChannel)
     val inPair: Boolean get() = phase == Phase.PAIRED || phase == Phase.RECONNECTING

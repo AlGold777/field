@@ -4,21 +4,33 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Text
+import androidx.compose.material3.Switch
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.unit.sp
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.unit.dp
 import app.soundfield.core.Role
+import app.soundfield.BuildConfig
+import app.soundfield.engine.Engine
 import app.soundfield.engine.UiState
 import kotlin.math.abs
 
 @Composable
-fun DiagnosticsScreen(ui: UiState, onBack: () -> Unit) {
+fun DiagnosticsScreen(ui: UiState, engine: Engine, onBack: () -> Unit) {
     val p = ui.pointDiag; val s = ui.serverDiag
     fun c(v: Double, good: Double, warn: Double): Color = when {
         v <= good -> SFColors.Good; v <= warn -> SFColors.Warn; else -> SFColors.Bad
     }
+    fun signalColor(diag: app.soundfield.engine.Diag): Color = when {
+        !diag.playing -> SFColors.TextDim
+        diag.outputRmsDbfs >= -50.0 -> SFColors.Good
+        diag.outputRmsDbfs >= -70.0 -> SFColors.Warn
+        else -> SFColors.Bad
+    }
+    fun signalText(diag: app.soundfield.engine.Diag): String =
+        if (diag.valid) "%.1f dBFS".format(diag.outputRmsDbfs) else "—"
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 20.dp).padding(top = 40.dp, bottom = 24.dp)) {
         BackBar("Диагностика", onBack)
         Subtitle("Обновляется каждую секунду. Этот телефон — ${if (ui.role == Role.SERVER) "Server" else "Point"}.")
@@ -66,12 +78,53 @@ fun DiagnosticsScreen(ui: UiState, onBack: () -> Unit) {
 
         SFCard {
             H3("Аудиовыход")
+            DiagRow("Звук на выходе · Server", signalText(s), signalColor(s))
+            DiagRow("Звук на выходе · Point", signalText(p), signalColor(p))
+            DiagRow("Сигнал канала Server → Point", if (s.valid) "%.1f dBFS".format(s.serverChannelRmsDbfs) else "—",
+                if (s.serverChannelRmsDbfs > -50.0) SFColors.Good else SFColors.TextDim)
             DiagRow("Ошибка воспроизведения Server", if (s.valid) "%+.2f мс".format(s.syncErrMs) else "—")
             DiagRow("Ошибка воспроизведения Point", if (p.valid) "%+.2f мс".format(p.syncErrMs) else "—")
             DiagRow("Underrun Server", if (s.valid) "${s.underruns}" else "—", if (s.underruns > 0) SFColors.Warn else SFColors.Text)
             DiagRow("Underrun Point", if (p.valid) "${p.underruns}" else "—", if (p.underruns > 0) SFColors.Warn else SFColors.Text)
             DiagRow("Выходная задержка Server", if (s.valid) "%.1f мс".format(s.latencyMs) else "—")
             DiagRow("Выходная задержка Point", if (p.valid) "%.1f мс".format(p.latencyMs) else "—")
+            DiagRow("Частота выхода · Server", if (s.outputTimestampValid) "%.0f кадров/с".format(s.outputFramesPerSecond) else "нет таймстампа")
+            DiagRow("Частота выхода · Point", if (p.outputTimestampValid) "%.0f кадров/с".format(p.outputFramesPerSecond) else "нет таймстампа")
+            DiagRow("Громкость / mute · Server",
+                if (s.valid) "%d/%d · %s".format(s.musicVolume, s.musicVolumeMax, if (s.musicMuted) "mute" else "on") else "—")
+            DiagRow("Громкость / mute · Point",
+                if (p.valid) "%d/%d · %s".format(p.musicVolume, p.musicVolumeMax, if (p.musicMuted) "mute" else "on") else "—")
+            DiagRow("Маршрут Server / Point", "%s / %s".format(s.audioRoute, p.audioRoute))
+            DiagRow("Аудиофокус Server / Point", "%s / %s".format(if (s.audioFocus) "есть" else "нет",
+                if (p.audioFocus) "есть" else "нет"))
+        }
+
+        SFCard {
+            H3("Активные инциденты")
+            if (ui.activeIncidents.isEmpty()) DiagRow("Нарушений нет", "—", SFColors.Good)
+            ui.activeIncidents.forEach { DiagRow(it, "идёт", SFColors.Bad) }
+        }
+
+        if (BuildConfig.DEBUG && ui.inPair) {
+            SFCard {
+                H3("Тестовые сбои · debug")
+                when (ui.role) {
+                    Role.SERVER -> {
+                        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                            Text("Остановить UDP-аудио", color = SFColors.Text, modifier = Modifier.weight(1f))
+                            Switch(checked = ui.debugUdpAudioStopped, onCheckedChange = engine::setDebugUdpAudioStopped)
+                        }
+                        Subtitle("TCP останется подключён. Ожидается POINT_NO_PACKETS.")
+                    }
+                    Role.POINT -> {
+                        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                            Text("Обнулить выход Point", color = SFColors.Text, modifier = Modifier.weight(1f))
+                            Switch(checked = ui.debugPointOutputSilenced, onCheckedChange = engine::setDebugPointOutputSilenced)
+                        }
+                        Subtitle("UDP продолжит поступать. Ожидается POINT_SILENT_OUTPUT.")
+                    }
+                }
+            }
         }
 
         SFCard {
@@ -81,5 +134,7 @@ fun DiagnosticsScreen(ui: UiState, onBack: () -> Unit) {
                 Text(line, color = SFColors.TextDim, fontSize = 12.sp, lineHeight = 16.sp, modifier = Modifier.padding(vertical = 3.dp))
             }
         }
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Center) { ProblemMarkButton(engine) }
+        TelemetryButton(ui, engine)
     }
 }

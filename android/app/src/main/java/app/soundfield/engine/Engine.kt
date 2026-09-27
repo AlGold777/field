@@ -24,7 +24,19 @@ import android.util.Base64
 import android.net.Uri
 import androidx.core.content.ContextCompat
 import app.soundfield.R
+import app.soundfield.BuildConfig
 import app.soundfield.diagnostics.Telemetry
+import app.soundfield.diagnostics.TelemetryContext
+import app.soundfield.diagnostics.TelemetryJson
+import app.soundfield.diagnostics.TelemetrySummary
+import app.soundfield.diagnostics.SnapshotRing
+import app.soundfield.diagnostics.IncidentRuleEngine
+import app.soundfield.diagnostics.AndroidTelemetryRules
+import app.soundfield.diagnostics.IncidentUpdate
+import app.soundfield.diagnostics.AtomicLatencyWindow
+import app.soundfield.diagnostics.AtomicSignalMeter
+import app.soundfield.diagnostics.TelemetryIdentifiers
+import app.soundfield.diagnostics.TelemetryText
 import app.soundfield.audio.AudioOutput
 import app.soundfield.audio.AudioFileDecoder
 import app.soundfield.audio.MicRecorder
@@ -45,6 +57,7 @@ import java.security.SecureRandom
 import java.io.File
 import java.io.FileOutputStream
 import java.io.BufferedOutputStream
+import java.io.ByteArrayOutputStream
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
@@ -52,6 +65,8 @@ import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
+import java.util.zip.GZIPOutputStream
 import kotlin.math.abs
 import kotlin.math.roundToInt
 
@@ -72,8 +87,12 @@ class Engine private constructor(private val app: Context) {
     }
     private data class IncomingFileTransfer(
         val id: String, val name: String, val size: Long, val temporaryFile: File,
-        val output: BufferedOutputStream, val startedElapsedMs: Long, var received: Long = 0,
+        val output: BufferedOutputStream, val startedElapsedMs: Long, val op: String, var received: Long = 0,
     )
+    private data class IncomingTelemetryTransfer(
+        val id: String, val temporaryFile: File, var received: Long = 0,
+    )
+    private data class RemoteTelemetryExport(val journal: String, val state: String)
 
     companion object {
         const val TAG = "SoundField"
@@ -84,6 +103,7 @@ class Engine private constructor(private val app: Context) {
         private val rnd = SecureRandom()
         private fun hex(bytes: Int) = ByteArray(bytes).also { rnd.nextBytes(it) }.joinToString("") { "%02x".format(it) }
         private const val TRANSFER_CHUNK_BYTES = 48 * 1024
+        private const val TELEMETRY_MAX_BYTES = 8L * 1024 * 1024
         private const val MAX_TRANSFER_FILE_BYTES = 512L * 1024 * 1024
         private const val MAX_TRANSFER_BATCH_BYTES = 1024L * 1024 * 1024
         private val PROGRESSIVE_LOOKAHEAD_FRAMES =
@@ -93,6 +113,40 @@ class Engine private constructor(private val app: Context) {
     }
 
     private val telemetry = Telemetry.get(app)
+    private val blackBox = SnapshotRing<Map<String, Any?>>(120)
+    private val incidentRules = IncidentRuleEngine(AndroidTelemetryRules.all)
+    private val tickIntervals = AtomicLatencyWindow()
+    private val lastTickAtNs = AtomicLong()
+    private val telemetryAcks = ConcurrentHashMap<String, CompletableFuture<JSONObject>>()
+    private val telemetryReady = ConcurrentHashMap<String, CompletableFuture<JSONObject>>()
+    private val telemetryExports = ConcurrentHashMap<String, CompletableFuture<RemoteTelemetryExport>>()
+    private val pendingRemoteStates = ConcurrentHashMap<String, String>()
+    private val incomingTelemetry = ConcurrentHashMap<String, IncomingTelemetryTransfer>()
+    private val telemetryRateSamples = ArrayDeque<Long>()
+    private var lastHeartbeatAtMs = 0L
+    private var previousUdpPackets = 0L
+    private var previousSentAudioPackets = 0L
+    private var previousNacksSent = 0L
+    private var previousUdpInvalid = 0L
+    private var previousUdpOtherSession = 0L
+    private var lastSlewEvents = 0L
+    private val pointChannelSignal = AtomicSignalMeter()
+    @Volatile private var debugUdpAudioStopped = false
+    @Volatile private var audioFocusHeld = false
+    private var currentDecodeOp: String? = null
+    private var calibrationOp: String? = null
+    private var fileTransferOp: String? = null
+    @Volatile private var transferLastProgressAtMs = 0L
+    private var decodeReadyAtLastCheck = -1L
+    private var decodeReadyChangedAtMs = 0L
+    private var decodeReadyTrackTag: String? = null
+    private var previousPointAudioPackets = 0L
+    private var reconnectSeriesOp: String? = null
+    private var reconnectAttemptOp: String? = null
+    private var lastCommandOp: String? = null
+    private var lastCommandAppliedSrvNs = 0L
+    private var lastCommandIssuedSrvNs = 0L
+    private var lastObservedCommandOp: String? = null
 
     // ------------------------------------------------------------------ инфраструктура
     private val ex = Executors.newSingleThreadScheduledExecutor { Thread(it, "sf-engine") }
@@ -111,7 +165,10 @@ class Engine private constructor(private val app: Context) {
     val ui: StateFlow<UiState> = _ui
     private fun ui(f: UiState.() -> UiState) = _ui.update { it.f() }
     private var msgCounter = 0
-    private fun toast(text: String) { msgCounter++; val id = msgCounter; ui { copy(message = text, messageId = id) } }
+    private fun toast(text: String) {
+        telemetry.record("USER_MESSAGE", mapOf("text" to text))
+        msgCounter++; val id = msgCounter; ui { copy(message = text, messageId = id) }
+    }
 
     // ------------------------------------------------------------------ аудио
     val music: PcmSource = loadMusic()
@@ -186,6 +243,13 @@ class Engine private constructor(private val app: Context) {
     private val udpInvalid = AtomicLong()
     private val udpOtherSession = AtomicLong()
     private val udpLastRx = AtomicLong()
+    private val udpFirstPacketPending = AtomicBoolean(false)
+    private val udpFirstPacketAtMs = AtomicLong()
+    private val udpFirstPacketFrom = AtomicReference<String?>(null)
+    private val udpReceiveFailures = AtomicLong()
+    private val udpSendFailures = AtomicLong()
+    private val udpReceiveError = AtomicReference<Throwable?>(null)
+    private val udpSendError = AtomicReference<Throwable?>(null)
     private val connLog = ArrayDeque<String>()
     private val logTime = java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.US)
 
@@ -231,6 +295,25 @@ class Engine private constructor(private val app: Context) {
     private var lastPing = 0L
     private var lastRecv = 0L
     private var lastLost = 0L
+
+    init {
+        telemetry.configure(context = {
+            val currentRole = role
+            val currentEpoch = if (currentRole == Role.SERVER) serverPlay.timeline.epoch else rx.timeline.epoch
+            val currentTrack = if (currentRole == Role.SERVER) queue.getOrNull(queueIndex)?.id
+                else ui.value.queueTracks.getOrNull(ui.value.queueIndex)?.id
+            TelemetryContext(
+                deviceId = myId,
+                role = currentRole.name.lowercase(),
+                pair = record?.key?.let(TelemetryIdentifiers::hash),
+                session = sessionId.takeIf { it != 0 }?.toString(),
+                epoch = currentEpoch,
+                track = currentTrack?.takeIf { it.isNotBlank() }?.let(TelemetryIdentifiers::hash),
+                serverNs = { ns -> if (role == Role.SERVER) ns else if (clock.ready) clock.toServer(ns) else null },
+            )
+        }, localRole = { if (role == Role.SERVER) "server" else "point" })
+        telemetry.setCrashSnapshotProvider { blackBox.drain() }
+    }
 
     // ================================================================== запуск
     private fun boot() {
@@ -424,17 +507,25 @@ class Engine private constructor(private val app: Context) {
         }
     }
 
-    private fun telemetryState(): String {
+    private fun telemetryStateSnapshot(): String {
         val now = SystemClock.elapsedRealtime()
         val state = ui.value
-        return "phase=$phase role=$role visible=$appVisible peer=$peerId " +
-            "tcpPort=${if (::tcp.isInitialized) tcp.localPort else 0} udpPort=${if (::udp.isInitialized) udp.localPort else 0} " +
-            "link=${link?.id} lastTcpRxAgoMs=${link?.let { now - it.lastRx }} pending=${pending?.id}:${pending?.tag} " +
-            "autoResume=$autoResume manualResume=$manualResumeActive attempt=$resumeAttempt " +
-            "udpPackets=${udpPackets.get()} udpInvalid=${udpInvalid.get()} udpOtherSession=${udpOtherSession.get()} " +
-            "udpLastRxAgoMs=${udpLastRx.get().takeIf { it > 0 }?.let { now - it }} " +
-            "audioRunning=${audio.isRunning} playing=${state.playing} " +
-            "serverDiag=${state.serverDiag.toJson("sdiag")} pointDiag=${state.pointDiag.toJson("diag")}"
+        val pairTag = record?.key?.let(TelemetryIdentifiers::hash).orEmpty()
+        return JSONObject().apply {
+            put("app", JSONObject().put("version", BuildConfig.VERSION_NAME).put("build", BuildConfig.VERSION_CODE))
+            put("device", JSONObject().put("id", myId).put("manufacturer", Build.MANUFACTURER).put("model", Build.MODEL)
+                .put("android", Build.VERSION.RELEASE).put("sdk", Build.VERSION.SDK_INT))
+            put("role", role.name.lowercase()); put("phase", phase.name); put("visible", appVisible)
+            put("pair", pairTag); put("session", sessionId); put("epoch", if (role == Role.SERVER) serverPlay.timeline.epoch else rx.timeline.epoch)
+            put("track", (if (role == Role.SERVER) queue.getOrNull(queueIndex)?.id else state.queueTracks.getOrNull(state.queueIndex)?.id)
+                ?.let(TelemetryIdentifiers::hash) ?: "")
+            put("mode", state.mode.wire); put("playing", state.playing); put("positionMs", positionMs())
+            put("link", JSONObject().put("id", link?.id ?: 0).put("lastRxAgoMs", link?.let { now - it.lastRx } ?: -1))
+            put("udp", JSONObject().put("packets", udpPackets.get()).put("invalid", udpInvalid.get())
+                .put("otherSession", udpOtherSession.get()).put("lastRxAgoMs", udpLastRx.get().takeIf { it > 0 }?.let { now - it } ?: -1))
+            put("serverDiag", state.serverDiag.toJson("sdiag")); put("pointDiag", state.pointDiag.toJson("diag"))
+            put("activeIncidents", org.json.JSONArray().apply { state.activeIncidents.forEach(::put) })
+        }.toString()
     }
 
     fun telemetryPermissionDenied() = post {
@@ -445,24 +536,225 @@ class Engine private constructor(private val app: Context) {
     fun exportTelemetry() = post {
         if (ui.value.telemetrySaving) return@post
         ui { copy(telemetrySaving = true, telemetryFile = null) }
-        val snapshot = buildString {
-            appendLine(telemetryState())
-            appendLine("protocol=${SF.PROTOCOL_VERSION} myId=$myId advertising=${discovery.advertising} browsing=${discovery.browsing}")
-            appendLine("rememberedPeer=${record?.peerId} lastHost=${record?.lastHost} lastPort=${record?.lastPort}")
-            ui.value.nearby.forEach { appendLine("nearby id=${it.id} platform=${it.platform} address=${it.host?.hostAddress}:${it.port} ringing=${it.supportsRinging}") }
-            try {
-                val cm = app.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
-                val active = cm.activeNetwork
-                val caps = active?.let { cm.getNetworkCapabilities(it) }
-                appendLine("activeNetwork=$active wifi=${caps?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)} vpn=${caps?.hasTransport(NetworkCapabilities.TRANSPORT_VPN)}")
-                val power = app.getSystemService(Context.POWER_SERVICE) as android.os.PowerManager
-                appendLine("interactive=${power.isInteractive} powerSave=${power.isPowerSaveMode} deviceIdle=${power.isDeviceIdleMode}")
-            } catch (e: Exception) { appendLine("networkSnapshotError=${e.javaClass.simpleName}") }
+        val op = java.util.UUID.randomUUID().toString()
+        telemetry.record("EXPORT_REQUEST", mapOf("role" to role.name.lowercase()), op = op)
+        flushBlackBox("export:$op")
+        val localSnapshot = telemetryStateSnapshot()
+        val peerLink = link?.takeIf { phase == Phase.PAIRED && it.isOpen }
+        val unavailable = when {
+            phase != Phase.PAIRED -> "not paired at export time"
+            peerPlatform.equals("ios", true) -> "the iOS app does not yet provide telemetry export"
+            !peerPlatform.equals("android", true) -> "peer platform does not support Android journal transfer"
+            peerLink == null -> "peer TCP link is unavailable"
+            else -> null
         }
-        telemetry.export(snapshot) { result -> post {
+        if (unavailable != null || peerLink == null) {
+            finishTelemetryExport(op, localSnapshot, null, unavailable)
+        } else {
+            requestPeerTelemetry(peerLink).whenComplete { remote, failure ->
+                post {
+                    val reason = failure?.cause?.message ?: failure?.message
+                    finishTelemetryExport(op, localSnapshot, remote, reason)
+                }
+            }
+        }
+    }
+
+    private fun finishTelemetryExport(op: String, localSnapshot: String, remote: RemoteTelemetryExport?, missingReason: String?) {
+        val clockOffset = when {
+            role == Role.POINT && clock.ready -> clock.model.a / 1e6
+            role == Role.SERVER && ui.value.pointDiag.clockReady -> ui.value.pointDiag.offsetMs
+            else -> null
+        }
+        telemetry.export(localSnapshot, if (role == Role.SERVER) "server" else "point", remote?.journal,
+            remote?.state, missingReason, clockOffset, op) { result -> post {
             ui { copy(telemetrySaving = false, telemetryFile = result.getOrNull()) }
             result.fold({ toast("Телеметрия сохранена: $it") }, { toast("Не удалось сохранить телеметрию: ${it.message ?: it.javaClass.simpleName}") })
         } }
+    }
+
+    private fun requestPeerTelemetry(activeLink: ControlLink): CompletableFuture<RemoteTelemetryExport> {
+        val id = java.util.UUID.randomUUID().toString()
+        val result = CompletableFuture<RemoteTelemetryExport>()
+        val ready = CompletableFuture<JSONObject>()
+        val file = File(app.cacheDir, "peer-telemetry-$id.jsonl")
+        file.delete()
+        incomingTelemetry[id] = IncomingTelemetryTransfer(id, file)
+        telemetryExports[id] = result
+        telemetryReady[id] = ready
+        activeLink.send(JSONObject().put("t", "telemetry-request").put("id", id))
+        io.execute {
+            try {
+                val accepted = ready.get(15, TimeUnit.SECONDS)
+                val size = accepted.optLong("bytes", -1)
+                require(size in 0..TELEMETRY_MAX_BYTES) { "Peer journal exceeds the 8 MiB export limit" }
+                pendingRemoteStates[id] = accepted.optString("state", "{}")
+                var offset = 0L
+                while (offset < size) {
+                    check(activeLink.isOpen && activeLink === link) { "Peer TCP link closed during telemetry transfer" }
+                    val count = minOf(TRANSFER_CHUNK_BYTES.toLong(), size - offset).toInt()
+                    val chunk = ByteArray(count)
+                    java.io.RandomAccessFile(file, "r").use { input -> input.seek(offset); input.readFully(chunk) }
+                    val ackId = "$id:$offset"
+                    val ack = CompletableFuture<JSONObject>()
+                    telemetryAcks[ackId] = ack
+                    activeLink.send(JSONObject().put("t", "telemetry-chunk").put("id", id).put("ackId", ackId)
+                        .put("offset", offset).put("data", Base64.encodeToString(chunk, Base64.NO_WRAP)))
+                    val response = ack.get(20, TimeUnit.SECONDS)
+                    check(response.optLong("offset", -1L) == offset + count) { "Peer confirmed an invalid telemetry offset" }
+                    offset += count
+                    telemetryAcks.remove(ackId, ack)
+                }
+                val doneAckId = "$id:done"
+                val doneAck = CompletableFuture<JSONObject>()
+                telemetryAcks[doneAckId] = doneAck
+                activeLink.send(JSONObject().put("t", "telemetry-end").put("id", id).put("bytes", size).put("ackId", doneAckId))
+                doneAck.get(20, TimeUnit.SECONDS)
+                result.get(1, TimeUnit.SECONDS)
+            } catch (e: Exception) {
+                result.completeExceptionally(e)
+            } finally {
+                telemetryReady.remove(id)
+                telemetryExports.remove(id, result)
+                telemetryAcks.keys.filter { it.startsWith("$id:") }.forEach(telemetryAcks::remove)
+                pendingRemoteStates.remove(id)
+                incomingTelemetry.remove(id)?.temporaryFile?.delete()
+            }
+        }
+        return result
+    }
+
+    private fun receiveTelemetryRequest(activeLink: ControlLink, o: JSONObject) {
+        val id = o.optString("id")
+        if (id.isBlank() || activeLink !== link || phase != Phase.PAIRED || !peerPlatform.equals("android", true)) {
+            activeLink.send(JSONObject().put("t", "telemetry-refuse").put("id", id)
+                .put("reason", "journal transfer is available only in an Android pair"))
+            return
+        }
+        telemetry.record("EXPORT_PEER_REQUEST", mapOf("requestId" to id))
+        flushBlackBox("peer-export:$id")
+        val state = telemetryStateSnapshot()
+        telemetry.readJournalSnapshot { result ->
+            result.fold({ journal ->
+                io.execute {
+                    val bytes = journal.toByteArray(Charsets.UTF_8)
+                    if (bytes.size > TELEMETRY_MAX_BYTES) {
+                        activeLink.send(JSONObject().put("t", "telemetry-refuse").put("id", id).put("reason", "journal exceeds 8 MiB"))
+                        return@execute
+                    }
+                    activeLink.send(JSONObject().put("t", "telemetry-ready").put("id", id).put("bytes", bytes.size)
+                        .put("state", state))
+                    var offset = 0
+                    while (offset < bytes.size) {
+                        if (!activeLink.isOpen || activeLink !== link) return@execute
+                        val count = minOf(TRANSFER_CHUNK_BYTES, bytes.size - offset)
+                        val chunk = bytes.copyOfRange(offset, offset + count)
+                        val ackId = "$id:$offset"
+                        val ack = CompletableFuture<JSONObject>()
+                        telemetryAcks[ackId] = ack
+                        activeLink.send(JSONObject().put("t", "telemetry-chunk").put("id", id).put("ackId", ackId)
+                            .put("offset", offset).put("data", Base64.encodeToString(chunk, Base64.NO_WRAP)))
+                        try {
+                            val response = ack.get(20, TimeUnit.SECONDS)
+                            check(response.optLong("offset", -1L) == (offset + count).toLong()) { "Peer confirmed an invalid telemetry offset" }
+                        } catch (e: Exception) {
+                            telemetry.record("EXPORT_PEER_TRANSFER_FAILED", mapOf("requestId" to id, "offset" to offset), error = e)
+                            return@execute
+                        } finally { telemetryAcks.remove(ackId, ack) }
+                        offset += count
+                    }
+                    val doneAckId = "$id:done"
+                    val doneAck = CompletableFuture<JSONObject>()
+                    telemetryAcks[doneAckId] = doneAck
+                    activeLink.send(JSONObject().put("t", "telemetry-end").put("id", id).put("bytes", bytes.size).put("ackId", doneAckId))
+                    try { doneAck.get(20, TimeUnit.SECONDS) }
+                    catch (e: Exception) { telemetry.record("EXPORT_PEER_TRANSFER_FAILED", mapOf("requestId" to id), error = e) }
+                    finally { telemetryAcks.remove(doneAckId, doneAck) }
+                }
+            }, { error ->
+                activeLink.send(JSONObject().put("t", "telemetry-refuse").put("id", id)
+                    .put("reason", error.message ?: "could not read peer journal"))
+            })
+        }
+    }
+
+    private fun receiveTelemetryChunk(activeLink: ControlLink, o: JSONObject) {
+        val id = o.optString("id")
+        val transfer = incomingTelemetry[id]
+        val ackId = o.optString("ackId")
+        if (transfer == null || ackId.isBlank()) return
+        try {
+            val offset = o.optLong("offset", -1L)
+            val bytes = Base64.decode(o.getString("data"), Base64.NO_WRAP)
+            require(offset == transfer.received) { "Telemetry transfer offset mismatch" }
+            require(bytes.isNotEmpty() && bytes.size <= TRANSFER_CHUNK_BYTES && transfer.received + bytes.size <= TELEMETRY_MAX_BYTES) {
+                "Invalid telemetry transfer chunk size"
+            }
+            val nextOffset = transfer.received + bytes.size
+            transfer.received = nextOffset
+            telemetry.writeTransferChunk(transfer.temporaryFile, offset, bytes) { result ->
+                result.fold(
+                    { activeLink.send(JSONObject().put("t", "telemetry-ack").put("ackId", ackId).put("offset", nextOffset)) },
+                    { error -> activeLink.send(JSONObject().put("t", "telemetry-refuse").put("id", id).put("ackId", ackId)
+                        .put("reason", error.message ?: "failed writing peer journal")) },
+                )
+            }
+        } catch (e: Exception) {
+            activeLink.send(JSONObject().put("t", "telemetry-refuse").put("id", id).put("ackId", ackId)
+                .put("reason", e.message ?: "invalid telemetry transfer chunk"))
+        }
+    }
+
+    private fun finishTelemetryReceive(activeLink: ControlLink, o: JSONObject) {
+        val id = o.optString("id")
+        val transfer = incomingTelemetry[id] ?: return
+        val totalBytes = o.optLong("bytes", -1L)
+        val ackId = o.optString("ackId")
+        if (totalBytes != transfer.received || totalBytes !in 0..TELEMETRY_MAX_BYTES) {
+            activeLink.send(JSONObject().put("t", "telemetry-refuse").put("id", id).put("ackId", ackId)
+                .put("reason", "incomplete peer journal"))
+            telemetryExports[id]?.completeExceptionally(IllegalStateException("incomplete peer journal"))
+            incomingTelemetry.remove(id)?.temporaryFile?.delete()
+            return
+        }
+        telemetry.readTransferFile(transfer.temporaryFile) { result ->
+            result.fold({ journal ->
+                val remote = RemoteTelemetryExport(journal, pendingRemoteStates[id].orEmpty())
+                telemetryExports[id]?.complete(remote)
+                telemetry.record("EXPORT_PEER_RECEIVED", mapOf("requestId" to id, "bytes" to totalBytes))
+                activeLink.send(JSONObject().put("t", "telemetry-done").put("ackId", ackId))
+            }, { error ->
+                telemetryExports[id]?.completeExceptionally(error)
+                activeLink.send(JSONObject().put("t", "telemetry-refuse").put("id", id).put("ackId", ackId)
+                    .put("reason", error.message ?: "failed to read peer journal"))
+            })
+            incomingTelemetry.remove(id)?.temporaryFile?.delete()
+        }
+    }
+
+    private fun receiveUserMark(o: JSONObject) {
+        val id = o.optString("markId").takeIf { it.isNotBlank() } ?: return
+        telemetry.record("USER_MARK", mapOf("markId" to id,
+            "comment" to TelemetryText.clean(o.optString("comment").take(200)),
+            "role" to o.optString("role", "unknown"), "peer" to true))
+        flushBlackBox("mark:$id")
+    }
+
+    private fun activeCommandOp(): String =
+        lastCommandOp?.takeIf { System.nanoTime() - lastCommandAppliedSrvNs < 5_000_000_000L }.orEmpty()
+
+    private fun observeCommand(o: JSONObject) {
+        val op = o.optString("op").takeIf { it.isNotBlank() } ?: return
+        if (op == lastObservedCommandOp) return
+        lastObservedCommandOp = op
+        val applied = o.optLong("cmdAppliedSrvNs", 0)
+        val issued = o.optLong("cmdIssuedSrvNs", 0)
+        val observedServerNs = if (clock.ready) clock.toServer(System.nanoTime()) else null
+        telemetry.record("CMD_RESULT_OBSERVED", mapOf(
+            "cmdAppliedSrvNs" to applied, "cmdIssuedSrvNs" to issued, "observedSrvNs" to observedServerNs,
+            "totalLatencyMs" to if (observedServerNs != null && issued > 0) (observedServerNs - issued) / 1e6 else null,
+            "deliveryLatencyMs" to if (observedServerNs != null && applied > 0) (observedServerNs - applied) / 1e6 else null,
+        ), op = op)
     }
 
     // ================================================================== публичный API (любой поток)
@@ -649,7 +941,10 @@ class Engine private constructor(private val app: Context) {
         }
         fileTransferCancelled.set(false)
         val requestedAt = SystemClock.elapsedRealtime()
-        telemetry.event("FILE_TRANSFER_PREPARING", "direction=send selections=${uris.size}")
+        val op = java.util.UUID.randomUUID().toString()
+        fileTransferOp = op
+        transferLastProgressAtMs = requestedAt
+        telemetry.record("FILE_TRANSFER_PREPARING", mapOf("direction" to "send", "selections" to uris.size), op = op)
         ui { copy(fileTransferText = "Подготовка отправки файлов…") }
         fileTransferIo.execute {
             var currentFileId: String? = null
@@ -679,7 +974,9 @@ class Engine private constructor(private val app: Context) {
                 totalBytes = total
                 batchStartedAt = SystemClock.elapsedRealtime()
                 transferStarted = true
-                telemetry.event("FILE_TRANSFER_START", "direction=send files=$totalFiles bytes=$totalBytes preparationMs=${batchStartedAt - requestedAt}")
+                telemetry.record("FILE_TRANSFER_START", mapOf("direction" to "send", "files" to totalFiles, "bytes" to totalBytes,
+                    "preparationMs" to batchStartedAt - requestedAt), op = op)
+                transferLastProgressAtMs = batchStartedAt
                 val buffer = ByteArray(TRANSFER_CHUNK_BYTES)
                 files.forEachIndexed { fileIndex, file ->
                     checkTransferStillActive(activeLink)
@@ -687,7 +984,9 @@ class Engine private constructor(private val app: Context) {
                     fileStartedAt = SystemClock.elapsedRealtime()
                     val id = java.util.UUID.randomUUID().toString()
                     currentFileId = id
-                    telemetry.event("FILE_TRANSFER_FILE_START", "direction=send id=$id file=$currentFileIndex/$totalFiles bytes=${file.size}")
+                    telemetry.record("FILE_TRANSFER_FILE_START", mapOf("direction" to "send", "transferId" to id,
+                        "fileIndex" to currentFileIndex, "fileCount" to totalFiles, "bytes" to file.size,
+                        "extension" to file.name.substringAfterLast('.', "").lowercase().take(8)), op = op)
                     val started = awaitFileReply(activeLink, id, JSONObject()
                         .put("t", "file-start").put("id", id).put("name", file.name).put("size", file.size)
                         .put("token", serverFileTransferToken))
@@ -705,8 +1004,9 @@ class Engine private constructor(private val app: Context) {
                             offset += count
                             check(ack.optLong("offset", -1) == offset) { "Server подтвердил неверный размер передачи" }
                             batchSent += count
+                            transferLastProgressAtMs = SystemClock.elapsedRealtime()
                             telemetry.limited("FILE_TRANSFER_PROGRESS",
-                                "direction=send id=$id file=$currentFileIndex/$totalFiles fileBytes=$offset/${file.size} batchBytes=$batchSent/$totalBytes")
+                                "direction=send id=$id file=$currentFileIndex/$totalFiles fileBytes=$offset/${file.size} batchBytes=$batchSent/$totalBytes", op = op)
                             post { if (fileTransferActive.get()) ui { copy(fileTransferText =
                                 "Отправка на Server · ${(batchSent * 100 / total).toInt()}%") } }
                         }
@@ -714,25 +1014,31 @@ class Engine private constructor(private val app: Context) {
                     }
                     val completed = awaitFileReply(activeLink, id, JSONObject().put("t", "file-end").put("id", id))
                     check(completed.optBoolean("complete")) { "Server не сохранил «${file.name}»" }
-                    telemetry.event("FILE_TRANSFER_FILE_COMPLETE",
-                        "direction=send id=$id file=$currentFileIndex/$totalFiles bytes=${file.size} elapsedMs=${SystemClock.elapsedRealtime() - fileStartedAt}")
+                    telemetry.record("FILE_TRANSFER_FILE_COMPLETE", mapOf("direction" to "send", "transferId" to id,
+                        "fileIndex" to currentFileIndex, "fileCount" to totalFiles, "bytes" to file.size,
+                        "elapsedMs" to SystemClock.elapsedRealtime() - fileStartedAt, "result" to "ok"), op = op)
                     currentFileId = null
                 }
-                telemetry.event("FILE_TRANSFER_COMPLETE",
-                    "direction=send files=$totalFiles bytes=$totalBytes elapsedMs=${SystemClock.elapsedRealtime() - batchStartedAt}")
+                telemetry.record("FILE_TRANSFER_COMPLETE", mapOf("direction" to "send", "files" to totalFiles, "bytes" to totalBytes,
+                    "elapsedMs" to SystemClock.elapsedRealtime() - batchStartedAt, "result" to "ok"), op = op)
                 post { ui { copy(fileTransferText = "") }; toast("Файлы отправлены на Server") }
             } catch (e: Exception) {
                 currentFileId?.let { id -> if (activeLink.isOpen) activeLink.send(JSONObject().put("t", "file-cancel").put("id", id)) }
                 val cancelled = fileTransferCancelled.get()
                 val elapsed = SystemClock.elapsedRealtime() - if (transferStarted) batchStartedAt else requestedAt
-                telemetry.event(if (cancelled) "FILE_TRANSFER_CANCELLED" else "FILE_TRANSFER_ABORTED",
-                    "direction=send stage=${if (transferStarted) "transfer" else "prepare"} file=$currentFileIndex/$totalFiles bytes=$batchSent/$totalBytes elapsedMs=$elapsed errorType=${e.javaClass.simpleName}")
+                telemetry.record(if (cancelled) "FILE_TRANSFER_CANCELLED" else "FILE_TRANSFER_ABORTED", mapOf(
+                    "direction" to "send", "stage" to if (transferStarted) "transfer" else "prepare",
+                    "fileIndex" to currentFileIndex, "fileCount" to totalFiles, "bytesSent" to batchSent,
+                    "totalBytes" to totalBytes, "elapsedMs" to elapsed,
+                    "result" to if (cancelled) "cancelled" else "error"), op = op, error = e)
                 val message = e.message?.takeIf { it.isNotBlank() } ?: "Передачу файлов прервали"
                 post { ui { copy(fileTransferText = "") }; toast(message) }
             } finally {
                 fileTransferAcks.values.forEach { it.completeExceptionally(IllegalStateException("Передача завершена")) }
                 fileTransferAcks.clear()
                 fileTransferActive.set(false)
+                fileTransferOp = null
+                transferLastProgressAtMs = 0L
             }
         }
     }
@@ -772,8 +1078,11 @@ class Engine private constructor(private val app: Context) {
         try { transfer.output.close() } catch (_: Exception) {}
         transfer.temporaryFile.delete()
         ui { copy(fileTransferText = "") }
-        if (reason != null) telemetry.event("FILE_TRANSFER_ABORTED",
-            "direction=receive id=${transfer.id} bytes=${transfer.received}/${transfer.size} elapsedMs=${SystemClock.elapsedRealtime() - transfer.startedElapsedMs} reason=${reason.take(100)}")
+        if (reason != null) telemetry.record("FILE_TRANSFER_ABORTED", mapOf(
+            "direction" to "receive", "transferId" to transfer.id, "bytesReceived" to transfer.received,
+            "totalBytes" to transfer.size, "elapsedMs" to SystemClock.elapsedRealtime() - transfer.startedElapsedMs,
+            "reason" to reason.take(100), "result" to "error"), op = transfer.op)
+        transferLastProgressAtMs = 0L
     }
 
     private fun handleIncomingFileStart(o: JSONObject) {
@@ -793,8 +1102,11 @@ class Engine private constructor(private val app: Context) {
         try {
             val output = BufferedOutputStream(FileOutputStream(tmp), 1 shl 16)
             val startedElapsedMs = SystemClock.elapsedRealtime()
-            incomingFileTransfer = IncomingFileTransfer(id, name, size, tmp, output, startedElapsedMs)
-            telemetry.event("FILE_TRANSFER_START", "direction=receive id=$id bytes=$size extension=${name.substringAfterLast('.', "").lowercase().take(8)}")
+            val op = java.util.UUID.randomUUID().toString()
+            incomingFileTransfer = IncomingFileTransfer(id, name, size, tmp, output, startedElapsedMs, op)
+            transferLastProgressAtMs = startedElapsedMs
+            telemetry.record("FILE_TRANSFER_START", mapOf("direction" to "receive", "transferId" to id, "bytes" to size,
+                "extension" to name.substringAfterLast('.', "").lowercase().take(8)), op = op)
             ui { copy(fileTransferText = "Получение от Point · 0%") }
             link?.send(JSONObject().put("t", "file-ack").put("id", id).put("offset", 0))
         } catch (e: Exception) { sendFileError(id, "Не удалось создать файл на Server") }
@@ -813,8 +1125,9 @@ class Engine private constructor(private val app: Context) {
             }
             transfer.output.write(bytes)
             transfer.received += bytes.size
+            transferLastProgressAtMs = SystemClock.elapsedRealtime()
             telemetry.limited("FILE_TRANSFER_PROGRESS",
-                "direction=receive id=$id bytes=${transfer.received}/${transfer.size}")
+                "direction=receive id=$id bytes=${transfer.received}/${transfer.size}", op = transfer.op)
             ui { copy(fileTransferText = "Получение от Point · ${(transfer.received * 100 / transfer.size).toInt()}%") }
             link?.send(JSONObject().put("t", "file-ack").put("id", id).put("offset", transfer.received))
         } catch (e: Exception) {
@@ -839,8 +1152,9 @@ class Engine private constructor(private val app: Context) {
             val target = File(transfer.temporaryFile.parentFile, "${java.util.UUID.randomUUID()}.$ext")
             check(transfer.temporaryFile.renameTo(target)) { "Не удалось сохранить принятый файл" }
             incomingFileTransfer = null
-            telemetry.event("FILE_TRANSFER_COMPLETE",
-                "direction=receive id=$id bytes=${transfer.size} elapsedMs=${SystemClock.elapsedRealtime() - transfer.startedElapsedMs} extension=$ext")
+            telemetry.record("FILE_TRANSFER_COMPLETE", mapOf("direction" to "receive", "transferId" to id, "bytes" to transfer.size,
+                "elapsedMs" to SystemClock.elapsedRealtime() - transfer.startedElapsedMs, "extension" to ext, "result" to "ok"), op = transfer.op)
+            transferLastProgressAtMs = 0L
             ui { copy(fileTransferText = "Подготовка аудиофайла…") }
             link?.send(JSONObject().put("t", "file-ack").put("id", id).put("offset", transfer.size).put("complete", true))
             addAudioFiles(listOf(Uri.fromFile(target)), deleteIfImportFails = listOf(target))
@@ -907,11 +1221,46 @@ class Engine private constructor(private val app: Context) {
     fun micPermissionGranted() = post { ui { copy(calib = calib.copy(needsMicPermission = false, resultText = "")) } }
 
     private fun cmd(a: String, extra: JSONObject.() -> Unit = {}) {
-        val o = JSONObject().put("t", "cmd").put("a", a).apply(extra)
+        val op = java.util.UUID.randomUUID().toString()
+        val issuedAt = if (role == Role.POINT && clock.ready) clock.toServer(System.nanoTime()) else System.nanoTime()
+        val o = JSONObject().put("t", "cmd").put("a", a).put("op", op)
+            .put("originRole", role.name.lowercase()).put("issuedSrvNs", issuedAt).apply(extra)
+        val detail = JSONObject(o.toString())
+        detail.remove("t"); detail.remove("op"); detail.remove("originRole"); detail.remove("issuedSrvNs")
+        if (detail.has("id")) detail.put("id", TelemetryIdentifiers.hash(detail.optString("id")))
+        telemetry.record("USER_COMMAND", mapOf("cmd" to a, "role" to role.name.lowercase(), "args" to detail.toString()), op = op)
         post {
             if (!ui.value.inPair) return@post
             if (role == Role.SERVER) handleCmd(o) else link?.send(o) ?: toast("Нет связи с Server")
         }
+    }
+
+    fun setDebugUdpAudioStopped(enabled: Boolean) = post {
+        if (!BuildConfig.DEBUG || role != Role.SERVER) return@post
+        if (debugUdpAudioStopped == enabled) return@post
+        debugUdpAudioStopped = enabled
+        ui { copy(debugUdpAudioStopped = enabled) }
+        telemetry.record(if (enabled) "DEBUG_FAILURE_START" else "DEBUG_FAILURE_END", mapOf(
+            "failure" to "stop_udp_audio", "expectedRule" to "POINT_NO_PACKETS"))
+    }
+
+    fun setDebugPointOutputSilenced(enabled: Boolean) = post {
+        if (!BuildConfig.DEBUG || role != Role.POINT) return@post
+        if (pointRenderer.debugSilence == enabled) return@post
+        pointRenderer.debugSilence = enabled
+        ui { copy(debugPointOutputSilenced = enabled) }
+        telemetry.record(if (enabled) "DEBUG_FAILURE_START" else "DEBUG_FAILURE_END", mapOf(
+            "failure" to "silence_point_output", "expectedRule" to "POINT_SILENT_OUTPUT"))
+    }
+
+    fun markProblem(comment: String) = post {
+        val markId = java.util.UUID.randomUUID().toString()
+        val safeComment = TelemetryText.clean(comment.take(200))
+        telemetry.record("USER_MARK", mapOf("markId" to markId, "comment" to safeComment, "role" to role.name.lowercase()))
+        flushBlackBox("mark:$markId")
+        if (phase == Phase.PAIRED) link?.send(JSONObject().put("t", "mark").put("markId", markId)
+            .put("comment", safeComment).put("role", role.name.lowercase()))
+        toast("Отметка сохранена, ${java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.getDefault()).format(java.util.Date())}")
     }
 
     /** Позиция воспроизведения для UI (мс). */
@@ -1007,12 +1356,20 @@ class Engine private constructor(private val app: Context) {
     private fun connectOutgoing(p: Peer, tag: String, first: JSONObject, timeoutMs: Long) {
         val host = p.host ?: return onConnectFailed(tag)
         pendingPeer = p
+        val attemptOp = if (tag == "resume-out" && phase == Phase.RECONNECTING) java.util.UUID.randomUUID().toString() else null
+        if (attemptOp != null) {
+            reconnectAttemptOp = attemptOp
+            telemetry.record("RECONNECT_ATTEMPT_START", mapOf("parentOp" to reconnectSeriesOp,
+                "attempt" to resumeAttempt, "method" to "last_ip_or_mdns"), op = attemptOp)
+        }
         telemetry.event("TCP_CONNECT_START", "tag=$tag peer=${p.id} host=${host.hostAddress} port=${p.port} ringing=${p.supportsRinging} responseTimeoutMs=$timeoutMs")
         io.execute {
             val started = SystemClock.elapsedRealtime()
             val s = Socket()
             try {
                 s.connect(InetSocketAddress(host, p.port), 2_500)
+                if (attemptOp != null) telemetry.record("RECONNECT_TCP_CONNECTED", mapOf(
+                    "elapsedMs" to SystemClock.elapsedRealtime() - started, "result" to "ok"), op = attemptOp)
                 telemetry.event("TCP_CONNECTED", "tag=$tag peer=${p.id} elapsedMs=${SystemClock.elapsedRealtime() - started}")
                 post {
                     val stillWanted = when (tag) {
@@ -1029,6 +1386,11 @@ class Engine private constructor(private val app: Context) {
                 }
             } catch (e: Exception) {
                 try { s.close() } catch (_: Exception) { }
+                if (attemptOp != null) {
+                    telemetry.record("RECONNECT_ATTEMPT_END", mapOf("elapsedMs" to SystemClock.elapsedRealtime() - started,
+                        "result" to "error"), op = attemptOp, error = e)
+                    if (reconnectAttemptOp == attemptOp) reconnectAttemptOp = null
+                }
                 telemetry.event("TCP_CONNECT_FAILED", "tag=$tag peer=${p.id} host=${host.hostAddress}:${p.port} elapsedMs=${SystemClock.elapsedRealtime() - started}", e)
                 post {
                     discovery.invalidatePeer(p.id)
@@ -1224,6 +1586,11 @@ class Engine private constructor(private val app: Context) {
         if (l === link) { onLinkLost(); return }
         if (l === pending) {
             pending = null
+            reconnectAttemptOp?.let { op ->
+                telemetry.record("RECONNECT_ATTEMPT_END", mapOf("result" to "timeout",
+                    "elapsedMs" to (SystemClock.elapsedRealtime() - reconnectSince)), op = op)
+                reconnectAttemptOp = null
+            }
             when (phase) {
                 Phase.INCOMING -> { phase = Phase.IDLE; ui { copy(phase = Phase.IDLE) } }
                 Phase.INVITING -> if (l.tag == "resume-out") later(700) { tryManualResume() } else {
@@ -1250,6 +1617,17 @@ class Engine private constructor(private val app: Context) {
         // «Продолжение» — пара та же, меняется только соединение (после обрыва, или второй телефон заметил
         // обрыв раньше нас и прислал resume, пока мы ещё считали связь живой). Музыка при этом не сбрасывается.
         val continuing = (phase == Phase.RECONNECTING || phase == Phase.PAIRED) && role == r && peerId == pid
+        if (continuing) {
+            val elapsed = SystemClock.elapsedRealtime() - reconnectSince
+            reconnectAttemptOp?.let { op ->
+                telemetry.record("RECONNECT_ATTEMPT_END", mapOf("result" to "ok", "elapsedMs" to elapsed), op = op)
+            }
+            reconnectAttemptOp = null
+            reconnectSeriesOp?.let { op ->
+                telemetry.record("RECONNECT_END", mapOf("result" to "ok", "durMs" to elapsed), op = op)
+            }
+            reconnectSeriesOp = null
+        }
         l.tag = "paired"
         link = l
         role = r; peerId = pid; peerName = pname; peerPlatform = pplat
@@ -1257,6 +1635,9 @@ class Engine private constructor(private val app: Context) {
         pairedAtMs = SystemClock.elapsedRealtime()
         lastAudioSessionResetMs = pairedAtMs
         udpLastRx.set(0)
+        udpFirstPacketPending.set(false)
+        udpFirstPacketAtMs.set(0)
+        udpFirstPacketFrom.set(null)
         lastAudioRxAt.set(0)
 
         val old = record
@@ -1323,6 +1704,9 @@ class Engine private constructor(private val app: Context) {
         ui { copy(phase = Phase.RECONNECTING, linkOk = false, audioMissing = false) }
         log("Связь с «$peerName» потеряна")
         reconnectSince = SystemClock.elapsedRealtime()
+        reconnectSeriesOp = java.util.UUID.randomUUID().toString()
+        telemetry.record("RECONNECT_START", mapOf("reason" to "tcp_link_lost", "role" to role.name.lowercase()),
+            op = reconnectSeriesOp)
         resumeAttempt = 0
         // NSD на Samsung/Xiaomi сбоит при быстром stopBrowse→startBrowse — пауза 500 мс.
         later(500) { if (phase == Phase.RECONNECTING) discovery.startBrowse() }
@@ -1423,12 +1807,27 @@ class Engine private constructor(private val app: Context) {
             "state" -> if (role == Role.POINT) applyState(o)
             "queue" -> if (role == Role.POINT) applyQueue(o)
             "timeline" -> if (role == Role.POINT) {
+                observeCommand(o)
                 rx.onTimeline(Timeline(o.getInt("epoch"), o.getBoolean("playing"),
                     o.getString("anchorFrame").toLong(), o.getString("anchorNs").toLong(),
                     o.optString("stopFrame", "-1").toLongOrNull() ?: -1L))
             }
             "sdiag" -> if (role == Role.POINT) ui { copy(serverDiag = Diag.fromJson(o)) }
             "calib" -> if (role == Role.POINT) applyCalib(o)
+            "mark" -> receiveUserMark(o)
+            "telemetry-request" -> link?.let { receiveTelemetryRequest(it, o) }
+            "telemetry-ready" -> telemetryReady[o.optString("id")]?.complete(o)
+            "telemetry-chunk" -> link?.let { receiveTelemetryChunk(it, o) }
+            "telemetry-ack" -> telemetryAcks[o.optString("ackId")]?.complete(o)
+            "telemetry-end" -> link?.let { finishTelemetryReceive(it, o) }
+            "telemetry-done" -> telemetryAcks[o.optString("ackId")]?.complete(o)
+            "telemetry-refuse" -> {
+                val error = IllegalStateException(o.optString("reason", "second phone declined telemetry export"))
+                val id = o.optString("id")
+                telemetryReady[id]?.completeExceptionally(error)
+                telemetryExports[id]?.completeExceptionally(error)
+                telemetryAcks[o.optString("ackId")]?.completeExceptionally(error)
+            }
         }
     }
 
@@ -1472,7 +1871,8 @@ class Engine private constructor(private val app: Context) {
         val tl = serverPlay.timeline
         link?.send(JSONObject().put("t", "timeline").put("epoch", tl.epoch).put("playing", tl.playing)
             .put("anchorFrame", tl.anchorFrame.toString()).put("anchorNs", tl.anchorNs.toString())
-            .put("stopFrame", tl.stopFrame.toString()))
+            .put("stopFrame", tl.stopFrame.toString()).put("op", activeCommandOp())
+            .put("cmdAppliedSrvNs", lastCommandAppliedSrvNs).put("cmdIssuedSrvNs", lastCommandIssuedSrvNs))
     }
 
     private fun stateJson(): JSONObject {
@@ -1483,7 +1883,8 @@ class Engine private constructor(private val app: Context) {
             .put("volL", volL.toDouble()).put("volR", volR.toDouble()).put("master", master.toDouble())
             .put("pointCh", Ch.name(pointChannel)).put("trimMs", trimNs / 1e6).put("serverName", myName)
             .put("undo", undoText).put("decodeProgress", decodeProgress ?: JSONObject.NULL)
-            .put("audioBuffering", ui.value.audioBuffering)
+            .put("audioBuffering", ui.value.audioBuffering).put("op", activeCommandOp())
+            .put("cmdAppliedSrvNs", lastCommandAppliedSrvNs).put("cmdIssuedSrvNs", lastCommandIssuedSrvNs)
     }
 
     private fun publishQueue() {
@@ -1529,6 +1930,7 @@ class Engine private constructor(private val app: Context) {
 
     /** Общий для обеих ролей разбор состояния плеера → UI (и параметры рендера на Point). */
     private fun applyState(o: JSONObject) {
+        if (role == Role.POINT) observeCommand(o)
         val playing = o.optBoolean("playing")
         val dur = o.optLong("durFrames")
         val vL = o.optDouble("volL", 1.0).toFloat(); val vR = o.optDouble("volR", 1.0).toFloat()
@@ -1551,6 +1953,14 @@ class Engine private constructor(private val app: Context) {
 
     private fun handleCmd(o: JSONObject) {
         val now = System.nanoTime()
+        val op = o.optString("op").takeIf { it.isNotBlank() } ?: java.util.UUID.randomUUID().toString()
+        lastCommandOp = op
+        lastCommandAppliedSrvNs = now
+        lastCommandIssuedSrvNs = o.optLong("issuedSrvNs", now)
+        telemetry.record("CMD_APPLIED", mapOf(
+            "cmd" to o.optString("a"), "originRole" to o.optString("originRole", "unknown"),
+            "appliedSrvNs" to now, "issuedSrvNs" to lastCommandIssuedSrvNs,
+        ), op = op)
         when (o.optString("a")) {
             "play" -> cmdPlay()
             "pause" -> cmdPause()
@@ -1774,35 +2184,45 @@ class Engine private constructor(private val app: Context) {
         onReady: (AudioSource) -> Unit = {},
         onProgress: (app.soundfield.core.SegmentedPcmSource) -> Unit = {},
     ): AudioSource? {
+        val op = java.util.UUID.randomUUID().toString()
+        val trackTag = TelemetryIdentifiers.hash(item.id)
+        currentDecodeOp = op
         decodedTracks[item.id]?.let {
-            telemetry.event("AUDIO_DECODE_CACHE_HIT", "trackId=${item.id} frames=${it.totalFrames}")
+            telemetry.record("AUDIO_DECODE_START", mapOf("track" to trackTag, "source" to "cache"), op = op)
+            telemetry.record("AUDIO_DECODE_COMPLETE", mapOf("track" to trackTag, "frames" to it.totalFrames,
+                "cacheHit" to true, "result" to "ok"), op = op)
             onReady(it)
+            currentDecodeOp = null
             return it
         }
         val inputBytes = runCatching { fileSize(item.ref().uri) }.getOrDefault(-1L)
         val mime = runCatching { app.contentResolver.getType(item.ref().uri) }.getOrNull() ?: "unknown"
         val startedAt = SystemClock.elapsedRealtime()
         var firstAudioAt: Long? = null
-        telemetry.event("AUDIO_DECODE_START", "trackId=${item.id} mime=$mime bytes=$inputBytes")
+        telemetry.record("AUDIO_DECODE_START", mapOf("track" to trackTag, "mime" to mime, "bytes" to inputBytes), op = op)
         return try {
             val decoded = AudioFileDecoder.decode(app, item.ref(), cancelled,
                 onReady = { ready ->
                     val now = SystemClock.elapsedRealtime()
                     if (firstAudioAt == null) {
                         firstAudioAt = now
-                        telemetry.event("AUDIO_DECODE_FIRST_AUDIO",
-                            "trackId=${item.id} elapsedMs=${now - startedAt} readyFrames=${ready.readyFrames} estimatedFrames=${ready.totalFrames}")
+                        telemetry.record("AUDIO_DECODE_FIRST_AUDIO", mapOf("track" to trackTag, "elapsedMs" to now - startedAt,
+                            "readyFrames" to ready.readyFrames, "estimatedFrames" to ready.totalFrames), op = op)
                     }
                     onReady(ready)
                 }, onProgress = { progress ->
                     telemetry.limited("AUDIO_DECODE_PROGRESS",
-                        "trackId=${item.id} readyFrames=${progress.readyFrames} estimatedFrames=${progress.totalFrames}")
+                        "track=$trackTag readyFrames=${progress.readyFrames} estimatedFrames=${progress.totalFrames}", op = op)
                     onProgress(progress)
                 })
             val elapsed = SystemClock.elapsedRealtime() - startedAt
             val durationMs = (decoded.totalFrames * 1_000.0 / SF.SAMPLE_RATE).toLong()
-            telemetry.event("AUDIO_DECODE_COMPLETE",
-                "trackId=${item.id} mime=$mime bytes=$inputBytes elapsedMs=$elapsed durationMs=$durationMs frames=${decoded.totalFrames} firstAudioMs=${firstAudioAt?.minus(startedAt) ?: -1L}")
+            telemetry.record("AUDIO_DECODE_COMPLETE", mapOf(
+                "track" to trackTag, "mime" to mime, "bytes" to inputBytes, "elapsedMs" to elapsed,
+                "durationMs" to durationMs, "frames" to decoded.totalFrames,
+                "firstAudioMs" to (firstAudioAt?.minus(startedAt) ?: -1L), "result" to "ok", "cacheHit" to false,
+            ), op = op)
+            currentDecodeOp = null
             Log.i(TAG, "decoded «${item.title}» in $elapsed ms")
             decoded
         } catch (t: Throwable) {
@@ -1810,8 +2230,12 @@ class Engine private constructor(private val app: Context) {
             val elapsed = SystemClock.elapsedRealtime() - startedAt
             val codecDiagnostic = (t as? MediaCodec.CodecException)?.diagnosticInfo
                 ?.take(160)?.let { " codecDiagnostic=$it" }.orEmpty()
-            telemetry.event(if (wasCancelled) "AUDIO_DECODE_CANCELLED" else "AUDIO_DECODE_FAILED",
-                "trackId=${item.id} mime=$mime bytes=$inputBytes elapsedMs=$elapsed firstAudioMs=${firstAudioAt?.minus(startedAt) ?: -1L} errorType=${t.javaClass.simpleName}$codecDiagnostic")
+            telemetry.record(if (wasCancelled) "AUDIO_DECODE_CANCELLED" else "AUDIO_DECODE_FAILED", mapOf(
+                "track" to trackTag, "mime" to mime, "bytes" to inputBytes, "elapsedMs" to elapsed,
+                "firstAudioMs" to (firstAudioAt?.minus(startedAt) ?: -1L),
+                "result" to if (wasCancelled) "cancelled" else "error", "codecDiagnostic" to codecDiagnostic,
+            ), op = op, error = t)
+            currentDecodeOp = null
             if (!wasCancelled) Log.w(TAG, "Could not load ${item.title}", t)
             null
         }
@@ -2112,9 +2536,13 @@ class Engine private constructor(private val app: Context) {
             return
         }
         calibRunning = true
+        val op = java.util.UUID.randomUUID().toString()
+        calibrationOp = op
+        telemetry.record("CALIBRATION_START", mapOf("apply" to apply, "role" to role.name.lowercase()), op = op)
         if (mode == SourceMode.MUSIC) { savedFrame = posFrame(); savedPlaying = serverPlay.timeline.running }
         mode = SourceMode.CALIBRATION; source = CalibrationSource(pointChannel)
         newEpoch(false, 0, System.nanoTime())
+        telemetry.record("CALIBRATION_STAGE", mapOf("stage" to "microphone_prepare"), op = op)
         broadcastCalib(true, "Подготовка микрофона…", "", true, null)
         val trimUsed = trimNs
         val anchor = AtomicLong(0)
@@ -2125,16 +2553,22 @@ class Engine private constructor(private val app: Context) {
                         val a = System.nanoTime() + 700_000_000L
                         anchor.set(a)
                         newEpoch(true, 0, a)
+                        telemetry.record("CALIBRATION_STAGE", mapOf("stage" to "signals"), op = op)
                         broadcastCalib(true, "Звучат тестовые сигналы — тишина, пожалуйста…", "", true, null)
                     }
                 }
-                post { broadcastCalib(true, "Анализ записи…", "", true, null) }
+                post {
+                    telemetry.record("CALIBRATION_STAGE", mapOf("stage" to "analysis"), op = op)
+                    broadcastCalib(true, "Анализ записи…", "", true, null)
+                }
                 val res = CalibrationAnalyzer.analyze(rec.samples, rec.sampleRate, rec.startNs, anchor.get(), trimUsed)
                 post { finishCalibration(res, apply, trimUsed) }
             } catch (e: Exception) {
                 Log.e(TAG, "calibration", e)
                 post {
                     calibRunning = false; restoreMusic(savedPlaying)
+                    telemetry.record("CALIBRATION_END", mapOf("result" to "error"), op = op, error = e)
+                    calibrationOp = null
                     broadcastCalib(false, "", "Ошибка микрофона: ${e.message}", false, null)
                 }
             }
@@ -2143,8 +2577,16 @@ class Engine private constructor(private val app: Context) {
 
     private fun finishCalibration(res: CalibrationAnalyzer.Result, apply: Boolean, trimUsed: Long) {
         calibRunning = false
+        val op = calibrationOp
+        calibrationOp = null
         restoreMusic(savedPlaying)
-        if (!res.ok) { broadcastCalib(false, "", res.message, false, null); return }
+        if (!res.ok) {
+            telemetry.record("CALIBRATION_END", mapOf("result" to "error", "quality" to res.spreadMs,
+                "message" to res.message), op = op)
+            broadcastCalib(false, "", res.message, false, null); return
+        }
+        telemetry.record("CALIBRATION_END", mapOf("result" to "ok", "lateMs" to res.lateMs,
+            "spreadMs" to res.spreadMs, "apply" to apply), op = op)
         val who = if (res.lateMs >= 0) "опаздывал" else "спешил"
         if (apply) {
             val newTrim = (trimUsed - (res.lateMs * 1e6).toLong())
@@ -2180,42 +2622,332 @@ class Engine private constructor(private val app: Context) {
     private fun heartbeat() {
         autoResumeTick()
         val nowMs = SystemClock.elapsedRealtime()
-        if (phase != Phase.IDLE && nowMs - lastTelemetry >= 10_000) {
-            lastTelemetry = nowMs
-            telemetry.event("HEALTH", telemetryState())
+        val heartbeatInterval = if (lastHeartbeatAtMs == 0L) 1_000L else (nowMs - lastHeartbeatAtMs).coerceAtLeast(0)
+        lastHeartbeatAtMs = nowMs
+        telemetryRateSamples.addLast(heartbeatInterval)
+        while (telemetryRateSamples.size > 20) telemetryRateSamples.removeFirst()
+        val heartbeatP95 = percentile95(telemetryRateSamples.toList())
+        val tickP95 = tickIntervals.takeP95Ms()
+        val output = audio.takeWindow(audioFocusHeld)
+        if (output.recoveryCount > 0) {
+            Log.w(TAG, "Recreating audio output after ${output.recoveryCount} failures", output.recoveryError)
+            telemetry.record("AUDIO_RECOVERY", mapOf("attempts" to output.recoveryCount), error = output.recoveryError)
         }
-        val l = link ?: return
-        if (phase != Phase.PAIRED) return
-        if (SystemClock.elapsedRealtime() - l.lastRx > SF.LINK_TIMEOUT_MS) { log("Нет данных ${SF.LINK_TIMEOUT_MS / 1000} с — соединение закрыто"); l.close("heartbeat timeout"); return }
-        l.send(JSONObject().put("t", "hb"))
-        if (role == Role.SERVER) {
-            val d = Diag(syncErrMs = serverRenderer.corrector.syncErrorMs, latencyMs = audio.latencyMs,
-                underruns = audio.underruns, resent = resent.get(), clockReady = true, valid = true)
-            ui { copy(serverDiag = d) }
-            l.send(d.toJson("sdiag"))
-            val pointAge = ui.value.pointDiag.audioAgeMs
-            val audioMissing = serverPlay.timeline.running && SystemClock.elapsedRealtime() - pairedAtMs > 5_000 &&
-                (pointUdp == null || pointAge < 0 || pointAge >= 5_000)
-            ui { copy(audioMissing = audioMissing) }
-            if (audioMissing && SystemClock.elapsedRealtime() - lastAudioSessionResetMs >= 5_000) {
-                renewAudioSession("Point не получает аудиопакеты")
-            }
+        if (udpFirstPacketPending.getAndSet(false)) {
+            telemetry.record("UDP_FIRST_PACKET", mapOf("from" to udpFirstPacketFrom.get(),
+                "ageAtObservationMs" to (nowMs - udpFirstPacketAtMs.get()).coerceAtLeast(0)))
+        }
+        val receiveFailureCount = udpReceiveFailures.getAndSet(0)
+        if (receiveFailureCount > 0) telemetry.limited("UDP_RECEIVE_FAILED", "count=$receiveFailureCount",
+            udpReceiveError.getAndSet(null))
+        val sendFailureCount = udpSendFailures.getAndSet(0)
+        if (sendFailureCount > 0) telemetry.limited("UDP_SEND_FAILED", "count=$sendFailureCount",
+            udpSendError.getAndSet(null))
+        val currentUi = ui.value
+        val playing = if (role == Role.SERVER) serverPlay.timeline.playing else rx.timeline.playing
+        val position = if (role == Role.SERVER) serverPlay.timeline.positionFrame(System.nanoTime()).coerceAtLeast(0)
+            else if (clock.ready) rx.timeline.positionFrame(clock.toServer(System.nanoTime())).coerceAtLeast(0) else 0L
+        val progressive = if (role == Role.SERVER) serverPlay.source as? SegmentedPcmSource else null
+        val readyFrames = progressive?.readyFrames ?: -1L
+        val decodeTrack = currentDecodeTrackTag()
+        if (decodeTrack != decodeReadyTrackTag || readyFrames != decodeReadyAtLastCheck) {
+            decodeReadyTrackTag = decodeTrack
+            decodeReadyAtLastCheck = readyFrames
+            decodeReadyChangedAtMs = nowMs
+        }
+        val decodedLead = if (readyFrames >= 0) readyFrames - position else -1L
+        val totalFrames = progressive?.totalFrames ?: -1L
+        val audioUnderruns = audio.underruns
+        val sourceMissing = if (role == Role.SERVER) serverRenderer.windowSourceMissingFrames.getAndSet(0) else 0
+        val pointMissing = if (role == Role.POINT) pointRenderer.windowUnderrunFrames.getAndSet(0) else 0
+        val channelSignal = if (role == Role.SERVER) pointChannelSignal.take() else null
+        val serverSignalDbfs = channelSignal?.rmsDbfs ?: currentUi.serverDiag.serverChannelRmsDbfs
+        val currentSlew = if (role == Role.SERVER) serverRenderer.corrector.slewEvents else pointRenderer.corrector.slewEvents
+        val slewDelta = (currentSlew - lastSlewEvents).coerceAtLeast(0)
+        lastSlewEvents = currentSlew
+        val pairTag = record?.key?.let(TelemetryIdentifiers::hash).orEmpty()
+        val trackTag = decodeTrack.orEmpty()
+        val udpNow = udpPackets.get()
+        val udpRate = (udpNow - previousUdpPackets).coerceAtLeast(0)
+        previousUdpPackets = udpNow
+        val sentNow = sentAudioPackets.get()
+        val sentRate = (sentNow - previousSentAudioPackets).coerceAtLeast(0)
+        previousSentAudioPackets = sentNow
+        val pointAudioRate = (rx.received - previousPointAudioPackets).coerceAtLeast(0)
+        previousPointAudioPackets = rx.received
+        val invalidNow = udpInvalid.get()
+        val invalidDelta = (invalidNow - previousUdpInvalid).coerceAtLeast(0)
+        previousUdpInvalid = invalidNow
+        if (invalidDelta > 0) telemetry.limited("UDP_INVALID", "count=$invalidDelta")
+        val otherSessionNow = udpOtherSession.get()
+        val otherSessionDelta = (otherSessionNow - previousUdpOtherSession).coerceAtLeast(0)
+        previousUdpOtherSession = otherSessionNow
+        val nacksNow = rx.nacksSent
+        val nackDelta = (nacksNow - previousNacksSent).coerceAtLeast(0)
+        previousNacksSent = nacksNow
+
+        val localDiag = if (role == Role.SERVER) {
+            Diag(
+                underruns = audioUnderruns + serverRenderer.underruns.get(), syncErrMs = serverRenderer.corrector.syncErrorMs,
+                latencyMs = audio.latencyMs, resent = resent.get(), clockReady = pointClockReady,
+                audioAgeMs = currentUi.pointDiag.audioAgeMs, valid = true,
+                pairTag = pairTag, sessionId = sessionId, epoch = serverPlay.timeline.epoch, trackTag = trackTag,
+                playbackPhase = phase.name, playing = playing,
+                outputRmsDbfs = output.signal.rmsDbfs, outputPeakDbfs = output.signal.peakDbfs,
+                outputSilentFrames = sourceMissing, outputFramesPerSecond = output.framesPerSecond,
+                outputTimestampValid = output.timestampValid, musicVolume = output.streamVolume,
+                musicVolumeMin = output.streamMinVolume, musicVolumeMax = output.streamMaxVolume, musicMuted = output.streamMuted,
+                audioRoute = output.route, audioFocus = output.audioFocus, serverChannelRmsDbfs = serverSignalDbfs,
+                decodeLeadFrames = decodedLead, decodeReadyFrames = readyFrames, decodePositionFrame = position,
+                tickP95Ms = tickP95, heartbeatIntervalMs = heartbeatP95,
+                tcpRxAgeMs = link?.let { nowMs - it.lastRx } ?: -1,
+                udpPacketsPerSec = udpRate, sentAudioPacketsPerSec = sentRate, udpInvalid = invalidNow,
+                udpOtherSession = otherSessionNow, nacksSent = nackDelta,
+                offsetMs = 0.0, trimMs = trimNs / 1e6,
+                hardJumps = serverRenderer.corrector.hardJumps, slewEvents = slewDelta,
+                decodeComplete = progressive?.complete ?: true, decodeTotalFrames = totalFrames,
+            )
         } else {
             val recv = rx.received; val lost = rx.lostFinal
             val dR = recv - lastRecv; val dL = lost - lastLost
             lastRecv = recv; lastLost = lost
             val loss = if (dR + dL > 0) dL * 100.0 / (dR + dL) else 0.0
-            val d = Diag(rttMs = clock.rttAvgMs, rttJitterMs = clock.rttJitterMs, jitterMs = rx.jitterMs, lossPct = loss,
+            Diag(
+                rttMs = clock.rttAvgMs, rttJitterMs = clock.rttJitterMs, jitterMs = rx.jitterMs, lossPct = loss,
                 recovered = rx.recovered, late = rx.late, stale = rx.stale, bufferMs = rx.bufferMs,
                 driftPpm = clock.driftPpm, clockUncMs = clock.uncertaintyMs,
-                underruns = pointRenderer.underrunEvents + audio.underruns, syncErrMs = pointRenderer.corrector.syncErrorMs,
-                latencyMs = audio.latencyMs, clockReady = clock.ready,
-                audioAgeMs = lastAudioRxAt.get().let { if (it == 0L) -1 else SystemClock.elapsedRealtime() - it }, valid = true)
-            ui { copy(pointDiag = d) }
-            ui { copy(audioMissing = rx.timeline.playing && SystemClock.elapsedRealtime() - pairedAtMs > 5_000 &&
-                (d.audioAgeMs < 0 || d.audioAgeMs >= 5_000)) }
-            l.send(d.toJson("diag"))
+                underruns = pointRenderer.underrunEvents.get() + audioUnderruns, syncErrMs = pointRenderer.corrector.syncErrorMs,
+                latencyMs = audio.latencyMs, clockReady = clock.ready, resent = currentUi.serverDiag.resent,
+                audioAgeMs = lastAudioRxAt.get().let { if (it == 0L) -1 else nowMs - it }, valid = true,
+                pairTag = pairTag, sessionId = sessionId, epoch = rx.timeline.epoch, trackTag = trackTag,
+                playbackPhase = phase.name, playing = playing,
+                outputRmsDbfs = output.signal.rmsDbfs, outputPeakDbfs = output.signal.peakDbfs,
+                outputSilentFrames = pointMissing, outputFramesPerSecond = output.framesPerSecond,
+                outputTimestampValid = output.timestampValid, musicVolume = output.streamVolume,
+                musicVolumeMin = output.streamMinVolume, musicVolumeMax = output.streamMaxVolume, musicMuted = output.streamMuted,
+                audioRoute = output.route, audioFocus = output.audioFocus, serverChannelRmsDbfs = serverSignalDbfs,
+                decodeLeadFrames = currentUi.serverDiag.decodeLeadFrames, decodeReadyFrames = currentUi.serverDiag.decodeReadyFrames,
+                decodePositionFrame = currentUi.serverDiag.decodePositionFrame, tickP95Ms = tickP95, heartbeatIntervalMs = heartbeatP95,
+                tcpRxAgeMs = link?.let { nowMs - it.lastRx } ?: -1, udpPacketsPerSec = udpRate,
+                sentAudioPacketsPerSec = currentUi.serverDiag.sentAudioPacketsPerSec, udpInvalid = invalidNow,
+                udpOtherSession = otherSessionNow, nacksSent = nackDelta,
+                offsetMs = if (clock.ready) (clock.toServer(System.nanoTime()) - System.nanoTime()) / 1e6 else 0.0,
+                trimMs = pointParams.trimNs / 1e6, hardJumps = pointRenderer.corrector.hardJumps, slewEvents = slewDelta,
+                decodeComplete = currentUi.serverDiag.decodeComplete, decodeTotalFrames = currentUi.serverDiag.decodeTotalFrames,
+            )
         }
+        if (role == Role.SERVER) ui { copy(serverDiag = localDiag) } else ui { copy(pointDiag = localDiag) }
+
+        val serverDiag = if (role == Role.SERVER) localDiag else ui.value.serverDiag
+        val pointDiag = if (role == Role.POINT) localDiag else ui.value.pointDiag
+        val snapshot = snapshotMetrics(nowMs, serverDiag, pointDiag, channelSignal, output, pointAudioRate, invalidDelta, otherSessionDelta)
+        blackBox.add(snapshot)
+        val violations = evaluateTelemetryRules(nowMs, serverDiag, pointDiag, localDiag, heartbeatP95)
+        val transitions = incidentRules.check(nowMs, violations)
+        transitions.forEach { update ->
+            val id = "${update.rule.name}-$myId-${update.sinceMs}"
+            val eventData = linkedMapOf<String, Any?>(
+                "rule" to update.rule.name, "incidentId" to id, "severity" to update.rule.severity,
+                "sinceMonoMs" to update.sinceMs, "durMs" to update.durationMs, "values" to update.values,
+            )
+            if (update.kind == "INCIDENT_START") {
+                eventData["snapshot"] = snapshot
+                telemetry.record(update.kind, eventData, category = "incident", op = id,
+                    severityOverride = update.rule.severity)
+                flushBlackBox(id)
+            } else {
+                if (update.kind == "INCIDENT_END") {
+                    eventData["result"] = "ok"
+                    eventData["recoveredSnapshot"] = snapshot
+                }
+                telemetry.record(update.kind, eventData, category = "incident", op = id,
+                    severityOverride = update.rule.severity)
+            }
+        }
+        val activeIncidents = incidentRules.active(nowMs).map {
+            "${it.rule.name} · ${formatDuration(it.durationMs)}"
+        }
+        ui { copy(activeIncidents = activeIncidents) }
+        if (nowMs - lastTelemetry >= 10_000) {
+            lastTelemetry = nowMs
+            telemetry.recordCompressed("HEALTH", mapOf("samples" to listOf(snapshot)), field = "samples")
+        }
+
+        val activeLink = link
+        if (phase != Phase.PAIRED || activeLink == null) return
+        if (nowMs - activeLink.lastRx > SF.LINK_TIMEOUT_MS) {
+            log("Нет данных ${SF.LINK_TIMEOUT_MS / 1000} с — соединение закрыто")
+            activeLink.close("heartbeat timeout")
+            return
+        }
+        activeLink.send(JSONObject().put("t", "hb"))
+        if (role == Role.SERVER) {
+            activeLink.send(localDiag.toJson("sdiag"))
+            val pointAge = ui.value.pointDiag.audioAgeMs
+            val audioMissing = serverPlay.timeline.running && nowMs - pairedAtMs > 5_000 &&
+                (pointUdp == null || pointAge < 0 || pointAge >= 5_000)
+            ui { copy(audioMissing = audioMissing) }
+            if (audioMissing && nowMs - lastAudioSessionResetMs >= 5_000) {
+                renewAudioSession("Point не получает аудиопакеты")
+            }
+        } else {
+            val audioMissing = rx.timeline.playing && nowMs - pairedAtMs > 5_000 &&
+                (localDiag.audioAgeMs < 0 || localDiag.audioAgeMs >= 5_000)
+            ui { copy(audioMissing = audioMissing) }
+            activeLink.send(localDiag.toJson("diag"))
+        }
+    }
+
+    private fun currentDecodeTrackTag(): String? {
+        val id = if (role == Role.SERVER) queue.getOrNull(queueIndex)?.id
+            else ui.value.queueTracks.getOrNull(ui.value.queueIndex)?.id
+        return id?.takeIf { it.isNotBlank() }?.let(TelemetryIdentifiers::hash)
+    }
+
+    private fun percentile95(samples: List<Long>): Double {
+        if (samples.isEmpty()) return 0.0
+        val sorted = samples.sorted()
+        val index = kotlin.math.ceil(sorted.lastIndex * 0.95).toInt().coerceIn(0, sorted.lastIndex)
+        return sorted[index].toDouble()
+    }
+
+    private fun snapshotMetrics(
+        nowMs: Long,
+        serverDiag: Diag,
+        pointDiag: Diag,
+        channelSignal: app.soundfield.diagnostics.SignalWindow?,
+        output: AudioOutput.Window,
+        pointAudioRate: Long,
+        invalidDelta: Long,
+        otherSessionDelta: Long,
+    ): Map<String, Any?> {
+        val state = ui.value
+        val track = if (role == Role.SERVER) queue.getOrNull(queueIndex)?.id
+            else state.queueTracks.getOrNull(state.queueIndex)?.id
+        return linkedMapOf(
+            "mono" to nowMs, "srvNs" to if (role == Role.SERVER) System.nanoTime()
+                else if (clock.ready) clock.toServer(System.nanoTime()) else null,
+            "device" to myId, "role" to role.name.lowercase(), "phase" to phase.name,
+            "network" to mapOf(
+                "rttMs" to pointDiag.rttMs, "rttJitterMs" to pointDiag.rttJitterMs,
+                "jitterMs" to pointDiag.jitterMs, "lossPct" to pointDiag.lossPct,
+                "nacksSent" to pointDiag.nacksSent, "resent" to serverDiag.resent,
+                "late" to pointDiag.late, "stale" to pointDiag.stale,
+                "udpPacketsPerSec" to serverDiag.udpPacketsPerSec,
+                "audioPacketsSentPerSec" to serverDiag.sentAudioPacketsPerSec,
+                "audioPacketsReceivedPerSec" to pointAudioRate,
+                "udpInvalidDelta" to invalidDelta, "udpOtherSessionDelta" to otherSessionDelta,
+                "audioAgeMs" to pointDiag.audioAgeMs, "tcpRxAgeMs" to (link?.let { nowMs - it.lastRx } ?: -1),
+            ),
+            "sync" to mapOf(
+                "offsetMs" to pointDiag.offsetMs, "driftPpm" to pointDiag.driftPpm,
+                "uncertaintyMs" to pointDiag.clockUncMs, "syncErrMsServer" to serverDiag.syncErrMs,
+                "syncErrMsPoint" to pointDiag.syncErrMs, "hardJumps" to serverDiag.hardJumps + pointDiag.hardJumps,
+                "slewEventsPerSec" to serverDiag.slewEvents + pointDiag.slewEvents, "trimMs" to pointDiag.trimMs,
+            ),
+            "buffers" to mapOf(
+                "jitterBufferMs" to pointDiag.bufferMs, "decodeLeadFrames" to serverDiag.decodeLeadFrames,
+                "decodeReadyFrames" to serverDiag.decodeReadyFrames, "decodePositionFrame" to serverDiag.decodePositionFrame,
+                "pointUnderrunFrames" to pointDiag.outputSilentFrames, "serverUnderrunFrames" to serverDiag.outputSilentFrames,
+            ),
+            "sound" to mapOf(
+                "outputRmsDbfs" to output.signal.rmsDbfs, "outputPeakDbfs" to output.signal.peakDbfs,
+                "outputFramesPerSec" to output.framesPerSecond, "outputTimestampValid" to output.timestampValid,
+                "serverChannelRmsDbfs" to (channelSignal?.rmsDbfs ?: serverDiag.serverChannelRmsDbfs),
+                "musicVolume" to output.streamVolume, "musicVolumeMin" to output.streamMinVolume,
+                "musicVolumeMax" to output.streamMaxVolume, "musicMuted" to output.streamMuted,
+                "route" to output.route, "audioFocus" to output.audioFocus,
+            ),
+            "playback" to mapOf(
+                "session" to sessionId, "epoch" to if (role == Role.SERVER) serverPlay.timeline.epoch else rx.timeline.epoch,
+                "playing" to state.playing, "positionFrame" to positionFrameSnapshot(),
+                "track" to track?.let(TelemetryIdentifiers::hash), "mode" to state.mode.wire,
+            ),
+            "loops" to mapOf("tickP95Ms" to serverDiag.tickP95Ms, "heartbeatIntervalP95Ms" to serverDiag.heartbeatIntervalMs),
+        )
+    }
+
+    private fun positionFrameSnapshot(): Long {
+        val now = System.nanoTime()
+        return if (role == Role.SERVER) serverPlay.timeline.positionFrame(now).coerceAtLeast(0)
+        else if (clock.ready) rx.timeline.positionFrame(clock.toServer(now)).coerceAtLeast(0) else 0
+    }
+
+    private fun evaluateTelemetryRules(
+        nowMs: Long,
+        serverDiag: Diag,
+        pointDiag: Diag,
+        localDiag: Diag,
+        heartbeatP95: Double,
+    ): Map<String, Map<String, Any?>> {
+        val result = linkedMapOf<String, Map<String, Any?>>()
+        val playing = serverDiag.playing || pointDiag.playing
+        fun violation(name: String, values: Map<String, Any?>) { result[name] = values }
+        if (phase == Phase.PAIRED && playing && (pointDiag.audioAgeMs < 0 || pointDiag.audioAgeMs >= 1_000)) {
+            violation("POINT_NO_PACKETS", mapOf("audioAgeMs" to pointDiag.audioAgeMs, "sessionId" to pointDiag.sessionId))
+        }
+        if (phase == Phase.PAIRED && playing && serverDiag.serverChannelRmsDbfs > -50.0 && pointDiag.outputRmsDbfs < -70.0) {
+            violation("POINT_SILENT_OUTPUT", mapOf("serverChannelRmsDbfs" to serverDiag.serverChannelRmsDbfs,
+                "pointOutputRmsDbfs" to pointDiag.outputRmsDbfs))
+        }
+        if (phase == Phase.PAIRED && playing && serverDiag.outputRmsDbfs < -70.0) {
+            violation("SERVER_SILENT_OUTPUT", mapOf("serverOutputRmsDbfs" to serverDiag.outputRmsDbfs,
+                "serverChannelRmsDbfs" to serverDiag.serverChannelRmsDbfs))
+        }
+        val stalledDevices = listOf("server" to serverDiag, "point" to pointDiag).filter { (_, diag) ->
+            playing && diag.outputTimestampValid && diag.outputFramesPerSecond < SF.SAMPLE_RATE * 0.9
+        }.map { (device, diag) -> mapOf("device" to device, "framesPerSec" to diag.outputFramesPerSecond) }
+        if (stalledDevices.isNotEmpty()) violation("OUTPUT_STALLED", mapOf("devices" to stalledDevices))
+        val muted = listOf("server" to serverDiag, "point" to pointDiag).filter { (_, diag) ->
+            playing && (diag.musicMuted || diag.musicVolume == 0)
+        }.map { (device, diag) -> mapOf("device" to device, "volume" to diag.musicVolume, "muted" to diag.musicMuted) }
+        if (muted.isNotEmpty()) violation("OUTPUT_MUTED", mapOf("devices" to muted))
+        val syncErrors = mapOf("serverMs" to serverDiag.syncErrMs, "pointMs" to pointDiag.syncErrMs)
+        if (phase == Phase.PAIRED && playing && (abs(serverDiag.syncErrMs) > 2.0 || abs(pointDiag.syncErrMs) > 2.0)) {
+            violation("SYNC_ERROR", syncErrors)
+        }
+        if (phase == Phase.PAIRED && playing && serverDiag.decodeTotalFrames >= 120L * SF.SAMPLE_RATE &&
+            !serverDiag.decodeComplete && serverDiag.decodeLeadFrames in 0 until (2L * SF.SAMPLE_RATE)) {
+            violation("DECODE_LEAD_LOW", mapOf("leadFrames" to serverDiag.decodeLeadFrames,
+                "thresholdFrames" to 2L * SF.SAMPLE_RATE, "readyFrames" to serverDiag.decodeReadyFrames))
+        }
+        if ((ui.value.loadingTracks || ui.value.audioBuffering) && nowMs - decodeReadyChangedAtMs >= 10_000) {
+            violation("DECODE_STUCK", mapOf("readyFrames" to decodeReadyAtLastCheck,
+                "unchangedMs" to nowMs - decodeReadyChangedAtMs, "loading" to ui.value.loadingTracks,
+                "buffering" to ui.value.audioBuffering))
+        }
+        val transferActive = fileTransferActive.get() || incomingFileTransfer != null
+        if (transferActive && transferLastProgressAtMs > 0 && nowMs - transferLastProgressAtMs >= 10_000) {
+            violation("TRANSFER_STUCK", mapOf("unchangedMs" to nowMs - transferLastProgressAtMs))
+        }
+        if (phase == Phase.PAIRED && serverDiag.valid && pointDiag.valid) {
+            val differences = linkedMapOf<String, Any?>()
+            if (serverDiag.pairTag.isNotBlank() && pointDiag.pairTag.isNotBlank() && serverDiag.pairTag != pointDiag.pairTag)
+                differences["pairTag"] = listOf(serverDiag.pairTag, pointDiag.pairTag)
+            if (serverDiag.sessionId != pointDiag.sessionId) differences["sessionId"] = listOf(serverDiag.sessionId, pointDiag.sessionId)
+            if (serverDiag.epoch != pointDiag.epoch) differences["epoch"] = listOf(serverDiag.epoch, pointDiag.epoch)
+            if (serverDiag.trackTag.isNotBlank() && pointDiag.trackTag.isNotBlank() && serverDiag.trackTag != pointDiag.trackTag)
+                differences["trackTag"] = listOf(serverDiag.trackTag, pointDiag.trackTag)
+            if (serverDiag.playbackPhase != pointDiag.playbackPhase) differences["phase"] = listOf(serverDiag.playbackPhase, pointDiag.playbackPhase)
+            if (serverDiag.playing != pointDiag.playing) differences["playing"] = listOf(serverDiag.playing, pointDiag.playing)
+            if (differences.isNotEmpty()) violation("STATE_MISMATCH", differences)
+        }
+        if (phase == Phase.PAIRED && (localDiag.tickP95Ms > 20.0 || heartbeatP95 > 1_500.0)) {
+            violation("LOOP_LATENCY", mapOf("tickP95Ms" to localDiag.tickP95Ms, "heartbeatP95Ms" to heartbeatP95))
+        }
+        val tcpAge = link?.let { nowMs - it.lastRx } ?: Long.MAX_VALUE
+        if (phase == Phase.PAIRED && tcpAge > 2_000) violation("LINK_SILENT", mapOf("tcpRxAgeMs" to tcpAge))
+        return result
+    }
+
+    private fun flushBlackBox(id: String) {
+        val samples = blackBox.drain()
+        telemetry.recordCompressed("BLACKBOX", mapOf("id" to id, "samples" to samples), field = "samples", op = id)
+    }
+
+    private fun formatDuration(ms: Long): String {
+        val seconds = ms / 1_000
+        return "%02d:%02d".format(seconds / 60, seconds % 60)
     }
 
     // ================================================================== UDP
@@ -2229,9 +2961,14 @@ class Engine private constructor(private val app: Context) {
                 val now = System.nanoTime()
                 udpPackets.incrementAndGet()
                 val m = Wire.decode(pkt.data, pkt.length)
-                if (m == null) { udpInvalid.incrementAndGet(); telemetry.limited("UDP_INVALID", "bytes=${pkt.length} from=${pkt.socketAddress}"); continue }
+                if (m == null) { udpInvalid.incrementAndGet(); continue }
                 if (m.session != sessionId || sessionId == 0) { udpOtherSession.incrementAndGet(); continue }
-                if (udpLastRx.getAndSet(SystemClock.elapsedRealtime()) == 0L) telemetry.event("UDP_FIRST_PACKET", "from=${pkt.socketAddress}")
+                val receivedAt = SystemClock.elapsedRealtime()
+                if (udpLastRx.getAndSet(receivedAt) == 0L) {
+                    udpFirstPacketAtMs.set(receivedAt)
+                    udpFirstPacketFrom.set(pkt.socketAddress.toString())
+                    udpFirstPacketPending.set(true)
+                }
                 when (m) {
                     is UdpMsg.Ping -> if (role == Role.SERVER && phase == Phase.PAIRED) {
                         pointUdp = pkt.socketAddress as InetSocketAddress
@@ -2246,7 +2983,7 @@ class Engine private constructor(private val app: Context) {
                     }
                 }
             } catch (e: Exception) {
-                telemetry.limited("UDP_RECEIVE_FAILED", error = e); Log.w(TAG, "udp: ${e.message}"); SystemClock.sleep(10)
+                udpReceiveFailures.incrementAndGet(); udpReceiveError.set(e); SystemClock.sleep(10)
             }
         }
     }
@@ -2255,13 +2992,17 @@ class Engine private constructor(private val app: Context) {
         while (true) {
             try {
                 if (phase == Phase.PAIRED) {
+                    val now = System.nanoTime()
+                    val previous = lastTickAtNs.getAndSet(now)
+                    if (previous > 0L) tickIntervals.record(now - previous)
                     if (role == Role.SERVER) serverSend() else pointNet()
                     SystemClock.sleep(5)
                 } else {
+                    lastTickAtNs.set(0L)
                     // Не в паре — нет смысла крутиться каждые 5 мс, спим 200 мс.
                     SystemClock.sleep(200)
                 }
-            } catch (e: Exception) { telemetry.limited("UDP_SEND_FAILED", error = e); Log.w(TAG, "tick: ${e.message}") }
+            } catch (e: Exception) { udpSendFailures.incrementAndGet(); udpSendError.set(e) }
         }
     }
 
@@ -2269,10 +3010,12 @@ class Engine private constructor(private val app: Context) {
         val count = minOf(SF.PACKET_FRAMES.toLong(), st.source.totalFrames - start).toInt().coerceAtLeast(0)
         val pCh = Ch.other(st.channel)
         val s = ShortArray(count) { i -> (st.source.sample(start + i, pCh) * 32767f).roundToInt().coerceIn(-32768, 32767).toShort() }
+        if (flags == 0) pointChannelSignal.addPcm16(s, count)
         return Wire.audio(sessionId, tl.epoch, seq, start, tl.timeOf(start), System.nanoTime(), flags, s, count)
     }
 
     private fun serverSend() { synchronized(sendLock) {
+        if (debugUdpAudioStopped) return
         val addr = pointUdp ?: return
         val st = serverPlay
         val tl = st.timeline
@@ -2325,9 +3068,11 @@ class Engine private constructor(private val app: Context) {
 
     // ================================================================== аудиофокус / прерывания
     private val focusListener = AudioManager.OnAudioFocusChangeListener { change ->
+        audioFocusHeld = change == AudioManager.AUDIOFOCUS_GAIN || audioFocusHeld
+        telemetry.record("AUDIO_FOCUS_CHANGE", mapOf("change" to change, "held" to audioFocusHeld))
         when (change) {
             AudioManager.AUDIOFOCUS_LOSS, AudioManager.AUDIOFOCUS_LOSS_TRANSIENT ->
-                post { onInterrupted("Звук прерван (звонок или другое приложение) — пара на паузе") }
+                { audioFocusHeld = false; post { onInterrupted("Звук прерван (звонок или другое приложение) — пара на паузе") } }
         }
     }
 
@@ -2339,17 +3084,22 @@ class Engine private constructor(private val app: Context) {
             .setOnAudioFocusChangeListener(focusListener, Handler(Looper.getMainLooper()))
             .setWillPauseWhenDucked(false)
             .build()
-        if (am.requestAudioFocus(req) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED) focusRequest = req
+        if (am.requestAudioFocus(req) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED) {
+            focusRequest = req
+            audioFocusHeld = true
+        }
     }
 
     private fun abandonFocus() {
         focusRequest?.let { am.abandonAudioFocusRequest(it) }
         focusRequest = null
+        audioFocusHeld = false
     }
 
     /** Прерывание на любом телефоне ставит на паузу всю пару — состояние остаётся согласованным. */
     private fun onInterrupted(reason: String) {
         focusRequest = null
+        audioFocusHeld = false
         if (!ui.value.inPair) return
         if (role == Role.SERVER) cmdPause() else link?.send(JSONObject().put("t", "cmd").put("a", "pause"))
         toast(reason)
