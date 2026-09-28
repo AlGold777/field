@@ -2288,6 +2288,7 @@ class Engine private constructor(private val app: Context) {
                             PeerPathDiagnosis.RoundVerdict.ALL_TIMEOUT
                     } == true
                     val manualLanRetry = manualLanBlockedPeerId == p.id && failedAllByTimeout && phase == Phase.INVITING &&
+                        peerPathDiagnoses[p.id]?.currentVerdict() == PeerPathDiagnosis.Verdict.LAN_PEER_BLOCKED &&
                         (tag == "invite-out" || tag == "resume-out" && manualResumeActive && !manualResumeAuto)
                     if (manualLanRetry) {
                         manualLanBlockedPeerId = null
