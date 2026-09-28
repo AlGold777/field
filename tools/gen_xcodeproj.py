@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
 """Генерирует ios/SoundField.xcodeproj/project.pbxproj из файлов в ios/SoundField/.
 Запуск: python3 tools/gen_xcodeproj.py (после добавления/удаления файлов)."""
-import hashlib, os
+import hashlib, os, re
 
 ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'ios')
 SRC = os.path.join(ROOT, 'SoundField')
+PROJECT_YML = os.path.join(ROOT, 'project.yml')
+with open(PROJECT_YML, encoding='utf-8') as source:
+    project_config = source.read()
+MARKETING_VERSION = re.search(r'(?m)^\s*MARKETING_VERSION:\s*(\S+)', project_config).group(1)
+CURRENT_PROJECT_VERSION = re.search(r'(?m)^\s*CURRENT_PROJECT_VERSION:\s*(\S+)', project_config).group(1)
 
 def oid(key):
     return hashlib.md5(key.encode()).hexdigest()[:24].upper()
@@ -108,7 +113,7 @@ w(f'\t\t{oid("sources")} /* Sources */ = {{isa = PBXSourcesBuildPhase; buildActi
 w('/* End PBXSourcesBuildPhase section */\n')
 
 common_proj = '''ALWAYS_SEARCH_USER_PATHS = NO; CLANG_ENABLE_MODULES = YES; CLANG_ENABLE_OBJC_ARC = YES; ENABLE_STRICT_OBJC_MSGSEND = YES; GCC_NO_COMMON_BLOCKS = YES; IPHONEOS_DEPLOYMENT_TARGET = 16.0; SDKROOT = iphoneos; SWIFT_VERSION = 5.0; SWIFT_STRICT_CONCURRENCY = minimal;'''
-target_common = '''ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon; ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor; CODE_SIGN_STYLE = Automatic; CURRENT_PROJECT_VERSION = 9; DEVELOPMENT_TEAM = ""; ENABLE_PREVIEWS = YES; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = SoundField/Info.plist; LD_RUNPATH_SEARCH_PATHS = ("$(inherited)", "@executable_path/Frameworks", ); MARKETING_VERSION = 1.1.7; PRODUCT_BUNDLE_IDENTIFIER = app.soundfield; PRODUCT_NAME = "$(TARGET_NAME)"; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator"; SUPPORTS_MACCATALYST = NO; SWIFT_EMIT_LOC_STRINGS = YES; TARGETED_DEVICE_FAMILY = 1;'''
+target_common = f'''ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon; ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor; CODE_SIGN_STYLE = Automatic; CURRENT_PROJECT_VERSION = {CURRENT_PROJECT_VERSION}; DEVELOPMENT_TEAM = ""; ENABLE_PREVIEWS = YES; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = SoundField/Info.plist; LD_RUNPATH_SEARCH_PATHS = ("$(inherited)", "@executable_path/Frameworks", ); MARKETING_VERSION = {MARKETING_VERSION}; PRODUCT_BUNDLE_IDENTIFIER = app.soundfield; PRODUCT_NAME = "$(TARGET_NAME)"; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator"; SUPPORTS_MACCATALYST = NO; SWIFT_EMIT_LOC_STRINGS = YES; TARGETED_DEVICE_FAMILY = 1;'''
 w('\n/* Begin XCBuildConfiguration section */\n')
 w(f'\t\t{oid("pc.debug")} /* Debug */ = {{isa = XCBuildConfiguration; buildSettings = {{ {common_proj} DEBUG_INFORMATION_FORMAT = dwarf; ENABLE_TESTABILITY = YES; GCC_OPTIMIZATION_LEVEL = 0; ONLY_ACTIVE_ARCH = YES; SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG; SWIFT_OPTIMIZATION_LEVEL = "-Onone"; }}; name = Debug; }};\n')
 w(f'\t\t{oid("pc.release")} /* Release */ = {{isa = XCBuildConfiguration; buildSettings = {{ {common_proj} DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym"; ENABLE_NS_ASSERTIONS = NO; SWIFT_COMPILATION_MODE = wholemodule; SWIFT_OPTIMIZATION_LEVEL = "-O"; VALIDATE_PRODUCT = YES; }}; name = Release; }};\n')

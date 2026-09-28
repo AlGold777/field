@@ -17,20 +17,29 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.stateDescription
 import app.soundfield.core.Ch
 import app.soundfield.core.Role
 import app.soundfield.core.SourceMode
+import app.soundfield.core.BalanceLaw
 import app.soundfield.engine.Engine
 import app.soundfield.engine.Phase
 import app.soundfield.engine.UiState
 import kotlinx.coroutines.delay
 import kotlin.math.abs
 import kotlin.math.roundToInt
+import java.util.Locale
 
 @Composable
 fun PlayerScreen(ui: UiState, engine: Engine, openCalibration: () -> Unit, openDiagnostics: () -> Unit,
@@ -172,23 +181,49 @@ fun PlayerScreen(ui: UiState, engine: Engine, openCalibration: () -> Unit, openD
             var m by remember(ui.master) { mutableFloatStateOf(ui.master) }
             var l by remember(ui.volL) { mutableFloatStateOf(ui.volL) }
             var r by remember(ui.volR) { mutableFloatStateOf(ui.volR) }
-            var balance by remember(ui.balance) { mutableFloatStateOf(ui.balance) }
+            var balance by remember { mutableFloatStateOf(ui.balance) }
+            var balanceDragging by remember { mutableStateOf(false) }
+            var wasInCenter by remember { mutableStateOf(abs(ui.balance - 0.5f) < 0.015f) }
+            val haptic = LocalHapticFeedback.current
+            LaunchedEffect(ui.balance, balanceDragging) { if (!balanceDragging) balance = ui.balance }
             SliderRow("Громкость", "${(m * 100).roundToInt()}%", m, SFColors.Master,
                 onChange = { m = it; engine.setVolume("M", it, finished = false) },
                 onDone = { engine.setVolume("M", m, finished = true) })
-            Text("Баланс между телефонами", color = SFColors.TextDim, fontSize = 14.sp)
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                Text("Баланс между телефонами", color = SFColors.TextDim, fontSize = 14.sp, modifier = Modifier.weight(1f))
+                TextButton(onClick = {
+                    balance = 0.5f; wasInCenter = true; engine.setBalance(0.5f, finished = true)
+                }) { Text(balanceLabel(balance), color = SFColors.Accent1, fontSize = 14.sp, fontWeight = FontWeight.SemiBold) }
+            }
             Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                 Text("L", color = SFColors.LeftText, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
                 Slider(
                     value = balance,
-                    onValueChange = { balance = it; engine.setBalance(it, finished = false) },
-                    onValueChangeFinished = { engine.setBalance(balance, finished = true) },
+                    onValueChange = { raw ->
+                        val centered = abs(raw - 0.5f) < 0.015f
+                        if (centered && !wasInCenter) haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                        wasInCenter = centered
+                        val value = if (centered) 0.5f else raw
+                        balanceDragging = true; balance = value; engine.setBalance(value, finished = false)
+                    },
+                    onValueChangeFinished = { balanceDragging = false; engine.setBalance(balance, finished = true) },
                     colors = SliderDefaults.colors(thumbColor = SFColors.Accent1, activeTrackColor = SFColors.Accent1,
                         inactiveTrackColor = Color(0x1AFFFFFF)),
-                    modifier = Modifier.weight(1f).padding(horizontal = 8.dp),
+                    modifier = Modifier.weight(1f).padding(horizontal = 8.dp)
+                        .drawWithContent {
+                            drawContent()
+                            drawLine(SFColors.TextDim.copy(alpha = 0.75f),
+                                Offset(size.width / 2f, size.height / 2f - 5.dp.toPx()),
+                                Offset(size.width / 2f, size.height / 2f + 5.dp.toPx()), strokeWidth = 2.dp.toPx())
+                        }
+                        .semantics {
+                            contentDescription = "Баланс между телефонами"
+                            stateDescription = "Баланс: ${balanceLabel(balance)}"
+                        },
                 )
                 Text("R", color = SFColors.RightText, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
             }
+            LaunchedEffect(balance) { if (!balanceDragging) wasInCenter = abs(balance - 0.5f) < 0.015f }
             SliderRow("Левый канал · L", "${(l * 100).roundToInt()}%", l, SFColors.Left,
                 onChange = { l = it; engine.setVolume("L", it) })
             SliderRow("Правый канал · R", "${(r * 100).roundToInt()}%", r, SFColors.Right,
@@ -218,4 +253,14 @@ fun PlayerScreen(ui: UiState, engine: Engine, openCalibration: () -> Unit, openD
 private fun RoundIcon(icon: String, onClick: () -> Unit) {
     Box(Modifier.size(54.dp).clip(CircleShape).background(SFColors.Secondary).clickable(onClick = onClick),
         contentAlignment = Alignment.Center) { Text(icon, color = Color.White, fontSize = 20.sp) }
+}
+
+private fun balanceLabel(value: Float): String {
+    val p = 2f * value.coerceIn(0f, 1f) - 1f
+    if (abs(p) < 0.001f) return "Центр"
+    if (abs(p) >= 0.995f) return if (p < 0f) "Только L" else "Только R"
+    val db = -BalanceLaw.differenceDb(value)
+    val rounded = (db * 2f).roundToInt() / 2f
+    val channel = if (p < 0f) "L" else "R"
+    return String.format(Locale.US, "%s +%.1f дБ", channel, rounded)
 }

@@ -1,5 +1,6 @@
 import SwiftUI
 import UniformTypeIdentifiers
+import UIKit
 
 struct PlayerView: View {
     let ui: UiState
@@ -14,6 +15,8 @@ struct PlayerView: View {
     @State private var volL = 1.0
     @State private var volR = 1.0
     @State private var balance = 0.5
+    @State private var balanceDragging = false
+    @State private var balanceWasInCenter = true
     @AppStorage("sf.queueExpanded") private var queueExpanded = false
     @State private var showingAudioSourceDialog = false
     @State private var showingAudioFiles = false
@@ -105,13 +108,44 @@ struct PlayerView: View {
                     SliderRow(label: "Громкость", valueText: "\(Int(master * 100))%", value: $master, color: SFColor.master,
                               onEditingEnded: { engine.setVolume("M", Float(master), finished: true) })
                         .onChange(of: master) { if abs($0 - Double(ui.master)) > 0.004 { engine.setVolume("M", Float($0), finished: false) } }
-                    Text("Баланс между телефонами").font(.system(size: 14)).foregroundColor(SFColor.dim)
+                    HStack {
+                        Text("Баланс между телефонами").font(.system(size: 14)).foregroundColor(SFColor.dim)
+                        Spacer()
+                        Button {
+                            balance = 0.5; balanceWasInCenter = true
+                            engine.setBalance(0.5, finished: true)
+                        } label: {
+                            Text(balanceLabel(balance)).font(.system(size: 14, weight: .semibold)).foregroundColor(SFColor.accent1)
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("Сбросить баланс в центр")
+                    }
                     HStack(spacing: 8) {
                         Text("L").font(.system(size: 13, weight: .semibold)).foregroundColor(SFColor.leftText)
-                        Slider(value: $balance, in: 0...1)
+                        ZStack {
+                            Slider(value: Binding(get: { balance }, set: { raw in
+                                let centered = abs(raw - 0.5) < 0.015
+                                if centered && !balanceWasInCenter {
+                                    let haptic = UISelectionFeedbackGenerator(); haptic.prepare(); haptic.selectionChanged()
+                                }
+                                balanceWasInCenter = centered
+                                let value = centered ? 0.5 : raw
+                                balance = value
+                                if abs(value - Double(ui.balance)) > 0.004 { engine.setBalance(Float(value), finished: false) }
+                            }), in: 0...1, onEditingChanged: { editing in
+                                balanceDragging = editing
+                                if !editing { engine.setBalance(Float(balance), finished: true) }
+                            })
                             .tint(SFColor.accent1)
-                            .onChange(of: balance) { if abs($0 - Double(ui.balance)) > 0.004 { engine.setBalance(Float($0), finished: false) } }
-                            .onEditingChanged { editing in if !editing { engine.setBalance(Float(balance), finished: true) } }
+                            GeometryReader { geometry in
+                                Rectangle().fill(SFColor.dim.opacity(0.8)).frame(width: 2, height: 10)
+                                    .position(x: geometry.size.width / 2, y: geometry.size.height / 2)
+                            }
+                            .allowsHitTesting(false)
+                        }
+                        .accessibilityElement()
+                        .accessibilityLabel("Баланс между телефонами")
+                        .accessibilityValue("Баланс: \(balanceLabel(balance))")
                         Text("R").font(.system(size: 13, weight: .semibold)).foregroundColor(SFColor.rightText)
                     }
                     SliderRow(label: "Левый канал · L", valueText: "\(Int(volL * 100))%", value: $volL, color: SFColor.left)
@@ -141,7 +175,10 @@ struct PlayerView: View {
         .onChange(of: ui.master) { _ in syncVolumes() }
         .onChange(of: ui.volL) { _ in syncVolumes() }
         .onChange(of: ui.volR) { _ in syncVolumes() }
-        .onChange(of: ui.balance) { _ in syncVolumes() }
+        .onChange(of: ui.balance) { value in
+            if !balanceDragging { balance = Double(value); balanceWasInCenter = abs(Double(value) - 0.5) < 0.015 }
+            syncVolumes()
+        }
         .onChange(of: ui.filePickerRequest) { request in
             if request > 0 { showingAudioSourceDialog = true }
         }
@@ -169,7 +206,18 @@ struct PlayerView: View {
         if abs(master - Double(ui.master)) > 0.005 { master = Double(ui.master) }
         if abs(volL - Double(ui.volL)) > 0.005 { volL = Double(ui.volL) }
         if abs(volR - Double(ui.volR)) > 0.005 { volR = Double(ui.volR) }
-        if abs(balance - Double(ui.balance)) > 0.005 { balance = Double(ui.balance) }
+        if !balanceDragging && abs(balance - Double(ui.balance)) > 0.005 {
+            balance = Double(ui.balance); balanceWasInCenter = abs(balance - 0.5) < 0.015
+        }
+    }
+
+    private func balanceLabel(_ value: Double) -> String {
+        let p = 2 * min(1, max(0, value)) - 1
+        if abs(p) < 0.001 { return "Центр" }
+        if abs(p) >= 0.995 { return p < 0 ? "Только L" : "Только R" }
+        let db = -Double(BalanceLaw.differenceDb(balance: Float(value)))
+        let rounded = (db * 2).rounded() / 2
+        return String(format: "%@ +%.1f дБ", p < 0 ? "L" : "R", rounded)
     }
 
     private var telemetrySnapshot: String {
