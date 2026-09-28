@@ -1,0 +1,693 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#111923">
+  <title>SoundField · Spatial Lab</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #111923;
+      --panel: #192330;
+      --panel-soft: #202c3a;
+      --line: #303d4b;
+      --muted: #9aaaba;
+      --text: #f0f5f8;
+      --teal: #68ded0;
+      --blue: #83b8ff;
+      --danger: #ff897d;
+      --shadow: 0 20px 50px #080d1380;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--text); min-height: 100vh; }
+    button, input, textarea { font: inherit; }
+    button { cursor: pointer; }
+    .shell { min-height: 100vh; display: grid; grid-template-columns: 244px minmax(0, 1fr); }
+    .sidebar { border-right: 1px solid var(--line); background: #131d28; display: flex; flex-direction: column; padding: 25px 16px 18px; }
+    .brand { display: flex; gap: 12px; align-items: center; padding: 0 10px 30px; }
+    .brand-mark { width: 36px; height: 36px; border-radius: 12px; background: linear-gradient(145deg, #70e5d5, #61a9ff); color: #13212b; display: grid; place-items: center; font-weight: 900; font-size: 18px; box-shadow: 0 6px 18px #66daca38; }
+    .brand-name { font-size: 14px; letter-spacing: .15em; font-weight: 800; }
+    .brand-sub { color: var(--muted); font-size: 10px; letter-spacing: .2em; margin-top: 3px; }
+    .nav-label { color: #748599; font-size: 10px; font-weight: 800; letter-spacing: .14em; text-transform: uppercase; padding: 0 12px 9px; }
+    .nav { display: grid; gap: 5px; }
+    .nav button { border: 0; border-radius: 10px; background: transparent; color: #b8c5d1; padding: 11px 12px; text-align: left; display: flex; align-items: center; gap: 12px; font-size: 13px; transition: .16s ease; }
+    .nav button:hover { background: #ffffff0a; color: white; }
+    .nav button.active { background: #263848; color: var(--teal); box-shadow: inset 2px 0 var(--teal); }
+    .nav-icon { width: 19px; text-align: center; font-size: 16px; }
+    .sidebar-bottom { margin-top: auto; border-top: 1px solid var(--line); padding: 17px 10px 0; color: var(--muted); font-size: 11px; line-height: 1.6; }
+    .dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: var(--teal); margin-right: 6px; box-shadow: 0 0 10px #68ded0a0; }
+    .main { min-width: 0; }
+    .topbar { height: 66px; border-bottom: 1px solid var(--line); padding: 0 34px; display: flex; justify-content: space-between; align-items: center; color: var(--muted); font-size: 11px; letter-spacing: .08em; }
+    .topbar-right { display: flex; align-items: center; gap: 14px; }
+    .pill { border: 1px solid #3c5964; border-radius: 99px; color: var(--teal); padding: 6px 10px; font-size: 10px; letter-spacing: .06em; }
+    .content { max-width: 1230px; padding: 34px; margin: 0 auto; }
+    .view { display: none; animation: appear .18s ease-out; }
+    .view.active { display: block; }
+    @keyframes appear { from { opacity: .5; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+    .eyebrow { color: var(--teal); letter-spacing: .15em; text-transform: uppercase; font-size: 10px; font-weight: 800; margin-bottom: 10px; }
+    h1 { margin: 0; font-size: clamp(25px, 3vw, 34px); letter-spacing: -.035em; font-weight: 650; }
+    h2 { font-size: 16px; margin: 0; font-weight: 650; }
+    h3 { font-size: 13px; margin: 0; font-weight: 650; }
+    .lead { margin: 10px 0 0; color: var(--muted); max-width: 700px; font-size: 13px; line-height: 1.7; }
+    .heading-row { display: flex; justify-content: space-between; gap: 22px; align-items: flex-end; margin-bottom: 25px; }
+    .badge { border: 1px solid var(--line); border-radius: 8px; padding: 8px 11px; color: #bdcad6; font-size: 11px; white-space: nowrap; }
+    .notice { border: 1px solid #35516a; background: #17283a; border-radius: 11px; padding: 12px 15px; color: #c1d6ed; font-size: 12px; line-height: 1.55; margin: 20px 0; }
+    .notice strong { color: #f0f5f8; }
+    .layout { display: grid; grid-template-columns: minmax(0, 1.55fr) minmax(260px, .8fr); gap: 18px; align-items: start; }
+    .stack { display: grid; gap: 17px; }
+    .card { background: var(--panel); border: 1px solid var(--line); border-radius: 15px; box-shadow: var(--shadow); }
+    .card-head { padding: 18px 20px 14px; display: flex; justify-content: space-between; align-items: center; gap: 10px; }
+    .card-body { padding: 0 20px 20px; }
+    .step { color: var(--teal); font-size: 10px; font-weight: 800; letter-spacing: .13em; }
+    .subtle { color: var(--muted); font-size: 12px; line-height: 1.6; }
+    .dropzone { border: 1px dashed #526578; border-radius: 12px; min-height: 150px; display: grid; place-items: center; text-align: center; padding: 22px; background: #15202b; transition: .15s ease; }
+    .dropzone.dragging { border-color: var(--teal); background: #1a3439; }
+    .folder-icon { font-size: 24px; margin-bottom: 8px; }
+    .dropzone strong { display: block; font-size: 13px; }
+    .dropzone .subtle { margin: 5px 0 12px; }
+    .file-input { display: none; }
+    .file-list { margin-top: 12px; display: grid; gap: 7px; }
+    .file-row { display: flex; justify-content: space-between; gap: 12px; align-items: center; padding: 9px 11px; background: #202c38; border: 1px solid #2f3e4b; border-radius: 8px; font-size: 11px; }
+    .file-row span:first-child { overflow-wrap: anywhere; }
+    .file-count { color: var(--muted); white-space: nowrap; }
+    .button { border: 1px solid #425464; border-radius: 9px; color: var(--text); background: #263443; min-height: 39px; padding: 0 14px; font-size: 12px; font-weight: 650; transition: .15s ease; }
+    .button:hover:not(:disabled) { border-color: #78cfc8; transform: translateY(-1px); background: #2c414d; }
+    .button.primary { background: linear-gradient(100deg, #69ddcf, #79c0ff); color: #10202b; border-color: transparent; font-weight: 800; }
+    .button.primary:hover:not(:disabled) { filter: brightness(1.06); }
+    .button.ghost { background: transparent; }
+    .button.small { min-height: 32px; padding: 0 10px; font-size: 11px; }
+    .button:disabled { cursor: not-allowed; opacity: .42; }
+    .field { display: grid; gap: 7px; margin-top: 15px; }
+    .field label, .field-label { color: #d4dee7; font-size: 11px; font-weight: 650; }
+    .field input[type="text"], .field input[type="number"], .field input[type="file"], .field textarea, .text-input { width: 100%; border: 1px solid #3a4958; border-radius: 8px; background: #121c26; color: var(--text); padding: 10px 11px; outline: none; }
+    .field input:focus, textarea:focus, .text-input:focus { border-color: #68cfc8; box-shadow: 0 0 0 3px #68ded01c; }
+    .checkline { display: flex; gap: 10px; align-items: flex-start; padding: 12px; border: 1px solid #354450; border-radius: 9px; margin-top: 15px; background: #17222d; }
+    .checkline input { accent-color: var(--teal); margin: 2px 0 0; }
+    .checkline span { font-size: 11px; line-height: 1.55; color: #c3d0db; }
+    .checkline strong { color: white; }
+    .variants { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin-top: 13px; }
+    .variant-chip { display: flex; align-items: center; gap: 8px; border: 1px solid #354450; background: #17222d; border-radius: 8px; padding: 10px; font-size: 11px; color: #c7d2dc; }
+    .variant-chip span:first-child { color: var(--teal); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 10px; }
+    .info-list { display: grid; gap: 11px; }
+    .info-line { display: flex; gap: 10px; align-items: flex-start; color: #becbd7; font-size: 11px; line-height: 1.5; }
+    .info-line i { font-style: normal; width: 19px; color: var(--teal); text-align: center; }
+    .side-stat { display: grid; grid-template-columns: 1fr 1fr; gap: 9px; margin: 14px 0 17px; }
+    .stat { border: 1px solid var(--line); background: #151f2a; border-radius: 10px; padding: 12px; }
+    .stat strong { display: block; font-size: 20px; color: white; }
+    .stat span { font-size: 10px; color: var(--muted); }
+    .action-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-top: 17px; }
+    .progress-wrap { margin-top: 17px; }
+    .progress-meta { display: flex; justify-content: space-between; gap: 10px; font-size: 11px; color: var(--muted); margin-bottom: 8px; }
+    .progress-bar { height: 6px; border-radius: 99px; overflow: hidden; background: #0f171f; }
+    .progress-bar span { display: block; width: 0; height: 100%; background: linear-gradient(90deg, var(--teal), var(--blue)); transition: width .3s ease; }
+    .run-state { margin-top: 15px; }
+    .run-ready { display: grid; grid-template-columns: 120px minmax(0, 1fr); gap: 20px; align-items: center; margin-top: 17px; padding-top: 17px; border-top: 1px solid var(--line); }
+    .qr { width: 112px; height: 112px; padding: 7px; border-radius: 10px; background: white; object-fit: contain; }
+    .run-ready h3 { margin-bottom: 5px; }
+    .phone-link { color: var(--teal); font-size: 11px; overflow-wrap: anywhere; text-decoration: underline; }
+    .empty { min-height: 154px; display: grid; place-items: center; text-align: center; color: var(--muted); padding: 22px; }
+    .empty-icon { font-size: 23px; opacity: .72; margin-bottom: 8px; }
+    .empty strong { color: #d8e2e9; display: block; font-size: 12px; font-weight: 600; }
+    .empty p { max-width: 400px; font-size: 11px; line-height: 1.55; margin: 5px auto 0; }
+    .signal-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; margin-top: 20px; }
+    .signal { padding: 15px; border: 1px solid var(--line); background: #151f2a; border-radius: 12px; }
+    .signal .signal-type { color: var(--teal); font-size: 10px; letter-spacing: .1em; text-transform: uppercase; }
+    .signal h3 { margin: 7px 0 5px; }
+    .signal p { margin: 0; min-height: 40px; color: var(--muted); font-size: 11px; line-height: 1.5; }
+    .signal input { accent-color: var(--teal); margin: 12px 7px 0 0; }
+    .sync-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 17px; margin-top: 21px; }
+    .result-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; margin-top: 16px; }
+    .result-metric { padding: 13px; background: #151f2a; border: 1px solid var(--line); border-radius: 10px; }
+    .result-metric strong { display: block; font-size: 18px; margin-bottom: 4px; }
+    .result-metric span { color: var(--muted); font-size: 10px; }
+    .report-table { width: 100%; border-collapse: collapse; font-size: 11px; margin-top: 12px; }
+    .report-table th, .report-table td { text-align: left; border-bottom: 1px solid var(--line); padding: 10px 9px; }
+    .report-table th { color: var(--muted); font-weight: 600; }
+    .table-scroll { overflow-x: auto; }
+    .status-tag { display: inline-flex; border-radius: 99px; padding: 4px 8px; background: #263b3a; color: var(--teal); font-size: 10px; }
+    .status-tag.fail { background: #412a2e; color: #ff9b91; }
+    .config-groups { display: grid; gap: 12px; }
+    .config-group { border: 1px solid var(--line); background: var(--panel); border-radius: 12px; overflow: hidden; }
+    .config-group summary { padding: 14px 17px; cursor: pointer; color: #dce6ed; font-size: 12px; font-weight: 700; text-transform: capitalize; }
+    .config-fields { border-top: 1px solid var(--line); padding: 8px 16px 15px; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 11px; }
+    .config-field { min-width: 0; border-bottom: 1px solid #2a3743; padding: 10px 0 12px; }
+    .config-field-top { display: flex; justify-content: space-between; gap: 9px; align-items: center; }
+    .config-field label { font-size: 10px; color: #dce6ed; overflow-wrap: anywhere; }
+    .config-default { color: #798a9a; font-size: 9px; margin-top: 4px; }
+    .config-field input, .config-field textarea { margin-top: 7px; width: 100%; border: 1px solid #394856; border-radius: 7px; padding: 8px 9px; background: #111a23; color: #eff6fa; font-size: 11px; }
+    .config-field input[type="checkbox"] { width: auto; accent-color: var(--teal); }
+    .mobile-shell { display: none; max-width: 740px; margin: 0 auto; padding: 20px 14px 40px; }
+    body.mobile-mode { background: #101820; }
+    body.mobile-mode .shell { display: none; }
+    body.mobile-mode .mobile-shell { display: block; }
+    .mobile-head { display: flex; justify-content: space-between; align-items: center; margin: 4px 0 22px; }
+    .mobile-brand { font-size: 12px; font-weight: 800; letter-spacing: .11em; }
+    .mobile-brand small { display: block; font-size: 9px; color: var(--muted); font-weight: 500; letter-spacing: .1em; margin-top: 4px; }
+    .mobile-title { font-size: 25px; line-height: 1.15; margin: 0; }
+    .mobile-tabs { display: grid; grid-template-columns: 1fr 1fr; border: 1px solid var(--line); background: #151f29; border-radius: 10px; padding: 4px; margin: 18px 0 14px; }
+    .mobile-tabs button { border: 0; background: transparent; color: var(--muted); border-radius: 7px; padding: 10px; font-size: 12px; }
+    .mobile-tabs button.active { background: #2a3d48; color: var(--teal); }
+    .mobile-track { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 12px 13px; border: 1px solid var(--line); border-radius: 10px; background: var(--panel); margin: 8px 0; }
+    .mobile-track strong { font-size: 12px; }
+    .mobile-track small { display: block; color: var(--muted); font-size: 10px; margin-top: 4px; }
+    .mobile-score-card { border: 1px solid var(--line); border-radius: 11px; background: var(--panel); margin: 8px 0; overflow: hidden; }
+    .mobile-score-card summary { padding: 14px; cursor: pointer; display: flex; justify-content: space-between; font-size: 12px; font-weight: 700; }
+    .mobile-score-card .score-body { padding: 0 13px 14px; }
+    .score-range { margin: 13px 0; }
+    .score-range-head { display: flex; justify-content: space-between; align-items: baseline; font-size: 11px; margin-bottom: 6px; }
+    .score-value { color: var(--teal); font-variant-numeric: tabular-nums; font-weight: 750; }
+    input[type="range"] { width: 100%; accent-color: var(--teal); min-height: 26px; }
+    .mobile-score-card textarea { width: 100%; background: #111a23; border: 1px solid #394856; border-radius: 8px; color: white; min-height: 56px; padding: 9px; resize: vertical; }
+    .mobile-sticky { position: sticky; bottom: 10px; padding: 10px 0 0; background: linear-gradient(transparent, #101820 25%); }
+    .mobile-sticky .button { width: 100%; min-height: 47px; }
+    .toast { position: fixed; z-index: 20; right: 22px; bottom: 22px; max-width: min(420px, calc(100vw - 44px)); padding: 12px 15px; border: 1px solid #467269; border-radius: 10px; background: #1e3636; color: white; box-shadow: var(--shadow); font-size: 12px; opacity: 0; transform: translateY(8px); pointer-events: none; transition: .2s; }
+    .toast.show { opacity: 1; transform: none; }
+    .toast.error { border-color: #834b4a; background: #462b30; }
+    .muted-link { color: var(--muted); font-size: 11px; }
+    @media (max-width: 960px) {
+      .shell { grid-template-columns: 210px minmax(0, 1fr); }
+      .content { padding: 27px 22px; }
+      .layout { grid-template-columns: 1fr; }
+    }
+    @media (max-width: 680px) {
+      .shell { display: block; padding-bottom: 68px; }
+      .sidebar { position: fixed; z-index: 10; bottom: 0; left: 0; right: 0; height: 62px; padding: 5px 6px; border-right: 0; border-top: 1px solid var(--line); display: block; background: #131d28f2; backdrop-filter: blur(16px); }
+      .brand, .nav-label, .sidebar-bottom { display: none; }
+      .nav { height: 100%; display: grid; grid-template-columns: repeat(4, 1fr); gap: 2px; }
+      .nav button { padding: 4px 2px; border-radius: 8px; display: flex; flex-direction: column; justify-content: center; gap: 2px; font-size: 9px; text-align: center; }
+      .nav button.active { box-shadow: inset 0 2px var(--teal); }
+      .nav-icon { font-size: 17px; }
+      .topbar { height: 52px; padding: 0 15px; font-size: 9px; }
+      .topbar .pill { padding: 5px 7px; font-size: 8px; }
+      .content { padding: 24px 15px; }
+      .heading-row { align-items: flex-start; flex-direction: column; gap: 11px; }
+      .sync-grid { grid-template-columns: 1fr; }
+      .signal-grid { grid-template-columns: 1fr; }
+      .result-grid { grid-template-columns: 1fr 1fr; }
+      .config-fields { grid-template-columns: 1fr; }
+      .run-ready { grid-template-columns: 92px minmax(0, 1fr); gap: 13px; }
+      .qr { width: 88px; height: 88px; }
+      .variants { grid-template-columns: 1fr; }
+      .card-head, .card-body { padding-left: 15px; padding-right: 15px; }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell" id="desktop-app">
+    <aside class="sidebar">
+      <div class="brand"><div class="brand-mark">S</div><div><div class="brand-name">SOUNDFIELD</div><div class="brand-sub">SPATIAL LAB</div></div></div>
+      <div class="nav-label">Рабочее место</div>
+      <nav class="nav" aria-label="Разделы прототипа">
+        <button class="active" data-view="music"><span class="nav-icon">◉</span>Слепой тест</button>
+        <button data-view="sync"><span class="nav-icon">⌁</span>Синхронизация</button>
+        <button data-view="scores"><span class="nav-icon">▤</span>Результаты</button>
+        <button data-view="settings"><span class="nav-icon">⚙</span>Настройки</button>
+      </nav>
+      <div class="sidebar-bottom"><span class="dot"></span>Локальный сервер активен<br>DSP-прототип <span id="side-version">0.1.2</span></div>
+    </aside>
+    <div class="main">
+      <header class="topbar"><span>SPATIAL AUDIO <span style="color:#526171">/</span> ПРОТОТИП</span><div class="topbar-right"><span class="pill">ЛОКАЛЬНЫЙ РЕЖИМ</span><span id="top-version">DSP 0.1.2</span></div></header>
+      <main class="content">
+        <section class="view active" id="view-music">
+          <div class="heading-row"><div><div class="eyebrow">Подготовка прослушивания</div><h1>Слепой тест</h1><p class="lead">Выберите джазовые записи — сервер рендерит проверенные варианты DSP, создаёт кодовый набор и страницу для телефона.</p></div><div class="badge">Оффлайн-обработка · без JS DSP</div></div>
+          <div class="notice"><strong>Важно для выборки:</strong> добавьте хотя бы один джазовый трек конца 1950-х–1960-х с жёстко разведёнными по каналам инструментами.</div>
+          <div class="layout">
+            <div class="stack">
+              <section class="card">
+                <div class="card-head"><div><span class="step">ШАГ 01</span><h2 style="margin-top:5px">Выберите папку с джазом</h2></div><span class="file-count" id="file-count">0 файлов</span></div>
+                <div class="card-body">
+                  <div class="dropzone" id="dropzone">
+                    <div><div class="folder-icon">▱</div><strong>Перетащите сюда папку с треками</strong><p class="subtle">WAV или FLAC · от 3 до 5 стереофайлов</p><button class="button small" type="button" id="browse-folder">Выбрать папку</button></div>
+                  </div>
+                  <input class="file-input" id="folder-input" type="file" accept=".wav,.flac,audio/wav,audio/flac" multiple webkitdirectory directory>
+                  <div class="file-list" id="file-list"></div>
+                  <label class="checkline"><input id="hardpan-confirmed" type="checkbox"><span><strong>В папке есть трек с жёстким панорамированием.</strong><br>Этот материал нужен для проверки ILD-защиты.</span></label>
+                  <div class="field"><label for="listener-name">Имя слушателя для бланка оценок</label><input id="listener-name" type="text" value="Слушатель 1" maxlength="64" placeholder="Например, Анна"></div>
+                  <div class="action-row"><button class="button primary" type="button" id="render-button">Сделать треки для теста</button><span class="subtle">Аудио создаётся на этом Mac</span></div>
+                  <div class="progress-wrap" id="render-progress" hidden><div class="progress-meta"><span id="render-message">Загружаю исходники</span><span id="render-percent">0%</span></div><div class="progress-bar"><span id="render-bar"></span></div></div>
+                  <div class="run-state" id="render-error" role="status"></div>
+                  <div id="render-result" hidden></div>
+                </div>
+              </section>
+            </div>
+            <div class="stack">
+              <section class="card">
+                <div class="card-head"><div><span class="step">СОСТАВ НАБОРА</span><h2 style="margin-top:5px">Варианты обработки</h2></div></div>
+                <div class="card-body">
+                  <div class="side-stat"><div class="stat"><strong id="variant-count">7</strong><span>вариантов для каждого фрагмента</span></div><div class="stat"><strong id="fragment-duration">40 с</strong><span>длина каждого фрагмента</span></div></div>
+                  <div class="variants">
+                    <div class="variant-chip"><span>REF</span><span>Исходный звук</span></div>
+                    <div class="variant-chip"><span>ANCHOR_MONO</span><span>Моно-якорь</span></div>
+                    <div class="variant-chip"><span>ANCHOR_OVER</span><span>Сильная ширина</span></div>
+                    <div class="variant-chip"><span>W2_LO</span><span>Умеренная база</span></div>
+                    <div class="variant-chip"><span>W2_HI</span><span>Сильная база</span></div>
+                    <div class="variant-chip"><span>W2_W3</span><span>Основной кандидат</span></div>
+                    <div class="variant-chip"><span>W2_W3_W6</span><span>Кандидат с отражениями</span></div>
+                  </div>
+                  <div class="info-list" style="margin-top:19px">
+                    <div class="info-line"><i>↗</i><span>Сканируйте QR-код телефоном, чтобы скачать кодовые WAV и открыть бланк оценок.</span></div>
+                    <div class="info-line"><i>⌁</i><span>Оценки с телефона сохраняются в обычный `scores_*.csv` для анализатора.</span></div>
+                    <div class="info-line"><i>◈</i><span>Раскрытие кодов доступно после сохранения оценок.</span></div>
+                  </div>
+                </div>
+              </section>
+              <section class="card" id="current-run-card">
+                <div class="card-head"><div><span class="step">ТЕКУЩИЙ НАБОР</span><h2 style="margin-top:5px">Статус</h2></div></div>
+                <div class="card-body" id="current-run-empty"><div class="empty"><div><div class="empty-icon">◌</div><strong>Пока нет подготовленного набора</strong><p>Выберите папку с треками, чтобы начать.</p></div></div></div>
+                <div class="card-body" id="current-run-summary" hidden></div>
+              </section>
+            </div>
+          </div>
+        </section>
+
+        <section class="view" id="view-sync">
+          <div class="heading-row"><div><div class="eyebrow">Проверка пары телефонов</div><h1>Синхронизация</h1><p class="lead">Сформируйте оригинальную sync-пробу, проиграйте её через SoundField, затем загрузите акустическую запись для анализа.</p></div><div class="badge">RT60 ≈ 0,4 с · шум −40 дБ</div></div>
+          <div class="sync-grid">
+            <section class="card"><div class="card-head"><div><span class="step">ШАГ 01</span><h2 style="margin-top:5px">Сигнал проверки</h2></div></div><div class="card-body"><p class="subtle">Сервер создаёт 10-минутный WAV с парными чирпами 1–6 кГц, интервалом 100 мс между каналами и периодом 1 с.</p><button class="button primary" id="create-sync" type="button">Создать и скачать sync_probe.wav</button><div id="sync-download" style="margin-top:12px"></div></div></section>
+            <section class="card"><div class="card-head"><div><span class="step">ШАГ 02</span><h2 style="margin-top:5px">Загрузите запись</h2></div></div><div class="card-body"><p class="subtle">Выберите WAV или FLAC, записанный из точки прослушивания. Анализатор измерит дрейф часов и разброс интервала L→R.</p><div class="field"><input id="sync-recording" type="file" accept=".wav,.flac,audio/wav,audio/flac"></div><button class="button" id="analyze-sync" type="button" disabled>Загрузить и анализировать</button><div id="sync-status" class="run-state"></div></div></section>
+          </div>
+          <section class="card" id="sync-report-card" style="margin-top:17px" hidden><div class="card-head"><div><span class="step">ОТЧЁТ</span><h2 style="margin-top:5px">Результат синхронизации</h2></div><a class="muted-link" id="sync-report-link" href="#" target="_blank">Открыть Markdown</a></div><div class="card-body" id="sync-report"></div></section>
+        </section>
+
+        <section class="view" id="view-scores">
+          <div class="heading-row"><div><div class="eyebrow">После прослушивания</div><h1>Раскрыть результаты</h1><p class="lead">Таблица и вердикты рассчитываются существующим `score.py` по сохранённым CSV и метрикам этого запуска.</p></div></div>
+          <section class="card"><div class="card-head"><div><span class="step">АНАЛИЗ</span><h2 style="margin-top:5px">Сводка оценок</h2></div><button class="button primary" id="reveal-button" type="button" disabled>Раскрыть результаты</button></div><div class="card-body"><div id="reveal-prerequisite" class="subtle">Сначала подготовьте музыкальные треки и сохраните оценки со страницы телефона.</div><div id="reveal-error" role="status"></div><div id="score-report-result" hidden></div></div></section>
+        </section>
+
+        <section class="view" id="view-settings">
+          <div class="heading-row"><div><div class="eyebrow">Параметры обработки</div><h1>Настройки</h1><p class="lead">Форма редактирует `config.yaml`; значения по умолчанию взяты из файла. Изменения применяются к следующему рендеру.</p></div><button class="button ghost" id="reset-config" type="button">Сбросить всё</button></div>
+          <div id="config-message" class="subtle" style="margin-bottom:13px"></div>
+          <div id="config-groups" class="config-groups"><div class="empty"><div><strong>Читаю config.yaml…</strong></div></div></div>
+          <div class="action-row"><button class="button primary" id="save-config" type="button">Сохранить настройки</button></div>
+        </section>
+      </main>
+    </div>
+  </div>
+
+  <main class="mobile-shell" id="mobile-app">
+    <header class="mobile-head"><div class="mobile-brand">SOUNDFIELD<small>СЛЕПОЙ ТЕСТ · <span id="mobile-version">0.1.2</span></small></div><span class="pill">НАБОР WAV</span></header>
+    <div class="eyebrow">Страница слушателя</div><h1 class="mobile-title">Слушайте и оценивайте</h1>
+    <p class="subtle" id="mobile-intro">Коды вариантов скрывают обработку. Скачайте треки, затем заполните оценки, не меняя порядок фрагмента.</p>
+    <div class="field"><label for="mobile-listener">Ваше имя для файла оценок</label><input class="text-input" id="mobile-listener" type="text" maxlength="64"></div>
+    <div class="mobile-tabs"><button class="active" data-mobile-tab="tracks">Скачать треки</button><button data-mobile-tab="scores">Оценить</button></div>
+    <section id="mobile-tracks-panel"><div id="mobile-track-list"></div></section>
+    <section id="mobile-scores-panel" hidden><p class="subtle">Для каждого кода задайте шесть оценок. Поле смещения головы можно оставить пустым.</p><div id="mobile-score-list"></div><div class="mobile-sticky"><button class="button primary" id="save-mobile-scores" type="button" disabled>Сохранить оценки</button></div><div id="mobile-score-message" class="subtle" style="margin-top:12px"></div></section>
+  </main>
+  <div class="toast" id="toast" role="status"></div>
+
+  <script>
+    const labels = {
+      width: "Ширина", depth: "Глубина", center: "Фокус центра", coloration: "Нет окраски",
+      naturalness: "Естественность", preference: "Предпочтение", shifted_center: "Центр при смещении головы"
+    };
+    const requiredScoreFields = ["width", "depth", "center", "coloration", "naturalness", "preference"];
+    let currentRunId = localStorage.getItem("spatialProtoRunId") || "";
+    let currentMobileData = null;
+    let configDraft = null;
+    let configDefaults = null;
+    let toastTimer;
+
+    function toast(message, error = false) {
+      const node = document.getElementById("toast");
+      node.textContent = message;
+      node.classList.toggle("error", error);
+      node.classList.add("show");
+      clearTimeout(toastTimer);
+      toastTimer = setTimeout(() => node.classList.remove("show"), 3600);
+    }
+    async function requestJson(url, options = {}) {
+      const response = await fetch(url, options);
+      const result = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(result.error || `Ошибка запроса (${response.status})`);
+      return result;
+    }
+    function uploadWithProgress(url, form, onProgress) {
+      return new Promise((resolve, reject) => {
+        const request = new XMLHttpRequest();
+        request.open("POST", url);
+        request.upload.addEventListener("progress", event => {
+          if (event.lengthComputable) onProgress(event.loaded / event.total);
+        });
+        request.addEventListener("load", () => {
+          const result = JSON.parse(request.responseText || "{}");
+          if (request.status < 200 || request.status >= 300) reject(new Error(result.error || `Ошибка запроса (${request.status})`));
+          else resolve(result);
+        });
+        request.addEventListener("error", () => reject(new Error("Не удалось связаться с локальным сервером")));
+        request.send(form);
+      });
+    }
+    function setView(name) {
+      document.querySelectorAll(".nav button").forEach(button => button.classList.toggle("active", button.dataset.view === name));
+      document.querySelectorAll(".view").forEach(view => view.classList.toggle("active", view.id === `view-${name}`));
+      if (name === "scores") refreshRunStatus();
+      if (name === "settings") loadConfig();
+    }
+    document.querySelectorAll(".nav button").forEach(button => button.addEventListener("click", () => setView(button.dataset.view)));
+
+    const folderInput = document.getElementById("folder-input");
+    const dropzone = document.getElementById("dropzone");
+    document.getElementById("browse-folder").addEventListener("click", () => folderInput.click());
+    folderInput.addEventListener("change", () => showSelectedFiles([...folderInput.files]));
+    ["dragenter", "dragover"].forEach(eventName => dropzone.addEventListener(eventName, event => { event.preventDefault(); dropzone.classList.add("dragging"); }));
+    ["dragleave", "drop"].forEach(eventName => dropzone.addEventListener(eventName, event => { event.preventDefault(); dropzone.classList.remove("dragging"); }));
+    dropzone.addEventListener("drop", event => {
+      const files = [...event.dataTransfer.files].filter(file => /\.(wav|flac)$/i.test(file.name));
+      showSelectedFiles(files);
+    });
+    function showSelectedFiles(files) {
+      const audio = files.filter(file => /\.(wav|flac)$/i.test(file.name));
+      document.getElementById("file-count").textContent = `${audio.length} ${audio.length === 1 ? "файл" : "файлов"}`;
+      const list = document.getElementById("file-list");
+      list.replaceChildren();
+      audio.forEach(file => {
+        const row = document.createElement("div"); row.className = "file-row";
+        const name = document.createElement("span"); name.textContent = file.webkitRelativePath || file.name;
+        const size = document.createElement("span"); size.className = "file-count"; size.textContent = `${(file.size / 1048576).toFixed(1)} МБ`;
+        row.append(name, size); list.append(row);
+      });
+      window.selectedAudioFiles = audio;
+    }
+    window.selectedAudioFiles = [];
+
+    document.getElementById("render-button").addEventListener("click", startRender);
+    async function startRender() {
+      const files = window.selectedAudioFiles || [];
+      if (files.length < 3 || files.length > 5) return toast("Выберите от 3 до 5 WAV/FLAC файлов", true);
+      if (!document.getElementById("hardpan-confirmed").checked) return toast("Подтвердите, что в выборке есть трек с жёсткой панорамой", true);
+      const button = document.getElementById("render-button"); button.disabled = true;
+      document.getElementById("render-error").textContent = "";
+      document.getElementById("render-result").hidden = true;
+      document.getElementById("render-progress").hidden = false;
+      setRenderProgress(1, "Загружаю исходники на локальный сервер");
+      const body = new FormData();
+      files.forEach(file => body.append("tracks", file, file.webkitRelativePath || file.name));
+      body.append("listener", document.getElementById("listener-name").value.trim() || "Слушатель 1");
+      body.append("hardpan_confirmed", "true");
+      try {
+        const started = await uploadWithProgress("/api/render", body, progress => setRenderProgress(Math.round(1 + progress * 4), "Загружаю исходники на локальный сервер"));
+        currentRunId = started.run_id; localStorage.setItem("spatialProtoRunId", currentRunId);
+        await pollRender(currentRunId);
+      } catch (error) {
+        document.getElementById("render-error").textContent = error.message;
+        toast(error.message, true);
+      } finally { button.disabled = false; }
+    }
+    function setRenderProgress(value, message) {
+      document.getElementById("render-bar").style.width = `${value}%`;
+      document.getElementById("render-percent").textContent = `${value}%`;
+      document.getElementById("render-message").textContent = message;
+    }
+    async function pollRender(runId) {
+      let state;
+      do {
+        state = await requestJson(`/api/runs/${runId}`);
+        setRenderProgress(state.progress || 0, state.message || "Обрабатываю");
+        updateCurrentRun(state);
+        if (state.status === "error") throw new Error(state.message || "Не удалось создать набор");
+        if (state.status !== "complete") await new Promise(resolve => setTimeout(resolve, 750));
+      } while (state.status !== "complete");
+      renderRunReady(state);
+      toast("Кодовые треки и отчёт готовы");
+    }
+    function renderRunReady(state) {
+      const result = document.getElementById("render-result"); result.hidden = false; result.replaceChildren();
+      const ready = document.createElement("div"); ready.className = "run-ready";
+      const qr = document.createElement("img"); qr.className = "qr"; qr.alt = "QR-ссылка на страницу слушателя";
+      const listener = document.getElementById("listener-name").value.trim() || "Слушатель 1";
+      qr.src = `/api/qr/${currentRunId}?listener=${encodeURIComponent(listener)}`;
+      const info = document.createElement("div");
+      const heading = document.createElement("h3"); heading.textContent = `${state.tracks_total || 0} кодовых WAV готовы`;
+      const copy = document.createElement("p"); copy.className = "subtle"; copy.textContent = "Сканируйте QR-код на телефоне: там доступны загрузка треков и бланк оценок.";
+      const link = document.createElement("a"); link.className = "phone-link"; link.href = state.mobile_url || `/mobile/${currentRunId}`; link.textContent = state.mobile_url || "Открыть страницу телефона"; link.target = "_blank"; link.rel = "noopener";
+      const actions = document.createElement("div"); actions.className = "action-row";
+      const finder = document.createElement("button"); finder.className = "button small"; finder.textContent = "Открыть папку в Finder"; finder.addEventListener("click", openFinder);
+      const reveal = document.createElement("button"); reveal.className = "button small"; reveal.textContent = "К результатам"; reveal.addEventListener("click", () => setView("scores"));
+      actions.append(finder, reveal); info.append(heading, copy, link, actions); ready.append(qr, info); result.append(ready);
+    }
+    function updateCurrentRun(state) {
+      document.getElementById("current-run-empty").hidden = true;
+      const summary = document.getElementById("current-run-summary"); summary.hidden = false; summary.replaceChildren();
+      const line = document.createElement("div"); line.className = "info-line";
+      const icon = document.createElement("i"); icon.textContent = state.status === "complete" ? "✓" : state.status === "error" ? "!" : "◌";
+      const text = document.createElement("span"); text.textContent = `${state.message || state.status} · ${state.progress || 0}%`;
+      line.append(icon, text); summary.append(line);
+      if (state.scores_saved) {
+        const saved = document.createElement("div"); saved.className = "info-line"; saved.style.marginTop = "10px"; saved.innerHTML = "<i>✓</i><span>Оценки сохранены — можно раскрывать результаты.</span>"; summary.append(saved);
+      }
+      const reveal = document.getElementById("reveal-button"); reveal.disabled = !state.scores_saved;
+      document.getElementById("reveal-prerequisite").textContent = state.scores_saved ? `Сохранено файлов оценок: ${state.score_file_count}.` : "Сначала сохраните оценки со страницы телефона.";
+    }
+    async function refreshRunStatus() {
+      if (!currentRunId) return;
+      try { const state = await requestJson(`/api/runs/${currentRunId}`); updateCurrentRun(state); if (state.status === "complete") renderRunReady(state); }
+      catch { currentRunId = ""; localStorage.removeItem("spatialProtoRunId"); }
+    }
+    async function openFinder() {
+      if (!currentRunId) return;
+      try { const result = await requestJson(`/api/open/${currentRunId}`, {method: "POST"}); toast(result.message); }
+      catch (error) { toast(error.message, true); }
+    }
+
+    document.getElementById("reveal-button").addEventListener("click", revealScores);
+    async function revealScores() {
+      if (!currentRunId) return;
+      const button = document.getElementById("reveal-button"); button.disabled = true; button.textContent = "Считаю…";
+      const errorBox = document.getElementById("reveal-error"); errorBox.textContent = "";
+      try {
+        const data = await requestJson(`/api/reveal/${currentRunId}`, {method: "POST", headers: {"Content-Type": "application/json"}, body: "{}"});
+        showScoreReport(data);
+      } catch (error) { errorBox.textContent = error.message; toast(error.message, true); }
+      finally { button.textContent = "Раскрыть результаты"; refreshRunStatus(); }
+    }
+    function showScoreReport(data) {
+      const root = document.getElementById("score-report-result"); root.hidden = false; root.replaceChildren();
+      const summary = data.summary;
+      const files = document.createElement("p"); files.className = "subtle"; files.textContent = `Учтено файлов: ${data.score_files.length}`; root.append(files);
+      const scroll = document.createElement("div"); scroll.className = "table-scroll";
+      const table = document.createElement("table"); table.className = "report-table";
+      const head = document.createElement("thead"); head.innerHTML = "<tr><th>Вариант</th><th>N</th><th>Ширина</th><th>Глубина</th><th>Центр</th><th>Окраска</th><th>Естественность</th><th>Предпочтение</th><th>Вердикт</th></tr>";
+      const body = document.createElement("tbody");
+      Object.entries(summary.variants || {}).forEach(([name, result]) => {
+        const verdict = summary.verdicts?.[name]?.verdict || "—";
+        const stats = field => { const value = result.attributes?.[field]; return value ? `${Math.round(value.median)} (${Math.round(value.q25)}–${Math.round(value.q75)})` : "—"; };
+        const row = document.createElement("tr");
+        [name, result.count, stats("width"), stats("depth"), stats("center"), stats("coloration"), stats("naturalness"), stats("preference")].forEach(value => { const td = document.createElement("td"); td.textContent = value; row.append(td); });
+        const verdictCell = document.createElement("td"); const tag = document.createElement("span"); tag.className = `status-tag${verdict.includes("ПРОВАЛ") ? " fail" : ""}`; tag.textContent = verdict; verdictCell.append(tag); row.append(verdictCell); body.append(row);
+      });
+      table.append(head, body); scroll.append(table); root.append(scroll);
+      const link = document.createElement("a"); link.className = "muted-link"; link.href = `/run-report/${currentRunId}/score_report.md`; link.textContent = "Открыть полный score_report.md"; link.target = "_blank"; link.rel = "noopener"; root.append(link);
+    }
+
+    document.getElementById("create-sync").addEventListener("click", async event => {
+      const button = event.currentTarget; button.disabled = true; button.textContent = "Создаю WAV…";
+      try {
+        const result = await requestJson("/api/sync/create", {method: "POST", headers: {"Content-Type": "application/json"}, body: "{}"});
+        const anchor = document.createElement("a"); anchor.className = "button small"; anchor.href = result.download_url; anchor.textContent = "Скачать sync_probe.wav"; anchor.download = "sync_probe.wav";
+        const label = document.createElement("div"); label.className = "subtle"; label.style.marginBottom = "8px"; label.textContent = "Файл готов · 10 минут · WAV PCM 24 bit";
+        const box = document.getElementById("sync-download"); box.replaceChildren(label, anchor); anchor.click(); toast("Синхронизационная проба создана");
+      } catch (error) { toast(error.message, true); }
+      finally { button.disabled = false; button.textContent = "Создать и скачать sync_probe.wav"; }
+    });
+    document.getElementById("sync-recording").addEventListener("change", event => { document.getElementById("analyze-sync").disabled = !event.target.files.length; });
+    document.getElementById("analyze-sync").addEventListener("click", uploadSyncRecording);
+    async function uploadSyncRecording() {
+      const file = document.getElementById("sync-recording").files[0]; if (!file) return;
+      const button = document.getElementById("analyze-sync"); button.disabled = true; button.textContent = "Загружаю…";
+      const form = new FormData(); form.append("recording", file, file.name);
+      const status = document.getElementById("sync-status"); status.textContent = "Передаю запись локальному анализатору…";
+      try {
+        const started = await requestJson("/api/sync/upload", {method: "POST", body: form});
+        let state;
+        do { state = await requestJson(`/api/sync-status/${started.sync_id}`); status.textContent = `${state.message} · ${state.progress}%`; if (state.status === "error") throw new Error(state.message); if (state.status !== "complete") await new Promise(resolve => setTimeout(resolve, 800)); } while (state.status !== "complete");
+        showSyncReport(state.result, started.sync_id); toast("Отчёт синхронизации готов");
+      } catch (error) { status.textContent = error.message; toast(error.message, true); }
+      finally { button.disabled = !document.getElementById("sync-recording").files.length; button.textContent = "Загрузить и анализировать"; }
+    }
+    function showSyncReport(result, syncId) {
+      const card = document.getElementById("sync-report-card"); card.hidden = false;
+      document.getElementById("sync-report-link").href = `/sync-report/${syncId}/report_sync.md`;
+      const root = document.getElementById("sync-report"); root.replaceChildren();
+      const metrics = [
+        [`${Number(result.estimated_recorder_clock_ppm).toFixed(2)} ppm`, "Дрейф часов записи"],
+        [`${Number(result.jitter_sigma_us).toFixed(2)} мкс`, "σ интервала L→R"],
+        [`${Number(result.jitter_p95_abs_us).toFixed(2)} мкс`, "p95 от медианы"]
+      ];
+      const grid = document.createElement("div"); grid.className = "result-grid";
+      metrics.forEach(([value, label]) => { const box = document.createElement("div"); box.className = "result-metric"; const strong = document.createElement("strong"); strong.textContent = value; const span = document.createElement("span"); span.textContent = label; box.append(strong, span); grid.append(box); }); root.append(grid);
+    }
+
+    document.getElementById("reset-config").addEventListener("click", resetConfig);
+    document.getElementById("save-config").addEventListener("click", saveConfig);
+    async function loadConfig() {
+      if (configDraft) { renderConfigForm(); return; }
+      try { const data = await requestJson("/api/config"); configDraft = data.config; configDefaults = data.defaults; document.getElementById("top-version").textContent = `DSP ${data.proto_version}`; document.getElementById("side-version").textContent = data.proto_version; document.getElementById("fragment-duration").textContent = `${data.config.fragment_seconds} с`; document.getElementById("variant-count").textContent = Object.keys(data.config.variants).length; renderConfigForm(); }
+      catch (error) { document.getElementById("config-message").textContent = error.message; }
+    }
+    function setPath(object, path, value) { let cursor = object; for (const part of path.slice(0, -1)) cursor = cursor[part]; cursor[path[path.length - 1]] = value; }
+    function getPath(object, path) { return path.reduce((cursor, part) => cursor[part], object); }
+    function renderConfigForm() {
+      const groups = document.getElementById("config-groups"); groups.replaceChildren();
+      Object.entries(configDraft).forEach(([groupName, groupValue]) => {
+        const details = document.createElement("details"); details.className = "config-group"; details.open = ["stft", "w2", "ambient"].includes(groupName);
+        const summary = document.createElement("summary"); summary.textContent = groupName; details.append(summary);
+        const fieldGrid = document.createElement("div"); fieldGrid.className = "config-fields";
+        flattenFields(groupValue, [groupName]).forEach(({path, value}) => fieldGrid.append(makeConfigField(path, value)));
+        details.append(fieldGrid); groups.append(details);
+      });
+      document.getElementById("fragment-duration").textContent = `${configDraft.fragment_seconds} с`;
+      document.getElementById("variant-count").textContent = Object.keys(configDraft.variants).length;
+      document.getElementById("config-message").textContent = "Настройки читаются и применяются сервером из config.yaml.";
+    }
+    function flattenFields(value, path) {
+      if (value && typeof value === "object" && !Array.isArray(value) && Object.keys(value).length) return Object.entries(value).flatMap(([key, child]) => flattenFields(child, [...path, key]));
+      return [{path, value}];
+    }
+    function makeConfigField(path, value) {
+      const defaults = getPath(configDefaults, path);
+      const wrapper = document.createElement("div"); wrapper.className = "config-field";
+      const top = document.createElement("div"); top.className = "config-field-top";
+      const label = document.createElement("label"); label.textContent = path.slice(1).join(" · ") || path[0];
+      const reset = document.createElement("button"); reset.className = "button ghost small field-reset"; reset.type = "button"; reset.textContent = "Сбросить";
+      top.append(label, reset); wrapper.append(top);
+      const defaultText = document.createElement("div"); defaultText.className = "config-default"; defaultText.textContent = `По умолчанию: ${JSON.stringify(defaults)}`; wrapper.append(defaultText);
+      let control;
+      if (typeof value === "boolean") { control = document.createElement("input"); control.type = "checkbox"; control.checked = value; }
+      else if (typeof value === "number") { control = document.createElement("input"); control.type = "number"; control.step = Number.isInteger(value) ? "1" : "any"; control.value = value; }
+      else if (Array.isArray(value)) { control = document.createElement("textarea"); control.rows = Math.min(5, Math.max(2, value.length)); control.value = JSON.stringify(value, null, 2); control.dataset.json = "true"; }
+      else if (value && typeof value === "object") { control = document.createElement("textarea"); control.rows = 3; control.value = JSON.stringify(value, null, 2); control.dataset.json = "true"; }
+      else { control = document.createElement("input"); control.type = "text"; control.value = value ?? ""; }
+      control.dataset.path = JSON.stringify(path); wrapper.append(control);
+      reset.addEventListener("click", () => { if (control.type === "checkbox") control.checked = defaults; else control.value = control.dataset.json ? JSON.stringify(defaults, null, 2) : defaults; });
+      return wrapper;
+    }
+    async function saveConfig() {
+      const candidate = structuredClone(configDraft);
+      try {
+        document.querySelectorAll("#config-groups [data-path]").forEach(control => {
+          const path = JSON.parse(control.dataset.path); const defaultValue = getPath(configDefaults, path);
+          let value;
+          if (control.type === "checkbox") value = control.checked;
+          else if (control.dataset.json) value = JSON.parse(control.value);
+          else if (typeof defaultValue === "number") value = Number.isInteger(defaultValue) ? parseInt(control.value, 10) : Number(control.value);
+          else value = control.value;
+          setPath(candidate, path, value);
+        });
+        const saved = await requestJson("/api/config", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({config: candidate})});
+        configDraft = saved.config; renderConfigForm(); toast(saved.message);
+      } catch (error) { toast(error.message, true); }
+    }
+    async function resetConfig() {
+      try { const saved = await requestJson("/api/config/reset", {method: "POST", headers: {"Content-Type": "application/json"}, body: "{}"}); configDraft = saved.config; renderConfigForm(); toast(saved.message); }
+      catch (error) { toast(error.message, true); }
+    }
+
+    const mobileMatch = location.pathname.match(/^\/mobile\/([a-f0-9]{32})\/?$/);
+    if (mobileMatch) {
+      document.body.classList.add("mobile-mode");
+      initializeMobile(mobileMatch[1]);
+    } else if (currentRunId) {
+      refreshRunStatus();
+      loadRunUiState();
+    }
+    async function loadRunUiState() {
+      try {
+        const state = await requestJson(`/api/runs/${currentRunId}`);
+        updateCurrentRun(state);
+        if (state.status === "complete") {
+          document.getElementById("render-progress").hidden = false;
+          setRenderProgress(100, state.message);
+          renderRunReady(state);
+        }
+      } catch {}
+    }
+
+    async function initializeMobile(runId) {
+      const query = new URLSearchParams(location.search);
+      const listener = query.get("listener") || "Слушатель";
+      document.getElementById("mobile-listener").value = listener;
+      try {
+        currentMobileData = await requestJson(`/api/mobile/${runId}?listener=${encodeURIComponent(listener)}`);
+        document.getElementById("mobile-version").textContent = currentMobileData.proto_version;
+        buildMobileTracks(currentMobileData);
+        buildMobileScores(currentMobileData);
+      } catch (error) {
+        document.getElementById("mobile-intro").textContent = error.message;
+        document.getElementById("mobile-track-list").textContent = "Набор ещё не готов или ссылка устарела.";
+      }
+      document.querySelectorAll("[data-mobile-tab]").forEach(button => button.addEventListener("click", () => {
+        const tab = button.dataset.mobileTab;
+        document.querySelectorAll("[data-mobile-tab]").forEach(item => item.classList.toggle("active", item === button));
+        document.getElementById("mobile-tracks-panel").hidden = tab !== "tracks";
+        document.getElementById("mobile-scores-panel").hidden = tab !== "scores";
+      }));
+    }
+    function buildMobileTracks(data) {
+      const root = document.getElementById("mobile-track-list"); root.replaceChildren();
+      if (!data.tracks.length) { root.textContent = "В этом наборе нет музыкальных WAV."; return; }
+      const note = document.createElement("p"); note.className = "subtle"; note.textContent = "Скачайте кодовые WAV по одному и добавьте каждый в очередь SoundField через меню «Поделиться»."; root.append(note);
+      let fragment = "";
+      data.tracks.forEach(track => {
+        if (fragment !== track.fragment) {
+          fragment = track.fragment; const title = document.createElement("div"); title.className = "step"; title.style.margin = "18px 0 7px"; title.textContent = `ФРАГМЕНТ ${fragment}`; root.append(title);
+        }
+        const row = document.createElement("div"); row.className = "mobile-track";
+        const text = document.createElement("div"); const code = document.createElement("strong"); code.textContent = track.code; const file = document.createElement("small"); file.textContent = track.filename; text.append(code, file);
+        const download = document.createElement("a"); download.className = "button small"; download.href = track.download_url; download.textContent = "Скачать"; download.setAttribute("download", track.filename);
+        row.append(text, download); root.append(row);
+      });
+      const help = document.createElement("p"); help.className = "subtle"; help.style.marginTop = "14px"; help.textContent = "После загрузки WAV откройте меню «Поделиться» и выберите SoundField, чтобы добавить трек в очередь."; root.append(help);
+    }
+    function buildMobileScores(data) {
+      const root = document.getElementById("mobile-score-list"); root.replaceChildren();
+      const scoreMap = data.saved_scores || {};
+      data.tracks.forEach((track, index) => {
+        const details = document.createElement("details"); details.className = "mobile-score-card"; if (index === 0) details.open = true;
+        const summary = document.createElement("summary"); summary.textContent = `${track.fragment} · ${track.code}`; const indicator = document.createElement("span"); indicator.className = "score-value"; indicator.dataset.cardStatus = track.code; indicator.textContent = scoreMap[track.code] ? "Сохранено" : "—"; summary.append(indicator); details.append(summary);
+        const body = document.createElement("div"); body.className = "score-body";
+        const existing = scoreMap[track.code] || {};
+        [...requiredScoreFields, "shifted_center"].forEach(field => {
+          const row = document.createElement("div"); row.className = "score-range";
+          const head = document.createElement("div"); head.className = "score-range-head"; const label = document.createElement("label"); label.textContent = labels[field] + (field === "shifted_center" ? " · необязательно" : "");
+          const value = document.createElement("span"); value.className = "score-value"; value.textContent = existing[field] !== undefined && existing[field] !== "" ? existing[field] : "—";
+          head.append(label, value); const input = document.createElement("input"); input.type = "range"; input.min = "0"; input.max = "100"; input.value = existing[field] !== undefined && existing[field] !== "" ? existing[field] : "50"; input.dataset.code = track.code; input.dataset.field = field; input.dataset.touched = existing[field] !== undefined && existing[field] !== "" ? "1" : "0"; input.dataset.required = field !== "shifted_center" ? "1" : "0";
+          input.addEventListener("input", () => { value.textContent = input.value; input.dataset.touched = "1"; updateScoreCompletion(); });
+          row.append(head, input); body.append(row);
+        });
+        const comment = document.createElement("textarea"); comment.placeholder = "Комментарий (необязательно)"; comment.dataset.comment = track.code; comment.value = existing.comment || ""; body.append(comment);
+        details.append(body); root.append(details);
+      });
+      document.getElementById("save-mobile-scores").addEventListener("click", () => saveMobileScores(data));
+      updateScoreCompletion();
+    }
+    function updateScoreCompletion() {
+      const required = [...document.querySelectorAll('#mobile-score-list input[data-required="1"]')];
+      const touched = required.filter(input => input.dataset.touched === "1").length;
+      document.getElementById("save-mobile-scores").disabled = required.length === 0 || touched !== required.length;
+      document.getElementById("mobile-score-message").textContent = `${Math.floor(touched / requiredScoreFields.length)} из ${Math.floor(required.length / requiredScoreFields.length)} кодов оценены полностью`;
+    }
+    async function saveMobileScores(data) {
+      const button = document.getElementById("save-mobile-scores"); button.disabled = true; button.textContent = "Сохраняю…";
+      try {
+        const rows = data.tracks.map(track => {
+          const row = {code: track.code};
+          [...requiredScoreFields, "shifted_center"].forEach(field => {
+            const input = document.querySelector(`#mobile-score-list input[data-code="${track.code}"][data-field="${field}"]`);
+            row[field] = input?.dataset.touched === "1" ? Number(input.value) : null;
+          });
+          row.comment = document.querySelector(`#mobile-score-list textarea[data-comment="${track.code}"]`)?.value || "";
+          return row;
+        });
+        const result = await requestJson(`/api/scores/${data.run_id}`, {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({listener: document.getElementById("mobile-listener").value, scores: rows})});
+        document.getElementById("mobile-score-message").textContent = result.message;
+        data.saved_scores = Object.fromEntries(rows.map(row => [row.code, row]));
+        document.querySelectorAll("[data-card-status]").forEach(node => node.textContent = "Сохранено");
+        toast("Оценки сохранены");
+      } catch (error) { document.getElementById("mobile-score-message").textContent = error.message; toast(error.message, true); }
+      finally { button.textContent = "Сохранить оценки"; updateScoreCompletion(); }
+    }
+  </script>
+</body>
+</html>

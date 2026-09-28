@@ -26,7 +26,7 @@ from dsp.xtc import apply_xtc
 from signals import generate_synthetic, write_sync_probe
 
 
-PROTO_VERSION = "0.1.1"
+PROTO_VERSION = "0.1.2"
 VARIANT_CODES = ("REF", "ANCHOR_MONO", "ANCHOR_OVER", "W2_LO", "W2_HI", "W2_W3", "W2_W3_W6")
 SUPPORTED_EXTENSIONS = {".wav", ".flac"}
 
@@ -221,7 +221,14 @@ def _listener_order(key: dict, listener: str, seed: int) -> list[dict]:
     return result
 
 
-def render_music(input_dir: str | Path, output_dir: Path, config: dict, seed: int, listeners: list[str] | None) -> dict:
+def render_music(
+    input_dir: str | Path,
+    output_dir: Path,
+    config: dict,
+    seed: int,
+    listeners: list[str] | None,
+    progress_callback=None,
+) -> dict:
     files = _input_files(input_dir)
     sample_rate = int(config["sample_rate"])
     rng = np.random.default_rng(seed)
@@ -241,6 +248,8 @@ def render_music(input_dir: str | Path, output_dir: Path, config: dict, seed: in
     }
     used: set[str] = set()
     all_scores = []
+    completed_variants = 0
+    total_variants = len(files) * len(VARIANT_CODES)
     for fragment_index, source_path in enumerate(files, start=1):
         fragment, start_seconds = _fragment_for_file(source_path, config)
         fragment_id = f"J{fragment_index:02d}"
@@ -265,6 +274,9 @@ def render_music(input_dir: str | Path, output_dir: Path, config: dict, seed: in
             }
             key["tracks"][blind_code] = item
             all_scores.append(item)
+            completed_variants += 1
+            if progress_callback:
+                progress_callback(completed_variants, total_variants, f"{fragment_id}: {variant}")
         print(f"{fragment_id}: {source_path.name} → {start_seconds:.1f}–{start_seconds + float(config['fragment_seconds']):.1f} с")
     for listener in listeners or []:
         order = _listener_order(key, listener, seed)

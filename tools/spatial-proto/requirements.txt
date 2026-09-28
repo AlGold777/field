@@ -4,3 +4,4 @@ soundfile>=0.12
 pyloudnorm>=0.1.1
 PyYAML>=6.0
 matplotlib>=3.7
+qrcode[pil]>=7.4
