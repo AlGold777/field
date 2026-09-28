@@ -19,6 +19,7 @@ class Discovery(
     private val ctx: Context,
     private val myId: String,
     private val onPeers: (List<Peer>) -> Unit,
+    private val onResolved: (Peer) -> Unit = {},
 ) {
     private val telemetry = Telemetry.get(ctx)
     private val nsd = ctx.getSystemService(Context.NSD_SERVICE) as NsdManager
@@ -208,6 +209,7 @@ class Discovery(
                         resolvedAt[i.serviceName] = SystemClock.elapsedRealtime()
                         if (resolveToken == token) resolving = false
                     }
+                    onResolved(p)
                     publish(); resolveNext()
                 }
             })

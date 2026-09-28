@@ -53,6 +53,7 @@ data class PairRecord(
     val levelTrimVersion: Int = 1,
     val delayCalib: DelayCalib = DelayCalib(),
     val levelCalib: LevelCalib = LevelCalib(),
+    val lastSuccessfulNetworkId: String? = null,
 ) {
     fun toJson(): String = JSONObject().apply {
         put("key", key); put("peerId", peerId); put("peerName", peerName); put("peerPlatform", peerPlatform)
@@ -65,6 +66,7 @@ data class PairRecord(
         put("levelCalib", JSONObject().put("state", levelCalib.state).put("atMs", levelCalib.atMs).put("db", levelCalib.db))
         lastHost?.let { put("lastHost", it) }; put("lastPort", lastPort)
         lastSuccessfulHost?.let { put("lastSuccessfulHost", it) }
+        lastSuccessfulNetworkId?.let { put("lastSuccessfulNetworkId", it) }
         put("peerAddresses", org.json.JSONArray().also { array -> peerAddresses.forEach { array.put(it.toJson()) } })
     }.toString()
 
@@ -91,6 +93,7 @@ data class PairRecord(
                     it.optInt("volTaper", 0), it.optInt("levelTrimVersion", 0),
                     it.optJSONObject("delayCalib")?.let { c -> DelayCalib(c.optString("state", "none"), c.optLong("atMs"), c.optDouble("spreadMs")) } ?: DelayCalib(),
                     it.optJSONObject("levelCalib")?.let { c -> LevelCalib(c.optString("state", "none"), c.optLong("atMs"), c.optDouble("db")) } ?: LevelCalib(),
+                    it.optString("lastSuccessfulNetworkId", "").ifEmpty { null },
                 )
             }
         } catch (e: Exception) { null }
@@ -310,6 +313,9 @@ data class UiState(
     val freezeCount: Int = 0,
     val freezeDurationMs: Long = 0,
     val showStabilitySettings: Boolean = false,
+    val showLanBlocked: Boolean = false,
+    val lanBlockedPeerName: String = "",
+    val lanBlockedDetails: String = "",
 ) {
     val myChannel: Int get() = if (role == Role.POINT) pointChannel else Ch.other(pointChannel)
     val inPair: Boolean get() = phase == Phase.PAIRED || phase == Phase.RECONNECTING

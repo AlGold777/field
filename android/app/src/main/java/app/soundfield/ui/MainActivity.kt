@@ -45,7 +45,7 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-private enum class Sub { NONE, CALIBRATION, DIAGNOSTICS, STABILITY }
+private enum class Sub { NONE, CALIBRATION, DIAGNOSTICS, STABILITY, LAN_BLOCKED }
 
 @Composable
 fun AppRoot(engine: Engine) {
@@ -81,9 +81,14 @@ fun AppRoot(engine: Engine) {
     LaunchedEffect(ui.showStabilitySettings) {
         if (ui.showStabilitySettings) sub = Sub.STABILITY
     }
-    if (!ui.inPair && sub != Sub.STABILITY) sub = Sub.NONE
+    LaunchedEffect(ui.showLanBlocked) {
+        if (ui.showLanBlocked) sub = Sub.LAN_BLOCKED
+        else if (sub == Sub.LAN_BLOCKED) sub = Sub.NONE
+    }
+    if (!ui.inPair && sub != Sub.STABILITY && sub != Sub.LAN_BLOCKED) sub = Sub.NONE
     BackHandler(enabled = sub != Sub.NONE) {
         if (sub == Sub.STABILITY) engine.dismissStabilitySettings()
+        if (sub == Sub.LAN_BLOCKED) engine.dismissLanBlockedHint()
         sub = Sub.NONE
     }
 
@@ -93,6 +98,7 @@ fun AppRoot(engine: Engine) {
                 engine.dismissStabilitySettings()
                 sub = Sub.NONE
             })
+            sub == Sub.LAN_BLOCKED -> LanBlockedScreen(ui.lanBlockedPeerName, ui.lanBlockedDetails, engine)
             !ui.inPair -> WelcomeScreen(ui, engine)
             sub == Sub.CALIBRATION -> CalibrationScreen(ui, engine,
                 requestMic = { micLauncher.launch(Manifest.permission.RECORD_AUDIO) }, onBack = { sub = Sub.NONE })

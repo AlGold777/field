@@ -106,7 +106,7 @@ class Engine private constructor(private val app: Context) {
         fun label() = "${route?.label ?: "process_default"} → ${host.hostAddress}"
     }
     private data class ConnectedSocket(val socket: Socket, val route: NetworkRoute?, val host: InetAddress)
-    private class ConnectionAttemptsException(val outcomes: List<String>, cause: Throwable?) :
+    private class ConnectionAttemptsException(val outcomes: List<String>, val candidates: List<PeerPathDiagnosis.Candidate>, cause: Throwable?) :
         Exception("All ${outcomes.size} connection candidates failed", cause)
     private data class AudioPreload(
         val epoch: Int, val startFrame: Long, val source: AudioSource, val channel: Int,
@@ -304,6 +304,12 @@ class Engine private constructor(private val app: Context) {
     @Volatile private var appVisible = true
     private var inviteRinging = false
     private val incomingLinks = java.util.Collections.newSetFromMap(java.util.concurrent.ConcurrentHashMap<ControlLink, Boolean>())
+    private val peerPathDiagnoses = ConcurrentHashMap<String, PeerPathDiagnosis>()
+    private val gatewayProbeAt = ConcurrentHashMap<String, Long>()
+    private val gatewayProbeState = ConcurrentHashMap<String, String>()
+    private val lanHintAt = ConcurrentHashMap<String, Long>()
+    private val lanBlockedLogAt = ConcurrentHashMap<String, Long>()
+    private val lanBlockedLogCount = ConcurrentHashMap<String, Int>()
     private var lastTelemetry = 0L
     private val udpPackets = AtomicLong()
     private val udpInvalid = AtomicLong()
@@ -400,7 +406,7 @@ class Engine private constructor(private val app: Context) {
         prefs.edit().putInt("tcpPort", tcp.localPort).apply()
         tcpAudioServer = ServerSocket(0)
         udp = DatagramSocket(0)
-        discovery = Discovery(app, myId) { peers ->
+        discovery = Discovery(app, myId, onPeers = { peers ->
             ui { copy(nearby = peers) }
             post {
                 val knownPeer = record?.peerId
@@ -409,7 +415,10 @@ class Engine private constructor(private val app: Context) {
                     else if (manualResumeActive && phase == Phase.INVITING && pending == null) tryManualResume()
                 }
             }
-        }
+        }, onResolved = { peer -> post {
+            peerPathDiagnoses.getOrPut(peer.id) { PeerPathDiagnosis() }
+                .onResolved(peer.host?.hostAddress.orEmpty(), peer.port, SystemClock.elapsedRealtime())
+        } })
         Thread({ acceptLoop() }, "sf-accept").apply { isDaemon = true; start() }
         Thread({ tcpAudioAcceptLoop() }, "sf-tcp-audio-accept").apply { isDaemon = true; start() }
         Thread({ udpLoop() }, "sf-udp").apply { isDaemon = true; priority = Thread.MAX_PRIORITY - 1; start() }
@@ -632,6 +641,9 @@ class Engine private constructor(private val app: Context) {
     }
 
     private fun onNetworkChanged() {
+        peerPathDiagnoses.values.forEach { it.onNetworkChanged() }
+        gatewayProbeAt.clear(); gatewayProbeState.clear()
+        ui { copy(showLanBlocked = false) }
         log("Сеть изменилась")
         refreshMultiWifiWarning()
         sendLocalAddressesIfPaired("network_changed")
@@ -1857,8 +1869,9 @@ class Engine private constructor(private val app: Context) {
             manualResumeActive = false
             phase = Phase.IDLE; ui { copy(phase = Phase.IDLE) }
             log("«${rec.peerName}» не ответил")
-            toast(if (manualResumeAuto) "«${rec.peerName}» пока не отвечает. Откройте SoundField на втором телефоне — пара восстановится"
-                  else "«${rec.peerName}» не найден. Откройте SoundField на втором телефоне в той же сети Wi‑Fi")
+            val verdict = peerPathDiagnoses[rec.peerId]?.currentVerdict()
+            toast(if (manualResumeAuto && verdict == PeerPathDiagnosis.Verdict.NONE) "«${rec.peerName}» пока не отвечает. Откройте SoundField на втором телефоне — пара восстановится"
+                else peerVerdictMessage(rec.peerName, verdict))
             return
         }
         val p = resumeTarget(rec)
@@ -1967,7 +1980,8 @@ class Engine private constructor(private val app: Context) {
                 }
             } catch (e: Exception) {
                 try { s?.close() } catch (_: Exception) { }
-                val candidateResults = (e as? ConnectionAttemptsException)?.outcomes.orEmpty()
+                val failure = e as? ConnectionAttemptsException
+                val candidateResults = failure?.outcomes.orEmpty()
                 if (tag == "resume-out" && phase == Phase.RECONNECTING) {
                     candidateResults.forEach(reconnectCandidateHistory::add)
                     while (reconnectCandidateHistory.size > 400) reconnectCandidateHistory.poll()
@@ -1986,9 +2000,21 @@ class Engine private constructor(private val app: Context) {
                     "errorMessage" to (e.message ?: e.javaClass.simpleName),
                     "elapsedMs" to SystemClock.elapsedRealtime() - started,
                     "wifiNetworks" to routes.map { it.label },
-                    "candidateResults" to candidateResults), error = e)
+                    "candidateResults" to failure?.candidates.orEmpty().map { mapOf("network" to it.networkLabel,
+                        "networkId" to it.networkId, "localIpv4" to it.localIpv4, "remoteAddress" to it.remoteHost,
+                        "remotePort" to it.remotePort, "reason" to it.reason.name) }), error = e)
                 post {
-                    log("Нет соединения с ${candidateResults.joinToString()} — ${e.cause?.message ?: e.message}")
+                    failure?.let { recordPeerPathRound(p, tag, it.candidates, routes) }
+                    if (peerPathDiagnoses[p.id]?.currentVerdict() == PeerPathDiagnosis.Verdict.LAN_PEER_BLOCKED) {
+                        val count = (lanBlockedLogCount[p.id] ?: 0) + 1
+                        lanBlockedLogCount[p.id] = count
+                        val last = lanBlockedLogAt[p.id] ?: 0L
+                        if (SystemClock.elapsedRealtime() - last >= 30_000) {
+                            lanBlockedLogAt[p.id] = SystemClock.elapsedRealtime()
+                            log("Нет соединения с «${p.name}» (ещё $count попыток)")
+                            lanBlockedLogCount[p.id] = 0
+                        }
+                    } else log("Нет соединения с ${candidateResults.joinToString()} — ${e.cause?.message ?: e.message}")
                     onConnectFailed(tag)
                 }
             }
@@ -2002,6 +2028,7 @@ class Engine private constructor(private val app: Context) {
     ): ConnectedSocket {
         val sockets = java.util.concurrent.CopyOnWriteArrayList<Socket>()
         val socketsByCandidate = ConcurrentHashMap<ConnectionCandidate, Socket>()
+        val reasons = ConcurrentHashMap<ConnectionCandidate, PeerPathDiagnosis.Reason>()
         val winningSocket = AtomicReference<Socket?>(null)
         val race = try {
             HappyEyeballs.connect(candidates, CONNECT_STAGGER_MS,
@@ -2009,6 +2036,11 @@ class Engine private constructor(private val app: Context) {
                     if (socket !== winningSocket.get()) try { socket.close() } catch (_: Exception) { }
                 } },
                 onAttempt = { index, candidate, status, error ->
+                    reasons[candidate] = when {
+                        status == "connected" -> PeerPathDiagnosis.Reason.OTHER
+                        status.contains("cancelled") -> PeerPathDiagnosis.Reason.CANCELLED
+                        else -> PeerPathDiagnosis.classify(error ?: java.io.IOException(status))
+                    }
                     val socket = socketsByCandidate[candidate]
                     if (status == "connected" && socket != null) winningSocket.set(socket)
                     val localAddress = socket?.localAddress?.hostAddress ?: candidate.route?.let { route ->
@@ -2023,7 +2055,8 @@ class Engine private constructor(private val app: Context) {
                         mapOf("tag" to tag, "attempt" to (index + 1), "network" to (candidate.route?.label ?: "process_default"),
                             "networkId" to (candidate.route?.networkId ?: "process_default"), "localAddress" to localAddress,
                             "localPort" to (socket?.localPort ?: 0), "remoteAddress" to candidate.host.hostAddress,
-                            "remotePort" to port, "result" to status, "errorMessage" to error?.message), error = error)
+                            "remotePort" to port, "result" to status,
+                            "reason" to (reasons[candidate]?.name ?: "OTHER"), "errorMessage" to error?.message), error = error)
                 }) { candidate ->
                 val socket = candidate.route?.network?.socketFactory?.createSocket() ?: Socket()
                 sockets += socket
@@ -2041,8 +2074,15 @@ class Engine private constructor(private val app: Context) {
                 val candidate = attempt.candidate as? ConnectionCandidate
                 "${candidate?.label() ?: attempt.candidate}=${attempt.result}"
             }
+            val candidates = e.attempts.mapNotNull { attempt ->
+                val candidate = attempt.candidate as? ConnectionCandidate ?: return@mapNotNull null
+                val route = candidate.route
+                PeerPathDiagnosis.Candidate(route?.networkId ?: "process_default", route?.label ?: "process_default",
+                    route?.let { networkAddresses(it.linkProperties).filterIsInstance<java.net.Inet4Address>().mapNotNull { a -> a.hostAddress } }.orEmpty(),
+                    candidate.host.hostAddress ?: "", port, reasons[candidate] ?: PeerPathDiagnosis.classify(java.io.IOException(attempt.result)))
+            }
             telemetry.record("CONNECT_CANDIDATES", mapOf("tag" to tag, "result" to "failed", "routes" to outcomes))
-            throw ConnectionAttemptsException(outcomes, e)
+            throw ConnectionAttemptsException(outcomes, candidates, e)
         }
         val outcomes = race.attempts.map { attempt -> "${attempt.candidate.label()}=${attempt.result}" }
         telemetry.record("CONNECT_CANDIDATES", mapOf("tag" to tag, "result" to "connected",
@@ -2050,14 +2090,112 @@ class Engine private constructor(private val app: Context) {
         return ConnectedSocket(race.connection, race.candidate.route, race.candidate.host)
     }
 
+    private fun recordPeerPathRound(peer: Peer, tag: String, candidates: List<PeerPathDiagnosis.Candidate>, routes: List<NetworkRoute>) {
+        val now = SystemClock.elapsedRealtime()
+        val gateways = probeGateways(routes, now)
+        val round = PeerPathDiagnosis.Round(candidates.firstOrNull()?.remoteHost.orEmpty(), peer.port, now, candidates)
+        val diagnosis = peerPathDiagnoses.getOrPut(peer.id) { PeerPathDiagnosis() }
+        val result = diagnosis.onRound(round, routes.map { it.networkId }.toSet(), gateways)
+        if (!result.changed || result.verdict == PeerPathDiagnosis.Verdict.NONE) return
+        val trigger = when {
+            tag == "invite-out" -> "invite-out"
+            tag == "resume-auto" -> "resume-auto"
+            tag == "resume-out" && phase == Phase.RECONNECTING -> "reconnect"
+            else -> "resume-out"
+        }
+        val localNetworks = routes.map { route -> mapOf("label" to route.label, "networkId" to route.networkId,
+            "ipv4" to networkAddresses(route.linkProperties).filterIsInstance<java.net.Inet4Address>().mapNotNull { it.hostAddress }) }
+        val shown = when (result.verdict) {
+            PeerPathDiagnosis.Verdict.LAN_PEER_BLOCKED -> {
+                log("Сеть блокирует соединение с «${peer.name}»: найден через mDNS (${round.host}:${peer.port}), TCP не проходит (${result.rounds} попыток)")
+                lanBlockedLogAt[peer.id] = now
+                lanBlockedLogCount[peer.id] = 0
+                trigger != "resume-auto" && showLanBlockedHint(peer, routes, trigger)
+            }
+            PeerPathDiagnosis.Verdict.NO_ROUTE -> { log("Нет маршрута до «${peer.name}». Проверьте, что оба телефона в одной сети Wi‑Fi"); false }
+            else -> false
+        }
+        telemetry.record("PEER_PATH_DIAGNOSIS", mapOf("peer" to peer.id, "peerName" to peer.name,
+            "verdict" to result.verdict.name, "confidence" to result.confidence?.name?.lowercase(),
+            "rounds" to result.rounds, "spanMs" to result.spanMs, "lastResolveAgeMs" to result.lastResolveAgeMs,
+            "resolvedPort" to result.resolvedPort, "triedPort" to result.triedPort,
+            "localNetworks" to localNetworks, "gatewayProbe" to gateways,
+            "candidateResults" to result.candidates.map { mapOf("network" to it.networkLabel, "networkId" to it.networkId,
+                "remoteAddress" to it.remoteHost, "remotePort" to it.remotePort, "reason" to it.reason.name) },
+            "shownToUser" to shown, "trigger" to trigger),
+            category = if (result.verdict == PeerPathDiagnosis.Verdict.LAN_PEER_BLOCKED) "incident" else "network")
+    }
+
+    private fun probeGateways(routes: List<NetworkRoute>, nowMs: Long): Map<String, String> = routes.associate { route ->
+        val id = route.networkId
+        val prevAt = gatewayProbeAt[id] ?: 0L
+        if (nowMs - prevAt < 60_000) return@associate id to (gatewayProbeState[id] ?: "unknown")
+        gatewayProbeAt[id] = nowMs
+        val gateway = route.linkProperties.routes.firstOrNull { it.isDefaultRoute && it.gateway is java.net.Inet4Address }?.gateway
+        val state = if (gateway == null) "unknown" else try {
+            fun attempt(port: Int): String {
+                val socket = route.network.socketFactory.createSocket()
+                try { socket.connect(InetSocketAddress(gateway, port), 1_000); return "ok" }
+                catch (e: java.net.ConnectException) {
+                    if (e.message.orEmpty().contains("refused", true) || e.message.orEmpty().contains("ECONNREFUSED", true)) return "ok"
+                    throw e
+                } finally { try { socket.close() } catch (_: Exception) {} }
+            }
+            try { attempt(80) } catch (e: java.net.SocketTimeoutException) {
+                try { attempt(53) } catch (_: java.net.SocketTimeoutException) { "timeout" }
+            }
+        } catch (_: Exception) { "unknown" }
+        gatewayProbeState[id] = state
+        id to state
+    }
+
+    private fun showLanBlockedHint(peer: Peer, routes: List<NetworkRoute>, trigger: String): Boolean {
+        val signature = routes.map { it.networkId }.sorted().joinToString(",")
+        val key = "lanHint:${peer.id}:$signature"
+        val lastShown = prefs.getLong(key, 0L)
+        val wallNow = System.currentTimeMillis()
+        if (wallNow - lastShown in 0 until 30 * 60_000L) return false
+        prefs.edit().putLong(key, wallNow).apply()
+        if (phase == Phase.INVITING && trigger != "resume-auto") {
+            manualResumeActive = false
+            pending?.let { it.tag = "dead"; it.close() }; pending = null
+            phase = Phase.IDLE
+            ui { copy(phase = Phase.IDLE) }
+            toast("Роутер блокирует соединение между телефонами")
+        }
+        ui { copy(showLanBlocked = true, lanBlockedPeerName = peer.name,
+            lanBlockedDetails = if (routes.size >= 2) "double_wifi" else if (record?.peerId == peer.id &&
+                record?.lastSuccessfulNetworkId != null && routes.none { it.networkId == record?.lastSuccessfulNetworkId }) "previous_wifi" else "") }
+        telemetry.record("LAN_BLOCKED_HINT_SHOWN", mapOf("peer" to peer.id, "trigger" to trigger))
+        telemetry.record("PEER_PATH_DIAGNOSIS_HINT", mapOf("peer" to peer.id, "shownToUser" to true, "trigger" to trigger))
+        return true
+    }
+
+    fun dismissLanBlockedHint(action: String = "dismiss") = post {
+        telemetry.record("LAN_BLOCKED_HINT_ACTION", mapOf("peerName" to ui.value.lanBlockedPeerName, "action" to action))
+        ui { copy(showLanBlocked = false) }
+    }
+
     private fun onConnectFailed(tag: String) {
         when {
             tag == "invite-out" && phase == Phase.INVITING -> {
-                phase = Phase.IDLE; ui { copy(phase = Phase.IDLE) }; toast("Не удалось подключиться к телефону")
+                val p = pendingPeer
+                val verdict = p?.let { peerPathDiagnoses[it.id]?.currentVerdict() }
+                if (verdict != PeerPathDiagnosis.Verdict.LAN_PEER_BLOCKED || !ui.value.showLanBlocked)
+                    toast(peerVerdictMessage(p?.name.orEmpty(), verdict, invite = true))
+                phase = Phase.IDLE; ui { copy(phase = Phase.IDLE) }
             }
             tag == "resume-out" && phase == Phase.RECONNECTING -> scheduleReconnect(reconnectDelay())
             tag == "resume-out" && phase == Phase.INVITING -> later(700) { tryManualResume() }
         }
+    }
+
+    private fun peerVerdictMessage(name: String, verdict: PeerPathDiagnosis.Verdict?, invite: Boolean = false): String = when (verdict) {
+        PeerPathDiagnosis.Verdict.LAN_PEER_BLOCKED -> "Роутер блокирует соединение между телефонами"
+        PeerPathDiagnosis.Verdict.NO_ROUTE -> "Нет маршрута до «$name». Проверьте, что оба телефона в одной сети Wi‑Fi"
+        PeerPathDiagnosis.Verdict.PEER_NOT_LISTENING -> "«$name» не отвечает. Откройте SoundField на втором телефоне"
+        PeerPathDiagnosis.Verdict.NOT_DISCOVERED -> "«$name» не найден. Откройте SoundField на втором телефоне в той же сети Wi‑Fi"
+        else -> if (invite) "Не удалось подключиться к телефону" else "«$name» пока не отвечает. Откройте SoundField на втором телефоне"
     }
 
     private fun newLink(s: Socket, tag: String = "") = ControlLink(s,
@@ -2275,6 +2413,7 @@ class Engine private constructor(private val app: Context) {
 
     // ================================================================== пара
     private fun becomePaired(l: ControlLink, r: Role, pid: String, pname: String, pplat: String, key: String, resumed: Boolean) {
+        peerPathDiagnoses.getOrPut(pid) { PeerPathDiagnosis() }.onConnected()
         pendingTimeout?.cancel(false)
         reconnectTask?.cancel(false)
         if (pending === l) pending = null
@@ -2325,9 +2464,10 @@ class Engine private constructor(private val app: Context) {
         peerTcpPortHint = 0
         record = if (old != null && old.key == key) old.copy(peerName = pname, peerPlatform = pplat, myRole = r,
             lastHost = host, lastPort = port, peerAddresses = TransportPlan.mergeAddresses(allPeerAddresses, old.peerAddresses),
-            lastSuccessfulHost = host)
+            lastSuccessfulHost = host, lastSuccessfulNetworkId = l.localNetworkId.takeIf { it != "unknown" })
                  else PairRecord(key, pid, pname, pplat, r, lastHost = host, lastPort = port,
-                     peerAddresses = allPeerAddresses, lastSuccessfulHost = host)
+                     peerAddresses = allPeerAddresses, lastSuccessfulHost = host,
+                     lastSuccessfulNetworkId = l.localNetworkId.takeIf { it != "unknown" })
         peerAddressSnapshot = emptyList()
         peerCapabilities = emptySet()
         peerUnreachableReported = false
@@ -2395,7 +2535,9 @@ class Engine private constructor(private val app: Context) {
 
     /** Экспоненциальный backoff: 1с → 2с → 4с → 8с → 15с (потолок). */
     private fun reconnectDelay(): Long {
-        return ReconnectBackoff.delayMs(resumeAttempt, availableNetworkRoutes(wifiOnly = true).isNotEmpty())
+        val delay = ReconnectBackoff.delayMs(resumeAttempt, availableNetworkRoutes(wifiOnly = true).isNotEmpty())
+        val diagnosis = record?.peerId?.let(peerPathDiagnoses::get)?.currentVerdict()
+        return if (diagnosis == PeerPathDiagnosis.Verdict.LAN_PEER_BLOCKED) maxOf(delay, 10_000) else delay
     }
 
     private fun onLinkLost() {
@@ -2445,8 +2587,13 @@ class Engine private constructor(private val app: Context) {
             val attempts = reconnectCandidateHistory.toList()
             telemetry.record("PEER_UNREACHABLE", mapOf("peer" to rec.peerId, "peerName" to rec.peerName,
                 "elapsedMs" to now - reconnectSince, "attemptedRoutes" to attempts))
-            maybeShowStabilitySettings("peer_unreachable")
-            toast("Не удаётся найти «${rec.peerName}» больше минуты. Проверьте Wi‑Fi на обоих телефонах; при двойном Wi‑Fi попробуйте оставить одну сеть.")
+            if (peerPathDiagnoses[rec.peerId]?.currentVerdict() == PeerPathDiagnosis.Verdict.LAN_PEER_BLOCKED) {
+                showLanBlockedHint(resumeTarget(rec) ?: Peer(rec.peerId, rec.peerName, rec.peerPlatform, null, rec.lastPort),
+                    availableNetworkRoutes(wifiOnly = true), "reconnect")
+            } else {
+                maybeShowStabilitySettings("peer_unreachable")
+                toast("Не удаётся найти «${rec.peerName}» больше минуты. Проверьте Wi‑Fi на обоих телефонах; при двойном Wi‑Fi попробуйте оставить одну сеть.")
+            }
         }
         if (now - lastBrowseRestart > 20_000) { lastBrowseRestart = now; discovery.restartBrowse() }
         val p = resumeTarget(rec)
@@ -3843,6 +3990,10 @@ class Engine private constructor(private val app: Context) {
         val result = linkedMapOf<String, Map<String, Any?>>()
         val playing = serverDiag.playing || pointDiag.playing
         fun violation(name: String, values: Map<String, Any?>) { result[name] = values }
+        peerPathDiagnoses.entries.firstOrNull { it.value.currentVerdict() == PeerPathDiagnosis.Verdict.LAN_PEER_BLOCKED }?.let { (id, _) ->
+            violation("LAN_ISOLATION", mapOf("peer" to id, "peerName" to (record?.peerName ?: peerName),
+                "candidateResults" to reconnectCandidateHistory.toList()))
+        }
         if (phase == Phase.RECONNECTING && reconnectSince > 0 && nowMs - reconnectSince >= 60_000L) {
             violation("PEER_UNREACHABLE", mapOf("peer" to peerId, "peerName" to peerName,
                 "elapsedMs" to nowMs - reconnectSince, "attemptedRoutes" to reconnectCandidateHistory.toList()))
