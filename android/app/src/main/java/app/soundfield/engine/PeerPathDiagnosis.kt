@@ -32,12 +32,25 @@ internal class PeerPathDiagnosis {
         resolution = Resolution(host, port, nowMs)
     }
 
-    @Synchronized fun onRound(round: Round, currentNetworks: Set<String>, gateway: Map<String, String>): Result {
+    @Synchronized fun onRound(
+        round: Round,
+        currentNetworks: Set<String>,
+        gateway: Map<String, String>,
+        peerPresent: Boolean = true,
+        presentPort: Int? = round.port,
+    ): Result {
+        if (!peerPresent) {
+            rounds.clear()
+            val changed = verdict != Verdict.NOT_DISCOVERED
+            verdict = Verdict.NOT_DISCOVERED
+            return Result(verdict, changed = changed, triedPort = round.port,
+                candidates = round.candidates, lastResolveAgeMs = resolution?.let { round.atMs - it.atMs })
+        }
         if (round.verdict == RoundVerdict.ANY_REFUSED) rounds.clear()
         rounds.addLast(round)
         while (rounds.size > 12) rounds.removeFirst()
         val lastResolution = resolution
-        val recent = lastResolution?.takeIf { round.atMs - it.atMs in 0..30_000 }
+        val currentPeerMatchesAttempt = presentPort != null && presentPort == round.port
         val timeoutRounds = rounds.takeLastWhile { it.verdict == RoundVerdict.ALL_TIMEOUT }
         val span = if (timeoutRounds.size >= 2) timeoutRounds.last().atMs - timeoutRounds.first().atMs else 0
         val allPathsTried = currentNetworks.isNotEmpty() && currentNetworks.all { n ->
@@ -47,21 +60,27 @@ internal class PeerPathDiagnosis {
         val gatewayOk = gatewayState.any { it == "ok" }
         val gatewayUnknown = gatewayState.isEmpty() || gatewayState.any { it == "unknown" }
         val next = when {
-            recent != null && recent.port == round.port && timeoutRounds.size >= 3 && span >= 5_000 && allPathsTried && (gatewayOk || gatewayUnknown) -> Verdict.LAN_PEER_BLOCKED
-            round.verdict == RoundVerdict.ANY_REFUSED && (recent == null || recent.port == round.port) -> Verdict.PEER_NOT_LISTENING
+            verdict == Verdict.LAN_PEER_BLOCKED && round.verdict != RoundVerdict.ANY_REFUSED -> Verdict.LAN_PEER_BLOCKED
+            currentPeerMatchesAttempt && timeoutRounds.size >= 3 && span >= 5_000 && allPathsTried && (gatewayOk || gatewayUnknown) -> Verdict.LAN_PEER_BLOCKED
+            round.verdict == RoundVerdict.ANY_REFUSED && currentPeerMatchesAttempt -> Verdict.PEER_NOT_LISTENING
+            !currentPeerMatchesAttempt -> Verdict.NONE
             rounds.takeLastWhile { it.verdict == RoundVerdict.ALL_NO_ROUTE }.size >= 3 -> Verdict.NO_ROUTE
-            recent == null && rounds.isNotEmpty() -> Verdict.NOT_DISCOVERED
             else -> Verdict.NONE
         }
         val changed = next != verdict
         verdict = next
         return Result(next, if (gatewayUnknown) Confidence.MEDIUM else Confidence.HIGH,
-            timeoutRounds.size, span, recent?.port ?: 0, round.port, round.candidates, changed,
+            timeoutRounds.size, span, lastResolution?.port ?: 0, round.port, round.candidates, changed,
             lastResolution?.let { round.atMs - it.atMs })
     }
 
     @Synchronized fun onConnected() { reset() }
     @Synchronized fun onNetworkChanged() { reset() }
+    @Synchronized fun onLost() {
+        rounds.clear()
+        resolution = null
+        verdict = Verdict.NOT_DISCOVERED
+    }
     @Synchronized fun currentVerdict(): Verdict = verdict
     @Synchronized fun latestCandidates(): List<Candidate> = rounds.lastOrNull()?.candidates.orEmpty()
     @Synchronized private fun reset() { rounds.clear(); resolution = null; verdict = Verdict.NONE }
