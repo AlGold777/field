@@ -1,6 +1,7 @@
 package app.soundfield.ui
 
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
@@ -17,35 +18,23 @@ import app.soundfield.engine.UiState
 
 @Composable
 fun WelcomeScreen(ui: UiState, engine: Engine) {
-    var renaming by remember { mutableStateOf(false) }
     var showLog by remember { mutableStateOf(false) }
-    Column(
-        Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 20.dp).padding(top = 48.dp, bottom = 24.dp),
-    ) {
+    Box(Modifier.fillMaxSize()) {
+      Column(
+          Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 20.dp).padding(top = 48.dp, bottom = 24.dp),
+      ) {
         Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
             Text("🔊", fontSize = 56.sp)
             Spacer(Modifier.height(12.dp))
             H1("SoundField")
-            Spacer(Modifier.height(6.dp))
-            Subtitle("Объедините два смартфона в стереосистему", align = TextAlign.Center)
         }
         Spacer(Modifier.height(28.dp))
 
         ui.remembered?.let { rec ->
-            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                PairStatusButton(
-                    if (ui.phase == Phase.INVITING || ui.autoResuming) "Подключение…" else "Подключить",
-                    if (ui.phase == Phase.INVITING || ui.autoResuming) SFColors.Warn else SFColors.Accent1,
-                    onClick = { engine.resumeRemembered() },
-                )
-                Spacer(Modifier.weight(1f))
-                Badge(if (rec.myRole == Role.SERVER) "SERVER" else "POINT", SFColors.Master)
-            }
-            Spacer(Modifier.height(18.dp))
             H3("Знакомая пара")
-            SFCard {
+            SFCard(Modifier.clickable { engine.resumeRemembered() }) {
                 H2(rec.peerName)
-                Subtitle("Этот телефон: ${if (rec.myRole == Role.SERVER) "Server" else "Point"} · пара сохранена")
+                Subtitle("Нажмите, чтобы подключиться")
             }
             if (ui.autoResuming) Subtitle("Ищем «${rec.peerName}» — пара восстановится автоматически…")
             GhostButton("Забыть", color = SFColors.TextDim) { engine.forgetPair() }
@@ -71,11 +60,9 @@ fun WelcomeScreen(ui: UiState, engine: Engine) {
                     onClick = { engine.invite(p) },
                 )
             }
-            Subtitle("Этот телефон станет Server (левый канал), второй — Point (правый). Каналы можно поменять позже.")
         }
 
         Spacer(Modifier.height(24.dp))
-        GhostButton("Этот телефон: ${ui.myName}  ✎", color = SFColors.TextDim) { renaming = true }
         GhostButton(if (showLog) "Скрыть журнал подключения" else "Журнал подключения", color = SFColors.TextDim) { showLog = !showLog }
         if (showLog) {
             if (ui.connLog.isEmpty()) Subtitle("Событий нет")
@@ -84,9 +71,13 @@ fun WelcomeScreen(ui: UiState, engine: Engine) {
             }
         }
         TelemetryButton(ui, engine)
+      }
+      ui.remembered?.let { rec ->
+          Box(Modifier.align(Alignment.TopEnd).padding(top = 12.dp, end = 20.dp)) {
+              Badge(if (rec.myRole == Role.SERVER) "SERVER" else "POINT", SFColors.Master)
+          }
+      }
     }
-
-    if (renaming) RenameDialog(ui.myName, onDismiss = { renaming = false }) { engine.rename(it); renaming = false }
 
     if (ui.phase == Phase.INVITING) {
         AlertDialog(

@@ -3,36 +3,27 @@ import SwiftUI
 struct WelcomeView: View {
     let ui: UiState
     let engine: Engine
-    @State private var renaming = false
-    @State private var newName = ""
     @State private var showLog = false
 
     var body: some View {
-        ScrollView {
+        ZStack(alignment: .topTrailing) {
+          ScrollView {
             VStack(alignment: .leading, spacing: 0) {
                 VStack(spacing: 8) {
                     Text("🔊").font(.system(size: 56))
                     Text("SoundField").font(.system(size: 30, weight: .bold)).foregroundStyle(SFColor.accent)
-                    Subtitle(text: "Объедините два смартфона в стереосистему", align: .center)
                 }
                 .frame(maxWidth: .infinity).padding(.bottom, 28)
 
                 if let rec = ui.remembered {
-                    HStack {
-                        Button { engine.resumeRemembered() } label: {
-                            StatusPill(text: ui.phase == .inviting || ui.autoResuming ? "Подключение…" : "Подключить",
-                                       color: ui.phase == .inviting || ui.autoResuming ? SFColor.warn : SFColor.accent1)
-                        }
-                        .buttonStyle(.plain)
-                        Spacer()
-                        Badge(text: rec.role.title.uppercased(), color: SFColor.master)
-                    }
-                    .padding(.bottom, 18)
                     H3(text: "Знакомая пара")
-                    SFCard {
-                        H2(text: rec.peerName)
-                        Subtitle(text: "Этот телефон: \(rec.role.title) · пара сохранена")
+                    Button { engine.resumeRemembered() } label: {
+                        SFCard {
+                            H2(text: rec.peerName)
+                            Subtitle(text: "Нажмите, чтобы подключиться")
+                        }
                     }
+                    .buttonStyle(.plain)
                     if ui.autoResuming { Subtitle(text: "Ищем «\(rec.peerName)» — пара восстановится автоматически…") }
                     GhostButton(title: "Забыть", color: SFColor.dim) { engine.forgetPair() }
                     .padding(.bottom, 12)
@@ -53,16 +44,12 @@ struct WelcomeView: View {
                             engine.invite(p)
                         }
                     }
-                    Subtitle(text: "Этот телефон станет Server (левый канал), второй — Point (правый). Каналы можно поменять позже.")
                 }
 
-                GhostButton(title: "Этот телефон: \(ui.myName)  ✎", color: SFColor.dim) {
-                    newName = ui.myName; renaming = true
-                }
-                .padding(.top, 24)
                 GhostButton(title: showLog ? "Скрыть журнал подключения" : "Журнал подключения", color: SFColor.dim) {
                     showLog.toggle()
                 }
+                .padding(.top, 24)
                 if showLog {
                     if ui.connLog.isEmpty { Subtitle(text: "Событий нет") }
                     ForEach(Array(ui.connLog.reversed().prefix(30).enumerated()), id: \.offset) { _, line in
@@ -72,11 +59,11 @@ struct WelcomeView: View {
                 }
             }
             .padding(.horizontal, 20).padding(.top, 24).padding(.bottom, 24)
-        }
-        .alert("Имя телефона", isPresented: $renaming) {
-            TextField("Видно второму телефону", text: $newName)
-            Button("Сохранить") { engine.rename(newName) }
-            Button("Отмена", role: .cancel) {}
+          }
+          if let rec = ui.remembered {
+              Badge(text: rec.role.title.uppercased(), color: SFColor.master)
+                  .padding(.top, 12).padding(.trailing, 20)
+          }
         }
         .alert("Подключение…", isPresented: .constant(ui.phase == .inviting)) {
             Button("Отмена", role: .cancel) { engine.cancelInvite() }
