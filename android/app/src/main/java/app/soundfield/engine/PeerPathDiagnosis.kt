@@ -63,6 +63,7 @@ internal class PeerPathDiagnosis {
     @Synchronized fun onConnected() { reset() }
     @Synchronized fun onNetworkChanged() { reset() }
     @Synchronized fun currentVerdict(): Verdict = verdict
+    @Synchronized fun latestCandidates(): List<Candidate> = rounds.lastOrNull()?.candidates.orEmpty()
     @Synchronized private fun reset() { rounds.clear(); resolution = null; verdict = Verdict.NONE }
 
     companion object {

@@ -3992,7 +3992,11 @@ class Engine private constructor(private val app: Context) {
         fun violation(name: String, values: Map<String, Any?>) { result[name] = values }
         peerPathDiagnoses.entries.firstOrNull { it.value.currentVerdict() == PeerPathDiagnosis.Verdict.LAN_PEER_BLOCKED }?.let { (id, _) ->
             violation("LAN_ISOLATION", mapOf("peer" to id, "peerName" to (record?.peerName ?: peerName),
-                "candidateResults" to reconnectCandidateHistory.toList()))
+                "candidateResults" to peerPathDiagnoses[id]?.latestCandidates().orEmpty().map { candidate ->
+                    mapOf("network" to candidate.networkLabel, "networkId" to candidate.networkId,
+                        "remoteAddress" to candidate.remoteHost, "remotePort" to candidate.remotePort,
+                        "reason" to candidate.reason.name)
+                }))
         }
         if (phase == Phase.RECONNECTING && reconnectSince > 0 && nowMs - reconnectSince >= 60_000L) {
             violation("PEER_UNREACHABLE", mapOf("peer" to peerId, "peerName" to peerName,
