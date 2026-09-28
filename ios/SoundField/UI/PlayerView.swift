@@ -12,8 +12,6 @@ struct PlayerView: View {
     @State private var dragging: Double? = nil
     @State private var confirmDisconnect = false
     @State private var master = 0.8
-    @State private var volL = 1.0
-    @State private var volR = 1.0
     @State private var balance = 0.5
     @State private var balanceDragging = false
     @State private var balanceWasInCenter = true
@@ -44,7 +42,10 @@ struct PlayerView: View {
                 if ui.mode != .music {
                     SFCard {
                         Text(ui.mode == .metronome ? "🥁 Метроном для ручной подстройки"
-                             : ui.mode == .lrtest ? "🔈 Проверка каналов: сначала L, потом R" : "🎯 Идёт калибровка")
+                             : ui.mode == .lrtest ? "🔈 Проверка каналов: сначала L, потом R"
+                             : ui.mode == .level ? "Уровень: L и R звучат по очереди"
+                             : ui.mode == .center ? "Проверка центра"
+                             : ui.mode == .levelMeasure ? "Экспериментальное измерение микрофонами" : "🎯 Идёт калибровка")
                             .font(.system(size: 15, weight: .semibold)).foregroundColor(SFColor.warn)
                     }
                 }
@@ -106,6 +107,7 @@ struct PlayerView: View {
                     Text("Sound").font(.system(size: 13, weight: .semibold)).kerning(1)
                         .foregroundColor(SFColor.dim).padding(.bottom, 8)
                     SliderRow(label: "Громкость", valueText: "\(Int(master * 100))%", value: $master, color: SFColor.master,
+                              enabled: ui.mode != .levelMeasure,
                               onEditingEnded: { engine.setVolume("M", Float(master), finished: true) })
                         .onChange(of: master) { if abs($0 - Double(ui.master)) > 0.004 { engine.setVolume("M", Float($0), finished: false) } }
                     HStack {
@@ -148,10 +150,6 @@ struct PlayerView: View {
                         .accessibilityValue("Баланс: \(balanceLabel(balance))")
                         Text("R").font(.system(size: 13, weight: .semibold)).foregroundColor(SFColor.rightText)
                     }
-                    SliderRow(label: "Левый канал · L", valueText: "\(Int(volL * 100))%", value: $volL, color: SFColor.left)
-                        .onChange(of: volL) { if abs($0 - Double(ui.volL)) > 0.004 { engine.setVolume("L", Float($0)) } }
-                    SliderRow(label: "Правый канал · R", valueText: "\(Int(volR * 100))%", value: $volR, color: SFColor.right)
-                        .onChange(of: volR) { if abs($0 - Double(ui.volR)) > 0.004 { engine.setVolume("R", Float($0)) } }
                 }
 
                 HStack(spacing: 8) {
@@ -173,8 +171,6 @@ struct PlayerView: View {
         .onReceive(timer) { _ in pos = engine.positionMs() }
         .onAppear { syncVolumes(); engine.setQueueExpanded(queueExpanded) }
         .onChange(of: ui.master) { _ in syncVolumes() }
-        .onChange(of: ui.volL) { _ in syncVolumes() }
-        .onChange(of: ui.volR) { _ in syncVolumes() }
         .onChange(of: ui.balance) { value in
             if !balanceDragging { balance = Double(value); balanceWasInCenter = abs(Double(value) - 0.5) < 0.015 }
             syncVolumes()
@@ -204,8 +200,6 @@ struct PlayerView: View {
 
     private func syncVolumes() {
         if abs(master - Double(ui.master)) > 0.005 { master = Double(ui.master) }
-        if abs(volL - Double(ui.volL)) > 0.005 { volL = Double(ui.volL) }
-        if abs(volR - Double(ui.volR)) > 0.005 { volR = Double(ui.volR) }
         if !balanceDragging && abs(balance - Double(ui.balance)) > 0.005 {
             balance = Double(ui.balance); balanceWasInCenter = abs(balance - 0.5) < 0.015
         }

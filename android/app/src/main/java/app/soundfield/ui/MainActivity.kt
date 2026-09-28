@@ -89,6 +89,7 @@ fun AppRoot(engine: Engine) {
     BackHandler(enabled = sub != Sub.NONE) {
         if (sub == Sub.STABILITY) engine.dismissStabilitySettings()
         if (sub == Sub.LAN_BLOCKED) engine.dismissLanBlockedHint()
+        if (sub == Sub.CALIBRATION && ui.mode == app.soundfield.core.SourceMode.LEVEL_MATCH) engine.stopLevelMatch(commit = false)
         sub = Sub.NONE
     }
 

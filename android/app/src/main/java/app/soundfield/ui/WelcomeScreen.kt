@@ -38,7 +38,7 @@ fun WelcomeScreen(ui: UiState, engine: Engine) {
             }
             SFCard(Modifier.clickable { engine.resumeRemembered() }) {
                 H2(rec.peerName)
-                Subtitle("Нажмите, чтобы подключиться")
+                Text("Подключить", color = SFColors.Accent1, fontSize = 13.sp, fontWeight = androidx.compose.ui.text.font.FontWeight.SemiBold)
             }
             Spacer(Modifier.height(12.dp))
         }

@@ -25,7 +25,7 @@ struct WelcomeView: View {
                     Button { engine.resumeRemembered() } label: {
                         SFCard {
                             H2(text: rec.peerName)
-                            Subtitle(text: "Нажмите, чтобы подключиться")
+                            Text("Подключить").font(.system(size: 13, weight: .semibold)).foregroundColor(SFColor.accent1)
                         }
                     }
                     .buttonStyle(.plain)

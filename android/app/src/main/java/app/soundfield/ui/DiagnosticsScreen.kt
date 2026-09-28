@@ -12,6 +12,8 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.unit.dp
 import app.soundfield.core.Role
+import app.soundfield.core.Ch
+import app.soundfield.core.BalanceLaw
 import app.soundfield.BuildConfig
 import app.soundfield.engine.Engine
 import app.soundfield.engine.UiState
@@ -42,7 +44,25 @@ fun DiagnosticsScreen(ui: UiState, engine: Engine, onBack: () -> Unit) {
             DiagRow("Оценка по часам", est?.let { "±%.2f мс".format(it) } ?: "—", est?.let { c(it, 2.0, 5.0) } ?: SFColors.Text)
             DiagRow("Акустически измерено", ui.calib.lastMeasuredMs?.let { "%+.1f мс".format(it) } ?: "не измерялось",
                 ui.calib.lastMeasuredMs?.let { c(abs(it), 2.0, 5.0) } ?: SFColors.TextDim)
-            DiagRow("Сдвиг Point (калибровка)", "%+.1f мс".format(ui.trimMs))
+            val delayState = when (ui.delayCalib.state) {
+                "auto" -> "авто, разброс %.1f мс".format(ui.delayCalib.spreadMs)
+                "manual" -> "вручную"
+                else -> "не откалибрована"
+            }
+            DiagRow("Задержка", "trim %+.1f мс · %s".format(ui.trimMs, delayState))
+            val serverCh = Ch.other(ui.pointChannel)
+            val lDb = if (serverCh == Ch.L) ui.levelTrimServerDb else ui.levelTrimPointDb
+            val rDb = if (serverCh == Ch.R) ui.levelTrimServerDb else ui.levelTrimPointDb
+            val levelSource = when (ui.levelCalib.state) { "ear" -> "на слух"; "mic" -> "микрофон"; "manual" -> "вручную"; else -> "не настроено" }
+            DiagRow("Уровень", "L-тел %+.1f дБ, R-тел %+.1f дБ · %s".format(lDb, rDb, levelSource))
+            val balanceP = 2f * ui.balance - 1f
+            val balanceDb = -BalanceLaw.differenceDb(ui.balance)
+            val balanceText = when {
+                kotlin.math.abs(balanceP) < 0.001f -> "Центр"
+                kotlin.math.abs(balanceP) >= 0.995f -> if (balanceP < 0) "Только L" else "Только R"
+                else -> "%s +%.1f дБ".format(if (balanceP < 0) "L" else "R", balanceDb)
+            }
+            DiagRow("Баланс", balanceText)
         }
 
         SFCard {

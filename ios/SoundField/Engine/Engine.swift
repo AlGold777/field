@@ -105,6 +105,17 @@ final class Engine {
     private var levelTrimPointDb: Float = 0
     private var delayCalib = DelayCalib()
     private var levelCalib = LevelCalib()
+    private var peerGainLawReady = false
+    private var didAcknowledgeGainLaw = false
+    private var levelMatchStartServerDb: Float = 0
+    private var levelMatchStartPointDb: Float = 0
+    private var micReferenceDeltaOne: Double?
+    private var micReferenceDeltaTwo: Double?
+    private var micSensitivityDeltaDb: Double?
+    private var levelMeasureText = ""
+    private var levelMeasureSavedServerDb: Float = 0
+    private var levelMeasureSavedPointDb: Float = 0
+    private var levelCaptureWaiters: [String: ([String: Any]) -> Void] = [:]
     private var lastGainCommandNs: [String: UInt64] = [:]
     private var pendingGainCommands: [String: () -> Void] = [:]
     private var scheduledGainCommands: [String: DispatchWorkItem] = [:]
@@ -172,6 +183,7 @@ final class Engine {
                 if began { self?.q.async { self?.onInterrupted("Звук прерван (звонок или другое приложение) — пара на паузе") } }
             }
             audio.onRouteWarning = { [weak self] text in self?.q.async { self?.toast(text) } }
+            audio.onRouteChanged = { [weak self] in self?.q.async { self?.handleAudioRouteChanged() } }
             let t = Thread { [weak self] in self?.tickLoop() }
             t.name = "sf-tick"; t.qualityOfService = .userInteractive; t.start()
             schedule(every: 1.0) { [weak self] in self?.heartbeat() }
@@ -373,11 +385,292 @@ final class Engine {
     func seekMs(_ ms: Int64) { cmd("seek", ["ms": ms]) }
     func skipMs(_ d: Int64) { cmd("skip", ["ms": d]) }
     func swapChannels() { cmd("swap") }
-    func setTrimMs(_ ms: Double) { cmd("trim", ["ms": ms]) }
+    func setTrimMs(_ ms: Double) { cmd("trim", ["ms": ms, "reset": false]) }
+    func resetTrim() { cmd("trim", ["ms": 0, "reset": true]) }
     func calibrate() { cmd("calibrate") }
     func measure() { cmd("measure") }
+    func setLevelTrim(_ device: String, _ db: Float) { cmd("levelTrim", ["dev": device, "db": Double(db)]) }
+    func setLevelOffsetDb(_ db: Float, finished: Bool = false) {
+        sendGainCommand("levelOffset", finished: finished) {
+            self.cmd("levelOffset", ["db": Double(db), "finished": finished])
+        }
+    }
+    func resetLevelTrims() { cmd("levelReset") }
+    func startLevelMatch() { cmd("levelStart") }
+    func stopLevelMatch(commit: Bool) { cmd("levelStop", ["commit": commit]) }
+    func startCenterCheck() { cmd("centerStart") }
+    func centerCheckAnswer(_ answer: String) { cmd("centerAnswer", ["answer": answer]) }
+    func measureLevels() { cmd("levelMeasure") }
+    func measureMicReference(_ position: Int) { cmd("levelMicReference", ["position": min(2, max(1, position))]) }
     func metronome(_ on: Bool) { cmd("metronome", ["on": on]) }
     func channelTest() { cmd("lrtest") }
+
+    private func handleAudioRouteChanged() {
+        guard state.inPair else { return }
+        if role == .point { cmd("routeChanged"); return }
+        resetCalibrationsForRoute()
+    }
+
+    private func resetCalibrationsForRoute() {
+        trimNs = 0; delayCalib = DelayCalib(); levelTrimServerDb = 0; levelTrimPointDb = 0; levelCalib = LevelCalib()
+        rebuildPlayState(); saveServerParams(); publishState()
+        NSLog("SoundField telemetry route_change_reset role=%@", role.rawValue)
+        toast("Аудиомаршрут изменился: повторите калибровку задержки и уровня")
+    }
+
+    private var levelStageReady: Bool { delayCalib.state != "none" && peerGainLawReady }
+    private func blockCalibrationIfNeeded(_ what: String) -> Bool {
+        guard !levelStageReady else { return false }
+        NSLog("SoundField telemetry calib_gate_blocked what=%@", what)
+        toast(levelGateMessage)
+        return true
+    }
+    private var levelGateMessage: String {
+        delayCalib.state == "none"
+            ? "Сначала выполните калибровку задержки: пока телефоны звучат с разным запаздыванием, звук тянет к одному из них, и уровнем это не исправить"
+            : "Обновите второй телефон для калибровки уровня"
+    }
+
+    private func normalizeLevelTrims() {
+        let peak = max(levelTrimServerDb, levelTrimPointDb)
+        levelTrimServerDb = min(0, max(-12, levelTrimServerDb - peak))
+        levelTrimPointDb = min(0, max(-12, levelTrimPointDb - peak))
+    }
+
+    private func setDeviceLevelTrim(_ device: String, _ db: Float) {
+        let value = (min(0, max(-12, db)) * 2).rounded() / 2
+        switch device { case "server": levelTrimServerDb = value; case "point": levelTrimPointDb = value; default: return }
+        normalizeLevelTrims()
+        levelCalib = LevelCalib(state: "manual", atMs: Int64(Date().timeIntervalSince1970 * 1000),
+                                db: Double(abs(levelTrimServerDb - levelTrimPointDb)))
+    }
+
+    private func applyLevelOffset(_ db: Float) {
+        let value = (min(12, max(-12, db)) * 2).rounded() / 2
+        if value < 0 {
+            if serverChannel == Ch.L { levelTrimServerDb = value; levelTrimPointDb = 0 }
+            else { levelTrimPointDb = value; levelTrimServerDb = 0 }
+        } else if value > 0 {
+            if serverChannel == Ch.R { levelTrimServerDb = -value; levelTrimPointDb = 0 }
+            else { levelTrimPointDb = -value; levelTrimServerDb = 0 }
+        } else { levelTrimServerDb = 0; levelTrimPointDb = 0 }
+    }
+
+    private func stopLevelMatch(_ commit: Bool) {
+        guard mode == .level else { return }
+        if commit {
+            let offset = serverChannel == Ch.L ? levelTrimServerDb - levelTrimPointDb : levelTrimPointDb - levelTrimServerDb
+            levelCalib = LevelCalib(state: "ear", atMs: Int64(Date().timeIntervalSince1970 * 1000), db: Double(offset))
+            NSLog("SoundField telemetry level_trim_set dev=pair db=%.1f source=ear", offset)
+        } else { levelTrimServerDb = levelMatchStartServerDb; levelTrimPointDb = levelMatchStartPointDb }
+        saveServerParams(); restoreMusic(savedPlaying); publishState()
+    }
+
+    private func levelResultObject(_ result: LevelAnalyzer.Result) -> [String: Any] {
+        func boxed(_ values: [Double?]) -> [Any] { values.map { $0.map { $0 as Any } ?? NSNull() } }
+        return ["levels": boxed(result.levelsDb), "snr": boxed(result.snrDb), "valid": result.validBands,
+                "peak": result.peakDbfs.isFinite ? result.peakDbfs : -120]
+    }
+
+    private func readLevelResult(_ o: [String: Any]) -> LevelAnalyzer.Result {
+        func values(_ key: String) -> [Double?] {
+            (o[key] as? [Any] ?? []).map { ($0 as? NSNumber)?.doubleValue }
+        }
+        return LevelAnalyzer.Result(levelsDb: values("levels"), snrDb: values("snr"),
+                                    validBands: Int(J.i64(o, "valid")), peakDbfs: J.d(o, "peak", .infinity))
+    }
+
+    private func analyzeLevelSweeps(_ samples: [Float], sampleRate: Int, recordingStartServerNs: Int64,
+                                    anchorServerNs: Int64, pointSpeaker: Bool, trimNsForPoint: Int64 = 0) -> [LevelAnalyzer.Result] {
+        (0..<LevelMeasureSource.repeats).map { repeatIndex in
+            let offset = LevelMeasureSource.initialSeconds + Double(repeatIndex) * LevelMeasureSource.cycleSeconds +
+                (pointSpeaker ? LevelMeasureSource.activeSeconds + LevelMeasureSource.gapSeconds : 0)
+            let signalStartNs = anchorServerNs + Int64(offset * 1e9) + (pointSpeaker ? trimNsForPoint : 0)
+            let start = Double(signalStartNs - recordingStartServerNs) / 1e9
+            return LevelAnalyzer.analyze(samples, sampleRate: sampleRate, start: start,
+                duration: LevelMeasureSource.activeSeconds, backgroundStart: start - 0.45, backgroundDuration: 0.4)
+        }
+    }
+
+    private func receiveLevelCapture(_ o: [String: Any]) {
+        let id = J.s(o, "id"), kind = J.s(o, "kind")
+        guard !id.isEmpty, role == .point, MicRecorder.permissionGranted else {
+            link?.send(["t": "levelCaptureResult", "id": id, "kind": kind,
+                        "error": id.isEmpty ? "Некорректный запрос" : "Разрешите микрофон на Point"])
+            return
+        }
+        let duration = J.d(o, "durationMs", kind == "reference" ? 4_200 : LevelMeasureSource.captureSeconds * 1_000) / 1_000
+        let anchor = J.i64(o, "anchorSrvNs")
+        DispatchQueue.main.async {
+            do {
+                try AudioOutput.configureMeasurementSession(); self.audio.restart()
+            } catch {
+                self.q.async { self.link?.send(["t": "levelCaptureResult", "id": id, "kind": kind, "error": error.localizedDescription]) }
+                return
+            }
+            self.mic.record(durationSec: duration, onStarted: {}, completion: { result in
+                AudioOutput.configurePlaybackSession(); self.audio.restart()
+                switch result {
+                case .failure(let error):
+                    self.q.async { self.link?.send(["t": "levelCaptureResult", "id": id, "kind": kind, "error": error.localizedDescription]) }
+                case .success(let rec):
+                    DispatchQueue.global(qos: .userInitiated).async {
+                        let serverStart = self.clock.ready ? self.clock.toServer(rec.startNs) : 0
+                        let payload: [String: Any]
+                        if kind == "reference" {
+                            let measured = LevelAnalyzer.analyze(rec.samples, sampleRate: rec.sampleRate, start: 0.2, duration: max(0, duration - 0.4))
+                            payload = ["t": "levelCaptureResult", "id": id, "kind": kind,
+                                       "startServerNs": serverStart, "result": self.levelResultObject(measured)]
+                        } else if anchor <= 0 || serverStart <= 0 {
+                            payload = ["t": "levelCaptureResult", "id": id, "kind": kind, "error": "Часы Point не синхронизированы"]
+                        } else {
+                            let results = self.analyzeLevelSweeps(rec.samples, sampleRate: rec.sampleRate,
+                                recordingStartServerNs: serverStart, anchorServerNs: anchor, pointSpeaker: false)
+                            payload = ["t": "levelCaptureResult", "id": id, "kind": kind, "startServerNs": serverStart,
+                                       "results": results.map(self.levelResultObject)]
+                        }
+                        self.q.async { self.link?.send(payload) }
+                    }
+                }
+            })
+        }
+    }
+
+    private func startLevelMicReference(_ position: Int) {
+        guard levelStageReady else { toast(levelGateMessage); return }
+        guard role == .server, (1...2).contains(position), let activeLink = link else { toast("Сверку микрофонов запускайте на Server"); return }
+        guard mode == .music, !calibRunning else { toast("Сначала завершите текущую калибровку или звуковую проверку"); return }
+        guard MicRecorder.permissionGranted else { toast("Разрешите доступ к микрофону на этом телефоне"); return }
+        guard position != 2 || micReferenceDeltaOne != nil else { toast("Сначала запишите положение 1"); return }
+        let id = UUID().uuidString
+        let remote = Locked<[String: Any]?>(nil), semaphore = DispatchSemaphore(value: 0)
+        levelCaptureWaiters[id] = { value in remote.value = value; semaphore.signal() }
+        levelMeasureText = "Сверка микрофонов · положение \(position): запись 4 с. Включите внешний шумовой источник по центру."
+        ui { $0.levelMeasureText = self.levelMeasureText }
+        if mode == .music { savedFrame = posFrame(); savedPlaying = playBox.value.timeline.playing }
+        newEpoch(false, posFrame(), MonoClock.nowNs())
+        activeLink.send(["t": "levelCapture", "id": id, "kind": "reference", "durationMs": 4_200])
+
+        DispatchQueue.main.async {
+            do { try AudioOutput.configureMeasurementSession(); self.audio.restart() }
+            catch {
+                self.q.async { self.levelCaptureWaiters.removeValue(forKey: id); self.levelMeasureText = "Сверка микрофонов не удалась: \(error.localizedDescription)"; self.restoreMusic(self.savedPlaying); self.publishState() }
+                return
+            }
+            self.mic.record(durationSec: 4.2, onStarted: {}, completion: { result in
+                AudioOutput.configurePlaybackSession(); self.audio.restart()
+                switch result {
+                case .failure(let error):
+                    self.q.async { self.levelCaptureWaiters.removeValue(forKey: id); self.levelMeasureText = "Сверка микрофонов не удалась: \(error.localizedDescription)"; self.restoreMusic(self.savedPlaying); self.publishState() }
+                case .success(let rec):
+                    DispatchQueue.global(qos: .userInitiated).async {
+                        do {
+                            let own = LevelAnalyzer.analyze(rec.samples, sampleRate: rec.sampleRate, start: 0.2, duration: 3.8)
+                            guard semaphore.wait(timeout: .now() + 8) == .success, let peer = remote.value else { throw NSError(domain: "SoundField.Level", code: 1, userInfo: [NSLocalizedDescriptionKey: "Point не прислал данные микрофона"]) }
+                            if let error = peer["error"] as? String { throw NSError(domain: "SoundField.Level", code: 2, userInfo: [NSLocalizedDescriptionKey: error]) }
+                            guard let raw = peer["result"] as? [String: Any], let delta = LevelAnalyzer.differenceDb(own, self.readLevelResult(raw)) else {
+                                throw NSError(domain: "SoundField.Level", code: 3, userInfo: [NSLocalizedDescriptionKey: "Недостаточно пригодных частотных полос"])
+                            }
+                            self.q.async {
+                                if position == 1 { self.micReferenceDeltaOne = delta } else { self.micReferenceDeltaTwo = delta }
+                                let d1 = self.micReferenceDeltaOne, d2 = self.micReferenceDeltaTwo
+                                if position == 2 && abs((d1 ?? 0) - delta) <= 3 { self.micSensitivityDeltaDb = ((d1 ?? 0) + delta) / 2 }
+                                else if position == 2 { self.micSensitivityDeltaDb = nil }
+                                self.levelMeasureText = position == 1
+                                    ? String(format: "ΔM: ожидается второе измерение после перестановки телефонов · d1 = %+.1f дБ", delta)
+                                    : abs((d1 ?? 0) - delta) > 3
+                                        ? "Сверка микрофонов отклонена: |d1 − d2| > 3 дБ. Поставьте внешний источник по центру и повторите."
+                                        : String(format: "Сверка микрофонов готова · ΔM = %+.1f дБ · d1 = %+.1f · d2 = %+.1f дБ", self.micSensitivityDeltaDb ?? 0, d1 ?? 0, d2 ?? 0)
+                                self.restoreMusic(self.savedPlaying); self.publishState()
+                            }
+                        } catch {
+                            self.q.async { self.levelCaptureWaiters.removeValue(forKey: id); self.levelMeasureText = "Сверка микрофонов не удалась: \(error.localizedDescription)"; self.restoreMusic(self.savedPlaying); self.publishState() }
+                        }
+                    }
+                }
+            })
+        }
+    }
+
+    private func startLevelMicMeasurement() {
+        guard levelStageReady else { toast(levelGateMessage); return }
+        guard role == .server else { toast("Запустите измерение на Server"); return }
+        guard mode == .music, !calibRunning else { toast("Сначала завершите текущую калибровку или звуковую проверку"); return }
+        guard let sensitivity = micSensitivityDeltaDb else { toast("Сначала завершите сверку микрофонов в двух положениях"); return }
+        guard MicRecorder.permissionGranted else { toast("Разрешите доступ к микрофону на этом телефоне"); return }
+        guard master >= 0.5 else { toast("Для измерения поднимите громкость Sound не ниже 50 %"); return }
+        guard let activeLink = link else { toast("Point не на связи"); return }
+        let id = UUID().uuidString
+        let remote = Locked<[String: Any]?>(nil), semaphore = DispatchSemaphore(value: 0)
+        levelCaptureWaiters[id] = { value in remote.value = value; semaphore.signal() }
+        levelMeasureSavedServerDb = levelTrimServerDb; levelMeasureSavedPointDb = levelTrimPointDb
+        levelTrimServerDb = 0; levelTrimPointDb = 0
+        levelMeasureText = "Измерение динамиков: 3 взаимных прохода. Не двигайте телефоны."
+        ui { $0.levelMeasureText = self.levelMeasureText }; publishState()
+        let anchor = MonoClock.nowNs() + 2_000_000_000
+        activeLink.send(["t": "levelCapture", "id": id, "kind": "output", "anchorSrvNs": anchor,
+                         "durationMs": Int(LevelMeasureSource.captureSeconds * 1_000)])
+        startTestMode(LevelMeasureSource(serverChannel: serverChannel, pointChannel: pointChannel), anchorNs: anchor)
+
+        DispatchQueue.main.async {
+            do { try AudioOutput.configureMeasurementSession(); self.audio.restart() }
+            catch {
+                self.q.async { self.levelCaptureWaiters.removeValue(forKey: id); self.failLevelMeasure(error.localizedDescription, id: id) }
+                return
+            }
+            self.mic.record(durationSec: LevelMeasureSource.captureSeconds, onStarted: {}, completion: { result in
+                AudioOutput.configurePlaybackSession(); self.audio.restart()
+                switch result {
+                case .failure(let error): self.q.async { self.levelCaptureWaiters.removeValue(forKey: id); self.failLevelMeasure(error.localizedDescription, id: id) }
+                case .success(let rec):
+                    DispatchQueue.global(qos: .userInitiated).async {
+                        do {
+                            let own = self.analyzeLevelSweeps(rec.samples, sampleRate: rec.sampleRate,
+                                recordingStartServerNs: rec.startNs, anchorServerNs: anchor, pointSpeaker: true, trimNsForPoint: self.trimNs)
+                            guard semaphore.wait(timeout: .now() + 30) == .success, let peer = remote.value else { throw NSError(domain: "SoundField.Level", code: 4, userInfo: [NSLocalizedDescriptionKey: "Point не прислал результаты измерения"]) }
+                            if let error = peer["error"] as? String { throw NSError(domain: "SoundField.Level", code: 5, userInfo: [NSLocalizedDescriptionKey: error]) }
+                            guard let raw = peer["results"] as? [[String: Any]], raw.count == LevelMeasureSource.repeats else { throw NSError(domain: "SoundField.Level", code: 6, userInfo: [NSLocalizedDescriptionKey: "Неполный результат Point"]) }
+                            let remoteResults = raw.map(self.readLevelResult)
+                            var deltas: [Double] = []
+                            for i in 0..<remoteResults.count {
+                                guard remoteResults[i].validBands >= 6, own[i].validBands >= 6,
+                                      let difference = LevelAnalyzer.differenceDb(remoteResults[i], own[i]) else {
+                                    throw NSError(domain: "SoundField.Level", code: 7, userInfo: [NSLocalizedDescriptionKey: "SNR ниже 15 дБ или менее 6 полос"])
+                                }
+                                deltas.append(difference + sensitivity)
+                            }
+                            let spread = (deltas.max() ?? 0) - (deltas.min() ?? 0)
+                            let dP = LevelAnalyzer.median(deltas) ?? 0
+                            let validBands = (remoteResults + own).map(\.validBands).min() ?? 0
+                            let snrValues = (remoteResults + own).flatMap { $0.snrDb.compactMap { $0 } }
+                            let snr = LevelAnalyzer.median(snrValues) ?? 0
+                            let accepted = spread <= 1 && abs(dP) <= 12
+                            self.q.async {
+                                self.levelTrimServerDb = self.levelMeasureSavedServerDb; self.levelTrimPointDb = self.levelMeasureSavedPointDb
+                                self.restoreMusic(self.savedPlaying)
+                                self.levelMeasureText = String(format: "ΔM %+.1f дБ · Δ %+.1f дБ · ΔP %+.1f дБ · разброс %.1f дБ · SNR %.1f дБ · полос %d/10 · %@",
+                                    sensitivity, dP - sensitivity, dP, spread, snr, validBands,
+                                    accepted ? "результат экспериментальный, не применён" : "качество недостаточно, повторите")
+                                NSLog("SoundField telemetry level_measure dM=%.1f d1=%.1f d2=%.1f delta=%.1f dP=%.1f spread=%.1f snr=%.1f bands=%d accepted=%@ applied=false",
+                                      sensitivity, self.micReferenceDeltaOne ?? 0, self.micReferenceDeltaTwo ?? 0,
+                                      dP - sensitivity, dP, spread, snr, validBands, accepted ? "true" : "false")
+                                self.saveServerParams(); self.publishState()
+                            }
+                        } catch { self.q.async { self.failLevelMeasure(error.localizedDescription, id: id) } }
+                    }
+                }
+            })
+        }
+    }
+
+    private func failLevelMeasure(_ reason: String, id: String? = nil) {
+        if let id { levelCaptureWaiters.removeValue(forKey: id) }
+        levelTrimServerDb = levelMeasureSavedServerDb; levelTrimPointDb = levelMeasureSavedPointDb
+        restoreMusic(savedPlaying)
+        levelMeasureText = "Измерение отклонено: \(reason). Результат не применён."
+        NSLog("SoundField telemetry level_measure result=rejected reason=%@ applied=false", reason)
+        saveServerParams(); publishState()
+    }
     func requestTrackPicker() {
         q.async {
             guard !self.calibRunning else { self.toast("Сначала завершите калибровку"); return }
@@ -800,6 +1093,10 @@ final class Engine {
         setAutoResume(true)
         log("Пара \(continuing ? "продолжена" : resumed ? "восстановлена" : "создана"): «\(pname)» \(host ?? "?"):\(record?.lastPort ?? 0), роль \(r.rawValue)")
         discovery.stopBrowse()
+        peerGainLawReady = false; didAcknowledgeGainLaw = false
+        if !continuing {
+            micReferenceDeltaOne = nil; micReferenceDeltaTwo = nil; micSensitivityDeltaDb = nil; levelMeasureText = ""
+        }
 
         if r == .server {
             if let rec = record, !continuing {
@@ -924,6 +1221,10 @@ final class Engine {
         case "name":
             peerName = J.s(o, "name", peerName); ui { $0.peerName = peerName }
             record?.peerName = peerName; persistRecord()
+        case "gainAck":
+            if role == .server && J.i64(o, "law") >= 2 && !peerGainLawReady { peerGainLawReady = true; publishState() }
+        case "levelCapture": if role == .point { receiveLevelCapture(o) }
+        case "levelCaptureResult": if role == .server { levelCaptureWaiters.removeValue(forKey: J.s(o, "id"))?(o) }
         case "cmd": if role == .server { handleCmd(o) }
         case "diag":
             if role == .server { let d = Diag.from(o); pointClockReady = d.clockReady; ui { $0.pointDiag = d } }
@@ -957,8 +1258,9 @@ final class Engine {
 
     // ================================================================== Server: шкала и команды
     private var serverChannel: Int { Ch.other(pointChannel) }
-    private var serverGain: Float { AudioGain.taper(master) * AudioGain.fromDb(levelTrimServerDb) * BalanceLaw.gain(channel: serverChannel, balance: balance) }
-    private var pointGain: Float { AudioGain.taper(master) * AudioGain.fromDb(levelTrimPointDb) * BalanceLaw.gain(channel: pointChannel, balance: balance) }
+    private func balanceGain(_ channel: Int) -> Float { mode == .music ? BalanceLaw.gain(channel: channel, balance: balance) : 1 }
+    private var serverGain: Float { AudioGain.taper(master) * AudioGain.fromDb(levelTrimServerDb) * balanceGain(serverChannel) }
+    private var pointGain: Float { AudioGain.taper(master) * AudioGain.fromDb(levelTrimPointDb) * balanceGain(pointChannel) }
 
     private func rebuildPlayState() {
         playBox.value = ServerPlayState(timeline: playBox.value.timeline, source: source, channel: serverChannel, gain: serverGain)
@@ -983,7 +1285,9 @@ final class Engine {
          "title": source.title, "artist": source.artist, "mode": mode.rawValue,
          "queueIndex": queueIndex, "queueCount": queue.count, "trackId": queue.indices.contains(queueIndex) ? queue[queueIndex].id : "",
          "volL": Double(volL), "volR": Double(volR), "master": Double(master), "balance": Double(balance),
-         "pointGain": Double(pointGain), "gainLaw": 2, "levelTrimServerDb": Double(levelTrimServerDb), "levelTrimPointDb": Double(levelTrimPointDb),
+         "pointGain": Double(pointGain), "gainLaw": 2, "peerGainLaw": peerGainLawReady ? 2 : 1,
+         "levelTrimServerDb": Double(levelTrimServerDb), "levelTrimPointDb": Double(levelTrimPointDb),
+         "levelMeasureText": levelMeasureText,
          "delayCalib": ["state": delayCalib.state, "atMs": delayCalib.atMs, "spreadMs": delayCalib.spreadMs],
          "levelCalib": ["state": levelCalib.state, "atMs": levelCalib.atMs, "db": levelCalib.db],
          "pointCh": Ch.name(pointChannel), "trimMs": Double(trimNs) / 1e6, "serverName": myName]
@@ -1035,6 +1339,9 @@ final class Engine {
         let trim = J.d(o, "trimMs")
         let decodingProgress = (o["decodeProgress"] as? NSNumber)?.doubleValue
         if role == .point {
+            if o["pointGain"] != nil && !didAcknowledgeGainLaw {
+                didAcknowledgeGainLaw = true; link?.send(["t": "gainAck", "law": 2])
+            }
             let gain = o["pointGain"] == nil ? m * (pCh == Ch.L ? vL : vR) * LegacyBalanceLaw.gain(channel: pCh, balance: b)
                 : min(1, max(0, Float(J.d(o, "pointGain"))))
             paramsBox.value = PointParams(gain: gain, trimNs: Int64(trim * 1e6), totalFrames: dur)
@@ -1047,13 +1354,14 @@ final class Engine {
             s.queueIndex = Int(J.i64(o, "queueIndex", -1))
             s.volL = vL; s.volR = vR; s.master = m; s.balance = b; s.pointChannel = pCh; s.trimMs = trim
             s.levelTrimServerDb = Float(J.d(o, "levelTrimServerDb")); s.levelTrimPointDb = Float(J.d(o, "levelTrimPointDb"))
+            s.levelMeasureText = J.s(o, "levelMeasureText")
             if let c = o["delayCalib"] as? [String: Any] {
                 s.delayCalib = DelayCalib(state: J.s(c, "state", "none"), atMs: J.i64(c, "atMs"), spreadMs: J.d(c, "spreadMs"))
             }
             if let c = o["levelCalib"] as? [String: Any] {
                 s.levelCalib = LevelCalib(state: J.s(c, "state", "none"), atMs: J.i64(c, "atMs"), db: J.d(c, "db"))
             }
-            s.gainLaw = Int(J.i64(o, "gainLaw", 1))
+            s.gainLaw = role == .point ? (o["pointGain"] == nil ? 1 : 2) : Int(J.i64(o, "peerGainLaw", 1))
         }
     }
 
@@ -1074,6 +1382,7 @@ final class Engine {
         case "previous": selectQueueTrack(at: navigationIndex - 1, startPlayback: true)
         case "select": selectQueueTrack(id: J.s(o, "id"))
         case "vol":
+            if mode == .levelMeasure { toast("Во время измерения общая громкость зафиксирована"); return }
             let v = Float(min(1, max(0, J.d(o, "v", 1))))
             switch J.s(o, "ch") {
             case "L", "R":
@@ -1087,6 +1396,7 @@ final class Engine {
         case "balance":
             balance = Float(min(1, max(0, J.d(o, "v", 0.5))))
             rebuildPlayState(); if J.b(o, "finished", true) { saveServerParams() }; publishState()
+            if J.b(o, "finished", true) { NSLog("SoundField telemetry balance_set balance=%.3f", balance) }
         case "swap":
             guard !calibRunning else { return }
             pointChannel = Ch.other(pointChannel); saveServerParams()
@@ -1095,12 +1405,45 @@ final class Engine {
             toast("Каналы поменяны: этот телефон — \(Ch.name(serverChannel))")
         case "trim":
             let ms = min(SF.maxTrimMs, max(-SF.maxTrimMs, J.d(o, "ms")))
-            trimNs = Int64(ms * 1e6); saveServerParams(); publishState()
+            trimNs = Int64(ms * 1e6)
+            delayCalib = J.b(o, "reset") ? DelayCalib() : DelayCalib(state: "manual", atMs: Int64(Date().timeIntervalSince1970 * 1000))
+            saveServerParams(); publishState()
         case "calibrate": startCalibration(apply: true)
         case "measure": startCalibration(apply: false)
         case "metronome":
             if J.b(o, "on") { startTestMode(MetronomeSource()) } else if mode == .metronome { restoreMusic(false) }
         case "lrtest": startTestMode(ChannelTestSource())
+        case "levelTrim":
+            guard !blockCalibrationIfNeeded("level_trim") else { return }
+            let device = J.s(o, "dev"), db = Float(J.d(o, "db"))
+            setDeviceLevelTrim(device, db); rebuildPlayState(); saveServerParams(); publishState()
+            NSLog("SoundField telemetry level_trim_set dev=%@ db=%.1f source=manual", device, db)
+        case "levelOffset":
+            guard !blockCalibrationIfNeeded("level_ear") else { return }
+            applyLevelOffset(Float(J.d(o, "db"))); rebuildPlayState()
+            if J.b(o, "finished") { saveServerParams() }
+            publishState()
+        case "levelReset":
+            guard !blockCalibrationIfNeeded("level_reset") else { return }
+            levelTrimServerDb = 0; levelTrimPointDb = 0; levelCalib = LevelCalib()
+            rebuildPlayState(); saveServerParams(); publishState()
+        case "levelStart":
+            guard !calibRunning else { toast("Дождитесь окончания калибровки задержки"); return }
+            guard levelStageReady else { toast(levelGateMessage); return }
+            levelMatchStartServerDb = levelTrimServerDb; levelMatchStartPointDb = levelTrimPointDb
+            startTestMode(LevelMatchSource())
+        case "levelStop": stopLevelMatch(J.b(o, "commit"))
+        case "centerStart":
+            guard !calibRunning else { toast("Дождитесь окончания калибровки задержки"); return }
+            guard levelStageReady else { toast(levelGateMessage); return }
+            startTestMode(CenterCheckSource())
+        case "centerAnswer":
+            let answer = J.s(o, "answer", "unknown")
+            NSLog("SoundField telemetry center_check answer=%@", answer)
+            if answer != "center" { toast("Сначала повторите калибровку задержки — даже 0,1 мс разницы сдвигает звук так же, как 1–1,5 дБ. Если после этого всё ещё тянет, выровняйте уровень на слух.") }
+        case "routeChanged": resetCalibrationsForRoute()
+        case "levelMicReference": startLevelMicReference(Int(J.i64(o, "position", 1)))
+        case "levelMeasure": startLevelMicMeasurement()
         default: break
         }
     }
@@ -1132,13 +1475,13 @@ final class Engine {
         newEpoch(playing, f, playing ? now + SF.startDelayNs : now)
     }
 
-    private func startTestMode(_ src: AudioSource) {
+    private func startTestMode(_ src: AudioSource, anchorNs: Int64? = nil) {
         guard !calibRunning else { return }
         pendingTrackId = nil
         ui { $0.loadingTracks = false; $0.loadingTrackId = nil }
         if mode == .music { savedFrame = posFrame(); savedPlaying = playBox.value.timeline.playing }
         mode = src.mode; source = src
-        newEpoch(true, 0, MonoClock.nowNs() + SF.startDelayNs)
+        newEpoch(true, 0, anchorNs ?? MonoClock.nowNs() + SF.startDelayNs)
     }
 
     private func restoreMusic(_ resume: Bool) {
@@ -1194,7 +1537,7 @@ final class Engine {
         case .music:
             if queueIndex + 1 < queue.count { selectQueueTrack(at: queueIndex + 1) }
             else { newEpoch(false, source.totalFrames, MonoClock.nowNs()) }
-        case .lrtest: restoreMusic(savedPlaying)
+        case .lrtest, .center: restoreMusic(savedPlaying)
         default: break
         }
     }
@@ -1268,7 +1611,9 @@ final class Engine {
         if apply {
             let lim = Int64(SF.maxTrimMs * 1e6)
             let newTrim = min(lim, max(-lim, trimUsed - Int64(res.lateMs * 1e6)))
-            trimNs = newTrim; saveServerParams(); publishState()
+            trimNs = newTrim
+            delayCalib = DelayCalib(state: "auto", atMs: Int64(Date().timeIntervalSince1970 * 1000), spreadMs: res.spreadMs)
+            saveServerParams(); publishState()
             broadcastCalib(false, "", String(format: "Готово. Point %@ на %.1f мс — компенсировано.\nСдвиг Point: %+.1f мс · точность ±%.1f мс",
                                              who, abs(res.lateMs), Double(newTrim) / 1e6, max(res.spreadMs, 0.1)), true, nil)
         } else {

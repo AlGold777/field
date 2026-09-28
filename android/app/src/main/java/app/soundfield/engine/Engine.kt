@@ -143,6 +143,7 @@ class Engine private constructor(private val app: Context) {
     private val telemetryAcks = ConcurrentHashMap<String, CompletableFuture<JSONObject>>()
     private val telemetryReady = ConcurrentHashMap<String, CompletableFuture<JSONObject>>()
     private val telemetryExports = ConcurrentHashMap<String, CompletableFuture<RemoteTelemetryExport>>()
+    private val levelCaptureAcks = ConcurrentHashMap<String, CompletableFuture<JSONObject>>()
     private val pendingRemoteStates = ConcurrentHashMap<String, String>()
     private val incomingTelemetry = ConcurrentHashMap<String, IncomingTelemetryTransfer>()
     private val telemetryRateSamples = ArrayDeque<Long>()
@@ -341,6 +342,17 @@ class Engine private constructor(private val app: Context) {
     private var levelTrimPointDb = 0f
     private var delayCalib = DelayCalib()
     private var levelCalib = LevelCalib()
+    private var levelMatchStartServerDb = 0f
+    private var levelMatchStartPointDb = 0f
+    private var peerGainLawReady = false
+    private var didAcknowledgeGainLaw = false
+    private var micReferenceOne: LevelAnalyzer.Result? = null
+    private var micReferenceDeltaOne: Double? = null
+    private var micReferenceDeltaTwo: Double? = null
+    private var micSensitivityDeltaDb: Double? = null
+    private var levelMeasureText = ""
+    private var levelMeasureSavedServerDb = 0f
+    private var levelMeasureSavedPointDb = 0f
     private val gainThrottleLock = Any()
     private val lastGainCommandAtNs = HashMap<String, Long>()
     private val pendingGainCommands = HashMap<String, () -> Unit>()
@@ -379,6 +391,7 @@ class Engine private constructor(private val app: Context) {
     private var lastLost = 0L
 
     init {
+        audio.onRouteChanged = { post { handleAudioRouteChanged() } }
         telemetry.configure(context = {
             val currentRole = role
             val currentEpoch = if (currentRole == Role.SERVER) serverPlay.timeline.epoch else rx.timeline.epoch
@@ -1333,11 +1346,261 @@ class Engine private constructor(private val app: Context) {
     fun seekMs(ms: Long) = cmd("seek") { put("ms", ms) }
     fun skipMs(delta: Long) = cmd("skip") { put("ms", delta) }
     fun swapChannels() = cmd("swap")
-    fun setTrimMs(ms: Double) = cmd("trim") { put("ms", ms) }
+    fun setTrimMs(ms: Double) = cmd("trim") { put("ms", ms); put("reset", false) }
+    fun resetTrim() = cmd("trim") { put("ms", 0.0); put("reset", true) }
     fun calibrate() = cmd("calibrate")
     fun measure() = cmd("measure")
+    fun setLevelTrim(device: String, db: Float) = cmd("levelTrim") { put("dev", device); put("db", db.toDouble()) }
+    fun setLevelOffsetDb(db: Float, finished: Boolean = false) {
+        sendGainCommand("levelOffset", finished) {
+            cmd("levelOffset", telemetry = finished) { put("db", db.toDouble()); put("finished", finished) }
+        }
+    }
+    fun resetLevelTrims() = cmd("levelReset")
+    fun startLevelMatch() = cmd("levelStart")
+    fun stopLevelMatch(commit: Boolean) = cmd("levelStop") { put("commit", commit) }
+    fun startCenterCheck() = cmd("centerStart")
+    fun centerCheckAnswer(answer: String) = cmd("centerAnswer") { put("answer", answer) }
+    fun measureLevels() = cmd("levelMeasure")
+    fun measureMicReference(position: Int) = cmd("levelMicReference") { put("position", position.coerceIn(1, 2)) }
     fun metronome(on: Boolean) = cmd("metronome") { put("on", on) }
     fun channelTest() = cmd("lrtest")
+
+    private fun handleAudioRouteChanged() {
+        if (!ui.value.inPair) return
+        if (role == Role.POINT) { cmd("routeChanged"); return }
+        resetCalibrationsForRoute()
+    }
+
+    private fun resetCalibrationsForRoute() {
+        trimNs = 0L; delayCalib = DelayCalib(); levelTrimServerDb = 0f; levelTrimPointDb = 0f; levelCalib = LevelCalib()
+        rebuildPlayState(); saveServerParams(); publishState()
+        telemetry.record("route_change_reset", mapOf("role" to role.name.lowercase()))
+        toast("Аудиомаршрут изменился: повторите калибровку задержки и уровня")
+    }
+
+    private fun levelStageReady() = delayCalib.state != "none" && peerGainLawReady
+    private fun blockCalibrationIfNeeded(what: String): Boolean {
+        if (calibRunning) { toast("Дождитесь окончания калибровки задержки"); return true }
+        if (levelStageReady()) return false
+        telemetry.record("calib_gate_blocked", mapOf("what" to what))
+        toast(levelGateMessage())
+        return true
+    }
+
+    private fun hasMicPermission() = ContextCompat.checkSelfPermission(app, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+    private fun levelGateMessage() = if (delayCalib.state == "none")
+        "Сначала выполните калибровку задержки: пока телефоны звучат с разным запаздыванием, звук тянет к одному из них, и уровнем это не исправить"
+    else "Обновите второй телефон для калибровки уровня"
+
+    private fun normalizeLevelTrims() {
+        val peak = maxOf(levelTrimServerDb, levelTrimPointDb)
+        levelTrimServerDb = (levelTrimServerDb - peak).coerceIn(-12f, 0f)
+        levelTrimPointDb = (levelTrimPointDb - peak).coerceIn(-12f, 0f)
+    }
+
+    private fun setDeviceLevelTrim(device: String, db: Float) {
+        val value = (db.coerceIn(-12f, 0f) * 2f).roundToInt() / 2f
+        when (device) {
+            "server" -> levelTrimServerDb = value
+            "point" -> levelTrimPointDb = value
+            else -> return
+        }
+        normalizeLevelTrims()
+        levelCalib = LevelCalib("manual", System.currentTimeMillis(), abs(levelTrimServerDb - levelTrimPointDb).toDouble())
+    }
+
+    private fun applyLevelOffset(db: Float) {
+        val value = (db.coerceIn(-12f, 12f) * 2f).roundToInt() / 2f
+        if (value < 0f) {
+            if (serverChannel() == Ch.L) { levelTrimServerDb = value; levelTrimPointDb = 0f }
+            else { levelTrimPointDb = value; levelTrimServerDb = 0f }
+        } else if (value > 0f) {
+            if (serverChannel() == Ch.R) { levelTrimServerDb = -value; levelTrimPointDb = 0f }
+            else { levelTrimPointDb = -value; levelTrimServerDb = 0f }
+        } else { levelTrimServerDb = 0f; levelTrimPointDb = 0f }
+    }
+
+    private fun finishLevelMatch(commit: Boolean) {
+        if (mode != SourceMode.LEVEL_MATCH) return
+        if (commit) {
+            val offset = if (serverChannel() == Ch.L) levelTrimServerDb - levelTrimPointDb else levelTrimPointDb - levelTrimServerDb
+            levelCalib = LevelCalib("ear", System.currentTimeMillis(), offset.toDouble())
+            telemetry.record("level_trim_set", mapOf("dev" to "pair", "db" to offset.toDouble(), "source" to "ear"))
+        } else {
+            levelTrimServerDb = levelMatchStartServerDb; levelTrimPointDb = levelMatchStartPointDb
+        }
+        saveServerParams()
+        restoreMusic(savedPlaying)
+        publishState()
+    }
+
+    private fun resultJson(result: LevelAnalyzer.Result): JSONObject {
+        val levels = org.json.JSONArray(); result.levelsDb.forEach { levels.put(it ?: JSONObject.NULL) }
+        val snr = org.json.JSONArray(); result.snrDb.forEach { snr.put(it ?: JSONObject.NULL) }
+        return JSONObject().put("levels", levels).put("snr", snr).put("valid", result.validBands)
+            .put("peak", result.peakDbfs.takeIf { it.isFinite() } ?: -120.0)
+    }
+
+    private fun readResult(o: JSONObject): LevelAnalyzer.Result {
+        fun values(key: String): List<Double?> {
+            val a = o.optJSONArray(key) ?: return emptyList()
+            return (0 until a.length()).map { if (a.isNull(it)) null else a.optDouble(it) }
+        }
+        return LevelAnalyzer.Result(values("levels"), values("snr"), o.optInt("valid"), o.optDouble("peak", Double.POSITIVE_INFINITY))
+    }
+
+    private fun captureResultMessage(id: String, kind: String, result: LevelAnalyzer.Result, startServerNs: Long = 0L) =
+        JSONObject().put("t", "levelCaptureResult").put("id", id).put("kind", kind)
+            .put("startServerNs", startServerNs).put("result", resultJson(result))
+
+    private fun analyzeLevelSweeps(samples: FloatArray, sampleRate: Int, recordingStartServerNs: Long,
+                                   anchorServerNs: Long, pointSpeaker: Boolean, trimNsForPoint: Long = 0L): List<LevelAnalyzer.Result> =
+        (0 until LevelMeasureSource.REPEATS).map { repeat ->
+            val offset = LevelMeasureSource.INITIAL_SECONDS + repeat * LevelMeasureSource.CYCLE_SECONDS +
+                if (pointSpeaker) LevelMeasureSource.ACTIVE_SECONDS + LevelMeasureSource.GAP_SECONDS else 0.0
+            val signalStartNs = anchorServerNs + (offset * 1e9).toLong() + if (pointSpeaker) trimNsForPoint else 0L
+            val start = (signalStartNs - recordingStartServerNs) / 1e9
+            LevelAnalyzer.analyze(samples, sampleRate, start, LevelMeasureSource.ACTIVE_SECONDS,
+                backgroundStart = start - 0.45, backgroundDuration = 0.4)
+        }
+
+    private fun receiveLevelCapture(o: JSONObject) {
+        val id = o.optString("id"); val kind = o.optString("kind")
+        if (id.isBlank() || !hasMicPermission()) {
+            link?.send(JSONObject().put("t", "levelCaptureResult").put("id", id).put("kind", kind)
+                .put("error", if (id.isBlank()) "Некорректный запрос" else "Разрешите микрофон на Point"))
+            return
+        }
+        val durationMs = o.optLong("durationMs", if (kind == "reference") 4_200L else (LevelMeasureSource.CAPTURE_SECONDS * 1000).toLong())
+        val anchorNs = o.optLong("anchorSrvNs")
+        io.execute {
+            try {
+                val rec = mic.record(durationMs) {}
+                val startServerNs = if (clock.ready) clock.toServer(rec.startNs) else 0L
+                val payload = if (kind == "reference") {
+                    val result = LevelAnalyzer.analyze(rec.samples, rec.sampleRate, 0.2, 3.8)
+                    captureResultMessage(id, kind, result, startServerNs)
+                } else {
+                    check(anchorNs > 0 && startServerNs > 0) { "Часы Point не синхронизированы" }
+                    val results = analyzeLevelSweeps(rec.samples, rec.sampleRate, startServerNs, anchorNs, pointSpeaker = false)
+                    val array = org.json.JSONArray(); results.forEach { array.put(resultJson(it)) }
+                    JSONObject().put("t", "levelCaptureResult").put("id", id).put("kind", kind)
+                        .put("startServerNs", startServerNs).put("results", array)
+                }
+                link?.send(payload)
+            } catch (e: Exception) {
+                link?.send(JSONObject().put("t", "levelCaptureResult").put("id", id).put("kind", kind)
+                    .put("error", e.message ?: "Ошибка записи микрофона"))
+            }
+        }
+    }
+
+    private fun startLevelMicReference(position: Int) {
+        if (blockCalibrationIfNeeded("mic_reference_$position")) return
+        if (role != Role.SERVER || position !in 1..2) { toast("Сверку микрофонов запускайте на Server"); return }
+        if (mode != SourceMode.MUSIC) { toast("Сначала завершите текущую звуковую проверку"); return }
+        if (!hasMicPermission()) { toast("Разрешите доступ к микрофону на этом телефоне") ; return }
+        if (position == 2 && micReferenceDeltaOne == null) { toast("Сначала запишите положение 1"); return }
+        val activeLink = link ?: run { toast("Point не на связи"); return }
+        val id = java.util.UUID.randomUUID().toString()
+        val future = CompletableFuture<JSONObject>(); levelCaptureAcks[id] = future
+        levelMeasureText = "Сверка микрофонов · положение $position: запись 4 с. Включите внешний шумовой источник по центру."
+        ui { copy(levelMeasureText = this@Engine.levelMeasureText) }
+        if (mode == SourceMode.MUSIC) { savedFrame = posFrame(); savedPlaying = serverPlay.timeline.running }
+        newEpoch(false, posFrame(), System.nanoTime())
+        activeLink.send(JSONObject().put("t", "levelCapture").put("id", id).put("kind", "reference").put("durationMs", 4_200))
+        io.execute {
+            try {
+                val own = mic.record(4_200) {}
+                val ownResult = LevelAnalyzer.analyze(own.samples, own.sampleRate, 0.2, 3.8)
+                val peer = future.get(8, TimeUnit.SECONDS)
+                check(!peer.has("error")) { peer.optString("error", "Микрофон Point недоступен") }
+                val peerResult = readResult(peer.getJSONObject("result"))
+                val measured = LevelAnalyzer.differenceDb(ownResult, peerResult)
+                    ?: error("Недостаточно пригодных частотных полос")
+                post {
+                    if (position == 1) micReferenceDeltaOne = measured else micReferenceDeltaTwo = measured
+                    micSensitivityDeltaDb = if (position == 2) {
+                        val d1 = micReferenceDeltaOne ?: 0.0
+                        if (abs(d1 - measured) > 3.0) null else (d1 + measured) / 2.0
+                    } else null
+                    val d1 = micReferenceDeltaOne
+                    val d2 = micReferenceDeltaTwo
+                    levelMeasureText = when {
+                        position == 1 -> "ΔM: ожидается второе измерение после перестановки телефонов · d1 = %+.1f дБ".format(measured)
+                        abs((d1 ?: 0.0) - measured) > 3.0 -> "Сверка микрофонов отклонена: |d1 − d2| > 3 дБ. Поставьте внешний источник по центру и повторите."
+                        else -> "Сверка микрофонов готова · ΔM = %+.1f дБ · d1 = %+.1f · d2 = %+.1f дБ".format(micSensitivityDeltaDb, d1, d2)
+                    }
+                    restoreMusic(savedPlaying); publishState()
+                }
+            } catch (e: Exception) {
+                post {
+                    levelMeasureText = "Сверка микрофонов не удалась: ${e.message ?: "ошибка записи"}"
+                    restoreMusic(savedPlaying); publishState()
+                }
+            } finally { levelCaptureAcks.remove(id, future) }
+        }
+    }
+
+    private fun startLevelMicMeasurement() {
+        if (blockCalibrationIfNeeded("mic_measure")) return
+        if (role != Role.SERVER) { toast("Запустите измерение на Server"); return }
+        if (mode != SourceMode.MUSIC) { toast("Сначала завершите текущую звуковую проверку"); return }
+        val sensitivity = micSensitivityDeltaDb ?: run { toast("Сначала завершите сверку микрофонов в двух положениях"); return }
+        if (!hasMicPermission()) { toast("Разрешите доступ к микрофону на этом телефоне"); return }
+        if (master < 0.5f) { toast("Для измерения поднимите громкость Sound не ниже 50 %"); return }
+        val activeLink = link ?: run { toast("Point не на связи"); return }
+        val id = java.util.UUID.randomUUID().toString()
+        val future = CompletableFuture<JSONObject>(); levelCaptureAcks[id] = future
+        levelMeasureSavedServerDb = levelTrimServerDb; levelMeasureSavedPointDb = levelTrimPointDb
+        levelTrimServerDb = 0f; levelTrimPointDb = 0f
+        levelMeasureText = "Измерение динамиков: 3 взаимных прохода. Не двигайте телефоны."
+        ui { copy(levelMeasureText = this@Engine.levelMeasureText) }
+        publishState()
+        val anchor = System.nanoTime() + 1_500_000_000L
+        activeLink.send(JSONObject().put("t", "levelCapture").put("id", id).put("kind", "output")
+            .put("anchorSrvNs", anchor).put("durationMs", (LevelMeasureSource.CAPTURE_SECONDS * 1000).toLong()))
+        startTestMode(LevelMeasureSource(serverChannel(), pointChannel), anchor)
+        io.execute {
+            try {
+                val own = mic.record((LevelMeasureSource.CAPTURE_SECONDS * 1000).toLong()) {}
+                val ownResults = analyzeLevelSweeps(own.samples, own.sampleRate, own.startNs, anchor, pointSpeaker = true, trimNsForPoint = trimNs)
+                val peer = future.get(30, TimeUnit.SECONDS)
+                check(!peer.has("error")) { peer.optString("error", "Микрофон Point недоступен") }
+                val arr = peer.optJSONArray("results") ?: error("Point не передал результаты измерения")
+                val remoteResults = (0 until arr.length()).map { readResult(arr.getJSONObject(it)) }
+                check(remoteResults.size == LevelMeasureSource.REPEATS) { "Неполный результат Point" }
+                val deltas = remoteResults.indices.map { i ->
+                    check(remoteResults[i].validBands >= 6 && ownResults[i].validBands >= 6) { "SNR < 15 дБ или менее 6 полос" }
+                    LevelAnalyzer.differenceDb(remoteResults[i], ownResults[i]) ?: error("Недостаточно общих частотных полос")
+                }.map { it + sensitivity }
+                val spread = (deltas.maxOrNull() ?: 0.0) - (deltas.minOrNull() ?: 0.0)
+                val delta = LevelAnalyzer.median(deltas) ?: error("Нет валидных проходов")
+                val validBands = (remoteResults + ownResults).minOf { it.validBands }
+                val snr = (remoteResults + ownResults).flatMap { r -> r.snrDb.filterNotNull() }.let { LevelAnalyzer.median(it) ?: 0.0 }
+                val accepted = spread <= 1.0 && abs(delta) <= 12.0
+                post {
+                    levelTrimServerDb = levelMeasureSavedServerDb; levelTrimPointDb = levelMeasureSavedPointDb
+                    restoreMusic(savedPlaying)
+                    levelMeasureText = "ΔM %+.1f дБ · Δ %+.1f дБ · ΔP %+.1f дБ · разброс %.1f дБ · SNR %.1f дБ · полос %d/10 · %s".format(
+                        sensitivity, delta - sensitivity, delta, spread, snr, validBands, if (accepted) "результат экспериментальный, не применён" else "качество недостаточно, повторите")
+                    telemetry.record("level_measure", mapOf("dM" to sensitivity, "d1" to (micReferenceDeltaOne ?: 0.0),
+                        "d2" to (micReferenceDeltaTwo ?: 0.0), "delta" to (delta - sensitivity), "dP" to delta,
+                        "spread" to spread, "snr" to snr, "bands" to validBands, "accepted" to accepted, "applied" to false))
+                    saveServerParams(); publishState()
+                }
+            } catch (e: Exception) {
+                post {
+                    levelTrimServerDb = levelMeasureSavedServerDb; levelTrimPointDb = levelMeasureSavedPointDb
+                    restoreMusic(savedPlaying)
+                    levelMeasureText = "Измерение отклонено: ${e.message ?: "проверьте шум и разрешения"}. Результат не применён."
+                    telemetry.record("level_measure", mapOf("result" to "rejected", "reason" to (e.message ?: "unknown"), "applied" to false))
+                    saveServerParams(); publishState()
+                }
+            } finally { levelCaptureAcks.remove(id, future) }
+        }
+    }
     fun nextTrack() = cmd("next")
     fun previousTrack() = cmd("previous")
     fun selectTrack(id: String) = cmd("select") { put("id", id) }
@@ -2478,6 +2741,12 @@ class Engine private constructor(private val app: Context) {
         if (!discovery.advertising) discovery.advertise(tcp.localPort, myName)
         log("Пара ${if (continuing) "продолжена" else if (resumed) "восстановлена" else "создана"}: «$pname» $host:$port, роль ${r.wire}")
         discovery.stopBrowse()
+        didAcknowledgeGainLaw = false
+        peerGainLawReady = false
+        if (!continuing) {
+            micReferenceOne = null; micReferenceDeltaOne = null; micReferenceDeltaTwo = null; micSensitivityDeltaDb = null
+            levelMeasureText = ""
+        }
 
         if (r == Role.SERVER) {
             record?.let { rec ->
@@ -2650,6 +2919,13 @@ class Engine private constructor(private val app: Context) {
             "bye" -> { setAutoResume(false); goIdle(sendBye = false, reason = "«$peerName» разорвал пару") }
             "name" -> { peerName = o.optString("name", peerName); ui { copy(peerName = peerName) }
                         record = record?.copy(peerName = peerName); persistRecord() }
+            "gainAck" -> if (role == Role.SERVER && o.optInt("law") >= 2 && !peerGainLawReady) {
+                peerGainLawReady = true; publishState()
+            }
+            "levelCapture" -> if (role == Role.POINT) receiveLevelCapture(o)
+            "levelCaptureResult" -> if (role == Role.SERVER) {
+                levelCaptureAcks[o.optString("id")]?.complete(o)
+            }
             // --- на Server ---
             "cmd" -> if (role == Role.SERVER) handleCmd(o)
             "diag" -> if (role == Role.SERVER) {
@@ -2774,8 +3050,9 @@ class Engine private constructor(private val app: Context) {
 
     // ================================================================== Server: шкала и команды
     private fun serverChannel() = Ch.other(pointChannel)
-    private fun serverGain() = AudioGain.taper(master) * AudioGain.fromDb(levelTrimServerDb) * BalanceLaw.gain(serverChannel(), balance)
-    private fun pointGain() = AudioGain.taper(master) * AudioGain.fromDb(levelTrimPointDb) * BalanceLaw.gain(pointChannel, balance)
+    private fun balanceGain(channel: Int) = if (mode == SourceMode.MUSIC) BalanceLaw.gain(channel, balance) else 1f
+    private fun serverGain() = AudioGain.taper(master) * AudioGain.fromDb(levelTrimServerDb) * balanceGain(serverChannel())
+    private fun pointGain() = AudioGain.taper(master) * AudioGain.fromDb(levelTrimPointDb) * balanceGain(pointChannel)
 
     private fun rebuildPlayState() {
         serverPlay = ServerPlayState(serverPlay.timeline, source, serverChannel(), serverGain())
@@ -2919,7 +3196,9 @@ class Engine private constructor(private val app: Context) {
             .put("volL", volL.toDouble()).put("volR", volR.toDouble()).put("master", master.toDouble())
             .put("balance", balance.toDouble())
             .put("pointGain", pointGain().toDouble()).put("gainLaw", 2)
+            .put("peerGainLaw", if (peerGainLawReady) 2 else 1)
             .put("levelTrimServerDb", levelTrimServerDb.toDouble()).put("levelTrimPointDb", levelTrimPointDb.toDouble())
+            .put("levelMeasureText", levelMeasureText)
             .put("delayCalib", JSONObject().put("state", delayCalib.state).put("atMs", delayCalib.atMs).put("spreadMs", delayCalib.spreadMs))
             .put("levelCalib", JSONObject().put("state", levelCalib.state).put("atMs", levelCalib.atMs).put("db", levelCalib.db))
             .put("pointCh", Ch.name(pointChannel)).put("trimMs", trimNs / 1e6).put("serverName", myName)
@@ -2980,6 +3259,10 @@ class Engine private constructor(private val app: Context) {
         val pCh = Ch.parse(o.optString("pointCh", "R"))
         val trim = o.optDouble("trimMs", 0.0)
         if (role == Role.POINT) {
+            if (o.has("pointGain") && !didAcknowledgeGainLaw) {
+                didAcknowledgeGainLaw = true
+                link?.send(JSONObject().put("t", "gainAck").put("law", 2))
+            }
             val gain = if (o.has("pointGain")) o.optDouble("pointGain").toFloat().coerceIn(0f, 1f)
                 else m * (if (pCh == Ch.L) vL else vR) * LegacyBalanceLaw.gain(pCh, b)
             pointParams = PointParams(gain, (trim * 1e6).toLong(), dur)
@@ -2992,7 +3275,8 @@ class Engine private constructor(private val app: Context) {
             levelTrimServerDb = o.optDouble("levelTrimServerDb", 0.0).toFloat(), levelTrimPointDb = o.optDouble("levelTrimPointDb", 0.0).toFloat(),
             delayCalib = o.optJSONObject("delayCalib")?.let { DelayCalib(it.optString("state", "none"), it.optLong("atMs"), it.optDouble("spreadMs")) } ?: DelayCalib(),
             levelCalib = o.optJSONObject("levelCalib")?.let { LevelCalib(it.optString("state", "none"), it.optLong("atMs"), it.optDouble("db")) } ?: LevelCalib(),
-            gainLaw = o.optInt("gainLaw", 1)) }
+            levelMeasureText = o.optString("levelMeasureText", ""),
+            gainLaw = if (role == Role.POINT) if (o.has("pointGain")) 2 else 1 else o.optInt("peerGainLaw", 1)) }
         if (playing) requestFocus()
         PlaybackService.refresh(app)
     }
@@ -3030,6 +3314,7 @@ class Engine private constructor(private val app: Context) {
             }
             "undoRemove" -> doUndoRemove()
             "vol" -> {
+                if (mode == SourceMode.LEVEL_MEASURE) { toast("Во время измерения общая громкость зафиксирована"); return }
                 val v = o.optDouble("v", 1.0).toFloat().coerceIn(0f, 1f)
                 when (o.optString("ch")) {
                     "L", "R" -> {
@@ -3046,6 +3331,7 @@ class Engine private constructor(private val app: Context) {
             "balance" -> {
                 balance = o.optDouble("v", 0.5).toFloat().coerceIn(0f, 1f)
                 rebuildPlayState(); if (o.optBoolean("finished", true)) saveServerParams(); publishState()
+                if (o.optBoolean("finished", true)) telemetry.record("balance_set", mapOf("balance" to balance.toDouble()))
             }
             "swap" -> {
                 if (calibRunning) return
@@ -3057,12 +3343,49 @@ class Engine private constructor(private val app: Context) {
             }
             "trim" -> {
                 val ms = o.optDouble("ms", 0.0).coerceIn(-SF.MAX_TRIM_MS.toDouble(), SF.MAX_TRIM_MS.toDouble())
-                trimNs = (ms * 1e6).toLong(); saveServerParams(); publishState()
+                trimNs = (ms * 1e6).toLong()
+                delayCalib = if (o.optBoolean("reset")) DelayCalib() else DelayCalib("manual", System.currentTimeMillis(), 0.0)
+                saveServerParams(); publishState()
             }
             "calibrate" -> startCalibration(apply = true)
             "measure" -> startCalibration(apply = false)
             "metronome" -> if (o.optBoolean("on")) startTestMode(MetronomeSource()) else if (mode == SourceMode.METRONOME) restoreMusic(false)
             "lrtest" -> startTestMode(ChannelTestSource())
+            "levelTrim" -> {
+                if (blockCalibrationIfNeeded("level_trim")) return
+                setDeviceLevelTrim(o.optString("dev"), o.optDouble("db", 0.0).toFloat())
+                rebuildPlayState(); saveServerParams(); publishState()
+                telemetry.record("level_trim_set", mapOf("dev" to o.optString("dev"), "db" to o.optDouble("db"), "source" to "manual"))
+            }
+            "levelOffset" -> {
+                if (blockCalibrationIfNeeded("level_ear")) return
+                applyLevelOffset(o.optDouble("db", 0.0).toFloat()); rebuildPlayState()
+                if (o.optBoolean("finished")) saveServerParams()
+                publishState()
+            }
+            "levelReset" -> {
+                if (blockCalibrationIfNeeded("level_reset")) return
+                levelTrimServerDb = 0f; levelTrimPointDb = 0f; levelCalib = LevelCalib()
+                rebuildPlayState(); saveServerParams(); publishState()
+            }
+            "levelStart" -> {
+                if (calibRunning) toast("Дождитесь окончания калибровки задержки")
+                else if (!levelStageReady()) toast(levelGateMessage())
+                else { levelMatchStartServerDb = levelTrimServerDb; levelMatchStartPointDb = levelTrimPointDb; startTestMode(LevelMatchSource()) }
+            }
+            "levelStop" -> finishLevelMatch(o.optBoolean("commit"))
+            "centerStart" -> {
+                if (calibRunning) toast("Дождитесь окончания калибровки задержки")
+                else if (!levelStageReady()) toast(levelGateMessage()) else startTestMode(CenterCheckSource())
+            }
+            "centerAnswer" -> {
+                val answer = o.optString("answer", "unknown")
+                telemetry.record("center_check", mapOf("answer" to answer))
+                if (answer != "center") toast("Сначала повторите калибровку задержки — даже 0,1 мс разницы сдвигает звук так же, как 1–1,5 дБ. Если после этого всё ещё тянет, выровняйте уровень на слух.")
+            }
+            "routeChanged" -> resetCalibrationsForRoute()
+            "levelMicReference" -> startLevelMicReference(o.optInt("position", 1))
+            "levelMeasure" -> startLevelMicMeasurement()
         }
     }
 
@@ -3123,7 +3446,7 @@ class Engine private constructor(private val app: Context) {
         newEpoch(playing, f, if (playing) now + SF.START_DELAY_NS else now)
     }
 
-    private fun startTestMode(src: AudioSource) {
+    private fun startTestMode(src: AudioSource, anchorNs: Long = System.nanoTime() + SF.START_DELAY_NS) {
         if (calibRunning) return
         pendingTrackId = null
         ui { copy(loadingTracks = false, loadingTrackId = null) }
@@ -3131,7 +3454,7 @@ class Engine private constructor(private val app: Context) {
         clearProgressiveBufferState()
         cancelScheduledPause()
         mode = src.mode; source = src
-        newEpoch(true, 0, System.nanoTime() + SF.START_DELAY_NS)
+        newEpoch(true, 0, anchorNs)
     }
 
     private fun restoreMusic(resume: Boolean) {
@@ -3579,7 +3902,7 @@ class Engine private constructor(private val app: Context) {
         when (mode) {
             SourceMode.MUSIC -> if (queueIndex + 1 < queue.size) selectTrack(queueIndex + 1)
                 else newEpoch(false, source.totalFrames, System.nanoTime())
-            SourceMode.CHANNEL_TEST -> restoreMusic(savedPlaying)
+            SourceMode.CHANNEL_TEST, SourceMode.CENTER_CHECK -> restoreMusic(savedPlaying)
             else -> {}
         }
     }
@@ -3652,7 +3975,9 @@ class Engine private constructor(private val app: Context) {
         if (apply) {
             val newTrim = (trimUsed - (res.lateMs * 1e6).toLong())
                 .coerceIn(-SF.MAX_TRIM_MS * 1_000_000L, SF.MAX_TRIM_MS * 1_000_000L)
-            trimNs = newTrim; saveServerParams(); publishState()
+            trimNs = newTrim
+            delayCalib = DelayCalib("auto", System.currentTimeMillis(), res.spreadMs)
+            saveServerParams(); publishState()
             broadcastCalib(false, "", "Готово. Point $who на %.1f мс — компенсировано.\nСдвиг Point: %+.1f мс · точность ±%.1f мс"
                 .format(abs(res.lateMs), newTrim / 1e6, maxOf(res.spreadMs, 0.1)), true, null)
         } else {

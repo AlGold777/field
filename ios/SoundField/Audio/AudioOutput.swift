@@ -14,6 +14,8 @@ final class AudioOutput {
     private(set) var running = false
     var onInterruption: ((Bool) -> Void)?     // true = началось
     var onRouteWarning: ((String) -> Void)?
+    var onRouteChanged: (() -> Void)?
+    private var routeSignature: String?
 
     private(set) var latencyMs = 0.0
     private(set) var underruns: Int64 = 0      // на iOS система не отдаёт счётчик — считаем отсутствие hostTime
@@ -146,6 +148,9 @@ final class AudioOutput {
     private func handleRouteChange(_ n: Notification) {
         updateLatency()
         let outs = AVAudioSession.sharedInstance().currentRoute.outputs
+        let signature = outs.map { "\($0.portType.rawValue):\($0.uid)" }.sorted().joined(separator: "|")
+        if let old = routeSignature, old != signature { onRouteChanged?() }
+        routeSignature = signature
         let onSpeaker = outs.contains { $0.portType == .builtInSpeaker || $0.portType == .builtInReceiver }
         if running && !onSpeaker {
             onRouteWarning?("Звук ушёл на «\(outs.first?.portName ?? "внешнее устройство")». Для стереопары отключите наушники/Bluetooth")

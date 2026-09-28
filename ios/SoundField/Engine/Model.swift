@@ -31,6 +31,7 @@ struct PairRecord: Codable, Equatable {
     var levelTrimVersion: Int = 1
     var delayCalib = DelayCalib()
     var levelCalib = LevelCalib()
+    var levelMeasureText = ""
     /// Последний известный адрес второго телефона и порт его TCP-сервера — быстрый путь без Bonjour.
     /// Optional: старые сохранённые пары без этих полей продолжают читаться.
     var lastHost: String? = nil

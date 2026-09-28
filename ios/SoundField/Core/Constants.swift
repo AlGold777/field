@@ -31,7 +31,7 @@ enum Ch {
     static func other(_ c: Int) -> Int { 1 - c }
 }
 
-enum SourceMode: String { case music, calib, metronome, lrtest }
+enum SourceMode: String { case music, calib, metronome, lrtest, level = "level", center = "center", levelMeasure }
 
 /// Монотонные часы в наносекундах (mach_absolute_time) — те же, что в AudioTimeStamp.mHostTime.
 enum MonoClock {

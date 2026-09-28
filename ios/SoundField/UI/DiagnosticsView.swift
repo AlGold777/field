@@ -11,6 +11,21 @@ struct DiagnosticsView: View {
     var body: some View {
         let p = ui.pointDiag, s = ui.serverDiag
         let est: Double? = (p.valid && s.valid) ? abs(p.syncErrMs - s.syncErrMs) + p.clockUncMs : nil
+        let serverCh = Ch.other(ui.pointChannel)
+        let leftLevel = serverCh == Ch.L ? ui.levelTrimServerDb : ui.levelTrimPointDb
+        let rightLevel = serverCh == Ch.R ? ui.levelTrimServerDb : ui.levelTrimPointDb
+        let levelSource = ["ear": "на слух", "mic": "микрофон", "manual": "вручную"][ui.levelCalib.state] ?? "не настроено"
+        let balanceP = 2 * ui.balance - 1
+        let balanceText: String
+        if abs(balanceP) < 0.001 { balanceText = "Центр" }
+        else if abs(balanceP) >= 0.995 { balanceText = balanceP < 0 ? "Только L" : "Только R" }
+        else {
+            let db = -BalanceLaw.differenceDb(balance: Float(ui.balance))
+            balanceText = String(format: "%@ +%.1f дБ", balanceP < 0 ? "L" : "R", db)
+        }
+        let delayState = ui.delayCalib.state == "auto"
+            ? String(format: "авто, разброс %.1f мс", ui.delayCalib.spreadMs)
+            : ui.delayCalib.state == "manual" ? "вручную" : "не откалибрована"
         ScrollView {
             VStack(alignment: .leading, spacing: 0) {
                 BackBar(title: "Диагностика", back: back)
@@ -23,7 +38,9 @@ struct DiagnosticsView: View {
                     DiagRow(label: "Акустически измерено",
                             value: ui.calib.lastMeasuredMs.map { String(format: "%+.1f мс", $0) } ?? "не измерялось",
                             color: ui.calib.lastMeasuredMs.map { c(abs($0), 2, 5) } ?? SFColor.dim)
-                    DiagRow(label: "Сдвиг Point (калибровка)", value: String(format: "%+.1f мс", ui.trimMs))
+                    DiagRow(label: "Задержка", value: String(format: "trim %+.1f мс · %@", ui.trimMs, delayState))
+                    DiagRow(label: "Уровень", value: String(format: "L-тел %+.1f дБ, R-тел %+.1f дБ · %@", leftLevel, rightLevel, levelSource))
+                    DiagRow(label: "Баланс", value: balanceText)
                 }
 
                 SFCard {

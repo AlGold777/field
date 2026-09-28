@@ -173,6 +173,79 @@ final class ChannelTestSource: AudioSource {
     }
 }
 
+/// Fixed-seed pink noise shaped into a frequency band and normalized to −20 dBFS RMS, capped at −8 dBFS peak.
+enum PinkNoise {
+    static func make(count: Int, lowHz: Double, highHz: Double, seed: UInt32 = 0x13579BDF) -> [Float] {
+        var state = seed
+        var b0: Float = 0, b1: Float = 0, b2: Float = 0, b3: Float = 0, b4: Float = 0, b5: Float = 0, b6: Float = 0
+        let aLow = Float(1 - exp(-2 * Double.pi * lowHz / Double(SF.sampleRate)))
+        let aHigh = Float(1 - exp(-2 * Double.pi * highHz / Double(SF.sampleRate)))
+        var low: Float = 0, high: Float = 0
+        var out = [Float](repeating: 0, count: count)
+        var power = 0.0, peak: Float = 0
+        for i in out.indices {
+            state ^= state << 13; state ^= state >> 17; state ^= state << 5
+            let white = Float(Double(state) / Double(UInt32.max) * 2 - 1)
+            b0 = 0.99886 * b0 + white * 0.0555179
+            b1 = 0.99332 * b1 + white * 0.0750759
+            b2 = 0.96900 * b2 + white * 0.1538520
+            b3 = 0.86650 * b3 + white * 0.3104856
+            b4 = 0.55000 * b4 + white * 0.5329522
+            b5 = -0.7616 * b5 - white * 0.0168980
+            let pink = (b0 + b1 + b2 + b3 + b4 + b5 + b6 + white * 0.5362) * 0.11
+            b6 = white * 0.115926
+            high += aHigh * (pink - high); low += aLow * (pink - low)
+            let sample = high - low
+            out[i] = sample; power += Double(sample) * Double(sample); peak = max(peak, abs(sample))
+        }
+        guard !out.isEmpty else { return out }
+        let rms = max(sqrt(power / Double(out.count)), 1e-9)
+        let scale = min(0.1 / rms, 0.39810717 / max(Double(peak), 1e-9))
+        for i in out.indices { out[i] = Float(Double(out[i]) * scale) }
+        return out
+    }
+}
+
+final class CenterCheckSource: AudioSource {
+    let mode = SourceMode.center
+    let title = "Проверка центра"
+    let artist = "Коррелированный розовый шум · оба телефона"
+    let totalFrames = Int64(SF.sampleRate) * 15 / 2
+    private let noise = PinkNoise.make(count: SF.sampleRate * 2, lowHz: 200, highHz: 8_000)
+    func sample(_ frame: Int64, _ ch: Int) -> Float {
+        guard frame >= 0 else { return 0 }
+        let pos = frame % (Int64(SF.sampleRate) * 5 / 2)
+        return pos < Int64(SF.sampleRate) * 2 ? noise[Int(pos % Int64(noise.count))] : 0
+    }
+}
+
+final class LevelMatchSource: AudioSource {
+    let mode = SourceMode.level
+    let title = "Выравнивание уровня на слух"
+    let artist = "Сигнал L и R звучит по очереди"
+    let totalFrames = Int64.max
+    private let tone = PinkNoise.make(count: SF.sampleRate * 3 / 2, lowHz: 500, highHz: 4_000)
+    private let active = Int64(SF.sampleRate) * 3 / 2
+    private let pause = Int64(SF.sampleRate) / 4
+    private let fadeFrames = Int64(SF.sampleRate) * 20 / 1_000
+    private var cycle: Int64 { active * 2 + pause * 2 }
+
+    private func sampleAt(_ frame: Int64) -> Float {
+        let envelope = min(1, min(Double(frame) / Double(fadeFrames), Double(active - 1 - frame) / Double(fadeFrames)))
+        return tone[Int(frame % Int64(tone.count))] * Float(max(0, envelope))
+    }
+
+    func sample(_ frame: Int64, _ ch: Int) -> Float {
+        guard frame >= 0 else { return 0 }
+        let pos = frame % cycle
+        if pos < active && ch == Ch.L { return sampleAt(pos) }
+        if pos >= active + pause && pos < active * 2 + pause && ch == Ch.R {
+            return sampleAt(pos - active - pause)
+        }
+        return 0
+    }
+}
+
 /// Минимальный WAV-парсер (PCM 16 бит, моно/стерео) → 48 кГц стерео int16.
 enum Wav {
     enum WavError: Error { case format }

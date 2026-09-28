@@ -102,6 +102,9 @@ fun PlayerScreen(ui: UiState, engine: Engine, openCalibration: () -> Unit, openD
                 Text(when (ui.mode) {
                     SourceMode.METRONOME -> "🥁 Метроном для ручной подстройки"
                     SourceMode.CHANNEL_TEST -> "🔈 Проверка каналов: сначала L, потом R"
+                    SourceMode.LEVEL_MATCH -> "Уровень: L и R звучат по очереди"
+                    SourceMode.CENTER_CHECK -> "Проверка центра"
+                    SourceMode.LEVEL_MEASURE -> "Экспериментальное измерение микрофонами"
                     else -> "🎯 Идёт калибровка"
                 }, color = SFColors.Warn, fontWeight = FontWeight.SemiBold)
             }
@@ -179,14 +182,13 @@ fun PlayerScreen(ui: UiState, engine: Engine, openCalibration: () -> Unit, openD
             Text("Sound", color = SFColors.TextDim, fontSize = 13.sp, letterSpacing = 1.sp,
                 fontWeight = FontWeight.SemiBold, modifier = Modifier.padding(bottom = 10.dp))
             var m by remember(ui.master) { mutableFloatStateOf(ui.master) }
-            var l by remember(ui.volL) { mutableFloatStateOf(ui.volL) }
-            var r by remember(ui.volR) { mutableFloatStateOf(ui.volR) }
             var balance by remember { mutableFloatStateOf(ui.balance) }
             var balanceDragging by remember { mutableStateOf(false) }
             var wasInCenter by remember { mutableStateOf(abs(ui.balance - 0.5f) < 0.015f) }
             val haptic = LocalHapticFeedback.current
             LaunchedEffect(ui.balance, balanceDragging) { if (!balanceDragging) balance = ui.balance }
             SliderRow("Громкость", "${(m * 100).roundToInt()}%", m, SFColors.Master,
+                enabled = ui.mode != SourceMode.LEVEL_MEASURE,
                 onChange = { m = it; engine.setVolume("M", it, finished = false) },
                 onDone = { engine.setVolume("M", m, finished = true) })
             Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
@@ -224,10 +226,6 @@ fun PlayerScreen(ui: UiState, engine: Engine, openCalibration: () -> Unit, openD
                 Text("R", color = SFColors.RightText, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
             }
             LaunchedEffect(balance) { if (!balanceDragging) wasInCenter = abs(balance - 0.5f) < 0.015f }
-            SliderRow("Левый канал · L", "${(l * 100).roundToInt()}%", l, SFColors.Left,
-                onChange = { l = it; engine.setVolume("L", it) })
-            SliderRow("Правый канал · R", "${(r * 100).roundToInt()}%", r, SFColors.Right,
-                onChange = { r = it; engine.setVolume("R", it) })
         }
 
         Row(Modifier.fillMaxWidth().padding(bottom = 12.dp).height(48.dp), horizontalArrangement = Arrangement.spacedBy(8.dp),

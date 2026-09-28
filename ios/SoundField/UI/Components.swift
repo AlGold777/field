@@ -99,12 +99,15 @@ struct TelemetryGlyph: View {
 struct GhostButton: View {
     let title: String
     var color: Color = SFColor.accent1
+    var enabled = true
     let action: () -> Void
     var body: some View {
         Button(action: action) {
             Text(title).font(.system(size: 15, weight: .semibold)).foregroundColor(color)
                 .frame(maxWidth: .infinity).padding(.vertical, 12)
         }
+        .disabled(!enabled)
+        .opacity(enabled ? 1 : 0.5)
     }
 }
 
@@ -211,6 +214,8 @@ struct SliderRow: View {
     let color: Color
     var range: ClosedRange<Double> = 0...1
     var step: Double? = nil
+    var enabled = true
+    var onEditingChanged: (Bool) -> Void = { _ in }
     var onEditingEnded: () -> Void = {}
     var body: some View {
         VStack(spacing: 2) {
@@ -220,9 +225,11 @@ struct SliderRow: View {
                 Text(valueText).font(.system(size: 14, weight: .semibold)).foregroundColor(color)
             }
             if let step {
-                Slider(value: $value, in: range, step: step, onEditingChanged: { if !$0 { onEditingEnded() } }).tint(color)
+                Slider(value: $value, in: range, step: step, onEditingChanged: { onEditingChanged($0); if !$0 { onEditingEnded() } })
+                    .tint(color).disabled(!enabled)
             } else {
-                Slider(value: $value, in: range, onEditingChanged: { if !$0 { onEditingEnded() } }).tint(color)
+                Slider(value: $value, in: range, onEditingChanged: { onEditingChanged($0); if !$0 { onEditingEnded() } })
+                    .tint(color).disabled(!enabled)
             }
         }
         .padding(.bottom, 6)

@@ -32,6 +32,7 @@ import java.util.concurrent.atomic.AtomicReference
 class AudioOutput(private val ctx: Context) {
     @Volatile var source: RenderSource? = null
     @Volatile var playbackActive: Boolean = false
+    @Volatile var onRouteChanged: (() -> Unit)? = null
     @Volatile var latencyMs = 0.0; private set
     @Volatile var underruns = 0L; private set
     @Volatile var timestampOk = false; private set
@@ -47,10 +48,13 @@ class AudioOutput(private val ctx: Context) {
     @Volatile private var thread: Thread? = null
     private val am = ctx.getSystemService(Context.AUDIO_SERVICE) as AudioManager
     @Volatile private var track: AudioTrack? = null
+    private val routeHandler = Handler(Looper.getMainLooper())
+    @Volatile private var routeSignature = ""
+    private var routeChangeTask: Runnable? = null
 
     private val deviceCallback = object : AudioDeviceCallback() {
-        override fun onAudioDevicesAdded(added: Array<out AudioDeviceInfo>) = pinSpeaker()
-        override fun onAudioDevicesRemoved(removed: Array<out AudioDeviceInfo>) = pinSpeaker()
+        override fun onAudioDevicesAdded(added: Array<out AudioDeviceInfo>) { pinSpeaker(); scheduleRouteCheck() }
+        override fun onAudioDevicesRemoved(removed: Array<out AudioDeviceInfo>) { pinSpeaker(); scheduleRouteCheck() }
     }
 
     val isRunning get() = thread?.isAlive == true
@@ -103,9 +107,28 @@ class AudioOutput(private val ctx: Context) {
 
     @Synchronized fun start() {
         if (isRunning) return
+        routeSignature = currentRouteSignature()
         am.registerAudioDeviceCallback(deviceCallback, Handler(Looper.getMainLooper()))
         thread = Thread({ loop() }, "sf-audio").apply { priority = Thread.MAX_PRIORITY }
         thread!!.start()
+    }
+
+    private fun currentRouteSignature(): String = am.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
+        .filter { it.isSink }.sortedBy { it.id }.joinToString("|") { "${it.type}:${it.address}" }
+
+    private fun scheduleRouteCheck() {
+        routeHandler.post {
+            routeChangeTask?.let(routeHandler::removeCallbacks)
+            val task = Runnable {
+                val now = currentRouteSignature()
+                if (routeSignature.isNotEmpty() && now != routeSignature) {
+                    routeSignature = now
+                    onRouteChanged?.invoke()
+                } else routeSignature = now
+            }
+            routeChangeTask = task
+            routeHandler.postDelayed(task, 300)
+        }
     }
 
     @Synchronized fun stop() {

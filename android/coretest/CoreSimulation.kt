@@ -244,6 +244,25 @@ fun testAudioGainLaws() {
     check("gain smoothing continues toward silence", b.last() < a.last())
 }
 
+fun testLevelAnalyzer() {
+    println("[LevelAnalyzer]")
+    val sr = SF.SAMPLE_RATE
+    val white = FloatArray(sr * 5) { i -> ((((i * 1_103_515_245L + 12_345L) ushr 16) and 0xffffL).toFloat() / 32_768f - 1f) * 0.001f }
+    val pink = PinkNoise.make(sr * 4, 500.0, 4_000.0, seed = 0x31415926)
+    val a = white.copyOf(); val b = white.copyOf()
+    for (i in pink.indices) { a[sr + i] += pink[i] * 0.25f; b[sr + i] += pink[i] * (0.25f * 10f.pow(-3f / 20f)) }
+    val aa = LevelAnalyzer.analyze(a, sr, 1.0, 3.8, backgroundStart = 0.05, backgroundDuration = 0.8)
+    val bb = LevelAnalyzer.analyze(b, sr, 1.0, 3.8, backgroundStart = 0.05, backgroundDuration = 0.8)
+    val delta = LevelAnalyzer.differenceDb(aa, bb)
+    check("3 dB between generated band-limited noise fields", delta != null && abs(delta - 3.0) < 0.3, delta?.toString().orEmpty())
+    check("six or more bands pass SNR and clipping gates", aa.validBands >= 6 && bb.validBands >= 6, "${aa.validBands}/${bb.validBands}")
+    val lowSnr = LevelAnalyzer.analyze(a, sr, 0.05, 0.8, backgroundStart = 0.05, backgroundDuration = 0.8)
+    check("low SNR is rejected", lowSnr.validBands == 0, lowSnr.validBands.toString())
+    val sparseA = LevelAnalyzer.Result(List(10) { if (it < 6) -20.0 else null }, List(10) { if (it < 6) 20.0 else null }, 6, -20.0)
+    val sparseB = LevelAnalyzer.Result(List(10) { if (it >= 5) -23.0 else null }, List(10) { if (it >= 5) 20.0 else null }, 6, -20.0)
+    check("fewer than six shared bands are rejected", LevelAnalyzer.differenceDb(sparseA, sparseB) == null)
+}
+
 fun testWavAndSources() {
     println("[WAV/Sources]")
     val f = File("../../tools/test_track.wav")
@@ -258,6 +277,11 @@ fun testWavAndSources() {
     val cal = CalibrationSource(Ch.R)
     check("calib: point chirp at 0.5 s on R", cal.sample(24_000 + 300, Ch.R) != 0f && cal.sample(24_000 + 300, Ch.L) == 0f)
     check("calib: server chirp at 1.0 s on L", cal.sample(48_000 + 300, Ch.L) != 0f && cal.sample(48_000 + 300, Ch.R) == 0f)
+    val level = LevelMatchSource()
+    val activeFrames = SF.SAMPLE_RATE * 3L / 2
+    check("level-match attack starts silently", level.sample(0, Ch.L) == 0f)
+    check("level-match fade ends before silence", abs(level.sample(activeFrames - 1, Ch.L)) < 0.001f)
+    check("level-match signals stay on their own channel", level.sample(0, Ch.R) == 0f && level.sample(activeFrames + SF.SAMPLE_RATE / 4L, Ch.R) == 0f)
 }
 
 fun testSegmentedPcmSource() {
@@ -301,6 +325,7 @@ fun main() {
     testWire()
     testCorrectorFrames()
     testAudioGainLaws()
+    testLevelAnalyzer()
     testClockSync()
     testWavAndSources()
     testSegmentedPcmSource()

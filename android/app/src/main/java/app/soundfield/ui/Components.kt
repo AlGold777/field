@@ -84,9 +84,9 @@ fun SecondaryButton(text: String, modifier: Modifier = Modifier, enabled: Boolea
 }
 
 @Composable
-fun GhostButton(text: String, modifier: Modifier = Modifier, color: Color = SFColors.Accent1, onClick: () -> Unit) {
+fun GhostButton(text: String, modifier: Modifier = Modifier, color: Color = SFColors.Accent1, enabled: Boolean = true, onClick: () -> Unit) {
     Box(
-        modifier.fillMaxWidth().clip(BtnShape).clickable(onClick = onClick).padding(vertical = 12.dp),
+        modifier.fillMaxWidth().clip(BtnShape).clickable(enabled = enabled, onClick = onClick).alpha(if (enabled) 1f else 0.5f).padding(vertical = 12.dp),
         contentAlignment = Alignment.Center,
     ) { Text(text, color = color, fontSize = 15.sp, fontWeight = FontWeight.SemiBold) }
 }
@@ -198,14 +198,14 @@ fun DeviceRow(icon: String, name: String, detail: String, trailing: @Composable 
 
 @Composable
 fun SliderRow(label: String, valueText: String, value: Float, color: Color, range: ClosedFloatingPointRange<Float> = 0f..1f,
-              steps: Int = 0, onChange: (Float) -> Unit, onDone: () -> Unit = {}) {
+              steps: Int = 0, enabled: Boolean = true, onChange: (Float) -> Unit, onDone: () -> Unit = {}) {
     Column(Modifier.fillMaxWidth().padding(bottom = 6.dp)) {
         Row(Modifier.fillMaxWidth()) {
             Text(label, color = SFColors.TextDim, fontSize = 14.sp, modifier = Modifier.weight(1f))
             Text(valueText, color = color, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
         }
         Slider(
-            value = value, onValueChange = onChange, onValueChangeFinished = onDone, valueRange = range, steps = steps,
+            value = value, onValueChange = onChange, onValueChangeFinished = onDone, valueRange = range, steps = steps, enabled = enabled,
             colors = SliderDefaults.colors(thumbColor = color, activeTrackColor = color, inactiveTrackColor = Color(0x1AFFFFFF)),
         )
     }

@@ -37,6 +37,7 @@ object Ch {
 }
 
 enum class SourceMode(val wire: String) {
-    MUSIC("music"), CALIBRATION("calib"), METRONOME("metronome"), CHANNEL_TEST("lrtest");
+    MUSIC("music"), CALIBRATION("calib"), METRONOME("metronome"), CHANNEL_TEST("lrtest"),
+    LEVEL_MATCH("level"), CENTER_CHECK("center"), LEVEL_MEASURE("levelMeasure");
     companion object { fun fromWire(s: String?) = entries.firstOrNull { it.wire == s } ?: MUSIC }
 }

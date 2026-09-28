@@ -289,6 +289,7 @@ data class UiState(
     val levelTrimPointDb: Float = 0f,
     val delayCalib: DelayCalib = DelayCalib(),
     val levelCalib: LevelCalib = LevelCalib(),
+    val levelMeasureText: String = "",
     val gainLaw: Int = 2,
     val pointChannel: Int = Ch.R,
     val trimMs: Double = 0.0,
