@@ -21,7 +21,7 @@ fun WelcomeScreen(ui: UiState, engine: Engine) {
     var showLog by remember { mutableStateOf(false) }
     Box(Modifier.fillMaxSize()) {
       Column(
-          Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 20.dp).padding(top = 48.dp, bottom = 24.dp),
+          Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 20.dp).padding(top = 60.dp, bottom = 24.dp),
       ) {
         Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
             Text("🔊", fontSize = 56.sp)
@@ -31,24 +31,25 @@ fun WelcomeScreen(ui: UiState, engine: Engine) {
         Spacer(Modifier.height(28.dp))
 
         ui.remembered?.let { rec ->
-            H3("Знакомая пара")
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                H3("Знакомая пара")
+                Spacer(Modifier.weight(1f))
+                GhostButton("Забыть", modifier = Modifier.width(IntrinsicSize.Min), color = SFColors.TextDim) { engine.forgetPair() }
+            }
             SFCard(Modifier.clickable { engine.resumeRemembered() }) {
                 H2(rec.peerName)
                 Subtitle("Нажмите, чтобы подключиться")
             }
-            if (ui.autoResuming) Subtitle("Ищем «${rec.peerName}» — пара восстановится автоматически…")
-            GhostButton("Забыть", color = SFColors.TextDim) { engine.forgetPair() }
             Spacer(Modifier.height(12.dp))
         }
 
-        H3("Телефоны рядом")
         SearchingDots()
+        H3("Телефоны рядом")
         if (ui.nearby.isEmpty()) {
             SFCard {
                 Text("📱📱", fontSize = 32.sp, modifier = Modifier.align(Alignment.CenterHorizontally))
                 Spacer(Modifier.height(8.dp))
-                Subtitle("Откройте SoundField на втором телефоне.\nОба телефона должны быть в одной сети Wi‑Fi " +
-                    "(или один раздаёт точку доступа).", align = TextAlign.Center, modifier = Modifier.fillMaxWidth())
+                Subtitle("Откройте SoundField на другом телефоне.", align = TextAlign.Center, modifier = Modifier.fillMaxWidth())
             }
         } else {
             ui.nearby.forEach { p ->

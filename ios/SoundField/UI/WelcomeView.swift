@@ -16,7 +16,12 @@ struct WelcomeView: View {
                 .frame(maxWidth: .infinity).padding(.bottom, 28)
 
                 if let rec = ui.remembered {
-                    H3(text: "Знакомая пара")
+                    HStack {
+                        H3(text: "Знакомая пара")
+                        Spacer()
+                        GhostButton(title: "Забыть", color: SFColor.dim) { engine.forgetPair() }
+                            .fixedSize(horizontal: true, vertical: false)
+                    }
                     Button { engine.resumeRemembered() } label: {
                         SFCard {
                             H2(text: rec.peerName)
@@ -24,17 +29,15 @@ struct WelcomeView: View {
                         }
                     }
                     .buttonStyle(.plain)
-                    if ui.autoResuming { Subtitle(text: "Ищем «\(rec.peerName)» — пара восстановится автоматически…") }
-                    GhostButton(title: "Забыть", color: SFColor.dim) { engine.forgetPair() }
                     .padding(.bottom, 12)
                 }
 
-                H3(text: "Телефоны рядом")
                 SearchingDots()
+                H3(text: "Телефоны рядом")
                 if ui.nearby.isEmpty {
                     SFCard {
                         Text("📱📱").font(.system(size: 32)).frame(maxWidth: .infinity)
-                        Subtitle(text: "Откройте SoundField на втором телефоне.\nОба телефона должны быть в одной сети Wi‑Fi (или один раздаёт точку доступа).",
+                        Subtitle(text: "Откройте SoundField на другом телефоне.",
                                  align: .center).frame(maxWidth: .infinity)
                     }
                 } else {
@@ -58,7 +61,7 @@ struct WelcomeView: View {
                     }
                 }
             }
-            .padding(.horizontal, 20).padding(.top, 24).padding(.bottom, 24)
+            .padding(.horizontal, 20).padding(.top, 36).padding(.bottom, 24)
           }
           if let rec = ui.remembered {
               Badge(text: rec.role.title.uppercased(), color: SFColor.master)
