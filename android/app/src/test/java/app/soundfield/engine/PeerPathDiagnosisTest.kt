@@ -53,6 +53,12 @@ class PeerPathDiagnosisTest {
         repeat(3) { d.onRound(PeerPathDiagnosis.Round("h", 41871, it * 3_000L, listOf(candidate("wifi1"))),
             setOf("wifi1", "wifi2"), mapOf("wifi1" to "ok", "wifi2" to "ok")) }
         assertEquals(PeerPathDiagnosis.Verdict.NONE, d.currentVerdict())
+
+        val both = PeerPathDiagnosis().apply { onResolved("192.168.1.9", 41871, 0) }
+        repeat(3) { both.onRound(PeerPathDiagnosis.Round("h", 41871, it * 3_000L,
+            listOf(candidate("wifi1"), candidate("wifi2"))), setOf("wifi1", "wifi2"),
+            mapOf("wifi1" to "ok", "wifi2" to "ok")) }
+        assertEquals(PeerPathDiagnosis.Verdict.LAN_PEER_BLOCKED, both.currentVerdict())
     }
 
     @Test fun successfulConnectionAndNetworkChangeClearVerdict() {
