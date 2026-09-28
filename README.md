@@ -22,6 +22,7 @@ SoundField/
 └── tools/
     ├── gen_test_track.py   генератор тестового трека (40 с, 48 кГц, стерео)
     ├── gen_xcodeproj.py    пересоздать project.pbxproj после добавления файлов в ios/
+    ├── spatial-proto/      офлайн-прототип обработки ширины и глубины сцены
     └── test_track.wav
 ```
 

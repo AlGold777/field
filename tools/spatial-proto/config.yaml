@@ -1,0 +1,84 @@
+sample_rate: 48000
+fragment_seconds: 40
+automatic_selection:
+  short_term_seconds: 3.0
+  step_seconds: 0.5
+  search: loudest_rolling_short_term_lufs
+fragment_starts: {}
+stft:
+  n_fft: 2048
+  hop: 512
+  coherence_time_seconds: 0.08
+  coherence_band_fraction_octave: 0.1666666667
+  transient_recovery_seconds: 0.03
+  transient_suppression: 0.3
+  transient_flux_threshold: 0.25
+  coherence_floor: 0.3
+  low_frequency_guard_hz: 300
+w2:
+  low_hz: 300
+  high_hz: 5000
+  lo_mid_db: 3.0
+  lo_high_db: 2.0
+  hi_mid_db: 6.0
+  hi_high_db: 4.0
+  anchor_over_side_db: 8.0
+ambient:
+  level_db: -2.0
+  side_gain_db: 3.0
+  decorrelation_highpass_hz: 300
+  d3_enabled: true
+  d3_corner_hz: 8000
+  d3_gain_db: -2.0
+  allpass_left:
+    - {delay_samples: 7, coefficient: 0.10}
+    - {delay_samples: 13, coefficient: 0.15}
+    - {delay_samples: 19, coefficient: 0.20}
+  allpass_right:
+    - {delay_samples: 11, coefficient: 0.12}
+    - {delay_samples: 17, coefficient: 0.18}
+    - {delay_samples: 23, coefficient: 0.22}
+reflections:
+  enabled: true
+  low_hz: 500
+  high_hz: 6000
+  taps:
+    - {left_delay_ms: 7.2, right_delay_ms: 10.5, gain_db: -17.0}
+    - {left_delay_ms: 13.4, right_delay_ms: 18.1, gain_db: -16.0}
+    - {left_delay_ms: 21.0, right_delay_ms: 15.7, gain_db: -18.0}
+limiter:
+  lookahead_ms: 5.0
+  ceiling_dbtp: -1.0
+  release_ms: 80.0
+  oversample: 4
+blind_test:
+  target_lufs: -18.0
+  allowed_lufs_delta: 0.3
+  synthetic_seconds: 20
+  sync_probe_seconds: 600
+  sync_chirp_ms: 20
+  sync_pair_interval_seconds: 1.0
+  sync_lr_offset_ms: 100.0
+  measurement_pause_seconds: 2.0
+variants:
+  REF: {kind: reference, role: hidden_reference}
+  ANCHOR_MONO: {kind: mono, role: narrow_anchor}
+  ANCHOR_OVER: {kind: over, role: overprocessed_anchor}
+  W2_LO: {kind: w2, profile: lo, role: moderate_base}
+  W2_HI: {kind: w2, profile: hi, role: strong_base}
+  W2_W3: {kind: w2_w3, profile: lo, role: main_candidate}
+  W2_W3_W6: {kind: w2_w3_w6, profile: lo, role: reflections_candidate}
+xtc:
+  speaker_spacing_m: 0.15
+  listener_distances_m: [0.4, 0.6]
+  head_radius_m: 0.0875
+  sound_speed_m_s: 343.0
+  low_hz: 500
+  high_hz: 6000
+  fft_size: 32768
+  causal_delay_ms: 30.0
+  regularization:
+    weak: 0.015
+    medium: 0.06
+    strong: 0.2
+random_seed: 20260928
