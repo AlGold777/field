@@ -329,8 +329,16 @@ class Engine private constructor(private val app: Context) {
     private var savedPlaying = false
     private var volL = 1f
     private var volR = 1f
-    private var master = 0.8f
+    private var master = 0.96f
     private var balance = 0.5f
+    private var levelTrimServerDb = 0f
+    private var levelTrimPointDb = 0f
+    private var delayCalib = DelayCalib()
+    private var levelCalib = LevelCalib()
+    private val gainThrottleLock = Any()
+    private val lastGainCommandAtNs = HashMap<String, Long>()
+    private val pendingGainCommands = HashMap<String, () -> Unit>()
+    private val scheduledGainCommands = HashMap<String, java.util.concurrent.ScheduledFuture<*>>()
     @Volatile private var pointChannel = Ch.R
     private var trimNs = 0L
     @Volatile private var pointUdp: InetSocketAddress? = null
@@ -1708,18 +1716,50 @@ class Engine private constructor(private val app: Context) {
     }
 
     private val audioExtensions = setOf("aac", "aif", "aiff", "alac", "amr", "flac", "m4a", "m4b", "mp3", "oga", "ogg", "opus", "wav", "wave", "weba", "wma")
-    fun setVolume(ch: String, v: Float) {
-        ui { when (ch) { "L" -> copy(volL = v); "R" -> copy(volR = v); else -> copy(master = v) } } // мгновенный отклик UI
-        cmd("vol") { put("ch", ch); put("v", v.toDouble()) }
+    fun setVolume(ch: String, v: Float, finished: Boolean = true) {
+        if (ch == "M") ui { copy(master = v) }
+        sendGainCommand("vol:$ch", finished) {
+            cmd("vol", telemetry = finished) { put("ch", ch); put("v", v.toDouble()); put("law", 2); put("finished", finished) }
+        }
     }
-    fun setBalance(v: Float) {
+    fun setBalance(v: Float, finished: Boolean = true) {
         val value = v.coerceIn(0f, 1f)
         ui { copy(balance = value) }
-        cmd("balance") { put("v", value.toDouble()) }
+        sendGainCommand("balance", finished) {
+            cmd("balance", telemetry = finished) { put("v", value.toDouble()); put("finished", finished) }
+        }
+    }
+
+    private fun sendGainCommand(key: String, finished: Boolean, send: () -> Unit) {
+        val now = System.nanoTime()
+        var immediate = false
+        synchronized(gainThrottleLock) {
+            val last = lastGainCommandAtNs[key] ?: Long.MIN_VALUE
+            val dueNs = if (last == Long.MIN_VALUE) now else last + 33_333_333L
+            if (finished || now >= dueNs) {
+                scheduledGainCommands.remove(key)?.cancel(false)
+                pendingGainCommands.remove(key)
+                lastGainCommandAtNs[key] = now
+                immediate = true
+            } else {
+                pendingGainCommands[key] = send
+                if (scheduledGainCommands[key] == null) {
+                    scheduledGainCommands[key] = ex.schedule({
+                        val pending = synchronized(gainThrottleLock) {
+                            scheduledGainCommands.remove(key)
+                            lastGainCommandAtNs[key] = System.nanoTime()
+                            pendingGainCommands.remove(key)
+                        }
+                        pending?.invoke()
+                    }, dueNs - now, TimeUnit.NANOSECONDS)
+                }
+            }
+        }
+        if (immediate) send()
     }
     fun micPermissionGranted() = post { ui { copy(calib = calib.copy(needsMicPermission = false, resultText = "")) } }
 
-    private fun cmd(a: String, extra: JSONObject.() -> Unit = {}) {
+    private fun cmd(a: String, telemetry: Boolean = true, extra: JSONObject.() -> Unit = {}) {
         val op = java.util.UUID.randomUUID().toString()
         val issuedAt = if (role == Role.POINT && clock.ready) clock.toServer(System.nanoTime()) else System.nanoTime()
         val o = JSONObject().put("t", "cmd").put("a", a).put("op", op)
@@ -1727,7 +1767,7 @@ class Engine private constructor(private val app: Context) {
         val detail = JSONObject(o.toString())
         detail.remove("t"); detail.remove("op"); detail.remove("originRole"); detail.remove("issuedSrvNs")
         if (detail.has("id")) detail.put("id", TelemetryIdentifiers.hash(detail.optString("id")))
-        telemetry.record("USER_COMMAND", mapOf("cmd" to a, "role" to role.name.lowercase(), "args" to detail.toString()), op = op)
+        if (telemetry) this.telemetry.record("USER_COMMAND", mapOf("cmd" to a, "role" to role.name.lowercase(), "args" to detail.toString()), op = op)
         post {
             if (!ui.value.inPair) return@post
             if (role == Role.SERVER) handleCmd(o) else link?.send(o) ?: toast("Нет связи с Server")
@@ -2301,8 +2341,25 @@ class Engine private constructor(private val app: Context) {
 
         if (r == Role.SERVER) {
             record?.let { rec ->
-                if (!continuing) { pointChannel = rec.pointChannel; trimNs = (rec.trimMs * 1e6).toLong()
-                    volL = rec.volL; volR = rec.volR; master = rec.master; balance = rec.balance }
+                if (!continuing) {
+                    pointChannel = rec.pointChannel; trimNs = (rec.trimMs * 1e6).toLong()
+                    volL = rec.volL; volR = rec.volR
+                    master = if (rec.volTaper < 2) AudioGain.migrateMaster(rec.master) else rec.master
+                    balance = rec.balance; levelTrimServerDb = rec.levelTrimServerDb; levelTrimPointDb = rec.levelTrimPointDb
+                    if (rec.levelTrimVersion < 1) {
+                        val legacyServer = if (Ch.other(pointChannel) == Ch.L) volL else volR
+                        val legacyPoint = if (pointChannel == Ch.L) volL else volR
+                        val migrated = AudioGain.migrateChannelGains(legacyServer, legacyPoint)
+                        levelTrimServerDb = migrated.first; levelTrimPointDb = migrated.second
+                    }
+                    delayCalib = rec.delayCalib.let {
+                        if (it.state == "none" && rec.trimMs != 0.0) DelayCalib("manual", System.currentTimeMillis(), 0.0) else it
+                    }
+                    levelCalib = rec.levelCalib
+                    record = rec.copy(master = master, volTaper = 2, levelTrimServerDb = levelTrimServerDb,
+                        levelTrimPointDb = levelTrimPointDb, levelTrimVersion = 1, delayCalib = delayCalib)
+                    persistRecord()
+                }
             }
             sessionId = rnd.nextInt().let { if (it == 0) 1 else it }
             pointUdp = null; pointClockReady = false
@@ -2434,7 +2491,8 @@ class Engine private constructor(private val app: Context) {
 
     private fun saveServerParams() {
         record = record?.copy(pointChannel = pointChannel, trimMs = trimNs / 1e6, volL = volL, volR = volR,
-            master = master, balance = balance)
+            master = master, balance = balance, levelTrimServerDb = levelTrimServerDb, levelTrimPointDb = levelTrimPointDb,
+            volTaper = 2, levelTrimVersion = 1, delayCalib = delayCalib, levelCalib = levelCalib)
         persistRecord()
     }
 
@@ -2569,11 +2627,8 @@ class Engine private constructor(private val app: Context) {
 
     // ================================================================== Server: шкала и команды
     private fun serverChannel() = Ch.other(pointChannel)
-    private fun channelBalanceGain(channel: Int, value: Float = balance): Float = when {
-        value <= 0.5f -> if (channel == Ch.L) 1f else value * 2f
-        else -> if (channel == Ch.R) 1f else (1f - value) * 2f
-    }
-    private fun serverGain() = master * (if (serverChannel() == Ch.L) volL else volR) * channelBalanceGain(serverChannel())
+    private fun serverGain() = AudioGain.taper(master) * AudioGain.fromDb(levelTrimServerDb) * BalanceLaw.gain(serverChannel(), balance)
+    private fun pointGain() = AudioGain.taper(master) * AudioGain.fromDb(levelTrimPointDb) * BalanceLaw.gain(pointChannel, balance)
 
     private fun rebuildPlayState() {
         serverPlay = ServerPlayState(serverPlay.timeline, source, serverChannel(), serverGain())
@@ -2716,6 +2771,10 @@ class Engine private constructor(private val app: Context) {
             .put("queueIndex", queueIndex).put("queueCount", queue.size).put("trackId", queue.getOrNull(queueIndex)?.id ?: "")
             .put("volL", volL.toDouble()).put("volR", volR.toDouble()).put("master", master.toDouble())
             .put("balance", balance.toDouble())
+            .put("pointGain", pointGain().toDouble()).put("gainLaw", 2)
+            .put("levelTrimServerDb", levelTrimServerDb.toDouble()).put("levelTrimPointDb", levelTrimPointDb.toDouble())
+            .put("delayCalib", JSONObject().put("state", delayCalib.state).put("atMs", delayCalib.atMs).put("spreadMs", delayCalib.spreadMs))
+            .put("levelCalib", JSONObject().put("state", levelCalib.state).put("atMs", levelCalib.atMs).put("db", levelCalib.db))
             .put("pointCh", Ch.name(pointChannel)).put("trimMs", trimNs / 1e6).put("serverName", myName)
             .put("undo", undoText).put("decodeProgress", decodeProgress ?: JSONObject.NULL)
             .put("audioBuffering", ui.value.audioBuffering).put("op", activeCommandOp())
@@ -2774,13 +2833,19 @@ class Engine private constructor(private val app: Context) {
         val pCh = Ch.parse(o.optString("pointCh", "R"))
         val trim = o.optDouble("trimMs", 0.0)
         if (role == Role.POINT) {
-            pointParams = PointParams(m * (if (pCh == Ch.L) vL else vR) * channelBalanceGain(pCh, b), (trim * 1e6).toLong(), dur)
+            val gain = if (o.has("pointGain")) o.optDouble("pointGain").toFloat().coerceIn(0f, 1f)
+                else m * (if (pCh == Ch.L) vL else vR) * LegacyBalanceLaw.gain(pCh, b)
+            pointParams = PointParams(gain, (trim * 1e6).toLong(), dur)
         }
         val progress = if (o.isNull("decodeProgress")) null else o.optDouble("decodeProgress").toFloat().coerceIn(0f, 1f)
         ui { copy(playing = playing, durationMs = dur * 1000 / SF.SAMPLE_RATE, title = o.optString("title"),
             artist = o.optString("artist"), mode = SourceMode.fromWire(o.optString("mode")), audioBuffering = o.optBoolean("audioBuffering"),
             queueIndex = o.optInt("queueIndex", -1), undoText = o.optString("undo", ""),
-            volL = vL, volR = vR, master = m, balance = b, pointChannel = pCh, trimMs = trim, decodingProgress = progress) }
+            volL = vL, volR = vR, master = m, balance = b, pointChannel = pCh, trimMs = trim, decodingProgress = progress,
+            levelTrimServerDb = o.optDouble("levelTrimServerDb", 0.0).toFloat(), levelTrimPointDb = o.optDouble("levelTrimPointDb", 0.0).toFloat(),
+            delayCalib = o.optJSONObject("delayCalib")?.let { DelayCalib(it.optString("state", "none"), it.optLong("atMs"), it.optDouble("spreadMs")) } ?: DelayCalib(),
+            levelCalib = o.optJSONObject("levelCalib")?.let { LevelCalib(it.optString("state", "none"), it.optLong("atMs"), it.optDouble("db")) } ?: LevelCalib(),
+            gainLaw = o.optInt("gainLaw", 1)) }
         if (playing) requestFocus()
         PlaybackService.refresh(app)
     }
@@ -2819,12 +2884,21 @@ class Engine private constructor(private val app: Context) {
             "undoRemove" -> doUndoRemove()
             "vol" -> {
                 val v = o.optDouble("v", 1.0).toFloat().coerceIn(0f, 1f)
-                when (o.optString("ch")) { "L" -> volL = v; "R" -> volR = v; else -> master = v }
-                rebuildPlayState(); saveServerParams(); publishState()
+                when (o.optString("ch")) {
+                    "L", "R" -> {
+                        if (o.optString("ch") == "L") volL = v else volR = v
+                        val oldS = if (serverChannel() == Ch.L) volL else volR
+                        val oldP = if (pointChannel == Ch.L) volL else volR
+                        val migrated = AudioGain.migrateChannelGains(oldS, oldP)
+                        levelTrimServerDb = migrated.first; levelTrimPointDb = migrated.second
+                    }
+                    else -> master = if (o.optInt("law", 1) >= 2) v else AudioGain.migrateMaster(v)
+                }
+                rebuildPlayState(); if (o.optBoolean("finished", true)) saveServerParams(); publishState()
             }
             "balance" -> {
                 balance = o.optDouble("v", 0.5).toFloat().coerceIn(0f, 1f)
-                rebuildPlayState(); saveServerParams(); publishState()
+                rebuildPlayState(); if (o.optBoolean("finished", true)) saveServerParams(); publishState()
             }
             "swap" -> {
                 if (calibRunning) return

@@ -61,10 +61,10 @@ final class GainRamp {
     private var current: Float = 1
     func apply(_ out: UnsafeMutablePointer<Float>, _ n: Int, _ target: Float) {
         guard n > 0 else { return }
-        let step = (target - current) / Float(n)
+        let k = Float(1 - exp(-1 / (0.015 * Double(SF.sampleRate))))
         var g = current
-        for i in 0..<n { g += step; out[i] *= g }
-        current = target
+        for i in 0..<n { g += (target - g) * k; out[i] *= g }
+        current = g
     }
 }
 

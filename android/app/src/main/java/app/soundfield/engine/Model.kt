@@ -38,19 +38,31 @@ data class PairRecord(
     val trimMs: Double = 0.0,
     val volL: Float = 1f,
     val volR: Float = 1f,
-    val master: Float = 0.8f,
+    val master: Float = 0.96f,
     /** Последний известный адрес второго телефона и порт его TCP-сервера — быстрый путь без mDNS. */
     val lastHost: String? = null,
     val lastPort: Int = 0,
     val peerAddresses: List<PeerAddress> = emptyList(),
     val lastSuccessfulHost: String? = lastHost,
     val balance: Float = 0.5f,
+    val levelTrimServerDb: Float = 0f,
+    val levelTrimPointDb: Float = 0f,
+    /** 0 означает запись до миграции громкостной кривой. */
+    val volTaper: Int = 2,
+    /** 0 означает, что старые volL/volR ещё нужно перенести в калибровочные уровни. */
+    val levelTrimVersion: Int = 1,
+    val delayCalib: DelayCalib = DelayCalib(),
+    val levelCalib: LevelCalib = LevelCalib(),
 ) {
     fun toJson(): String = JSONObject().apply {
         put("key", key); put("peerId", peerId); put("peerName", peerName); put("peerPlatform", peerPlatform)
         put("myRole", myRole.wire); put("pointCh", Ch.name(pointChannel)); put("trimMs", trimMs)
         put("volL", volL.toDouble()); put("volR", volR.toDouble()); put("master", master.toDouble())
         put("balance", balance.toDouble())
+        put("levelTrimServerDb", levelTrimServerDb.toDouble()); put("levelTrimPointDb", levelTrimPointDb.toDouble())
+        put("volTaper", volTaper); put("levelTrimVersion", levelTrimVersion)
+        put("delayCalib", JSONObject().put("state", delayCalib.state).put("atMs", delayCalib.atMs).put("spreadMs", delayCalib.spreadMs))
+        put("levelCalib", JSONObject().put("state", levelCalib.state).put("atMs", levelCalib.atMs).put("db", levelCalib.db))
         lastHost?.let { put("lastHost", it) }; put("lastPort", lastPort)
         lastSuccessfulHost?.let { put("lastSuccessfulHost", it) }
         put("peerAddresses", org.json.JSONArray().also { array -> peerAddresses.forEach { array.put(it.toJson()) } })
@@ -74,11 +86,19 @@ data class PairRecord(
                         }
                     }.orEmpty(), it.optString("lastSuccessfulHost", "").ifEmpty { null },
                     it.optDouble("balance", 0.5).toFloat(),
+                    it.optDouble("levelTrimServerDb", 0.0).toFloat(),
+                    it.optDouble("levelTrimPointDb", 0.0).toFloat(),
+                    it.optInt("volTaper", 0), it.optInt("levelTrimVersion", 0),
+                    it.optJSONObject("delayCalib")?.let { c -> DelayCalib(c.optString("state", "none"), c.optLong("atMs"), c.optDouble("spreadMs")) } ?: DelayCalib(),
+                    it.optJSONObject("levelCalib")?.let { c -> LevelCalib(c.optString("state", "none"), c.optLong("atMs"), c.optDouble("db")) } ?: LevelCalib(),
                 )
             }
         } catch (e: Exception) { null }
     }
 }
+
+data class DelayCalib(val state: String = "none", val atMs: Long = 0, val spreadMs: Double = 0.0)
+data class LevelCalib(val state: String = "none", val atMs: Long = 0, val db: Double = 0.0)
 
 /** Технические показатели одной стороны пары. */
 data class Diag(
@@ -260,8 +280,13 @@ data class UiState(
     val mode: SourceMode = SourceMode.MUSIC,
     val volL: Float = 1f,
     val volR: Float = 1f,
-    val master: Float = 0.8f,
+    val master: Float = 0.96f,
     val balance: Float = 0.5f,
+    val levelTrimServerDb: Float = 0f,
+    val levelTrimPointDb: Float = 0f,
+    val delayCalib: DelayCalib = DelayCalib(),
+    val levelCalib: LevelCalib = LevelCalib(),
+    val gainLaw: Int = 2,
     val pointChannel: Int = Ch.R,
     val trimMs: Double = 0.0,
     // калибровка и диагностика

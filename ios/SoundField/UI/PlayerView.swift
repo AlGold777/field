@@ -102,14 +102,16 @@ struct PlayerView: View {
                 SFCard {
                     Text("Sound").font(.system(size: 13, weight: .semibold)).kerning(1)
                         .foregroundColor(SFColor.dim).padding(.bottom, 8)
-                    SliderRow(label: "Громкость", valueText: "\(Int(master * 100))%", value: $master, color: SFColor.master)
-                        .onChange(of: master) { if abs($0 - Double(ui.master)) > 0.004 { engine.setVolume("M", Float($0)) } }
+                    SliderRow(label: "Громкость", valueText: "\(Int(master * 100))%", value: $master, color: SFColor.master,
+                              onEditingEnded: { engine.setVolume("M", Float(master), finished: true) })
+                        .onChange(of: master) { if abs($0 - Double(ui.master)) > 0.004 { engine.setVolume("M", Float($0), finished: false) } }
                     Text("Баланс между телефонами").font(.system(size: 14)).foregroundColor(SFColor.dim)
                     HStack(spacing: 8) {
                         Text("L").font(.system(size: 13, weight: .semibold)).foregroundColor(SFColor.leftText)
                         Slider(value: $balance, in: 0...1)
                             .tint(SFColor.accent1)
-                            .onChange(of: balance) { if abs($0 - Double(ui.balance)) > 0.004 { engine.setBalance(Float($0)) } }
+                            .onChange(of: balance) { if abs($0 - Double(ui.balance)) > 0.004 { engine.setBalance(Float($0), finished: false) } }
+                            .onEditingChanged { editing in if !editing { engine.setBalance(Float(balance), finished: true) } }
                         Text("R").font(.system(size: 13, weight: .semibold)).foregroundColor(SFColor.rightText)
                     }
                     SliderRow(label: "Левый канал · L", valueText: "\(Int(volL * 100))%", value: $volL, color: SFColor.left)

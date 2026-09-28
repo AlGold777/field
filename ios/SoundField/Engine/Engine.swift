@@ -99,8 +99,15 @@ final class Engine {
     private var source: AudioSource
     private var savedFrame: Int64 = 0
     private var savedPlaying = false
-    private var volL: Float = 1, volR: Float = 1, master: Float = 0.8
+    private var volL: Float = 1, volR: Float = 1, master: Float = 0.96
     private var balance: Float = 0.5
+    private var levelTrimServerDb: Float = 0
+    private var levelTrimPointDb: Float = 0
+    private var delayCalib = DelayCalib()
+    private var levelCalib = LevelCalib()
+    private var lastGainCommandNs: [String: UInt64] = [:]
+    private var pendingGainCommands: [String: () -> Void] = [:]
+    private var scheduledGainCommands: [String: DispatchWorkItem] = [:]
     private let pointChBox = Locked<Int>(Ch.R)
     private var pointChannel: Int { get { pointChBox.value } set { pointChBox.value = newValue } }
     private var trimNs: Int64 = 0
@@ -443,14 +450,43 @@ final class Engine {
     func setQueueExpanded(_ expanded: Bool) {
         q.async { self.defaults.set(expanded, forKey: "sf.queueExpanded"); self.ui { $0.queueExpanded = expanded } }
     }
-    func setVolume(_ ch: String, _ v: Float) {
-        q.async { self.ui { s in switch ch { case "L": s.volL = v; case "R": s.volR = v; default: s.master = v } } }
-        cmd("vol", ["ch": ch, "v": Double(v)])
+    func setVolume(_ ch: String, _ v: Float, finished: Bool = true) {
+        if ch == "M" { q.async { self.ui { $0.master = v } } }
+        sendGainCommand("vol:\(ch)", finished: finished) {
+            self.cmd("vol", ["ch": ch, "v": Double(v), "law": 2, "finished": finished])
+        }
     }
-    func setBalance(_ value: Float) {
+    func setBalance(_ value: Float, finished: Bool = true) {
         let value = min(1, max(0, value))
         q.async { self.ui { $0.balance = value } }
-        cmd("balance", ["v": Double(value)])
+        sendGainCommand("balance", finished: finished) {
+            self.cmd("balance", ["v": Double(value), "finished": finished])
+        }
+    }
+
+    private func sendGainCommand(_ key: String, finished: Bool, send: @escaping () -> Void) {
+        q.async {
+            let now = DispatchTime.now().uptimeNanoseconds
+            let last = self.lastGainCommandNs[key] ?? 0
+            let due = last == 0 ? now : last + 33_333_333
+            if finished || now >= due {
+                self.scheduledGainCommands.removeValue(forKey: key)?.cancel()
+                self.pendingGainCommands.removeValue(forKey: key)
+                self.lastGainCommandNs[key] = now
+                send()
+            } else {
+                self.pendingGainCommands[key] = send
+                guard self.scheduledGainCommands[key] == nil else { return }
+                let item = DispatchWorkItem { [weak self] in
+                    guard let self else { return }
+                    self.scheduledGainCommands.removeValue(forKey: key)
+                    self.lastGainCommandNs[key] = DispatchTime.now().uptimeNanoseconds
+                    self.pendingGainCommands.removeValue(forKey: key)?()
+                }
+                self.scheduledGainCommands[key] = item
+                self.q.asyncAfter(deadline: .now() + .nanoseconds(Int(due - now)), execute: item)
+            }
+        }
     }
     func micPermissionGranted() { q.async { self.ui { $0.calib.needsMicPermission = false; $0.calib.resultText = "" } } }
 
@@ -768,7 +804,21 @@ final class Engine {
         if r == .server {
             if let rec = record, !continuing {
                 pointChannel = Ch.parse(rec.pointCh); trimNs = Int64(rec.trimMs * 1e6)
-                volL = Float(rec.volL); volR = Float(rec.volR); master = Float(rec.master); balance = Float(rec.balance ?? 0.5)
+                volL = Float(rec.volL); volR = Float(rec.volR)
+                master = rec.volTaper < 2 ? AudioGain.migrateMaster(Float(rec.master)) : Float(rec.master)
+                balance = Float(rec.balance ?? 0.5); levelTrimServerDb = Float(rec.levelTrimServerDb); levelTrimPointDb = Float(rec.levelTrimPointDb)
+                if rec.levelTrimVersion < 1 {
+                    let legacyServer = Ch.other(pointChannel) == Ch.L ? volL : volR
+                    let legacyPoint = pointChannel == Ch.L ? volL : volR
+                    let migrated = AudioGain.migrateChannelGains(serverGain: legacyServer, pointGain: legacyPoint)
+                    levelTrimServerDb = migrated.0; levelTrimPointDb = migrated.1
+                }
+                delayCalib = rec.delayCalib.state == "none" && rec.trimMs != 0
+                    ? DelayCalib(state: "manual", atMs: Int64(Date().timeIntervalSince1970 * 1000)) : rec.delayCalib
+                levelCalib = rec.levelCalib
+                var migrated = rec; migrated.master = Double(master); migrated.volTaper = 2
+                migrated.levelTrimServerDb = Double(levelTrimServerDb); migrated.levelTrimPointDb = Double(levelTrimPointDb)
+                migrated.levelTrimVersion = 1; migrated.delayCalib = delayCalib; record = migrated; persistRecord()
             }
             sessionId = Int32.random(in: 1...Int32.max)
             pointUdpBox.value = nil; pointClockReady = false
@@ -861,6 +911,8 @@ final class Engine {
         guard var r = record else { return }
         r.pointCh = Ch.name(pointChannel); r.trimMs = Double(trimNs) / 1e6
         r.volL = Double(volL); r.volR = Double(volR); r.master = Double(master); r.balance = Double(balance)
+        r.levelTrimServerDb = Double(levelTrimServerDb); r.levelTrimPointDb = Double(levelTrimPointDb)
+        r.volTaper = 2; r.levelTrimVersion = 1; r.delayCalib = delayCalib; r.levelCalib = levelCalib
         record = r; persistRecord()
     }
 
@@ -905,12 +957,8 @@ final class Engine {
 
     // ================================================================== Server: шкала и команды
     private var serverChannel: Int { Ch.other(pointChannel) }
-    private func channelBalanceGain(_ channel: Int, _ value: Float? = nil) -> Float {
-        let balance = value ?? self.balance
-        return balance <= 0.5 ? (channel == Ch.L ? 1 : balance * 2)
-            : (channel == Ch.R ? 1 : (1 - balance) * 2)
-    }
-    private var serverGain: Float { master * (serverChannel == Ch.L ? volL : volR) * channelBalanceGain(serverChannel) }
+    private var serverGain: Float { AudioGain.taper(master) * AudioGain.fromDb(levelTrimServerDb) * BalanceLaw.gain(channel: serverChannel, balance: balance) }
+    private var pointGain: Float { AudioGain.taper(master) * AudioGain.fromDb(levelTrimPointDb) * BalanceLaw.gain(channel: pointChannel, balance: balance) }
 
     private func rebuildPlayState() {
         playBox.value = ServerPlayState(timeline: playBox.value.timeline, source: source, channel: serverChannel, gain: serverGain)
@@ -935,6 +983,9 @@ final class Engine {
          "title": source.title, "artist": source.artist, "mode": mode.rawValue,
          "queueIndex": queueIndex, "queueCount": queue.count, "trackId": queue.indices.contains(queueIndex) ? queue[queueIndex].id : "",
          "volL": Double(volL), "volR": Double(volR), "master": Double(master), "balance": Double(balance),
+         "pointGain": Double(pointGain), "gainLaw": 2, "levelTrimServerDb": Double(levelTrimServerDb), "levelTrimPointDb": Double(levelTrimPointDb),
+         "delayCalib": ["state": delayCalib.state, "atMs": delayCalib.atMs, "spreadMs": delayCalib.spreadMs],
+         "levelCalib": ["state": levelCalib.state, "atMs": levelCalib.atMs, "db": levelCalib.db],
          "pointCh": Ch.name(pointChannel), "trimMs": Double(trimNs) / 1e6, "serverName": myName]
     }
 
@@ -984,7 +1035,9 @@ final class Engine {
         let trim = J.d(o, "trimMs")
         let decodingProgress = (o["decodeProgress"] as? NSNumber)?.doubleValue
         if role == .point {
-            paramsBox.value = PointParams(gain: m * (pCh == Ch.L ? vL : vR) * channelBalanceGain(pCh, b), trimNs: Int64(trim * 1e6), totalFrames: dur)
+            let gain = o["pointGain"] == nil ? m * (pCh == Ch.L ? vL : vR) * LegacyBalanceLaw.gain(channel: pCh, balance: b)
+                : min(1, max(0, Float(J.d(o, "pointGain"))))
+            paramsBox.value = PointParams(gain: gain, trimNs: Int64(trim * 1e6), totalFrames: dur)
         }
         ui { s in
             s.playing = playing; s.durationMs = dur * 1000 / Int64(SF.sampleRate)
@@ -993,6 +1046,14 @@ final class Engine {
             s.title = J.s(o, "title"); s.artist = J.s(o, "artist"); s.mode = SourceMode(rawValue: J.s(o, "mode")) ?? .music
             s.queueIndex = Int(J.i64(o, "queueIndex", -1))
             s.volL = vL; s.volR = vR; s.master = m; s.balance = b; s.pointChannel = pCh; s.trimMs = trim
+            s.levelTrimServerDb = Float(J.d(o, "levelTrimServerDb")); s.levelTrimPointDb = Float(J.d(o, "levelTrimPointDb"))
+            if let c = o["delayCalib"] as? [String: Any] {
+                s.delayCalib = DelayCalib(state: J.s(c, "state", "none"), atMs: J.i64(c, "atMs"), spreadMs: J.d(c, "spreadMs"))
+            }
+            if let c = o["levelCalib"] as? [String: Any] {
+                s.levelCalib = LevelCalib(state: J.s(c, "state", "none"), atMs: J.i64(c, "atMs"), db: J.d(c, "db"))
+            }
+            s.gainLaw = Int(J.i64(o, "gainLaw", 1))
         }
     }
 
@@ -1014,11 +1075,18 @@ final class Engine {
         case "select": selectQueueTrack(id: J.s(o, "id"))
         case "vol":
             let v = Float(min(1, max(0, J.d(o, "v", 1))))
-            switch J.s(o, "ch") { case "L": volL = v; case "R": volR = v; default: master = v }
-            rebuildPlayState(); saveServerParams(); publishState()
+            switch J.s(o, "ch") {
+            case "L", "R":
+                if J.s(o, "ch") == "L" { volL = v } else { volR = v }
+                let oldS = serverChannel == Ch.L ? volL : volR, oldP = pointChannel == Ch.L ? volL : volR
+                let migrated = AudioGain.migrateChannelGains(serverGain: oldS, pointGain: oldP)
+                levelTrimServerDb = migrated.0; levelTrimPointDb = migrated.1
+            default: master = J.i64(o, "law", 1) >= 2 ? v : AudioGain.migrateMaster(v)
+            }
+            rebuildPlayState(); if J.b(o, "finished", true) { saveServerParams() }; publishState()
         case "balance":
             balance = Float(min(1, max(0, J.d(o, "v", 0.5))))
-            rebuildPlayState(); saveServerParams(); publishState()
+            rebuildPlayState(); if J.b(o, "finished", true) { saveServerParams() }; publishState()
         case "swap":
             guard !calibRunning else { return }
             pointChannel = Ch.other(pointChannel); saveServerParams()

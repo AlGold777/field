@@ -114,10 +114,10 @@ class GainRamp {
     private var current = 1f
     fun apply(out: FloatArray, n: Int, target: Float) {
         if (n <= 0) return
-        val step = (target - current) / n
+        val k = (1.0 - kotlin.math.exp(-1.0 / (0.015 * SF.SAMPLE_RATE))).toFloat()
         var g = current
-        for (i in 0 until n) { g += step; out[i] *= g }
-        current = target
+        for (i in 0 until n) { g += (target - g) * k; out[i] *= g }
+        current = g
     }
 }
 

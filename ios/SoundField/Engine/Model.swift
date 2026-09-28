@@ -23,13 +23,66 @@ struct PairRecord: Codable, Equatable {
     var trimMs: Double = 0
     var volL: Double = 1
     var volR: Double = 1
-    var master: Double = 0.8
+    var master: Double = 0.96
     var balance: Double? = nil
+    var levelTrimServerDb: Double = 0
+    var levelTrimPointDb: Double = 0
+    var volTaper: Int = 2
+    var levelTrimVersion: Int = 1
+    var delayCalib = DelayCalib()
+    var levelCalib = LevelCalib()
     /// Последний известный адрес второго телефона и порт его TCP-сервера — быстрый путь без Bonjour.
     /// Optional: старые сохранённые пары без этих полей продолжают читаться.
     var lastHost: String? = nil
     var lastPort: Int? = nil
     var role: Role { Role(rawValue: myRole) ?? .point }
+
+    init(key: String, peerId: String, peerName: String, peerPlatform: String, myRole: String,
+         pointCh: String = "R", trimMs: Double = 0, volL: Double = 1, volR: Double = 1,
+         master: Double = 0.96, balance: Double? = nil, levelTrimServerDb: Double = 0,
+         levelTrimPointDb: Double = 0, volTaper: Int = 2, levelTrimVersion: Int = 1,
+         delayCalib: DelayCalib = DelayCalib(), levelCalib: LevelCalib = LevelCalib(),
+         lastHost: String? = nil, lastPort: Int? = nil) {
+        self.key = key; self.peerId = peerId; self.peerName = peerName; self.peerPlatform = peerPlatform
+        self.myRole = myRole; self.pointCh = pointCh; self.trimMs = trimMs; self.volL = volL; self.volR = volR
+        self.master = master; self.balance = balance; self.levelTrimServerDb = levelTrimServerDb
+        self.levelTrimPointDb = levelTrimPointDb; self.volTaper = volTaper; self.levelTrimVersion = levelTrimVersion
+        self.delayCalib = delayCalib; self.levelCalib = levelCalib; self.lastHost = lastHost; self.lastPort = lastPort
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case key, peerId, peerName, peerPlatform, myRole, pointCh, trimMs, volL, volR, master, balance
+        case lastHost, lastPort, levelTrimServerDb, levelTrimPointDb, volTaper, levelTrimVersion, delayCalib, levelCalib
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        key = try c.decode(String.self, forKey: .key); peerId = try c.decode(String.self, forKey: .peerId)
+        peerName = try c.decode(String.self, forKey: .peerName); peerPlatform = try c.decodeIfPresent(String.self, forKey: .peerPlatform) ?? "ios"
+        myRole = try c.decode(String.self, forKey: .myRole); pointCh = try c.decodeIfPresent(String.self, forKey: .pointCh) ?? "R"
+        trimMs = try c.decodeIfPresent(Double.self, forKey: .trimMs) ?? 0
+        volL = try c.decodeIfPresent(Double.self, forKey: .volL) ?? 1; volR = try c.decodeIfPresent(Double.self, forKey: .volR) ?? 1
+        master = try c.decodeIfPresent(Double.self, forKey: .master) ?? 0.8; balance = try c.decodeIfPresent(Double.self, forKey: .balance)
+        lastHost = try c.decodeIfPresent(String.self, forKey: .lastHost); lastPort = try c.decodeIfPresent(Int.self, forKey: .lastPort)
+        levelTrimServerDb = try c.decodeIfPresent(Double.self, forKey: .levelTrimServerDb) ?? 0
+        levelTrimPointDb = try c.decodeIfPresent(Double.self, forKey: .levelTrimPointDb) ?? 0
+        volTaper = try c.decodeIfPresent(Int.self, forKey: .volTaper) ?? 0
+        levelTrimVersion = try c.decodeIfPresent(Int.self, forKey: .levelTrimVersion) ?? 0
+        delayCalib = try c.decodeIfPresent(DelayCalib.self, forKey: .delayCalib) ?? DelayCalib()
+        levelCalib = try c.decodeIfPresent(LevelCalib.self, forKey: .levelCalib) ?? LevelCalib()
+    }
+}
+
+struct DelayCalib: Codable, Equatable {
+    var state = "none"
+    var atMs: Int64 = 0
+    var spreadMs = 0.0
+}
+
+struct LevelCalib: Codable, Equatable {
+    var state = "none"
+    var atMs: Int64 = 0
+    var db = 0.0
 }
 
 struct Diag: Equatable {
@@ -104,8 +157,13 @@ struct UiState: Equatable {
     var mode: SourceMode = .music
     var volL: Float = 1
     var volR: Float = 1
-    var master: Float = 0.8
+    var master: Float = 0.96
     var balance: Float = 0.5
+    var levelTrimServerDb: Float = 0
+    var levelTrimPointDb: Float = 0
+    var delayCalib = DelayCalib()
+    var levelCalib = LevelCalib()
+    var gainLaw = 2
     var pointChannel = Ch.R
     var trimMs = 0.0
     var calib = CalibUi()

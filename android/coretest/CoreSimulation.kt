@@ -78,7 +78,7 @@ fun testEndToEnd(lossPct: Double, jitterMs: Double, spikePct: Double, limitP95: 
     val cs = ClockSync()
     val rx = PointReceiver(cs)
     val params = PointParams(1f, 0, src.totalFrames)
-    val renderer = PointRenderer(rx, cs) { params }
+    val renderer = PointRenderer(rx, cs, TcpAudioBuffer(), { "udp" }) { params }
 
     data class InFlight(val deliverAt: Long, val bytes: ByteArray)
     val toPoint = ArrayList<InFlight>(); val toServer = ArrayList<InFlight>()
@@ -216,6 +216,34 @@ fun testCorrectorFrames() {
     check("slews toward ideal", abs(c.syncErrorMs) < 0.5, "err=%.3f".format(c.syncErrorMs))
 }
 
+fun testAudioGainLaws() {
+    println("[AudioGain]")
+    val centerL = BalanceLaw.gain(Ch.L, 0.5f); val centerR = BalanceLaw.gain(Ch.R, 0.5f)
+    check("balance center is unity", centerL == 1f && centerR == 1f, "$centerL/$centerR")
+    check("balance never boosts", (0..100).all { i ->
+        val b = i / 100f; BalanceLaw.gain(Ch.L, b) <= 1f && BalanceLaw.gain(Ch.R, b) <= 1f
+    })
+    fun db(g: Float) = 20 * log10(g.toDouble())
+    val cases = listOf(0.05f to -0.9, 0.10f to -1.8, 0.25f to -5.0, 0.50f to -12.0, 0.75f to -24.1)
+    cases.forEach { (p, expected) ->
+        val b = (1 + p) / 2
+        check("balance attenuation p=$p", abs(db(BalanceLaw.gain(Ch.L, b)) - expected) < 0.12,
+            "${db(BalanceLaw.gain(Ch.L, b))} dB")
+    }
+    check("balance end mutes opposite channel", BalanceLaw.gain(Ch.L, 1f) == 0f && BalanceLaw.gain(Ch.R, 0f) == 0f)
+    check("taper endpoints", AudioGain.taper(1f) == 1f && AudioGain.taper(0f) == 0f)
+    check("taper midpoint is -25 dB", abs(db(AudioGain.taper(0.5f)) + 25) < 0.01)
+    check("old master 0.8 migrates without level jump", abs(AudioGain.migrateMaster(0.8f) - 0.9612f) < 0.001)
+    val trims = AudioGain.migrateChannelGains(0.5f, 1f)
+    check("legacy channel migration normalizes quiet phone", abs(trims.first + 6.0206f) < 0.001f && trims.second == 0f, "$trims")
+
+    val smoother = GainRamp()
+    val a = FloatArray(48) { 1f }; smoother.apply(a, a.size, 0f)
+    val b = FloatArray(48) { 1f }; smoother.apply(b, b.size, 0f)
+    check("gain smoothing has no sample discontinuity", abs(a.last() - b.first()) < 0.003f)
+    check("gain smoothing continues toward silence", b.last() < a.last())
+}
+
 fun testWavAndSources() {
     println("[WAV/Sources]")
     val f = File("../../tools/test_track.wav")
@@ -272,6 +300,7 @@ fun testSegmentedPcmSource() {
 fun main() {
     testWire()
     testCorrectorFrames()
+    testAudioGainLaws()
     testClockSync()
     testWavAndSources()
     testSegmentedPcmSource()

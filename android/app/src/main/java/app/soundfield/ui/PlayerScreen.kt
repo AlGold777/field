@@ -174,13 +174,15 @@ fun PlayerScreen(ui: UiState, engine: Engine, openCalibration: () -> Unit, openD
             var r by remember(ui.volR) { mutableFloatStateOf(ui.volR) }
             var balance by remember(ui.balance) { mutableFloatStateOf(ui.balance) }
             SliderRow("Громкость", "${(m * 100).roundToInt()}%", m, SFColors.Master,
-                onChange = { m = it; engine.setVolume("M", it) })
+                onChange = { m = it; engine.setVolume("M", it, finished = false) },
+                onDone = { engine.setVolume("M", m, finished = true) })
             Text("Баланс между телефонами", color = SFColors.TextDim, fontSize = 14.sp)
             Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                 Text("L", color = SFColors.LeftText, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
                 Slider(
                     value = balance,
-                    onValueChange = { balance = it; engine.setBalance(it) },
+                    onValueChange = { balance = it; engine.setBalance(it, finished = false) },
+                    onValueChangeFinished = { engine.setBalance(balance, finished = true) },
                     colors = SliderDefaults.colors(thumbColor = SFColors.Accent1, activeTrackColor = SFColors.Accent1,
                         inactiveTrackColor = Color(0x1AFFFFFF)),
                     modifier = Modifier.weight(1f).padding(horizontal = 8.dp),
