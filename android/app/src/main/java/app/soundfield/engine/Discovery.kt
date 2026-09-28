@@ -20,6 +20,7 @@ class Discovery(
     private val myId: String,
     private val onPeers: (List<Peer>) -> Unit,
     private val onResolved: (Peer) -> Unit = {},
+    private val onLost: (String) -> Unit = {},
 ) {
     private val telemetry = Telemetry.get(ctx)
     private val nsd = ctx.getSystemService(Context.NSD_SERVICE) as NsdManager
@@ -124,10 +125,12 @@ class Discovery(
             }
             override fun onServiceLost(info: NsdServiceInfo) {
                 telemetry.event("NSD_LOST", info.serviceName)
-                synchronized(lock) {
-                    peers.remove(info.serviceName)
+                val lostPeerId = synchronized(lock) {
+                    val removed = peers.remove(info.serviceName)
                     resolvedAt.remove(info.serviceName)
+                    removed?.id ?: info.serviceName.removePrefix(SF.SERVICE_PREFIX)
                 }
+                onLost(lostPeerId)
                 publish()
             }
         }
@@ -150,11 +153,14 @@ class Discovery(
 
     /** Инвалидация устаревшего пира (например, при ошибке TCP-подключения к старому IP/порту). */
     fun invalidatePeer(id: String) {
-        synchronized(lock) {
-            val key = peers.entries.firstOrNull { it.value.id == id }?.key ?: return
+        val removed = synchronized(lock) {
+            val entry = peers.entries.firstOrNull { it.value.id == id } ?: return
+            val key = entry.key
             peers.remove(key)
             resolvedAt.remove(key)
+            true
         }
+        if (removed) onLost(id)
         publish()
     }
 

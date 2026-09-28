@@ -290,6 +290,8 @@ class Engine private constructor(private val app: Context) {
     /** Идёт восстановление сохранённой пары с экрана «Знакомая пара» (вручную или автоматически). */
     private var manualResumeActive = false
     private var manualResumeAuto = false
+    /** Manual action that started while this peer already had the sticky LAN isolation verdict. */
+    private var manualLanBlockedPeerId: String? = null
     private var resumeAttempt = 0
     /** Порт TCP-сервера второго телефона, полученный в invite/resume/accept, — для быстрого переподключения. */
     private var peerTcpPortHint = 0
@@ -431,6 +433,12 @@ class Engine private constructor(private val app: Context) {
         }, onResolved = { peer -> post {
             peerPathDiagnoses.getOrPut(peer.id) { PeerPathDiagnosis() }
                 .onResolved(peer.host?.hostAddress.orEmpty(), peer.port, SystemClock.elapsedRealtime())
+        } }, onLost = { peerId -> post {
+            val diagnosis = peerPathDiagnoses[peerId]
+            val wasLanBlocked = diagnosis?.currentVerdict() == PeerPathDiagnosis.Verdict.LAN_PEER_BLOCKED
+            diagnosis?.onLost()
+            if (manualLanBlockedPeerId == peerId) manualLanBlockedPeerId = null
+            if (wasLanBlocked) ui { copy(showLanBlocked = false) }
         } })
         Thread({ acceptLoop() }, "sf-accept").apply { isDaemon = true; start() }
         Thread({ tcpAudioAcceptLoop() }, "sf-tcp-audio-accept").apply { isDaemon = true; start() }
@@ -655,6 +663,7 @@ class Engine private constructor(private val app: Context) {
 
     private fun onNetworkChanged() {
         peerPathDiagnoses.values.forEach { it.onNetworkChanged() }
+        manualLanBlockedPeerId = null
         gatewayProbeAt.clear(); gatewayProbeState.clear()
         ui { copy(showLanBlocked = false) }
         log("Сеть изменилась")
@@ -2100,6 +2109,9 @@ class Engine private constructor(private val app: Context) {
 
     private fun doInvite(p: Peer) {
         if (phase != Phase.IDLE) return
+        manualLanBlockedPeerId = p.id.takeIf {
+            peerPathDiagnoses[it]?.currentVerdict() == PeerPathDiagnosis.Verdict.LAN_PEER_BLOCKED
+        }
         stopAutoResume()
         pendingKey = hex(16)
         phase = Phase.INVITING
@@ -2112,6 +2124,9 @@ class Engine private constructor(private val app: Context) {
 
     private fun doManualResume(auto: Boolean = false) {
         val rec = record ?: return
+        manualLanBlockedPeerId = rec.peerId.takeIf { !auto &&
+            peerPathDiagnoses[it]?.currentVerdict() == PeerPathDiagnosis.Verdict.LAN_PEER_BLOCKED
+        }
         if (phase == Phase.IDLE) stopAutoResume()
         // Ручное действие пользователя перебивает фоновый auto-resume, даже если pending уже есть
         if (!auto) dropAutoPending()
@@ -2268,6 +2283,22 @@ class Engine private constructor(private val app: Context) {
                         "remotePort" to it.remotePort, "reason" to it.reason.name) }), error = e)
                 post {
                     failure?.let { recordPeerPathRound(p, tag, it.candidates, routes) }
+                    val failedAllByTimeout = failure?.candidates?.let {
+                        PeerPathDiagnosis.classifyRound(it.map(PeerPathDiagnosis.Candidate::reason)) ==
+                            PeerPathDiagnosis.RoundVerdict.ALL_TIMEOUT
+                    } == true
+                    val manualLanRetry = manualLanBlockedPeerId == p.id && failedAllByTimeout && phase == Phase.INVITING &&
+                        (tag == "invite-out" || tag == "resume-out" && manualResumeActive && !manualResumeAuto)
+                    if (manualLanRetry) {
+                        manualLanBlockedPeerId = null
+                        manualResumeActive = false
+                        phase = Phase.IDLE
+                        ui { copy(phase = Phase.IDLE) }
+                        log("«${p.name}» не ответил")
+                        showLanBlockedHint(p, routes, if (tag == "invite-out") "invite-out" else "resume-out", manual = true)
+                        toast(peerVerdictMessage(p.name, peerPathDiagnoses[p.id]?.currentVerdict()))
+                        return@post
+                    }
                     if (peerPathDiagnoses[p.id]?.currentVerdict() == PeerPathDiagnosis.Verdict.LAN_PEER_BLOCKED) {
                         val count = (lanBlockedLogCount[p.id] ?: 0) + 1
                         lanBlockedLogCount[p.id] = count
@@ -2358,7 +2389,9 @@ class Engine private constructor(private val app: Context) {
         val gateways = probeGateways(routes, now)
         val round = PeerPathDiagnosis.Round(candidates.firstOrNull()?.remoteHost.orEmpty(), peer.port, now, candidates)
         val diagnosis = peerPathDiagnoses.getOrPut(peer.id) { PeerPathDiagnosis() }
-        val result = diagnosis.onRound(round, routes.map { it.networkId }.toSet(), gateways)
+        val discoveredPeer = discovery.peer(peer.id)
+        val result = diagnosis.onRound(round, routes.map { it.networkId }.toSet(), gateways,
+            peerPresent = discoveredPeer != null, presentPort = discoveredPeer?.port)
         if (!result.changed || result.verdict == PeerPathDiagnosis.Verdict.NONE) return
         val trigger = when {
             tag == "invite-out" -> "invite-out"
@@ -2373,7 +2406,8 @@ class Engine private constructor(private val app: Context) {
                 log("Сеть блокирует соединение с «${peer.name}»: найден через mDNS (${round.host}:${peer.port}), TCP не проходит (${result.rounds} попыток)")
                 lanBlockedLogAt[peer.id] = now
                 lanBlockedLogCount[peer.id] = 0
-                trigger != "resume-auto" && showLanBlockedHint(peer, routes, trigger)
+                trigger != "resume-auto" && showLanBlockedHint(peer, routes, trigger,
+                    manual = phase == Phase.INVITING && (tag == "invite-out" || manualResumeActive && !manualResumeAuto))
             }
             PeerPathDiagnosis.Verdict.NO_ROUTE -> { log("Нет маршрута до «${peer.name}». Проверьте, что оба телефона в одной сети Wi‑Fi"); false }
             else -> false
@@ -2412,12 +2446,12 @@ class Engine private constructor(private val app: Context) {
         id to state
     }
 
-    private fun showLanBlockedHint(peer: Peer, routes: List<NetworkRoute>, trigger: String): Boolean {
+    private fun showLanBlockedHint(peer: Peer, routes: List<NetworkRoute>, trigger: String, manual: Boolean = false): Boolean {
         val signature = routes.map { it.networkId }.sorted().joinToString(",")
         val key = "lanHint:${peer.id}:$signature"
         val lastShown = prefs.getLong(key, 0L)
         val wallNow = System.currentTimeMillis()
-        if (wallNow - lastShown in 0 until 30 * 60_000L) return false
+        if (!manual && wallNow - lastShown in 0 until 30 * 60_000L) return false
         prefs.edit().putLong(key, wallNow).apply()
         if (phase == Phase.INVITING && trigger != "resume-auto") {
             manualResumeActive = false
@@ -2677,6 +2711,7 @@ class Engine private constructor(private val app: Context) {
     // ================================================================== пара
     private fun becomePaired(l: ControlLink, r: Role, pid: String, pname: String, pplat: String, key: String, resumed: Boolean) {
         peerPathDiagnoses.getOrPut(pid) { PeerPathDiagnosis() }.onConnected()
+        if (manualLanBlockedPeerId == pid) manualLanBlockedPeerId = null
         pendingTimeout?.cancel(false)
         reconnectTask?.cancel(false)
         if (pending === l) pending = null
