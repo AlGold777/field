@@ -44,11 +44,13 @@ data class PairRecord(
     val lastPort: Int = 0,
     val peerAddresses: List<PeerAddress> = emptyList(),
     val lastSuccessfulHost: String? = lastHost,
+    val balance: Float = 0.5f,
 ) {
     fun toJson(): String = JSONObject().apply {
         put("key", key); put("peerId", peerId); put("peerName", peerName); put("peerPlatform", peerPlatform)
         put("myRole", myRole.wire); put("pointCh", Ch.name(pointChannel)); put("trimMs", trimMs)
         put("volL", volL.toDouble()); put("volR", volR.toDouble()); put("master", master.toDouble())
+        put("balance", balance.toDouble())
         lastHost?.let { put("lastHost", it) }; put("lastPort", lastPort)
         lastSuccessfulHost?.let { put("lastSuccessfulHost", it) }
         put("peerAddresses", org.json.JSONArray().also { array -> peerAddresses.forEach { array.put(it.toJson()) } })
@@ -71,6 +73,7 @@ data class PairRecord(
                                 ?.takeIf { address -> address.ip.isNotBlank() }
                         }
                     }.orEmpty(), it.optString("lastSuccessfulHost", "").ifEmpty { null },
+                    it.optDouble("balance", 0.5).toFloat(),
                 )
             }
         } catch (e: Exception) { null }
@@ -258,6 +261,7 @@ data class UiState(
     val volL: Float = 1f,
     val volR: Float = 1f,
     val master: Float = 0.8f,
+    val balance: Float = 0.5f,
     val pointChannel: Int = Ch.R,
     val trimMs: Double = 0.0,
     // калибровка и диагностика

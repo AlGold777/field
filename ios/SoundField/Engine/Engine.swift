@@ -100,6 +100,7 @@ final class Engine {
     private var savedFrame: Int64 = 0
     private var savedPlaying = false
     private var volL: Float = 1, volR: Float = 1, master: Float = 0.8
+    private var balance: Float = 0.5
     private let pointChBox = Locked<Int>(Ch.R)
     private var pointChannel: Int { get { pointChBox.value } set { pointChBox.value = newValue } }
     private var trimNs: Int64 = 0
@@ -446,6 +447,11 @@ final class Engine {
         q.async { self.ui { s in switch ch { case "L": s.volL = v; case "R": s.volR = v; default: s.master = v } } }
         cmd("vol", ["ch": ch, "v": Double(v)])
     }
+    func setBalance(_ value: Float) {
+        let value = min(1, max(0, value))
+        q.async { self.ui { $0.balance = value } }
+        cmd("balance", ["v": Double(value)])
+    }
     func micPermissionGranted() { q.async { self.ui { $0.calib.needsMicPermission = false; $0.calib.resultText = "" } } }
 
     private func cmd(_ a: String, _ extra: [String: Any] = [:]) {
@@ -762,7 +768,7 @@ final class Engine {
         if r == .server {
             if let rec = record, !continuing {
                 pointChannel = Ch.parse(rec.pointCh); trimNs = Int64(rec.trimMs * 1e6)
-                volL = Float(rec.volL); volR = Float(rec.volR); master = Float(rec.master)
+                volL = Float(rec.volL); volR = Float(rec.volR); master = Float(rec.master); balance = Float(rec.balance ?? 0.5)
             }
             sessionId = Int32.random(in: 1...Int32.max)
             pointUdpBox.value = nil; pointClockReady = false
@@ -854,7 +860,7 @@ final class Engine {
     private func saveServerParams() {
         guard var r = record else { return }
         r.pointCh = Ch.name(pointChannel); r.trimMs = Double(trimNs) / 1e6
-        r.volL = Double(volL); r.volR = Double(volR); r.master = Double(master)
+        r.volL = Double(volL); r.volR = Double(volR); r.master = Double(master); r.balance = Double(balance)
         record = r; persistRecord()
     }
 
@@ -899,7 +905,12 @@ final class Engine {
 
     // ================================================================== Server: шкала и команды
     private var serverChannel: Int { Ch.other(pointChannel) }
-    private var serverGain: Float { master * (serverChannel == Ch.L ? volL : volR) }
+    private func channelBalanceGain(_ channel: Int, _ value: Float? = nil) -> Float {
+        let balance = value ?? self.balance
+        return balance <= 0.5 ? (channel == Ch.L ? 1 : balance * 2)
+            : (channel == Ch.R ? 1 : (1 - balance) * 2)
+    }
+    private var serverGain: Float { master * (serverChannel == Ch.L ? volL : volR) * channelBalanceGain(serverChannel) }
 
     private func rebuildPlayState() {
         playBox.value = ServerPlayState(timeline: playBox.value.timeline, source: source, channel: serverChannel, gain: serverGain)
@@ -923,7 +934,7 @@ final class Engine {
         ["t": "state", "playing": playBox.value.timeline.playing, "durFrames": source.totalFrames,
          "title": source.title, "artist": source.artist, "mode": mode.rawValue,
          "queueIndex": queueIndex, "queueCount": queue.count, "trackId": queue.indices.contains(queueIndex) ? queue[queueIndex].id : "",
-         "volL": Double(volL), "volR": Double(volR), "master": Double(master),
+         "volL": Double(volL), "volR": Double(volR), "master": Double(master), "balance": Double(balance),
          "pointCh": Ch.name(pointChannel), "trimMs": Double(trimNs) / 1e6, "serverName": myName]
     }
 
@@ -968,11 +979,12 @@ final class Engine {
         let playing = J.b(o, "playing")
         let dur = J.i64(o, "durFrames")
         let vL = Float(J.d(o, "volL", 1)), vR = Float(J.d(o, "volR", 1)), m = Float(J.d(o, "master", 0.8))
+        let b = Float(min(1, max(0, J.d(o, "balance", 0.5))))
         let pCh = Ch.parse(J.s(o, "pointCh", "R"))
         let trim = J.d(o, "trimMs")
         let decodingProgress = (o["decodeProgress"] as? NSNumber)?.doubleValue
         if role == .point {
-            paramsBox.value = PointParams(gain: m * (pCh == Ch.L ? vL : vR), trimNs: Int64(trim * 1e6), totalFrames: dur)
+            paramsBox.value = PointParams(gain: m * (pCh == Ch.L ? vL : vR) * channelBalanceGain(pCh, b), trimNs: Int64(trim * 1e6), totalFrames: dur)
         }
         ui { s in
             s.playing = playing; s.durationMs = dur * 1000 / Int64(SF.sampleRate)
@@ -980,7 +992,7 @@ final class Engine {
             s.decodingProgress = decodingProgress
             s.title = J.s(o, "title"); s.artist = J.s(o, "artist"); s.mode = SourceMode(rawValue: J.s(o, "mode")) ?? .music
             s.queueIndex = Int(J.i64(o, "queueIndex", -1))
-            s.volL = vL; s.volR = vR; s.master = m; s.pointChannel = pCh; s.trimMs = trim
+            s.volL = vL; s.volR = vR; s.master = m; s.balance = b; s.pointChannel = pCh; s.trimMs = trim
         }
     }
 
@@ -1003,6 +1015,9 @@ final class Engine {
         case "vol":
             let v = Float(min(1, max(0, J.d(o, "v", 1))))
             switch J.s(o, "ch") { case "L": volL = v; case "R": volR = v; default: master = v }
+            rebuildPlayState(); saveServerParams(); publishState()
+        case "balance":
+            balance = Float(min(1, max(0, J.d(o, "v", 0.5))))
             rebuildPlayState(); saveServerParams(); publishState()
         case "swap":
             guard !calibRunning else { return }

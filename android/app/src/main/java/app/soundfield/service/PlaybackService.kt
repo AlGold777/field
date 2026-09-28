@@ -24,7 +24,7 @@ import app.soundfield.diagnostics.Telemetry
 /**
  * Foreground-сервис типа mediaPlayback: держит процесс, Wi‑Fi (low latency) и CPU, пока телефон в паре —
  * воспроизведение и синхронизация продолжаются при выключенном экране и в фоне.
- * В уведомлении — «Пауза/Играть» и «Разорвать пару».
+ * В уведомлении — управление воспроизведением.
  */
 class PlaybackService : Service() {
 
@@ -68,7 +68,6 @@ class PlaybackService : Service() {
         val engine = Engine.get(this)
         when (intent?.action) {
             ACTION_TOGGLE -> engine.togglePlay()
-            ACTION_DISCONNECT -> engine.disconnect()
         }
         val n = build(this)
         try {
@@ -95,7 +94,6 @@ class PlaybackService : Service() {
         private const val CHANNEL = "soundfield_pair"
         private const val ID = 42
         const val ACTION_TOGGLE = "app.soundfield.TOGGLE"
-        const val ACTION_DISCONNECT = "app.soundfield.DISCONNECT"
         @Volatile private var running = false
 
         fun start(ctx: Context) {
@@ -132,7 +130,6 @@ class PlaybackService : Service() {
             val open = PendingIntent.getActivity(ctx, 0, Intent(ctx, MainActivity::class.java)
                 .addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP), flags)
             val toggle = PendingIntent.getService(ctx, 1, Intent(ctx, PlaybackService::class.java).setAction(ACTION_TOGGLE), flags)
-            val disc = PendingIntent.getService(ctx, 2, Intent(ctx, PlaybackService::class.java).setAction(ACTION_DISCONNECT), flags)
             val roleText = if (s.role == Role.SERVER) "Server" else "Point"
             val ch = if (s.myChannel == 0) "левый" else "правый"
             val title = when (s.phase) {
@@ -149,7 +146,6 @@ class PlaybackService : Service() {
                 .setCategory(NotificationCompat.CATEGORY_TRANSPORT)
                 .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
                 .addAction(0, if (s.playing) "Пауза" else "Играть", toggle)
-                .addAction(0, "Разорвать пару", disc)
                 .build()
         }
     }

@@ -18,14 +18,23 @@ struct WelcomeView: View {
                 .frame(maxWidth: .infinity).padding(.bottom, 28)
 
                 if let rec = ui.remembered {
-                    H3(text: "Знакомая пара")
-                    DeviceRow(icon: "🔁", name: rec.peerName,
-                              detail: "Этот телефон: \(rec.role.title) · без подтверждения") { engine.resumeRemembered() }
-                    if ui.autoResuming { Subtitle(text: "Ищем «\(rec.peerName)» — пара восстановится автоматически…") }
                     HStack {
-                        GhostButton(title: "Подключить снова") { engine.resumeRemembered() }
-                        GhostButton(title: "Забыть", color: SFColor.dim) { engine.forgetPair() }
+                        Button { engine.resumeRemembered() } label: {
+                            StatusPill(text: ui.phase == .inviting || ui.autoResuming ? "Подключение…" : "Подключить",
+                                       color: ui.phase == .inviting || ui.autoResuming ? SFColor.warn : SFColor.accent1)
+                        }
+                        .buttonStyle(.plain)
+                        Spacer()
+                        Badge(text: rec.role.title.uppercased(), color: SFColor.master)
                     }
+                    .padding(.bottom, 18)
+                    H3(text: "Знакомая пара")
+                    SFCard {
+                        H2(text: rec.peerName)
+                        Subtitle(text: "Этот телефон: \(rec.role.title) · пара сохранена")
+                    }
+                    if ui.autoResuming { Subtitle(text: "Ищем «\(rec.peerName)» — пара восстановится автоматически…") }
+                    GhostButton(title: "Забыть", color: SFColor.dim) { engine.forgetPair() }
                     .padding(.bottom, 12)
                 }
 

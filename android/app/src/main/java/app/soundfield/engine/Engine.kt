@@ -330,6 +330,7 @@ class Engine private constructor(private val app: Context) {
     private var volL = 1f
     private var volR = 1f
     private var master = 0.8f
+    private var balance = 0.5f
     @Volatile private var pointChannel = Ch.R
     private var trimNs = 0L
     @Volatile private var pointUdp: InetSocketAddress? = null
@@ -1711,6 +1712,11 @@ class Engine private constructor(private val app: Context) {
         ui { when (ch) { "L" -> copy(volL = v); "R" -> copy(volR = v); else -> copy(master = v) } } // мгновенный отклик UI
         cmd("vol") { put("ch", ch); put("v", v.toDouble()) }
     }
+    fun setBalance(v: Float) {
+        val value = v.coerceIn(0f, 1f)
+        ui { copy(balance = value) }
+        cmd("balance") { put("v", value.toDouble()) }
+    }
     fun micPermissionGranted() = post { ui { copy(calib = calib.copy(needsMicPermission = false, resultText = "")) } }
 
     private fun cmd(a: String, extra: JSONObject.() -> Unit = {}) {
@@ -2296,7 +2302,7 @@ class Engine private constructor(private val app: Context) {
         if (r == Role.SERVER) {
             record?.let { rec ->
                 if (!continuing) { pointChannel = rec.pointChannel; trimNs = (rec.trimMs * 1e6).toLong()
-                    volL = rec.volL; volR = rec.volR; master = rec.master }
+                    volL = rec.volL; volR = rec.volR; master = rec.master; balance = rec.balance }
             }
             sessionId = rnd.nextInt().let { if (it == 0) 1 else it }
             pointUdp = null; pointClockReady = false
@@ -2427,7 +2433,8 @@ class Engine private constructor(private val app: Context) {
     }
 
     private fun saveServerParams() {
-        record = record?.copy(pointChannel = pointChannel, trimMs = trimNs / 1e6, volL = volL, volR = volR, master = master)
+        record = record?.copy(pointChannel = pointChannel, trimMs = trimNs / 1e6, volL = volL, volR = volR,
+            master = master, balance = balance)
         persistRecord()
     }
 
@@ -2562,7 +2569,11 @@ class Engine private constructor(private val app: Context) {
 
     // ================================================================== Server: шкала и команды
     private fun serverChannel() = Ch.other(pointChannel)
-    private fun serverGain() = master * (if (serverChannel() == Ch.L) volL else volR)
+    private fun channelBalanceGain(channel: Int, value: Float = balance): Float = when {
+        value <= 0.5f -> if (channel == Ch.L) 1f else value * 2f
+        else -> if (channel == Ch.R) 1f else (1f - value) * 2f
+    }
+    private fun serverGain() = master * (if (serverChannel() == Ch.L) volL else volR) * channelBalanceGain(serverChannel())
 
     private fun rebuildPlayState() {
         serverPlay = ServerPlayState(serverPlay.timeline, source, serverChannel(), serverGain())
@@ -2704,6 +2715,7 @@ class Engine private constructor(private val app: Context) {
             .put("title", source.title).put("artist", source.artist).put("mode", mode.wire)
             .put("queueIndex", queueIndex).put("queueCount", queue.size).put("trackId", queue.getOrNull(queueIndex)?.id ?: "")
             .put("volL", volL.toDouble()).put("volR", volR.toDouble()).put("master", master.toDouble())
+            .put("balance", balance.toDouble())
             .put("pointCh", Ch.name(pointChannel)).put("trimMs", trimNs / 1e6).put("serverName", myName)
             .put("undo", undoText).put("decodeProgress", decodeProgress ?: JSONObject.NULL)
             .put("audioBuffering", ui.value.audioBuffering).put("op", activeCommandOp())
@@ -2758,16 +2770,17 @@ class Engine private constructor(private val app: Context) {
         val dur = o.optLong("durFrames")
         val vL = o.optDouble("volL", 1.0).toFloat(); val vR = o.optDouble("volR", 1.0).toFloat()
         val m = o.optDouble("master", 0.8).toFloat()
+        val b = o.optDouble("balance", 0.5).toFloat().coerceIn(0f, 1f)
         val pCh = Ch.parse(o.optString("pointCh", "R"))
         val trim = o.optDouble("trimMs", 0.0)
         if (role == Role.POINT) {
-            pointParams = PointParams(m * (if (pCh == Ch.L) vL else vR), (trim * 1e6).toLong(), dur)
+            pointParams = PointParams(m * (if (pCh == Ch.L) vL else vR) * channelBalanceGain(pCh, b), (trim * 1e6).toLong(), dur)
         }
         val progress = if (o.isNull("decodeProgress")) null else o.optDouble("decodeProgress").toFloat().coerceIn(0f, 1f)
         ui { copy(playing = playing, durationMs = dur * 1000 / SF.SAMPLE_RATE, title = o.optString("title"),
             artist = o.optString("artist"), mode = SourceMode.fromWire(o.optString("mode")), audioBuffering = o.optBoolean("audioBuffering"),
             queueIndex = o.optInt("queueIndex", -1), undoText = o.optString("undo", ""),
-            volL = vL, volR = vR, master = m, pointChannel = pCh, trimMs = trim, decodingProgress = progress) }
+            volL = vL, volR = vR, master = m, balance = b, pointChannel = pCh, trimMs = trim, decodingProgress = progress) }
         if (playing) requestFocus()
         PlaybackService.refresh(app)
     }
@@ -2807,6 +2820,10 @@ class Engine private constructor(private val app: Context) {
             "vol" -> {
                 val v = o.optDouble("v", 1.0).toFloat().coerceIn(0f, 1f)
                 when (o.optString("ch")) { "L" -> volL = v; "R" -> volR = v; else -> master = v }
+                rebuildPlayState(); saveServerParams(); publishState()
+            }
+            "balance" -> {
+                balance = o.optDouble("v", 0.5).toFloat().coerceIn(0f, 1f)
                 rebuildPlayState(); saveServerParams(); publishState()
             }
             "swap" -> {

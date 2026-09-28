@@ -39,14 +39,14 @@ fun PlayerScreen(ui: UiState, engine: Engine, openCalibration: () -> Unit, openD
     var pos by remember { mutableLongStateOf(0L) }
     var dragging by remember { mutableStateOf<Float?>(null) }
     val swipeThreshold = with(LocalDensity.current) { 48.dp.toPx() }
-    LaunchedEffect(Unit) { while (true) { pos = engine.positionMs(); delay(200) } }
+    LaunchedEffect(ui.inPair) { if (ui.inPair) while (true) { pos = engine.positionMs(); delay(200) } }
 
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 20.dp).padding(top = 40.dp, bottom = 24.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             when {
-                ui.phase == Phase.RECONNECTING && ui.role == Role.POINT -> StatusPill("Переподключение…", SFColors.Warn)
-                ui.phase == Phase.RECONNECTING -> StatusPill("Ждём «${ui.peerName}»", SFColors.Warn)
-                else -> StatusPill("Стереопара активна", SFColors.Good)
+                ui.phase == Phase.RECONNECTING && ui.role == Role.POINT -> PairStatusButton("Переподключение…", SFColors.Warn, { confirmDisconnect = true })
+                ui.phase == Phase.RECONNECTING -> PairStatusButton("Ждём «${ui.peerName}»", SFColors.Warn, { confirmDisconnect = true })
+                else -> PairStatusButton("Стереопара активна", SFColors.Good, { confirmDisconnect = true })
             }
             Spacer(Modifier.weight(1f))
             Badge(if (ui.role == Role.SERVER) "SERVER" else "POINT", SFColors.Master)
@@ -167,32 +167,47 @@ fun PlayerScreen(ui: UiState, engine: Engine, openCalibration: () -> Unit, openD
 
         // --- громкость ---
         SFCard {
-            H3("Громкость")
+            Text("Sound", color = SFColors.TextDim, fontSize = 13.sp, letterSpacing = 1.sp,
+                fontWeight = FontWeight.SemiBold, modifier = Modifier.padding(bottom = 10.dp))
             var m by remember(ui.master) { mutableFloatStateOf(ui.master) }
             var l by remember(ui.volL) { mutableFloatStateOf(ui.volL) }
             var r by remember(ui.volR) { mutableFloatStateOf(ui.volR) }
-            SliderRow("Общая (оба канала)", "${(m * 100).roundToInt()}%", m, SFColors.Master,
+            var balance by remember(ui.balance) { mutableFloatStateOf(ui.balance) }
+            SliderRow("Громкость", "${(m * 100).roundToInt()}%", m, SFColors.Master,
                 onChange = { m = it; engine.setVolume("M", it) })
+            Text("Баланс между телефонами", color = SFColors.TextDim, fontSize = 14.sp)
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                Text("L", color = SFColors.LeftText, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                Slider(
+                    value = balance,
+                    onValueChange = { balance = it; engine.setBalance(it) },
+                    colors = SliderDefaults.colors(thumbColor = SFColors.Accent1, activeTrackColor = SFColors.Accent1,
+                        inactiveTrackColor = Color(0x1AFFFFFF)),
+                    modifier = Modifier.weight(1f).padding(horizontal = 8.dp),
+                )
+                Text("R", color = SFColors.RightText, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+            }
             SliderRow("Левый канал · L", "${(l * 100).roundToInt()}%", l, SFColors.Left,
                 onChange = { l = it; engine.setVolume("L", it) })
             SliderRow("Правый канал · R", "${(r * 100).roundToInt()}%", r, SFColors.Right,
                 onChange = { r = it; engine.setVolume("R", it) })
         }
 
-        SecondaryButton("🎯  Калибровка задержки") { openCalibration() }
-        SecondaryButton("📊  Диагностика пары") { openDiagnostics() }
-        ProblemMarkButton(engine)
-        DangerButton("⛓  Разорвать пару") { confirmDisconnect = true }
-        TelemetryButton(ui, engine)
+        Row(Modifier.fillMaxWidth().padding(bottom = 12.dp).height(48.dp), horizontalArrangement = Arrangement.spacedBy(8.dp),
+            verticalAlignment = Alignment.CenterVertically) {
+            PlayerActionButton("Калибровка", Modifier.weight(1f), openCalibration)
+            PlayerActionButton("Диагностика", Modifier.weight(1f), openDiagnostics)
+            TelemetryIconButton(ui, engine)
+        }
+        ui.telemetryFile?.let { Subtitle("Сохранено: $it", modifier = Modifier.padding(bottom = 8.dp)) }
     }
 
     if (confirmDisconnect) {
         AlertDialog(
             onDismissRequest = { confirmDisconnect = false },
-            title = { Text("Разорвать пару?") },
-            text = { Text("Воспроизведение остановится на обоих телефонах. Пара сохранится — её можно быстро подключить снова.") },
-            confirmButton = { TextButton(onClick = { confirmDisconnect = false; engine.disconnect() }) { Text("Разорвать") } },
-            dismissButton = { TextButton(onClick = { confirmDisconnect = false }) { Text("Отмена") } },
+            title = { Text("Вы хотите разорвать пару?") },
+            confirmButton = { TextButton(onClick = { confirmDisconnect = false; engine.disconnect() }) { Text("Да") } },
+            dismissButton = { TextButton(onClick = { confirmDisconnect = false }) { Text("Нет") } },
         )
     }
 }

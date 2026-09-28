@@ -32,18 +32,23 @@ fun WelcomeScreen(ui: UiState, engine: Engine) {
         Spacer(Modifier.height(28.dp))
 
         ui.remembered?.let { rec ->
-            H3("Знакомая пара")
-            DeviceRow(
-                icon = "🔁", name = rec.peerName,
-                detail = "Этот телефон: ${if (rec.myRole == Role.SERVER) "Server" else "Point"} · без подтверждения",
-                trailing = { Text("→", color = SFColors.TextDim) },
-                onClick = { engine.resumeRemembered() },
-            )
-            if (ui.autoResuming) Subtitle("Ищем «${rec.peerName}» — пара восстановится автоматически…")
-            Row {
-                GhostButton("Подключить снова", Modifier.weight(1f)) { engine.resumeRemembered() }
-                GhostButton("Забыть", Modifier.weight(1f), color = SFColors.TextDim) { engine.forgetPair() }
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                PairStatusButton(
+                    if (ui.phase == Phase.INVITING || ui.autoResuming) "Подключение…" else "Подключить",
+                    if (ui.phase == Phase.INVITING || ui.autoResuming) SFColors.Warn else SFColors.Accent1,
+                    onClick = { engine.resumeRemembered() },
+                )
+                Spacer(Modifier.weight(1f))
+                Badge(if (rec.myRole == Role.SERVER) "SERVER" else "POINT", SFColors.Master)
             }
+            Spacer(Modifier.height(18.dp))
+            H3("Знакомая пара")
+            SFCard {
+                H2(rec.peerName)
+                Subtitle("Этот телефон: ${if (rec.myRole == Role.SERVER) "Server" else "Point"} · пара сохранена")
+            }
+            if (ui.autoResuming) Subtitle("Ищем «${rec.peerName}» — пара восстановится автоматически…")
+            GhostButton("Забыть", color = SFColors.TextDim) { engine.forgetPair() }
             Spacer(Modifier.height(12.dp))
         }
 

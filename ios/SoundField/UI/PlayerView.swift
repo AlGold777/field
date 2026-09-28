@@ -13,6 +13,7 @@ struct PlayerView: View {
     @State private var master = 0.8
     @State private var volL = 1.0
     @State private var volR = 1.0
+    @State private var balance = 0.5
     @AppStorage("sf.queueExpanded") private var queueExpanded = false
     @State private var showingAudioSourceDialog = false
     @State private var showingAudioFiles = false
@@ -23,9 +24,12 @@ struct PlayerView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 0) {
                 HStack {
-                    if ui.phase == .reconnecting && ui.role == .point { StatusPill(text: "Переподключение…", color: SFColor.warn) }
-                    else if ui.phase == .reconnecting { StatusPill(text: "Ждём «\(ui.peerName)»", color: SFColor.warn) }
-                    else { StatusPill(text: "Стереопара активна", color: SFColor.good) }
+                    Button { confirmDisconnect = true } label: {
+                        if ui.phase == .reconnecting && ui.role == .point { StatusPill(text: "Переподключение…", color: SFColor.warn) }
+                        else if ui.phase == .reconnecting { StatusPill(text: "Ждём «\(ui.peerName)»", color: SFColor.warn) }
+                        else { StatusPill(text: "Стереопара активна", color: SFColor.good) }
+                    }
+                    .buttonStyle(.plain)
                     Spacer()
                     Badge(text: ui.role == .server ? "SERVER" : "POINT", color: SFColor.master)
                 }
@@ -96,18 +100,37 @@ struct PlayerView: View {
                 queueSection
 
                 SFCard {
-                    H3(text: "Громкость")
-                    SliderRow(label: "Общая (оба канала)", valueText: "\(Int(master * 100))%", value: $master, color: SFColor.master)
+                    Text("Sound").font(.system(size: 13, weight: .semibold)).kerning(1)
+                        .foregroundColor(SFColor.dim).padding(.bottom, 8)
+                    SliderRow(label: "Громкость", valueText: "\(Int(master * 100))%", value: $master, color: SFColor.master)
                         .onChange(of: master) { if abs($0 - Double(ui.master)) > 0.004 { engine.setVolume("M", Float($0)) } }
+                    Text("Баланс между телефонами").font(.system(size: 14)).foregroundColor(SFColor.dim)
+                    HStack(spacing: 8) {
+                        Text("L").font(.system(size: 13, weight: .semibold)).foregroundColor(SFColor.leftText)
+                        Slider(value: $balance, in: 0...1)
+                            .tint(SFColor.accent1)
+                            .onChange(of: balance) { if abs($0 - Double(ui.balance)) > 0.004 { engine.setBalance(Float($0)) } }
+                        Text("R").font(.system(size: 13, weight: .semibold)).foregroundColor(SFColor.rightText)
+                    }
                     SliderRow(label: "Левый канал · L", valueText: "\(Int(volL * 100))%", value: $volL, color: SFColor.left)
                         .onChange(of: volL) { if abs($0 - Double(ui.volL)) > 0.004 { engine.setVolume("L", Float($0)) } }
                     SliderRow(label: "Правый канал · R", valueText: "\(Int(volR * 100))%", value: $volR, color: SFColor.right)
                         .onChange(of: volR) { if abs($0 - Double(ui.volR)) > 0.004 { engine.setVolume("R", Float($0)) } }
                 }
 
-                SecondaryButton(title: "🎯  Калибровка задержки") { openCalibration() }
-                SecondaryButton(title: "📊  Диагностика пары") { openDiagnostics() }
-                DangerButton(title: "⛓  Разорвать пару") { confirmDisconnect = true }
+                HStack(spacing: 8) {
+                    PlayerActionButton(title: "Калибровка", action: openCalibration)
+                    PlayerActionButton(title: "Диагностика", action: openDiagnostics)
+                    ShareLink(item: telemetrySnapshot) {
+                        TelemetryGlyph().frame(width: 23, height: 23)
+                            .frame(width: 48, height: 48)
+                            .background(RoundedRectangle(cornerRadius: 14).fill(SFColor.secondary))
+                            .overlay(RoundedRectangle(cornerRadius: 14).stroke(SFColor.secondaryBorder, lineWidth: 1))
+                    }
+                    .buttonStyle(PressStyle())
+                    .accessibilityLabel("Экспорт телеметрии")
+                }
+                .padding(.bottom, 12)
             }
             .padding(.horizontal, 20).padding(.vertical, 24)
         }
@@ -116,6 +139,7 @@ struct PlayerView: View {
         .onChange(of: ui.master) { _ in syncVolumes() }
         .onChange(of: ui.volL) { _ in syncVolumes() }
         .onChange(of: ui.volR) { _ in syncVolumes() }
+        .onChange(of: ui.balance) { _ in syncVolumes() }
         .onChange(of: ui.filePickerRequest) { request in
             if request > 0 { showingAudioSourceDialog = true }
         }
@@ -133,11 +157,9 @@ struct PlayerView: View {
         .fileImporter(isPresented: $showingAudioFolder, allowedContentTypes: [.folder]) { result in
             if case .success(let url) = result { engine.addAudioFiles([url]) }
         }
-        .alert("Разорвать пару?", isPresented: $confirmDisconnect) {
-            Button("Разорвать", role: .destructive) { engine.disconnect() }
-            Button("Отмена", role: .cancel) {}
-        } message: {
-            Text("Воспроизведение остановится на обоих телефонах. Пара сохранится — её можно быстро подключить снова.")
+        .alert("Вы хотите разорвать пару?", isPresented: $confirmDisconnect) {
+            Button("Да", role: .destructive) { engine.disconnect() }
+            Button("Нет", role: .cancel) {}
         }
     }
 
@@ -145,6 +167,33 @@ struct PlayerView: View {
         if abs(master - Double(ui.master)) > 0.005 { master = Double(ui.master) }
         if abs(volL - Double(ui.volL)) > 0.005 { volL = Double(ui.volL) }
         if abs(volR - Double(ui.volR)) > 0.005 { volR = Double(ui.volR) }
+        if abs(balance - Double(ui.balance)) > 0.005 { balance = Double(ui.balance) }
+    }
+
+    private var telemetrySnapshot: String {
+        let phase: String
+        switch ui.phase {
+        case .idle: phase = "idle"
+        case .inviting: phase = "connecting"
+        case .incoming: phase = "incoming"
+        case .paired: phase = "paired"
+        case .reconnecting: phase = "reconnecting"
+        }
+        func summary(_ label: String, _ diag: Diag) -> String {
+            "\(label): valid=\(diag.valid), RTT=\(String(format: "%.1f", diag.rttMs)) ms, " +
+                "jitter=\(String(format: "%.1f", diag.jitterMs)) ms, loss=\(String(format: "%.2f", diag.lossPct))%, " +
+                "buffer=\(String(format: "%.1f", diag.bufferMs)) ms, clock uncertainty=\(String(format: "%.1f", diag.clockUncMs)) ms, " +
+                "underruns=\(diag.underruns)"
+        }
+        return [
+            "SoundField telemetry snapshot",
+            "Created: \(ISO8601DateFormatter().string(from: Date()))",
+            "Pair state: \(phase)",
+            "Role: \(ui.role.rawValue)",
+            "Balance: \(String(format: "%.2f", balance))",
+            summary("Server", ui.serverDiag),
+            summary("Point", ui.pointDiag),
+        ].joined(separator: "\n")
     }
 
     private var trackStatusText: String {

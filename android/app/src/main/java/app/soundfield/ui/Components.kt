@@ -122,6 +122,36 @@ fun StatusPill(text: String, color: Color) {
 }
 
 @Composable
+fun PairStatusButton(text: String, color: Color, onClick: () -> Unit, enabled: Boolean = true) {
+    val t = rememberInfiniteTransition(label = "pair-status-dot")
+    val alpha by t.animateFloat(0.4f, 1f, infiniteRepeatable(tween(900), RepeatMode.Reverse), label = "pair-status-alpha")
+    Row(
+        Modifier.clip(RoundedCornerShape(20.dp)).background(color.copy(alpha = 0.15f))
+            .border(1.dp, color.copy(alpha = 0.3f), RoundedCornerShape(20.dp))
+            .clickable(enabled = enabled, role = androidx.compose.ui.semantics.Role.Button, onClick = onClick)
+            .padding(horizontal = 14.dp, vertical = 7.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Box(Modifier.size(8.dp).alpha(if (enabled) alpha else 0.6f).clip(CircleShape).background(color))
+        Spacer(Modifier.width(8.dp))
+        Text(text, color = color, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+    }
+}
+
+@Composable
+fun PlayerActionButton(text: String, modifier: Modifier = Modifier, onClick: () -> Unit) {
+    Box(
+        modifier.fillMaxHeight().clip(RoundedCornerShape(14.dp)).background(SFColors.Secondary)
+            .border(1.dp, SFColors.SecondaryBorder, RoundedCornerShape(14.dp))
+            .clickable(onClick = onClick).padding(horizontal = 8.dp, vertical = 12.dp),
+        contentAlignment = Alignment.Center,
+    ) {
+        Text(text, color = SFColors.Text, fontSize = 13.sp, fontWeight = FontWeight.SemiBold,
+            maxLines = 1, textAlign = TextAlign.Center)
+    }
+}
+
+@Composable
 fun Badge(text: String, color: Color) {
     Text(text, color = color, fontSize = 11.sp, fontWeight = FontWeight.SemiBold,
         modifier = Modifier.clip(RoundedCornerShape(20.dp)).background(color.copy(alpha = 0.18f)).padding(horizontal = 10.dp, vertical = 4.dp))

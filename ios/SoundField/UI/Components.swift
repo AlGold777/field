@@ -63,6 +63,39 @@ struct SecondaryButton: View {
     }
 }
 
+struct PlayerActionButton: View {
+    let title: String
+    let action: () -> Void
+    var body: some View {
+        Button(action: action) {
+            Text(title).font(.system(size: 13, weight: .semibold)).foregroundColor(SFColor.text)
+                .lineLimit(1).minimumScaleFactor(0.8)
+                .frame(maxWidth: .infinity).frame(height: 48)
+                .background(RoundedRectangle(cornerRadius: 14).fill(SFColor.secondary))
+                .overlay(RoundedRectangle(cornerRadius: 14).stroke(SFColor.secondaryBorder, lineWidth: 1))
+        }
+        .buttonStyle(PressStyle())
+    }
+}
+
+struct TelemetryGlyph: View {
+    var body: some View {
+        GeometryReader { geometry in
+            let size = geometry.size
+            Path { path in
+                path.move(to: CGPoint(x: size.width * 0.08, y: size.height * 0.62))
+                path.addLine(to: CGPoint(x: size.width * 0.30, y: size.height * 0.62))
+                path.addLine(to: CGPoint(x: size.width * 0.44, y: size.height * 0.22))
+                path.addLine(to: CGPoint(x: size.width * 0.60, y: size.height * 0.78))
+                path.addLine(to: CGPoint(x: size.width * 0.73, y: size.height * 0.45))
+                path.addLine(to: CGPoint(x: size.width * 0.92, y: size.height * 0.45))
+            }
+            .stroke(SFColor.accent1, style: StrokeStyle(lineWidth: 2, lineCap: .round, lineJoin: .round))
+        }
+        .frame(width: 23, height: 23)
+    }
+}
+
 struct GhostButton: View {
     let title: String
     var color: Color = SFColor.accent1

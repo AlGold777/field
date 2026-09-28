@@ -24,6 +24,7 @@ struct PairRecord: Codable, Equatable {
     var volL: Double = 1
     var volR: Double = 1
     var master: Double = 0.8
+    var balance: Double? = nil
     /// Последний известный адрес второго телефона и порт его TCP-сервера — быстрый путь без Bonjour.
     /// Optional: старые сохранённые пары без этих полей продолжают читаться.
     var lastHost: String? = nil
@@ -104,6 +105,7 @@ struct UiState: Equatable {
     var volL: Float = 1
     var volR: Float = 1
     var master: Float = 0.8
+    var balance: Float = 0.5
     var pointChannel = Ch.R
     var trimMs = 0.0
     var calib = CalibUi()
