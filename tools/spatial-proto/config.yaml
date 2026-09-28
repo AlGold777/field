@@ -15,6 +15,8 @@ stft:
   transient_flux_threshold: 0.25
   coherence_floor: 0.3
   low_frequency_guard_hz: 300
+  ild_direct_db: 12
+  ild_ramp_db: 6
 w2:
   low_hz: 300
   high_hz: 5000
@@ -25,19 +27,13 @@ w2:
   anchor_over_side_db: 8.0
 ambient:
   level_db: -2.0
-  side_gain_db: 3.0
+  side_gain_db: 2.0
   decorrelation_highpass_hz: 300
+  theta_max_deg: 45
+  decorrelation_cycles_per_octave: 1.5
   d3_enabled: true
   d3_corner_hz: 8000
   d3_gain_db: -2.0
-  allpass_left:
-    - {delay_samples: 7, coefficient: 0.10}
-    - {delay_samples: 13, coefficient: 0.15}
-    - {delay_samples: 19, coefficient: 0.20}
-  allpass_right:
-    - {delay_samples: 11, coefficient: 0.12}
-    - {delay_samples: 17, coefficient: 0.18}
-    - {delay_samples: 23, coefficient: 0.22}
 reflections:
   enabled: true
   low_hz: 500

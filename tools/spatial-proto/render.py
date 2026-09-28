@@ -26,7 +26,7 @@ from dsp.xtc import apply_xtc
 from signals import generate_synthetic, write_sync_probe
 
 
-PROTO_VERSION = "0.1.0"
+PROTO_VERSION = "0.1.1"
 VARIANT_CODES = ("REF", "ANCHOR_MONO", "ANCHOR_OVER", "W2_LO", "W2_HI", "W2_W3", "W2_W3_W6")
 SUPPORTED_EXTENSIONS = {".wav", ".flac"}
 
@@ -281,7 +281,7 @@ def render_measurement(output_dir: Path, config: dict, seed: int) -> dict:
     seconds = float(config["blind_test"]["synthetic_seconds"])
     rng = np.random.default_rng(seed)
     synthetics = generate_synthetic(seconds, sample_rate, seed)
-    sequence = [(signal_name, variant) for signal_name in ("pink_center", "pink_stereo") for variant in VARIANT_CODES]
+    sequence = [(signal_name, variant) for signal_name in ("pink_center", "pink_stereo", "pan_hard") for variant in VARIANT_CODES]
     rng.shuffle(sequence)
     measure_dir = output_dir / "measure"
     measure_dir.mkdir(parents=True, exist_ok=True)
@@ -415,7 +415,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--date", help="имя папки запуска, по умолчанию текущая дата")
     parser.add_argument("--seed", type=int, help="seed для кодов и перемешивания")
     parser.add_argument("--listener", action="append", help="создать индивидуальный порядок и CSV-шаблон оценок; можно повторять")
-    parser.add_argument("--measure", action="store_true", help="рендерить плейлист pink_center/pink_stereo для записи телефоном")
+    parser.add_argument("--measure", action="store_true", help="рендерить плейлист pink_center/pink_stereo/pan_hard для записи телефоном")
     parser.add_argument("--sync-probe", action="store_true", help="рендерить десятиминутный sync_probe.wav")
     parser.add_argument("--xtc", action="store_true", help="рендерить отдельную слепую ветку XTC на одном телефоне")
     args = parser.parse_args(argv)

@@ -139,7 +139,8 @@ def summarize(key_path: str | Path, score_paths: list[str | Path], metrics_path:
     if metrics_path:
         with Path(metrics_path).open("r", encoding="utf-8") as file:
             file_metrics = json.load(file)
-    technical = file_metrics.get("max_midband_mono_sum_deviation_db", {}) if file_metrics else {}
+    technical = file_metrics.get("max_midband_mono_sum_shape_deviation_db", {}) if file_metrics else {}
+    highres_technical = file_metrics.get("max_midband_mono_sum_welch_ripple_pp_db", {}) if file_metrics else {}
     verdicts = {}
     for variant in variants:
         if variant.startswith("REF"):
@@ -156,7 +157,7 @@ def summarize(key_path: str | Path, score_paths: list[str | Path], metrics_path:
         is_music = all(row["kind"] == "music" for row in included if row["condition"] == variant)
         mono_deviation = technical.get(actual_variant) if is_music else None
         if mono_deviation is not None and float(mono_deviation) > 2.0:
-            failures.append(f"моно-сумма отклоняется на {float(mono_deviation):.2f} дБ")
+            failures.append(f"форма моно-суммы отличается от REF на {float(mono_deviation):.2f} дБ")
         success_attributes = []
         for attribute, label in (("width", "ширина"), ("depth", "глубина")):
             if attribute in attrs and attribute in ref_attrs and attrs[attribute]["median"] >= ref_attrs[attribute]["median"] + 15:
@@ -167,7 +168,12 @@ def summarize(key_path: str | Path, score_paths: list[str | Path], metrics_path:
             verdict = "УСПЕХ: " + " и/или ".join(success_attributes)
         else:
             verdict = "НЕТ ВЫИГРЫША ≥15"
-        verdicts[variant] = {"verdict": verdict, "failures": failures, "successful_attributes": success_attributes, "mono_sum_max_deviation_db": mono_deviation}
+        verdicts[variant] = {
+            "verdict": verdict,
+            "failures": failures,
+            "successful_attributes": success_attributes,
+            "mono_sum_max_shape_deviation_db": mono_deviation,
+        }
 
     result = {
         "PROTO_VERSION": key.get("PROTO_VERSION", PROTO_VERSION),
@@ -200,6 +206,11 @@ def summarize(key_path: str | Path, score_paths: list[str | Path], metrics_path:
     else:
         lines.append("Нет.")
     lines.extend(["", "Слушатель исключается, если REF получил естественность ниже 70 более чем в половине контрольных условий.", ""])
+    lines.extend(["Технический критерий: форму моно-суммы оценивают после вычитания среднего отклонения по 1/3-октавным полосам 200 Гц–5 кГц; провал — остаток больше 2 дБ в любой полосе. Высокое разрешение по Велчу (8192 точки, 300 Гц–5 кГц) — дополнительный ориентир не более 1 дБ пик-пик.", ""])
+    if highres_technical:
+        lines.extend(["| Вариант | Welch ripple p-p, 300 Гц–5 кГц |", "|---|---:|"])
+        lines.extend(f"| {variant} | {float(value):.2f} дБ |" for variant, value in highres_technical.items())
+        lines.append("")
     output.write_text("\n".join(lines), encoding="utf-8")
     result_path = output.with_suffix(".json")
     with result_path.open("w", encoding="utf-8") as file:

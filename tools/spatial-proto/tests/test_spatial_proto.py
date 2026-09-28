@@ -8,19 +8,22 @@ from pathlib import Path
 
 import numpy as np
 import soundfile as sf
+from scipy.signal import correlate, welch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "tests"))
 
 from analyze_recording import analyze_sync
+from analyze_files import analyze_rendered_files
 from dsp.ambient import apply_w3
 from dsp.coherence import analyze_coherence
 from dsp.common import istft, split_lr4_bands, stft
 from dsp.limiter import limit, true_peak
 from dsp.msband import apply_w2
-from render import VARIANT_CODES, _loudness_match_and_limit, load_config, process, render_music
+from render import VARIANT_CODES, _loudness_match_and_limit, load_config, process, render_measurement, render_music
 from simulate_sync_recording import simulate
+from signals import _pink_noise, generate_synthetic
 
 
 def relative_error_db(reference: np.ndarray, actual: np.ndarray) -> float:
@@ -65,6 +68,61 @@ class DspTests(unittest.TestCase):
         w3, _ = apply_w3(w2, weight, self.config["ambient"], self.sample_rate)
         self.assertLess(relative_error_db(w3[:, :1], w3[:, 1:]), -60.0)
 
+    def test_hard_panned_sources_keep_level_and_stay_direct(self) -> None:
+        source = generate_synthetic(12.0, self.sample_rate, 712)["pan_hard"]
+        _, weight, _ = analyze_coherence(source, self.sample_rate, self.config["stft"])
+        output = process(source, self.config["variants"]["W2_W3"], self.config)
+        frequencies = np.fft.rfftfreq(self.config["stft"]["n_fft"], 1.0 / self.sample_rate)
+        mean_mask = float(np.mean(weight[frequencies >= 300.0]))
+        input_rms = np.sqrt(np.mean(source * source, axis=0))
+        output_rms = np.sqrt(np.mean(output * output, axis=0))
+        level_change_db = 20.0 * np.log10(output_rms / input_rms)
+        self.assertLessEqual(mean_mask, 0.15)
+        self.assertTrue(np.all(np.abs(level_change_db) <= 0.5), level_change_db)
+
+    def test_partial_coherence_diffuse_paths_are_aligned_and_mono_is_flat(self) -> None:
+        rng = np.random.default_rng(918)
+        left = _pink_noise(16.0, self.sample_rate, rng)
+        independent = _pink_noise(16.0, self.sample_rate, rng)
+        right = 0.5 * left + np.sqrt(0.75) * independent
+        source = np.column_stack((left, right))
+        _, weight, _ = analyze_coherence(source, self.sample_rate, self.config["stft"])
+        w2_settings = self.config["w2"]
+        w2 = apply_w2(
+            source,
+            {
+                "low_hz": w2_settings["low_hz"],
+                "high_hz": w2_settings["high_hz"],
+                "mid_db": w2_settings["lo_mid_db"],
+                "high_db": w2_settings["lo_high_db"],
+            },
+            weight,
+            self.sample_rate,
+        )
+        output, diffuse = apply_w3(w2, weight, self.config["ambient"], self.sample_rate)
+        centered_l = diffuse[:, 0] - np.mean(diffuse[:, 0])
+        centered_r = diffuse[:, 1] - np.mean(diffuse[:, 1])
+        cross = correlate(centered_l, centered_r, mode="full", method="fft")
+        lag = int(np.argmax(np.abs(cross)) - (len(centered_l) - 1))
+        self.assertLessEqual(abs(lag), 1, f"diffuse cross-correlation peak lag={lag} samples")
+
+        mono_in = np.mean(source, axis=1)
+        mono_out = np.mean(output, axis=1)
+        frequencies, input_power = welch(mono_in, self.sample_rate, nperseg=8192, noverlap=4096)
+        _, output_power = welch(mono_out, self.sample_rate, nperseg=8192, noverlap=4096)
+        band = (frequencies >= 300.0) & (frequencies <= 5000.0)
+        deviation = 10.0 * np.log10(np.maximum(output_power[band], 1e-30) / np.maximum(input_power[band], 1e-30))
+        ripple_pp_db = float(np.max(deviation) - np.min(deviation))
+        self.assertLessEqual(ripple_pp_db, 1.0, f"mono-sum ripple={ripple_pp_db:.2f} dB p-p")
+
+    def test_impulse_peak_keeps_its_sample_alignment(self) -> None:
+        source = np.zeros((24_000, 2), dtype=np.float64)
+        source[12_000, 0] = 1.0
+        source[12_000, 1] = 1.0
+        output = process(source, self.config["variants"]["W2_W3"], self.config)
+        output_peak = int(np.argmax(np.max(np.abs(output), axis=1)))
+        self.assertEqual(output_peak, 12_000)
+
     def test_limiter_respects_true_peak_ceiling(self) -> None:
         t = np.arange(self.sample_rate) / self.sample_rate
         source = np.column_stack((1.8 * np.sin(2 * np.pi * 997 * t), 1.8 * np.sin(2 * np.pi * 997 * t + 0.02)))
@@ -84,6 +142,25 @@ class DspTests(unittest.TestCase):
 
 
 class IntegrationTests(unittest.TestCase):
+    def test_pan_hard_is_analyzed_and_included_in_measurement_playlist(self) -> None:
+        config = load_config()
+        config["blind_test"]["synthetic_seconds"] = 2.0
+        config["blind_test"]["measurement_pause_seconds"] = 0.01
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            measurement = render_measurement(root, config, 123)
+            self.assertEqual(len(measurement["tracks"]), 3 * len(VARIANT_CODES))
+            self.assertEqual({item["signal"] for item in measurement["tracks"]}, {"pink_center", "pink_stereo", "pan_hard"})
+
+            analysis = root / "analysis"
+            analysis.mkdir()
+            with (analysis / "key.json").open("w", encoding="utf-8") as file:
+                json.dump({"sample_rate": 48_000, "seed": 123, "tracks": {}}, file)
+            metrics = analyze_rendered_files(analysis, config)
+            pan_metrics = metrics["synthetic"]["pan_hard"]["W2_W3"]
+            self.assertLessEqual(pan_metrics["mean_diffuse_mask_above_300_hz"], 0.15)
+            self.assertTrue(np.all(np.abs(pan_metrics["channel_level_change_db"]) <= 0.5))
+
     def test_same_seed_creates_same_codes_and_pcm_files(self) -> None:
         config = load_config()
         config["fragment_seconds"] = 1.0
@@ -113,10 +190,27 @@ class IntegrationTests(unittest.TestCase):
         config = load_config()
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            for jitter in (0.0, 20.0, 100.0):
-                path = simulate(root / f"sync-{jitter:g}.wav", jitter, duration_seconds=24, seed=35)
-                report = analyze_sync(path, root / f"report-{jitter:g}", config)
-                self.assertLessEqual(abs(report["jitter_sigma_us"] - jitter), 5.0, f"target={jitter}, report={report['jitter_sigma_us']}")
+            for drift in (-20.0, 20.0):
+                for jitter in (0.0, 20.0, 100.0):
+                    name = f"sync-{jitter:g}-{drift:+g}"
+                    path = simulate(
+                        root / f"{name}.wav",
+                        jitter,
+                        duration_seconds=60,
+                        seed=35,
+                        recorder_drift_ppm=drift,
+                    )
+                    report = analyze_sync(path, root / f"report-{name}", config)
+                    self.assertLessEqual(
+                        abs(report["jitter_sigma_us"] - jitter),
+                        5.0,
+                        f"target σ={jitter}, drift={drift}, report={report['jitter_sigma_us']}",
+                    )
+                    self.assertLessEqual(
+                        abs(report["estimated_recorder_clock_ppm"] - drift),
+                        1.0,
+                        f"target ppm={drift}, report={report['estimated_recorder_clock_ppm']}",
+                    )
 
 
 if __name__ == "__main__":

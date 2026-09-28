@@ -18,6 +18,7 @@ import soundfile as sf
 from scipy.signal import csd, welch
 
 from dsp.common import band_power, one_third_octave_centers
+from dsp.coherence import analyze_coherence
 from render import PROTO_VERSION, VARIANT_CODES, _variant_params, load_config, process
 from dsp.limiter import limit
 from signals import generate_synthetic
@@ -46,6 +47,21 @@ def _band_values(frequencies: np.ndarray, values: np.ndarray, centers: np.ndarra
         val = band_power(frequencies, values, float(center))
         result.append(float(val))
     return result
+
+
+def _welch_shape_ripple_pp(audio: np.ndarray, reference: np.ndarray, sample_rate: int) -> float:
+    """High-resolution mono-sum ripple relative to REF over 300 Hz–5 kHz."""
+    count = min(8192, len(audio), len(reference))
+    if count < 256:
+        return float("nan")
+    noverlap = min(count // 2, 4096)
+    mono = (audio[:, 0] + audio[:, 1]) * 0.5
+    ref_mono = (reference[:, 0] + reference[:, 1]) * 0.5
+    frequencies, power = welch(mono, sample_rate, nperseg=count, noverlap=noverlap, nfft=8192)
+    _, ref_power = welch(ref_mono, sample_rate, nperseg=count, noverlap=noverlap, nfft=8192)
+    selected = (frequencies >= 300.0) & (frequencies <= 5000.0)
+    delta_db = 10.0 * np.log10(np.maximum(power[selected], 1e-30) / np.maximum(ref_power[selected], 1e-30))
+    return float(np.max(delta_db) - np.min(delta_db))
 
 
 def _click_width_ms(audio: np.ndarray, sample_rate: int) -> float:
@@ -82,7 +98,8 @@ def _plot_lines(path: Path, centers: np.ndarray, series: dict[str, list[float]],
     axis.set_ylabel(ylabel)
     axis.set_title(title)
     axis.grid(True, which="both", alpha=0.25)
-    axis.legend(ncol=3, fontsize=8)
+    if series:
+        axis.legend(ncol=3, fontsize=8)
     fig.savefig(path, dpi=140)
     plt.close(fig)
 
@@ -108,12 +125,14 @@ def analyze_rendered_files(run_dir: str | Path, config: dict | None = None) -> d
             raise ValueError(f"Частота файла {item['filename']} не совпадает с ключом")
     music_plot: dict[str, list[float]] = {}
     coherence_plot: dict[str, list[float]] = {}
-    max_midband_deviation = {variant: 0.0 for variant in VARIANT_CODES}
+    max_midband_shape_deviation = {variant: 0.0 for variant in VARIANT_CODES}
+    max_welch_ripple = {variant: 0.0 for variant in VARIANT_CODES}
     all_lufs_levels: dict[str, list[float]] = defaultdict(list)
     for fragment_id, variants in sorted(grouped.items()):
         if "REF" not in variants:
             raise ValueError(f"В ключе {fragment_id} отсутствует REF")
         ref_f, ref_mono, _, _ = _spectra(variants["REF"], sample_rate)
+        midband = (centers >= 200.0) & (centers <= 5000.0)
         fragment_result = {}
         for variant, audio in variants.items():
             freq, mono_power, coh_f, coherence = _spectra(audio, sample_rate)
@@ -123,20 +142,29 @@ def analyze_rendered_files(run_dir: str | Path, config: dict | None = None) -> d
                 current_power = band_power(freq, mono_power, float(center))
                 deviation.append(float(10.0 * np.log10(max(current_power, 1e-30) / max(ref_power, 1e-30))))
             coh_bands = _band_values(coh_f, coherence, centers)
+            shape_deviation = np.asarray(deviation, dtype=np.float64)
+            shape_deviation[midband] -= float(np.mean(shape_deviation[midband]))
+            highres_ripple = _welch_shape_ripple_pp(audio, variants["REF"], sample_rate)
             fragment_result[variant] = {
                 "mono_sum_deviation_db": deviation,
+                "mono_sum_shape_deviation_db": shape_deviation.tolist(),
                 "interchannel_coherence": coh_bands,
-                "max_midband_deviation_db": float(max(abs(v) for center, v in zip(centers, deviation) if 200 <= center <= 5000)),
+                "max_midband_shape_deviation_db": float(np.max(np.abs(shape_deviation[midband]))),
+                "high_res_mono_sum_ripple_pp_db": highres_ripple,
             }
-            max_midband_deviation[variant] = max(max_midband_deviation[variant], fragment_result[variant]["max_midband_deviation_db"])
+            max_midband_shape_deviation[variant] = max(
+                max_midband_shape_deviation[variant], fragment_result[variant]["max_midband_shape_deviation_db"]
+            )
+            if np.isfinite(highres_ripple):
+                max_welch_ripple[variant] = max(max_welch_ripple[variant], highres_ripple)
             source_item = next(x for x in key["tracks"].values() if x["fragment_id"] == fragment_id and x["variant"] == variant)
             all_lufs_levels[variant].append(float(source_item["loudness"]["lufs_after_limiter"]))
         fragments[fragment_id] = fragment_result
     if grouped:
         for variant in VARIANT_CODES:
-            values = [fragments[f][variant]["mono_sum_deviation_db"] for f in fragments if variant in fragments[f]]
-            if values:
-                music_plot[variant] = list(np.median(np.asarray(values), axis=0))
+            if any(variant in fragments[f] for f in fragments):
+                shape_values = [fragments[f][variant]["mono_sum_shape_deviation_db"] for f in fragments if variant in fragments[f]]
+                music_plot[variant] = list(np.median(np.asarray(shape_values), axis=0))
                 coh_values = [fragments[f][variant]["interchannel_coherence"] for f in fragments if variant in fragments[f]]
                 coherence_plot[variant] = list(np.median(np.asarray(coh_values), axis=0))
 
@@ -146,7 +174,7 @@ def analyze_rendered_files(run_dir: str | Path, config: dict | None = None) -> d
     synthetic_metrics = {}
     pink_plot: dict[str, list[float]] = {}
     click_plot: dict[str, float] = {}
-    for signal_name in ("pink_center", "clicks_center"):
+    for signal_name in ("pink_center", "clicks_center", "pan_hard"):
         outputs = {}
         for variant in VARIANT_CODES:
             processed = process(synthetic_data[signal_name], _variant_params(config, variant), config, sample_rate)
@@ -167,9 +195,20 @@ def analyze_rendered_files(run_dir: str | Path, config: dict | None = None) -> d
                 "mono_spectrum_deviation_db": deviations,
                 "click_width_ms": _click_width_ms(audio, sample_rate) if signal_name == "clicks_center" else None,
             }
+            if signal_name == "pan_hard":
+                input_audio = synthetic_data[signal_name]
+                input_rms = np.sqrt(np.mean(input_audio * input_audio, axis=0))
+                output_rms = np.sqrt(np.mean(audio * audio, axis=0))
+                _, pan_weight, _ = analyze_coherence(input_audio, sample_rate, config["stft"])
+                frequencies = np.fft.rfftfreq(int(config["stft"]["n_fft"]), 1.0 / sample_rate)
+                selected_bins = frequencies >= 300.0
+                per_variant[variant]["channel_level_change_db"] = (
+                    20.0 * np.log10(np.maximum(output_rms, 1e-15) / np.maximum(input_rms, 1e-15))
+                ).tolist()
+                per_variant[variant]["mean_diffuse_mask_above_300_hz"] = float(np.mean(pan_weight[selected_bins]))
             if signal_name == "pink_center":
                 pink_plot[variant] = deviations
-            else:
+            elif signal_name == "clicks_center":
                 click_plot[variant] = float(per_variant[variant]["click_width_ms"])
         synthetic_metrics[signal_name] = per_variant
 
@@ -183,10 +222,12 @@ def analyze_rendered_files(run_dir: str | Path, config: dict | None = None) -> d
         "one_third_octave_centers_hz": centers.tolist(),
         "fragments": dict(fragments),
         "synthetic": synthetic_metrics,
-        "max_midband_mono_sum_deviation_db": max_midband_deviation,
+        "max_midband_mono_sum_shape_deviation_db": max_midband_shape_deviation,
+        "max_midband_mono_sum_welch_ripple_pp_db": max_welch_ripple,
         "limiter_trigger_count": limiter_counts,
         "lufs_after_limiter": {variant: values for variant, values in all_lufs_levels.items()},
         "criterion_mono_sum_limit_db": 2.0,
+        "criterion_high_res_welch_ripple_target_pp_db": 1.0,
     }
     with (run_dir / "metrics.json").open("w", encoding="utf-8") as file:
         json.dump(metrics, file, ensure_ascii=False, indent=2)
@@ -202,21 +243,23 @@ def analyze_rendered_files(run_dir: str | Path, config: dict | None = None) -> d
     plt.close(fig)
 
     rows = ["# Объективный отчёт по отрендеренным файлам", "", f"Версия прототипа: `{PROTO_VERSION}`. Частота: {sample_rate} Гц.", ""]
-    rows.extend(["| Вариант | Худшее отклонение моно-суммы, 200 Гц–5 кГц | Средняя когерентность | `pink_center`, худшее отклонение | Щелчок, мс | Срабатывания лимитера |", "|---|---:|---:|---:|---:|---:|"])
+    rows.extend(["| Вариант | Худшее отклонение формы моно-суммы, 200 Гц–5 кГц | Welch ripple p-p, 300 Гц–5 кГц | Средняя когерентность | `pink_center`, худшее отклонение | Щелчок, мс | Срабатывания лимитера |", "|---|---:|---:|---:|---:|---:|---:|"])
     for variant in VARIANT_CODES:
-        deviations = [abs(v) for fragment in fragments.values() for v, center in zip(fragment.get(variant, {}).get("mono_sum_deviation_db", []), centers) if 200 <= center <= 5000]
+        deviations = [abs(v) for fragment in fragments.values() for v, center in zip(fragment.get(variant, {}).get("mono_sum_shape_deviation_db", []), centers) if 200 <= center <= 5000]
         coherence_values = [v for fragment in fragments.values() for v in fragment.get(variant, {}).get("interchannel_coherence", [])]
         pink_values = [abs(v) for v, center in zip(pink_plot.get(variant, []), centers) if 100 <= center <= 12_000]
         click = click_plot.get(variant, float("nan"))
         rows.append(
-            f"| {variant} | {max(deviations, default=float('nan')):.2f} dB | {np.mean(coherence_values) if coherence_values else float('nan'):.3f} | "
+            f"| {variant} | {max(deviations, default=float('nan')):.2f} dB | {max_welch_ripple[variant]:.2f} dB | {np.mean(coherence_values) if coherence_values else float('nan'):.3f} | "
             f"{max(pink_values, default=float('nan')):.2f} dB | {click:.2f} | {limiter_counts[variant]} |"
         )
     rows.extend(
         [
             "",
-            "Критерий провала по файлам: отклонение моно-суммы больше 2 дБ хотя бы в одной полосе 200 Гц–5 кГц.",
-            "Для `pink_center` и ширины щелчка приведены дополнительные контрольные метрики. Запись телефоном анализируется отдельно.",
+            "Критерий провала по файлам: после вычитания среднего отклонения формы больше 2 дБ хотя бы в одной 1/3-октавной полосе 200 Гц–5 кГц.",
+            "Дополнительный ориентир: неравномерность высокого разрешения по Велчу (8192 точки, 300 Гц–5 кГц) — не более 1 дБ пик-пик.",
+            "`pan_hard` проверяется отдельно в синтетических метриках; он не входит в музыкальный слепой тест.",
+            "Ограничение ILD-защиты: она не распознаёт отдельные источники, если оба края одновременно заполнены похожим по спектру материалом. В слуховой тест включите хотя бы один джазовый трек конца 1950-х–1960-х годов с жёстким разведением инструментов.",
             "",
             "## Графики",
             "",
@@ -230,6 +273,22 @@ def analyze_rendered_files(run_dir: str | Path, config: dict | None = None) -> d
             "",
         ]
     )
+    pan_hard = synthetic_metrics["pan_hard"]
+    rows.extend(
+        [
+            "",
+            "## Контроль `pan_hard`",
+            "",
+            "| Вариант | Изменение уровня L | Изменение уровня R | Средний вес diffuse выше 300 Гц |",
+            "|---|---:|---:|---:|",
+        ]
+    )
+    for variant in VARIANT_CODES:
+        item = pan_hard[variant]
+        levels = item["channel_level_change_db"]
+        rows.append(
+            f"| {variant} | {levels[0]:+.2f} dB | {levels[1]:+.2f} dB | {item['mean_diffuse_mask_above_300_hz']:.3f} |"
+        )
     (run_dir / "report_files.md").write_text("\n".join(rows), encoding="utf-8")
     return metrics
 
@@ -241,7 +300,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         metrics = analyze_rendered_files(args.run_dir, load_config(args.config))
-        print(f"Отчёт: {args.run_dir / 'report_files.md'}; вариантов: {len(metrics['max_midband_mono_sum_deviation_db'])}")
+        print(f"Отчёт: {args.run_dir / 'report_files.md'}; вариантов: {len(metrics['max_midband_mono_sum_shape_deviation_db'])}")
     except (OSError, ValueError, KeyError) as error:
         print(f"Ошибка: {error}", file=sys.stderr)
         return 2

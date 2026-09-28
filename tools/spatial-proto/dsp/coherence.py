@@ -35,11 +35,13 @@ def analyze_coherence(
     raw = np.abs(smooth_cross) / np.sqrt(smooth_left * smooth_right + 1e-30)
     frequencies = np.fft.rfftfreq(n_fft, 1.0 / sample_rate)
     smoothed = np.empty_like(raw)
+    ild_db = np.empty_like(smooth_left)
     fraction = float(settings.get("coherence_band_fraction_octave", 1.0 / 6.0))
     half_ratio = 2.0 ** (fraction / 2.0)
     for index, frequency in enumerate(frequencies):
         if frequency <= 0.0:
             smoothed[index] = raw[index]
+            ild_db[index] = 10.0 * np.log10((smooth_left[index] + 1e-30) / (smooth_right[index] + 1e-30))
             continue
         low, high = frequency / half_ratio, frequency * half_ratio
         first = max(1, int(np.searchsorted(frequencies, low, side="left")))
@@ -48,6 +50,7 @@ def analyze_coherence(
         left_power = np.mean(smooth_left[first:last], axis=0) if last > first else smooth_left[index]
         right_power = np.mean(smooth_right[first:last], axis=0) if last > first else smooth_right[index]
         smoothed[index] = np.abs(cross) / np.sqrt(left_power * right_power + 1e-30)
+        ild_db[index] = 10.0 * np.log10((left_power + 1e-30) / (right_power + 1e-30))
     smoothed = np.clip(smoothed, 0.0, 1.0)
 
     magnitude = np.mean(np.abs(spectrum), axis=2)
@@ -74,6 +77,10 @@ def analyze_coherence(
 
     floor = float(settings.get("coherence_floor", 0.3))
     weight = np.clip((1.0 - smoothed - floor) / (1.0 - floor), 0.0, 1.0)
+    direct_ild_db = float(settings.get("ild_direct_db", 12.0))
+    ild_ramp_db = max(float(settings.get("ild_ramp_db", 6.0)), 1e-6)
+    ild_guard = np.clip((direct_ild_db - np.abs(ild_db)) / ild_ramp_db, 0.0, 1.0)
+    weight *= ild_guard
     frequencies_below = frequencies < float(settings.get("low_frequency_guard_hz", 300.0))
     weight[frequencies_below] = 0.0
     weight *= transient_gain[None, :]

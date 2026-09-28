@@ -5,6 +5,7 @@ from pathlib import Path
 import numpy as np
 import soundfile as sf
 from scipy.signal import chirp
+from scipy.signal import butter, sosfiltfilt
 from scipy.signal.windows import tukey
 
 
@@ -21,11 +22,25 @@ def _pink_noise(seconds: float, sample_rate: int, rng: np.random.Generator) -> n
     return noise * 0.15
 
 
+def _filtered_pink(seconds: float, sample_rate: int, rng: np.random.Generator, kind: str, cutoff_hz: float) -> np.ndarray:
+    source = _pink_noise(seconds, sample_rate, rng)
+    sections = butter(2, cutoff_hz, btype=kind, fs=sample_rate, output="sos")
+    filtered = sosfiltfilt(sections, source)
+    rms = float(np.sqrt(np.mean(filtered * filtered)))
+    return filtered * (0.15 / max(rms, 1e-12))
+
+
 def generate_synthetic(seconds: float = 20.0, sample_rate: int = 48_000, seed: int = 0) -> dict[str, np.ndarray]:
     rng = np.random.default_rng(seed)
     center = _pink_noise(seconds, sample_rate, rng)
     pink_center = np.column_stack((center, center))
     pink_stereo = np.column_stack((_pink_noise(seconds, sample_rate, rng), _pink_noise(seconds, sample_rate, rng)))
+    pan_hard = np.column_stack(
+        (
+            _filtered_pink(seconds, sample_rate, rng, "lowpass", 2000.0),
+            _filtered_pink(seconds, sample_rate, rng, "highpass", 1000.0),
+        )
+    )
     click_count = int(round(seconds * 2.0))
     clicks = np.zeros(int(round(seconds * sample_rate)), dtype=np.float64)
     burst_samples = max(16, int(round(0.003 * sample_rate)))
@@ -40,6 +55,7 @@ def generate_synthetic(seconds: float = 20.0, sample_rate: int = 48_000, seed: i
     return {
         "pink_center": pink_center,
         "pink_stereo": pink_stereo,
+        "pan_hard": pan_hard,
         "clicks_center": np.column_stack((clicks, clicks)),
         "channel_id": generate_channel_id(sample_rate),
     }
