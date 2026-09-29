@@ -1702,7 +1702,7 @@ class Engine private constructor(private val app: Context) {
         if (mode != SourceMode.MUSIC) { toast("Сначала завершите текущую звуковую проверку"); return }
         val sensitivity = micSensitivityDeltaDb ?: run { toast("Сначала завершите сверку микрофонов в двух положениях"); return }
         if (!hasMicPermission()) { toast("Разрешите доступ к микрофону на этом телефоне"); return }
-        if (master < 0.5f) { toast("Для измерения поднимите громкость Sound не ниже 50 %"); return }
+        if (master < 0.5f) { toast("Для измерения поднимите громкость Sound не ниже ${(AudioGain.masterToSlider(0.5f) * 100).toInt() + 1} %"); return }
         val activeLink = link ?: run { toast("Point не на связи"); return }
         val id = java.util.UUID.randomUUID().toString()
         val future = CompletableFuture<JSONObject>(); levelCaptureAcks[id] = future

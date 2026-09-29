@@ -30,6 +30,7 @@ import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.stateDescription
+import app.soundfield.core.AudioGain
 import app.soundfield.core.Ch
 import app.soundfield.core.Role
 import app.soundfield.core.SourceMode
@@ -191,16 +192,18 @@ fun PlayerScreen(ui: UiState, engine: Engine, openCalibration: () -> Unit, openD
         SFCard {
             Text("Sound", color = SFColors.TextDim, fontSize = 13.sp, letterSpacing = 1.sp,
                 fontWeight = FontWeight.SemiBold, modifier = Modifier.padding(bottom = 10.dp))
-            var m by remember(ui.master) { mutableFloatStateOf(ui.master) }
+            var volume by remember { mutableFloatStateOf(AudioGain.masterToSlider(ui.master)) }
+            var volumeDragging by remember { mutableStateOf(false) }
+            LaunchedEffect(ui.master, volumeDragging) { if (!volumeDragging) volume = AudioGain.masterToSlider(ui.master) }
             var balance by remember { mutableFloatStateOf(ui.balance) }
             var balanceDragging by remember { mutableStateOf(false) }
             var wasInCenter by remember { mutableStateOf(abs(ui.balance - 0.5f) < 0.015f) }
             val haptic = LocalHapticFeedback.current
             LaunchedEffect(ui.balance, balanceDragging) { if (!balanceDragging) balance = ui.balance }
-            SliderRow("Громкость", "${(m * 100).roundToInt()}%", m, SFColors.Master,
+            SliderRow("Громкость", "${(volume * 100).roundToInt()}%", volume, SFColors.Master,
                 enabled = ui.mode != SourceMode.LEVEL_MEASURE,
-                onChange = { m = it; engine.setVolume("M", it, finished = false) },
-                onDone = { engine.setVolume("M", m, finished = true) })
+                onChange = { volumeDragging = true; volume = it; engine.setVolume("M", AudioGain.sliderToMaster(it), finished = false) },
+                onDone = { volumeDragging = false; engine.setVolume("M", AudioGain.sliderToMaster(volume), finished = true) })
             if (!ui.soloMode) Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                 Text("Баланс между телефонами", color = SFColors.TextDim, fontSize = 14.sp, modifier = Modifier.weight(1f))
                 TextButton(onClick = {

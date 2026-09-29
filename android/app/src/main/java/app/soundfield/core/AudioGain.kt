@@ -36,6 +36,29 @@ object AudioGain {
         return if (v < 0.005f) 0f else 10.0.pow((-50.0 * (1.0 - v) / 20.0)).toFloat()
     }
 
+    /**
+     * Положение ползунка громкости ↔ `master` (закон [taper], хранится и передаётся по сети).
+     * Раньше ползунок был линейным по `master`, то есть по 50 дБ равномерно: нижняя треть шкалы лежала ниже −35 дБ,
+     * где изменения не слышны, а вся слышимая динамика умещалась в верхней трети. Теперь усиление растёт как
+     * u^1.4 (≈28 дБ на декаду ползунка): равные шаги ползунка дают близкие по воспринимаемой громкости шаги.
+     * Формат `master` не менялся — совместимость с iOS и старыми версиями сохранена.
+     */
+    const val SLIDER_EXPONENT = 1.4
+    private const val MASTER_MIN = 0.005f
+
+    fun sliderToMaster(slider: Float): Float {
+        val u = slider.coerceIn(0f, 1f)
+        if (u < MASTER_MIN) return 0f
+        val gain = u.toDouble().pow(SLIDER_EXPONENT)
+        return (1.0 + 20.0 * kotlin.math.log10(gain) / 50.0).coerceIn(MASTER_MIN.toDouble(), 1.0).toFloat()
+    }
+
+    fun masterToSlider(master: Float): Float {
+        if (master < MASTER_MIN) return 0f
+        val gain = taper(master).toDouble()
+        return gain.pow(1.0 / SLIDER_EXPONENT).coerceIn(0.0, 1.0).toFloat()
+    }
+
     fun migrateMaster(old: Float): Float {
         if (old <= 0f) return 0f
         return (1.0 + 20.0 * kotlin.math.log10(old.toDouble()) / 50.0).coerceIn(0.0, 1.0).toFloat()
