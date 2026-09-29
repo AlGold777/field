@@ -19,7 +19,13 @@ data class SpatialDspConfig(
     val gHighDb: Double = 0.0,
     val gAmbientDb: Double = 0.0,
     val strength: Double = 1.0,
+    val depthDb: Double = 0.0,
+    val reflectionsEnabled: Boolean = false,
+    val reflectionTaps: List<SpatialReflectionTap> = emptyList(),
+    val preserveLoudness: Boolean = true,
 )
+
+data class SpatialReflectionTap(val leftMs: Double, val rightMs: Double, val gainDb: Double)
 
 /** Streaming width processor. Input spectra are retained for attack lookahead, output stays frame aligned. */
 class SpatialProcessor(
@@ -74,6 +80,8 @@ class SpatialProcessor(
     private val midGain = 10.0.pow(config.gMidDb * config.strength / 20.0)
     private val highGain = 10.0.pow(config.gHighDb * config.strength / 20.0)
     private val ambientGain = 10.0.pow(config.gAmbientDb * config.strength / 20.0)
+    private val depthGain = 10.0.pow(config.depthDb * config.strength / 20.0)
+    private val depthHighGain = 10.0.pow((config.depthDb - 2.0) * config.strength / 20.0)
 
     init {
         require(sampleRate > 0 && fftSize >= 2 && fftSize.countOneBits() == 1 && hopSize in 1..fftSize)
@@ -180,7 +188,7 @@ class SpatialProcessor(
             fluxHistory[fluxPosition * BAND_COUNT + band] = flux
             fluxCursor[band] = (fluxPosition + 1) % FLUX_WINDOW_FRAMES
             fluxCount[band] = min(FLUX_WINDOW_FRAMES, fluxCount[band] + 1)
-            attacks[slot * BAND_COUNT + band] = if (isAttack(band, fluxCount[band])) 1 else 0
+            attacks[slot * BAND_COUNT + band] = if (isAttack(band, fluxCount[band], flux)) 1 else 0
         }
 
         for (bin in 0 until bins) {
@@ -244,12 +252,23 @@ class SpatialProcessor(
             val rr = ringRReal[specIndex]; val ri = ringRImag[specIndex]
             val midR = (lr + rr) * 0.5; val midI = (li + ri) * 0.5
             val sideR = (lr - rr) * 0.5 * gain; val sideI = (li - ri) * 0.5 * gain
-            val lReal = midR + sideR; val lImag = midI + sideI
-            val rReal = midR - sideR; val rImag = midI - sideI
+            val depthT = (ln(max(1.0, hz) / 8_000.0) / ln(2.0)).coerceIn(0.0, 1.0)
+            val highBlend = smoothstepCos(depthT)
+            val targetDepthGain = depthGain + (depthHighGain - depthGain) * highBlend
+            val octaveThird = 2.0.pow(1.0 / 6.0)
+            val depthLo = max(1, kotlin.math.ceil((hz / octaveThird) * fftSize / sampleRate).toInt()).coerceAtMost(bins - 1)
+            val depthHi = kotlin.math.floor((hz * octaveThird) * fftSize / sampleRate).toInt().plus(1).coerceAtMost(bins)
+            var depthMask = 0.0
+            for (k in depthLo until depthHi) depthMask += ringMask[binBase + k] * releaseState[binBand[k]]
+            depthMask /= max(1, depthHi - depthLo)
+            val depth = 1.0 - (1.0 - targetDepthGain) * depthMask
+            val effectiveMidR = midR * depth; val effectiveMidI = midI * depth
+            val lReal = effectiveMidR + sideR; val lImag = effectiveMidI + sideI
+            val rReal = effectiveMidR - sideR; val rImag = effectiveMidI - sideI
             totalLeft += lReal * lReal + lImag * lImag
             totalRight += rReal * rReal + rImag * rImag
             totalCross += lReal * rReal + lImag * rImag
-            totalMid += midR * midR + midI * midI
+            totalMid += effectiveMidR * effectiveMidR + effectiveMidI * effectiveMidI
             totalSide += sideR * sideR + sideI * sideI
             realL[bin] = lReal; imagL[bin] = lImag; realR[bin] = rReal; imagR[bin] = rImag
             val mirror = fftSize - bin
@@ -290,14 +309,14 @@ class SpatialProcessor(
         return peak
     }
 
-    private fun isAttack(band: Int, count: Int): Boolean {
+    private fun isAttack(band: Int, count: Int, currentFlux: Double): Boolean {
         if (count < 8) return false
         for (i in 0 until count) fluxScratch[i] = fluxHistory[i * BAND_COUNT + band]
         fluxScratch.sort(0, count)
         val median = median(fluxScratch, count)
         for (i in 0 until count) deviationScratch[i] = abs(fluxHistory[i * BAND_COUNT + band] - median)
         deviationScratch.sort(0, count)
-        return fluxScratch[count - 1] > median + 4.0 * median(deviationScratch, count)
+        return currentFlux > median + 4.0 * median(deviationScratch, count)
     }
 
     private fun median(sorted: DoubleArray, count: Int): Double =

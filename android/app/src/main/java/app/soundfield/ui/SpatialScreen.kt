@@ -15,6 +15,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Slider
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.*
@@ -77,6 +78,7 @@ fun SpatialScreen(ui: UiState, engine: Engine, onBack: () -> Unit) {
     )
     var custom by remember(ui.spatial) { mutableStateOf(initial) }
     var near by remember(ui.spatial.profile) { mutableStateOf(ui.spatial.profile == "pair_near") }
+    var preserveLoudness by remember(ui.spatial) { mutableStateOf(ui.spatial.preserveLoudness) }
     var meter by remember { mutableStateOf(0.0 to 0.0) }
     LaunchedEffect(ui.spatialAvailable) {
         while (ui.spatialAvailable) {
@@ -84,15 +86,17 @@ fun SpatialScreen(ui: UiState, engine: Engine, onBack: () -> Unit) {
             delay(80)
         }
     }
-    fun apply(values: SpatialCustom = custom, placementNear: Boolean = near) {
+    fun apply(values: SpatialCustom = custom, placementNear: Boolean = near, preserve: Boolean = preserveLoudness) {
         custom = values
         near = placementNear
+        preserveLoudness = preserve
         val profile = if (ui.soloMode) "solo_stereo_speaker" else if (placementNear) "pair_near" else "pair_wide"
         engine.setSpatial(ui.spatial.copy(
             enabled = true,
             level = ui.spatial.level.takeIf { it != SpatialLevel.OFF } ?: SpatialLevel.SOFT,
             profile = profile,
             custom = values,
+            preserveLoudness = preserve,
         ), finished = true)
     }
 
@@ -111,6 +115,16 @@ fun SpatialScreen(ui: UiState, engine: Engine, onBack: () -> Unit) {
         SpatialSettingSlider("Воздух", custom.gAmbientDb.coerceIn(0.0, 6.0).toFloat() / 6f,
             onValueChange = { value -> custom = custom.copy(gAmbientDb = value * 6.0) },
             onValueChangeFinished = { apply() })
+        SpatialSettingSlider("Глубина", (custom.depthDb + 6.0).coerceIn(0.0, 6.0).toFloat() / 6f,
+            onValueChange = { value -> custom = custom.copy(depthDb = value * 6.0 - 6.0) },
+            onValueChangeFinished = { apply() })
+        SpatialSettingSlider("Отражения", (custom.reflectionDb + 30.0).coerceIn(0.0, 20.0).toFloat() / 20f,
+            onValueChange = { value -> custom = custom.copy(reflectionDb = value * 20.0 - 30.0) },
+            onValueChangeFinished = { apply() })
+        Row(Modifier.fillMaxWidth().padding(top = 10.dp), verticalAlignment = Alignment.CenterVertically) {
+            Text("Сохранять громкость", color = SFColors.Text, fontSize = 15.sp, modifier = Modifier.weight(1f))
+            Switch(checked = preserveLoudness, onCheckedChange = { apply(preserve = it) })
+        }
         if (!ui.soloMode) {
             Row(Modifier.fillMaxWidth().padding(top = 14.dp), verticalAlignment = Alignment.CenterVertically) {
                 Text("Телефоны рядом", color = SFColors.Text, fontSize = 15.sp, modifier = Modifier.weight(1f))
@@ -119,9 +133,10 @@ fun SpatialScreen(ui: UiState, engine: Engine, onBack: () -> Unit) {
         }
         TextButton(onClick = {
             custom = initial
+            preserveLoudness = true
             val profile = if (ui.soloMode) "solo_stereo_speaker" else "pair_wide"
             engine.setSpatial(SpatialSettings(enabled = ui.spatial.enabled, level = ui.spatial.level,
-                profile = profile, custom = null), finished = true)
+                profile = profile, custom = null, preserveLoudness = true), finished = true)
         }, modifier = Modifier.align(Alignment.End)) { Text("Сбросить") }
     }
 }

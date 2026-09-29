@@ -198,6 +198,7 @@ fun DiagnosticsScreen(ui: UiState, engine: Engine, onRequestSyncProbe: () -> Uni
                 DiagRow("Скорость DSP", "%.1f×".format(spatialStats.realtimeFactor))
                 DiagRow("Запас кэша", "%.0f мс".format(spatialStats.cacheAheadMs))
                 DiagRow("Перезапуски / недоборы", "${spatialStats.restarts} / ${spatialStats.misses}")
+                DiagRow("Ограничитель / компенсация", "%.1f / %+.1f дБ".format(spatialStats.limiterDb, spatialStats.loudnessCompDb))
                 DiagRow("Версия", app.soundfield.dsp.DSP_VERSION)
             }
         }

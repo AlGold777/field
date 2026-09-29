@@ -2,6 +2,9 @@ package app.soundfield.core
 
 import app.soundfield.dsp.Radix2Fft
 import app.soundfield.dsp.SpatialDspConfig
+import app.soundfield.dsp.SpatialLoudnessCompensator
+import app.soundfield.dsp.SpatialPeakLimiter
+import app.soundfield.dsp.SpatialReflectionProcessor
 import app.soundfield.dsp.SpatialProcessor
 import kotlin.math.PI
 import kotlin.math.cos
@@ -14,6 +17,8 @@ class SpatialSource(
     cacheSeconds: Int = DEFAULT_CACHE_SECONDS,
     spatialConfig: SpatialDspConfig = SpatialDspConfig(),
 ) : AudioSource, AutoCloseable, PrefetchableAudioSource {
+    private val bypass = !spatialConfig.enabled &&
+        !(spatialConfig.reflectionsEnabled && spatialConfig.reflectionTaps.isNotEmpty())
     override val mode get() = inner.mode
     override val title get() = inner.title
     override val artist get() = inner.artist
@@ -25,6 +30,10 @@ class SpatialSource(
     private val cache = FloatArray(cacheCapacityFrames * 2)
     private val fft = Radix2Fft(FFT_SIZE)
     private val spatialProcessor = SpatialProcessor(spatialConfig)
+    private val reflectionProcessor = if (spatialConfig.reflectionsEnabled && spatialConfig.reflectionTaps.isNotEmpty())
+        SpatialReflectionProcessor(spatialConfig.reflectionTaps, strength = spatialConfig.strength) else null
+    private val peakLimiter = SpatialPeakLimiter()
+    private val loudnessCompensator = SpatialLoudnessCompensator(enabled = spatialConfig.enabled && spatialConfig.preserveLoudness)
     private val window = DoubleArray(FFT_SIZE) { i -> sqrt(0.5 - 0.5 * cos(2.0 * PI * i / FFT_SIZE)) }
     private val realL = DoubleArray(FFT_SIZE)
     private val imagL = DoubleArray(FFT_SIZE)
@@ -47,6 +56,8 @@ class SpatialSource(
         private set
     val sideMidDb: Double get() = spatialProcessor.sideMidDb
     val correlation: Double get() = spatialProcessor.correlation
+    val limiterReductionDb: Double get() = peakLimiter.maxReductionDb
+    val loudnessCompensationDb: Double get() = loudnessCompensator.compensationDb
     private val missCount = java.util.concurrent.atomic.AtomicLong()
     val misses: Long get() = missCount.get()
     private val restartCount = java.util.concurrent.atomic.AtomicLong()
@@ -96,8 +107,27 @@ class SpatialSource(
                 val sourceComplete = inner.complete
                 val wanted = requestedHead.get()
                 var progressed = false
-                while (workerRunning.get() && nextFrameStart - spatialProcessor.lookaheadHops * HOP_SIZE < wanted &&
-                    nextFrameStart - spatialProcessor.lookaheadHops * HOP_SIZE < inner.totalFrames &&
+                if (bypass) {
+                    val end = minOf(wanted, ready, inner.totalFrames)
+                    val processingStartedAt = System.nanoTime()
+                    var frame = processedHead
+                    while (workerRunning.get() && frame < end) {
+                        val cacheIndex = ((frame % cacheCapacityFrames) * 2L).toInt()
+                        cache[cacheIndex] = inner.sample(frame, 0).takeUnless { it.isNaN() } ?: 0f
+                        cache[cacheIndex + 1] = inner.sample(frame, 1).takeUnless { it.isNaN() } ?: 0f
+                        frame++
+                    }
+                    if (frame > processedHead) {
+                        val processingNs = (System.nanoTime() - processingStartedAt).coerceAtLeast(1L)
+                        val instantFactor = (frame - processedHead).toDouble() * 1e9 / (processingNs * SF.SAMPLE_RATE)
+                        realtimeFactor = if (realtimeFactor <= 0.0) instantFactor
+                            else realtimeFactor * 0.9 + instantFactor * 0.1
+                        processedHead = frame
+                        progressed = true
+                    }
+                }
+                while (!bypass && workerRunning.get() && nextFrameStart - spatialProcessor.lookaheadHops * HOP_SIZE - peakLimiter.lookaheadFrames < wanted &&
+                    nextFrameStart - spatialProcessor.lookaheadHops * HOP_SIZE < inner.totalFrames + peakLimiter.lookaheadFrames &&
                     (sourceComplete || nextFrameStart + FFT_SIZE <= ready)) {
                     if (restartAtFrame.get() != NO_RESTART) break
                     val frameStartedAt = System.nanoTime()
@@ -135,6 +165,9 @@ class SpatialSource(
         java.util.Arrays.fill(accumulationR, 0.0)
         java.util.Arrays.fill(accumulationWeight, 0.0)
         spatialProcessor.reset()
+        reflectionProcessor?.reset()
+        peakLimiter.reset()
+        loudnessCompensator.reset()
         processedHead = warmupStart
         realtimeFactor = 0.0
         restartCount.incrementAndGet()
@@ -173,23 +206,41 @@ class SpatialSource(
     }
 
     private fun publishHop(frameStart: Long) {
-        val blockEnd = minOf(frameStart + HOP_SIZE, inner.totalFrames)
+        val blockEnd = minOf(frameStart + HOP_SIZE, inner.totalFrames + peakLimiter.lookaheadFrames)
         val blockStart = maxOf(frameStart, 0L)
         for (frame in blockStart until blockEnd) {
-            val accumulationIndex = frame.toInt() and accumulationMask
-            val weight = accumulationWeight[accumulationIndex]
-            val left = if (weight > 1e-12) (accumulationL[accumulationIndex] / weight).toFloat() else 0f
-            val right = if (weight > 1e-12) (accumulationR[accumulationIndex] / weight).toFloat() else 0f
-            if (frame >= startAtFrame) {
-                val cacheIndex = ((frame % cacheCapacityFrames) * 2L).toInt()
-                cache[cacheIndex] = left
-                cache[cacheIndex + 1] = right
+            val rawLeft: Float
+            val rawRight: Float
+            if (frame < inner.totalFrames) {
+                val accumulationIndex = frame.toInt() and accumulationMask
+                val weight = accumulationWeight[accumulationIndex]
+                rawLeft = if (weight > 1e-12) (accumulationL[accumulationIndex] / weight).toFloat() else 0f
+                rawRight = if (weight > 1e-12) (accumulationR[accumulationIndex] / weight).toFloat() else 0f
+                accumulationL[accumulationIndex] = 0.0
+                accumulationR[accumulationIndex] = 0.0
+                accumulationWeight[accumulationIndex] = 0.0
+            } else {
+                rawLeft = 0f; rawRight = 0f
             }
-            accumulationL[accumulationIndex] = 0.0
-            accumulationR[accumulationIndex] = 0.0
-            accumulationWeight[accumulationIndex] = 0.0
+            val inputLeft = if (frame in 0 until inner.totalFrames) inner.sample(frame, 0).takeUnless { it.isNaN() } ?: 0f else 0f
+            val inputRight = if (frame in 0 until inner.totalFrames) inner.sample(frame, 1).takeUnless { it.isNaN() } ?: 0f else 0f
+            val reflected = reflectionProcessor?.process(inputLeft, inputRight) ?: 0f
+            val processedLeft = rawLeft + reflected
+            val processedRight = rawRight - reflected
+            loudnessCompensator.observe(inputLeft, inputRight, processedLeft, processedRight)
+            val compensation = loudnessCompensator.gain()
+            if (peakLimiter.process(frame, (processedLeft * compensation).toFloat(),
+                    (processedRight * compensation).toFloat())) {
+                val outputFrame = peakLimiter.outputFrame
+                if (outputFrame in startAtFrame until inner.totalFrames) {
+                    val cacheIndex = ((outputFrame % cacheCapacityFrames) * 2L).toInt()
+                    cache[cacheIndex] = peakLimiter.outputLeft
+                    cache[cacheIndex + 1] = peakLimiter.outputRight
+                }
+                if (outputFrame >= 0L && outputFrame + 1 > processedHead)
+                    processedHead = minOf(outputFrame + 1, inner.totalFrames)
+            }
         }
-        if (blockEnd > processedHead) processedHead = blockEnd
     }
 
     override fun close() {

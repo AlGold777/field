@@ -30,6 +30,7 @@ data class SpatialSettings(
     val level: SpatialLevel = SpatialLevel.OFF,
     val profile: String = "pair_wide",
     val custom: SpatialCustom? = null,
+    val preserveLoudness: Boolean = true,
 ) {
     fun sanitized(): SpatialSettings = copy(
         enabled = enabled && level != SpatialLevel.OFF,
@@ -40,7 +41,8 @@ data class SpatialSettings(
 
     fun toJson(): JSONObject {
         val clean = sanitized()
-        return JSONObject().put("enabled", clean.enabled).put("level", clean.level.wire).put("profile", clean.profile).apply {
+        return JSONObject().put("enabled", clean.enabled).put("level", clean.level.wire).put("profile", clean.profile)
+            .put("preserveLoudness", clean.preserveLoudness).apply {
             clean.custom?.let { values -> put("custom", JSONObject()
                 .put("gMidDb", values.gMidDb).put("gHighDb", values.gHighDb).put("gAmbientDb", values.gAmbientDb)
                 .put("depthDb", values.depthDb).put("reflectionDb", values.reflectionDb)) }
@@ -56,6 +58,12 @@ data class SpatialSettings(
             gHighDb = customValues?.gHighDb ?: profileData.gHighDb,
             gAmbientDb = customValues?.gAmbientDb ?: profileData.gAmbientDb,
             strength = clean.level.multiplier,
+            depthDb = customValues?.depthDb ?: profileData.depthDb,
+            reflectionsEnabled = profileData.reflectionsEnabled,
+            reflectionTaps = profileData.reflectionTaps.map { tap ->
+                tap.copy(gainDb = customValues?.reflectionDb ?: tap.gainDb)
+            },
+            preserveLoudness = clean.preserveLoudness,
         )
     }
 
@@ -66,7 +74,7 @@ data class SpatialSettings(
                 c.optDouble("depthDb", -2.0), c.optDouble("reflectionDb", -17.0),
             ).sanitized() }
             SpatialSettings(o.optBoolean("enabled"), SpatialLevel.parse(o.optString("level", "off")),
-                o.optString("profile", "pair_wide"), custom).sanitized()
+                o.optString("profile", "pair_wide"), custom, o.optBoolean("preserveLoudness", true)).sanitized()
         } ?: SpatialSettings()
     }
 }

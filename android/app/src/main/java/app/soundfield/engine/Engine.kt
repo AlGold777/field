@@ -2177,6 +2177,7 @@ class Engine private constructor(private val app: Context) {
                 clean.custom?.let { custom -> put("custom", JSONObject()
                     .put("gMidDb", custom.gMidDb).put("gHighDb", custom.gHighDb).put("gAmbientDb", custom.gAmbientDb)
                     .put("depthDb", custom.depthDb).put("reflectionDb", custom.reflectionDb)) }
+                put("preserveLoudness", clean.preserveLoudness)
                 put("finished", finished)
             }
         }
@@ -2194,6 +2195,8 @@ class Engine private constructor(private val app: Context) {
             misses = current?.misses ?: 0,
             sideMidDb = current?.sideMidDb ?: 0.0,
             correlation = current?.correlation ?: 1.0,
+            limiterDb = current?.limiterReductionDb ?: 0.0,
+            loudnessCompDb = current?.loudnessCompensationDb ?: 0.0,
         )
     }
 
@@ -3481,6 +3484,7 @@ class Engine private constructor(private val app: Context) {
             telemetry.record("SPATIAL_CONFIG", mapOf("profile" to clean.profile, "level" to clean.level.wire,
                 "params" to clean.custom?.let { mapOf("gMidDb" to it.gMidDb, "gHighDb" to it.gHighDb,
                     "gAmbientDb" to it.gAmbientDb, "depthDb" to it.depthDb, "reflectionDb" to it.reflectionDb) },
+                "preserveLoudness" to clean.preserveLoudness,
                 "dspVersion" to DSP_VERSION, "profilesVersion" to SpatialProfiles.VERSION,
                 "reason" to reason, "fFrame" to f))
         }
@@ -3856,7 +3860,8 @@ class Engine private constructor(private val app: Context) {
                     c.optDouble("gMidDb", 3.0), c.optDouble("gHighDb", 2.0), c.optDouble("gAmbientDb", 2.0),
                     c.optDouble("depthDb", -2.0), c.optDouble("reflectionDb", -17.0)) }
                 val settings = SpatialSettings(o.optBoolean("enabled", false), SpatialLevel.parse(o.optString("level")),
-                    o.optString("profile", if (soloMode) "solo_stereo_speaker" else "pair_wide"), custom).sanitized()
+                    o.optString("profile", if (soloMode) "solo_stereo_speaker" else "pair_wide"), custom,
+                    o.optBoolean("preserveLoudness", true)).sanitized()
                 applySpatialSettings(settings, o.optBoolean("finished", true),
                     if (soloMode) "solo" else o.optString("originRole", "pair"))
             }
@@ -4689,6 +4694,10 @@ class Engine private constructor(private val app: Context) {
                 "cacheAheadMs" to ((activeSpatial.readyFrames - currentPosition).coerceAtLeast(0) * 1000.0 / SF.SAMPLE_RATE),
                 "restarts" to activeSpatial.restarts,
                 "misses" to activeSpatial.misses,
+                "limiterDb" to activeSpatial.limiterReductionDb,
+                "loudnessCompDb" to activeSpatial.loudnessCompensationDb,
+                "sideMidDb" to activeSpatial.sideMidDb,
+                "corrMin" to activeSpatial.correlation,
                 "dspVersion" to DSP_VERSION,
             ))
             lastSpatialPerfAtMs = nowMs

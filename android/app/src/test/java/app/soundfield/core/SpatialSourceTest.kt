@@ -19,13 +19,13 @@ class SpatialSourceTest {
             val indices = longArrayOf(0, 1, 511, 512, 17_003, 23_999, 48_000, 99_999, input.totalFrames - 1)
             val expected = indices.map { frame -> floatArrayOf(input.sample(frame, Ch.L), input.sample(frame, Ch.R)) }
             for (index in indices.indices.reversed()) {
-                assertEquals("L frame ${indices[index]}", expected[index][0], spatial.sample(indices[index], Ch.L), 2e-6f)
-                assertEquals("R frame ${indices[index]}", expected[index][1], spatial.sample(indices[index], Ch.R), 2e-6f)
+                assertEquals("L frame ${indices[index]}", expected[index][0], spatial.sample(indices[index], Ch.L), 0f)
+                assertEquals("R frame ${indices[index]}", expected[index][1], spatial.sample(indices[index], Ch.R), 0f)
             }
             // Every frame is available in cache and sample output is independent of consumer request order.
             for (frame in 0 until input.totalFrames step 97) {
-                assertEquals(input.sample(frame, Ch.L), spatial.sample(frame, Ch.L), 2e-6f)
-                assertEquals(input.sample(frame, Ch.R), spatial.sample(frame, Ch.R), 2e-6f)
+                assertEquals(input.sample(frame, Ch.L), spatial.sample(frame, Ch.L), 0f)
+                assertEquals(input.sample(frame, Ch.R), spatial.sample(frame, Ch.R), 0f)
             }
             assertEquals(0L, spatial.misses)
         }
@@ -85,6 +85,31 @@ class SpatialSourceTest {
         }
     }
 
+    @Test fun earlyReflectionsStayInSideAndPreserveTheMonoSum() {
+        val input = AntiPhaseSource(2L * SF.SAMPLE_RATE)
+        val taps = listOf(app.soundfield.dsp.SpatialReflectionTap(4.0, 7.0, -17.0))
+        val baseConfig = SpatialDspConfig(enabled = true, preserveLoudness = false)
+        SpatialSource(input, spatialConfig = baseConfig).use { reference ->
+            SpatialSource(input, spatialConfig = baseConfig.copy(reflectionsEnabled = true, reflectionTaps = taps)).use { spatial ->
+                reference.requestThrough(input.totalFrames); spatial.requestThrough(input.totalFrames)
+                await("reference render") { reference.complete || reference.processingError != null }
+                await("reflection render") { spatial.complete || spatial.processingError != null }
+                reference.processingError?.let { throw AssertionError("reference worker failed", it) }
+                spatial.processingError?.let { throw AssertionError("spatial worker failed", it) }
+                var addedSideEnergy = 0.0; var sumError = 0.0
+                for (frame in SF.SAMPLE_RATE.toLong() until input.totalFrames step 29) {
+                    val outL = spatial.sample(frame, 0); val outR = spatial.sample(frame, 1)
+                    val refL = reference.sample(frame, 0); val refR = reference.sample(frame, 1)
+                    val sideDelta = ((outL - outR) - (refL - refR)) * 0.5
+                    addedSideEnergy += sideDelta * sideDelta
+                    sumError = maxOf(sumError, kotlin.math.abs(outL + outR - refL - refR).toDouble())
+                }
+                assertTrue("reflections should add delayed Side energy", addedSideEnergy > 0.01)
+                assertTrue("Side reflections must preserve the mono sum", sumError < 2e-6)
+            }
+        }
+    }
+
     private fun await(label: String, condition: () -> Boolean) {
         val deadline = System.nanoTime() + 5_000_000_000L
         while (!condition() && System.nanoTime() < deadline) Thread.sleep(2)
@@ -120,5 +145,16 @@ class SpatialSourceTest {
 
     private class MonoSource(total: Long) : ProceduralSource(total) {
         override fun sample(frame: Long, ch: Int): Float = super.sample(frame, Ch.L)
+    }
+
+    private class AntiPhaseSource(override val totalFrames: Long) : AudioSource {
+        override val mode = SourceMode.MUSIC
+        override val title = "anti-phase tone"
+        override val artist = "test"
+        override fun sample(frame: Long, ch: Int): Float {
+            if (frame !in 0 until totalFrames) return 0f
+            val value = sin(2 * PI * 1_000.0 * frame / SF.SAMPLE_RATE) * 0.3
+            return (if (ch == 0) value else -value).toFloat()
+        }
     }
 }

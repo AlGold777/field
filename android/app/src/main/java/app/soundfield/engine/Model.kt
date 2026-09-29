@@ -285,6 +285,8 @@ data class SpatialDeveloperSnapshot(
     val misses: Long,
     val sideMidDb: Double,
     val correlation: Double,
+    val limiterDb: Double,
+    val loudnessCompDb: Double,
 )
 
 data class UiState(
