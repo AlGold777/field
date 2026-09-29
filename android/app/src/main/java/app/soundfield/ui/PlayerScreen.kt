@@ -47,7 +47,7 @@ import java.util.Locale
 
 @Composable
 fun PlayerScreen(ui: UiState, engine: Engine, openCalibration: () -> Unit, openDiagnostics: () -> Unit,
-    openTrackPicker: () -> Unit, openEqualizer: () -> Unit, openSpatial: () -> Unit) {
+    openTrackPicker: () -> Unit, openEqualizer: () -> Unit, openSpatial: () -> Unit, openPairing: () -> Unit) {
     var confirmDisconnect by remember { mutableStateOf(false) }
     var pos by remember { mutableLongStateOf(0L) }
     var dragging by remember { mutableStateOf<Float?>(null) }
@@ -57,7 +57,13 @@ fun PlayerScreen(ui: UiState, engine: Engine, openCalibration: () -> Unit, openD
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 20.dp).padding(top = 40.dp, bottom = 24.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             when {
-                ui.soloMode -> PairStatusButton("Соло · этот телефон", SFColors.Accent1, { engine.stopSolo() })
+                ui.soloMode -> {
+                    PairStatusButton("Подключить телефон", SFColors.Accent1, openPairing)
+                    ui.remembered?.let { rec ->
+                        Spacer(Modifier.width(8.dp))
+                        PairStatusButton("«${rec.peerName}»", SFColors.Good, { engine.resumeRemembered() })
+                    }
+                }
                 ui.phase == Phase.RECONNECTING && ui.role == Role.POINT -> PairStatusButton("Переподключение…", SFColors.Warn, { confirmDisconnect = true })
                 ui.phase == Phase.RECONNECTING -> PairStatusButton("Ждём «${ui.peerName}»", SFColors.Warn, { confirmDisconnect = true })
                 else -> PairStatusButton("Стереопара активна", SFColors.Good, { confirmDisconnect = true })
@@ -245,10 +251,8 @@ fun PlayerScreen(ui: UiState, engine: Engine, openCalibration: () -> Unit, openD
 
         Row(Modifier.fillMaxWidth().padding(bottom = 12.dp).height(48.dp), horizontalArrangement = Arrangement.spacedBy(8.dp),
             verticalAlignment = Alignment.CenterVertically) {
-            if (!ui.soloMode) {
-                PlayerActionButton("Калибровка", Modifier.weight(1f), openCalibration)
-                PlayerActionButton("Диагностика", Modifier.weight(1f), openDiagnostics)
-            }
+            if (!ui.soloMode) PlayerActionButton("Калибровка", Modifier.weight(1f), openCalibration)
+            PlayerActionButton("Диагностика", Modifier.weight(1f), openDiagnostics)
             TelemetryIconButton(ui, engine)
         }
         ui.telemetryFile?.let { Subtitle("Сохранено: $it", modifier = Modifier.padding(bottom = 8.dp)) }

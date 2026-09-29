@@ -16,17 +16,18 @@ import app.soundfield.engine.Engine
 import app.soundfield.engine.Phase
 import app.soundfield.engine.UiState
 
+/** Экран подключения второго телефона. Открывается с плеера; после создания пары закрывается сам. */
 @Composable
-fun WelcomeScreen(ui: UiState, engine: Engine) {
+fun WelcomeScreen(ui: UiState, engine: Engine, onBack: () -> Unit) {
     var showLog by remember { mutableStateOf(false) }
     Box(Modifier.fillMaxSize()) {
       Column(
-          Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 20.dp).padding(top = 60.dp, bottom = 24.dp),
+          Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 20.dp).padding(top = 24.dp, bottom = 24.dp),
       ) {
-        Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
-            Text("🔊", fontSize = 56.sp)
-            Spacer(Modifier.height(12.dp))
-            H1("SoundField")
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text("‹", color = SFColors.Accent1, fontSize = 32.sp,
+                modifier = Modifier.clickable(onClick = onBack).padding(end = 12.dp))
+            H1("Второй телефон")
         }
         Spacer(Modifier.height(28.dp))
 
@@ -39,14 +40,6 @@ fun WelcomeScreen(ui: UiState, engine: Engine) {
             SFCard(Modifier.clickable { engine.resumeRemembered() }) {
                 H2(rec.peerName)
                 Text("Подключить", color = SFColors.Accent1, fontSize = 13.sp, fontWeight = androidx.compose.ui.text.font.FontWeight.SemiBold)
-            }
-            Spacer(Modifier.height(12.dp))
-        }
-
-        if (!ui.soloMode) {
-            SFCard(Modifier.clickable { engine.startSolo() }) {
-                H3("Слушать на этом телефоне")
-                Subtitle("Открыть локальный плеер и слушать музыку без пары")
             }
             Spacer(Modifier.height(12.dp))
         }
@@ -87,7 +80,11 @@ fun WelcomeScreen(ui: UiState, engine: Engine) {
           }
       }
     }
+}
 
+/** Диалоги подключения показываются поверх любого экрана: приглашение может прийти, пока играет плеер. */
+@Composable
+fun PairingDialogs(ui: UiState, engine: Engine) {
     if (ui.phase == Phase.INVITING) {
         AlertDialog(
             onDismissRequest = {},
@@ -111,7 +108,8 @@ fun WelcomeScreen(ui: UiState, engine: Engine) {
         AlertDialog(
             onDismissRequest = {},
             title = { Text("Создать стереопару?") },
-            text = { Text("«${ui.incomingName}» приглашает этот телефон в стереопару.\nЭтот телефон станет Point и будет играть правый канал.") },
+            text = { Text("«${ui.incomingName}» приглашает этот телефон в стереопару.\nЭтот телефон станет Point и будет играть правый канал." +
+                if (ui.soloMode && ui.playing) "\nМузыка на этом телефоне будет остановлена; после разрыва пары очередь вернётся." else "") },
             confirmButton = { TextButton(onClick = { engine.acceptIncoming() }) { Text("Принять") } },
             dismissButton = { TextButton(onClick = { engine.rejectIncoming() }) { Text("Отклонить") } },
         )

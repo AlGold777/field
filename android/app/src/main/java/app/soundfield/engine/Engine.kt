@@ -120,6 +120,7 @@ class Engine private constructor(private val app: Context) {
 
     companion object {
         const val TAG = "SoundField"
+        private const val SOLO_SERVICE_IDLE_MS = 5 * 60_000L
         @Volatile private var inst: Engine? = null
         fun get(ctx: Context): Engine = inst ?: synchronized(this) {
             inst ?: Engine(ctx.applicationContext).also { inst = it; it.boot() }
@@ -499,6 +500,8 @@ class Engine private constructor(private val app: Context) {
             spatial = spatialSettings, spatialAvailable = spatialAvailableNow()) }
         watchNetwork()
         log("Запуск: TCP ${tcp.localPort}, UDP ${udp.localPort}")
+        // Главная страница — плеер: соло стартует сразу, без пары. Пара — надстройка (см. becomePaired / goIdle).
+        post { if (!soloMode && phase == Phase.IDLE) startSoloPlayback() }
         if (autoResume && record != null) post { startAutoResume() }
     }
 
@@ -785,7 +788,7 @@ class Engine private constructor(private val app: Context) {
     }
 
     private fun autoResumeTick() {
-        if (soloMode || autoResumeUntil == 0L) return
+        if (autoResumeUntil == 0L) return
         val now = SystemClock.elapsedRealtime()
         if (!autoResume || record == null || now > autoResumeUntil) {
             if (phase == Phase.IDLE) log("Фоновое восстановление: «${record?.peerName}» не ответил")
@@ -793,6 +796,13 @@ class Engine private constructor(private val app: Context) {
         }
         if (phase != Phase.IDLE || pending != null || now - lastAutoAttempt < 3_000) return
         val rec = record ?: return
+        if (soloMode && serverPlay.timeline.playing && rec.myRole == Role.POINT) {
+            // Point подхватил бы очередь Server и оборвал музыку на этом телефоне — молча так не делаем.
+            autoResumeUntil = 0; ui { copy(autoResuming = false) }
+            telemetry.record("AUTO_RESUME_DEFERRED", mapOf("reason" to "solo_playing_as_point"))
+            log("Восстановление пары отложено: на этом телефоне играет музыка")
+            return
+        }
         val p = resumeTarget(rec) ?: return
         lastAutoAttempt = now
         connectOutgoing(p, "resume-auto", resumeJson(rec), 3_000)
@@ -1360,15 +1370,68 @@ class Engine private constructor(private val app: Context) {
         startSoloPlayback()
     }
 
-    fun stopSolo() = post {
-        if (!soloMode) return@post
-        stopSoloPlayback()
-        discovery.startBrowse()
+    // ---- фоновый сервис соло: нужен только пока играет музыка (и 5 мин после паузы), иначе процесс замораживается зря
+    private var soloServiceActive = false
+    private var soloServiceStopTask: ScheduledFuture<*>? = null
+    private var soloHandoffFrame = -1L
+    private var soloHandoffPlaying = false
+    private var soloResumeFrame = 0L
+
+    private fun ensureSoloService() {
+        soloServiceStopTask?.cancel(false); soloServiceStopTask = null
+        if (soloServiceActive) return
+        soloServiceActive = true
+        try { PlaybackService.start(app) } catch (e: Exception) {
+            Log.w(TAG, "fgs", e); telemetry.event("FOREGROUND_SERVICE_FAILED", error = e)
+        }
     }
 
-    private fun startSoloPlayback() {
-        setAutoResume(false)
-        stopAutoResume()
+    private fun scheduleSoloServiceStop() {
+        if (!soloServiceActive || soloServiceStopTask != null) return
+        soloServiceStopTask = later(SOLO_SERVICE_IDLE_MS) {
+            soloServiceStopTask = null
+            if (soloMode && soloServiceActive && !serverPlay.timeline.playing) {
+                soloServiceActive = false
+                try { PlaybackService.stop(app) } catch (_: Exception) {}
+                if (!appVisible && phase == Phase.IDLE) hideWhileBackground()
+            }
+        }
+    }
+
+    private fun dropSoloService() {
+        soloServiceStopTask?.cancel(false); soloServiceStopTask = null
+        soloServiceActive = false
+    }
+
+    /**
+     * Соло → пара. Server продолжает ту же музыку с той же позиции (переход в becomePaired берёт [soloHandoffFrame]);
+     * Point ставит свою музыку на паузу, очередь остаётся в памяти и вернётся после разрыва пары.
+     */
+    private fun leaveSoloForPair(newRole: Role) {
+        val timeline = serverPlay.timeline
+        val frame = if (mode == SourceMode.MUSIC) posFrame() else 0L
+        val playing = timeline.playing && mode == SourceMode.MUSIC
+        telemetry.record("SOLO_TO_PAIR", mapOf("asRole" to newRole.name.lowercase(), "wasPlaying" to playing,
+            "positionMs" to frame * 1000 / SF.SAMPLE_RATE))
+        dropSoloService()
+        if (newRole == Role.SERVER) {
+            saveSoloEqProfile(activeSoloEqRouteKey)
+            soloMode = false
+            activeSoloEqRouteKey = ""
+            audio.playbackActive = false
+            audio.source = null
+            audio.stop()
+            audio.preferPhoneSpeaker = true
+            soloHandoffFrame = frame
+            soloHandoffPlaying = playing
+            ui { copy(soloMode = false, eqAvailable = false) }
+        } else {
+            soloResumeFrame = frame
+            stopSoloPlayback()
+        }
+    }
+
+    private fun startSoloPlayback(frame: Long = 0L, playing: Boolean = false) {
         soloMode = true
         role = Role.SERVER
         negotiatedCapabilities = emptySet()
@@ -1389,12 +1452,10 @@ class Engine private constructor(private val app: Context) {
         }
         audio.source = serverRenderer
         audio.playbackActive = false
-        newEpoch(false, 0, System.nanoTime())
+        newEpoch(playing, frame.coerceIn(0L, source.totalFrames), System.nanoTime())
         audio.start()
-        try { PlaybackService.start(app) } catch (e: Exception) {
-            Log.w(TAG, "fgs", e); telemetry.event("FOREGROUND_SERVICE_FAILED", error = e)
-        }
-        ui { copy(soloMode = true, phase = Phase.IDLE, role = Role.SERVER, playing = false,
+        if (playing) { requestFocus(); ensureSoloService() }
+        ui { copy(soloMode = true, phase = Phase.IDLE, role = Role.SERVER, playing = playing,
             title = source.title, artist = source.artist, durationMs = source.totalFrames * 1000 / SF.SAMPLE_RATE,
             mode = SourceMode.MUSIC, eq = eqSettings, eqAvailable = true, eqRouteLabel = audio.routeLabel(),
             eqPreampDb = eqConfig.preampDb.toFloat(), eqCurveDb = eqConfig.curveDb.map { it.toFloat() },
@@ -1407,6 +1468,7 @@ class Engine private constructor(private val app: Context) {
 
     private fun stopSoloPlayback() {
         if (!soloMode) return
+        dropSoloService()
         saveSoloEqProfile(activeSoloEqRouteKey)
         soloMode = false
         activeSoloEqRouteKey = ""
@@ -1443,7 +1505,8 @@ class Engine private constructor(private val app: Context) {
         telemetry.event("APP_BACKGROUND", "phase=$phase")
         appVisible = false
         if (role == Role.POINT) cancelPointFileTransfer()
-        if (phase == Phase.IDLE && !soloMode) hideWhileBackground()
+        // Без пары процесс замораживается вскоре после ухода с экрана, если его не держит сервис (играющее соло).
+        if (phase == Phase.IDLE && !(soloMode && soloServiceActive)) hideWhileBackground()
     }
 
     private fun hideWhileBackground() {
@@ -1460,7 +1523,7 @@ class Engine private constructor(private val app: Context) {
         when (phase) {
             Phase.IDLE -> {
                 if (!discovery.browsing) discovery.startBrowse()
-                if (!soloMode && autoResume && record != null && autoResumeUntil == 0L) startAutoResume()
+                if (autoResume && record != null && autoResumeUntil == 0L) startAutoResume()
             }
             Phase.RECONNECTING -> if (pending == null) { log("Возврат в приложение — переподключаемся сразу"); scheduleReconnect(0) }
             Phase.PAIRED -> {
@@ -2453,7 +2516,6 @@ class Engine private constructor(private val app: Context) {
 
     private fun doInvite(p: Peer) {
         if (phase != Phase.IDLE) return
-        if (soloMode) stopSoloPlayback()
         manualLanBlockedPeerId = p.id.takeIf {
             peerPathDiagnoses[it]?.currentVerdict() == PeerPathDiagnosis.Verdict.LAN_PEER_BLOCKED
         }
@@ -2469,7 +2531,6 @@ class Engine private constructor(private val app: Context) {
 
     private fun doManualResume(auto: Boolean = false) {
         val rec = record ?: return
-        if (soloMode) stopSoloPlayback()
         manualLanBlockedPeerId = rec.peerId.takeIf { !auto &&
             peerPathDiagnoses[it]?.currentVerdict() == PeerPathDiagnosis.Verdict.LAN_PEER_BLOCKED
         }
@@ -2872,7 +2933,6 @@ class Engine private constructor(private val app: Context) {
         val l = pending ?: return
         val p = pendingPeer ?: return
         if (phase != Phase.INCOMING) return
-        if (soloMode) stopSoloPlayback()
         telemetry.event("INVITE_ACCEPT", "peer=${p.id}")
         l.send(acceptJson(pendingKey, Role.POINT))
         peerTcpPortHint = p.port
@@ -2946,6 +3006,11 @@ class Engine private constructor(private val app: Context) {
                 if (!ok) {
                     log("Отклонён resume от «$pname»: пара неизвестна")
                     l.tag = "dead"; l.sendAndClose(JSONObject().put("t", "reject").put("reason", "unknown")); return
+                }
+                if (soloMode && serverPlay.timeline.playing && rec!!.myRole == Role.POINT) {
+                    log("Resume от «$pname» отклонён: на этом телефоне играет музыка")
+                    telemetry.record("AUTO_RESUME_DEFERRED", mapOf("reason" to "solo_playing_as_point", "inbound" to true))
+                    l.tag = "dead"; l.sendAndClose(JSONObject().put("t", "busy")); return
                 }
                 // Оба телефона стучатся друг к другу одновременно — оставляем одно соединение детерминированно:
                 // входящее принимает телефон с бо́льшим id (как и для встречных приглашений).
@@ -3058,6 +3123,7 @@ class Engine private constructor(private val app: Context) {
 
     // ================================================================== пара
     private fun becomePaired(l: ControlLink, r: Role, pid: String, pname: String, pplat: String, key: String, resumed: Boolean) {
+        if (soloMode) leaveSoloForPair(r)
         soloMode = false
         audio.preferPhoneSpeaker = true
         peerPathDiagnoses.getOrPut(pid) { PeerPathDiagnosis() }.onConnected()
@@ -3164,7 +3230,11 @@ class Engine private constructor(private val app: Context) {
             if (!continuing) {
                 mode = SourceMode.MUSIC
                 source = if (queueIndex in queue.indices) currentQueueSource ?: music else music
-                newEpoch(false, 0, System.nanoTime())
+                // Соло → Server: та же музыка с той же позиции и в том же состоянии (играет/пауза), без сброса.
+                val handoff = soloHandoffFrame >= 0L
+                newEpoch(handoff && soloHandoffPlaying, if (handoff) soloHandoffFrame.coerceIn(0L, source.totalFrames) else 0L,
+                    System.nanoTime())
+                soloHandoffFrame = -1L; soloHandoffPlaying = false
                 if (queueIndex in queue.indices && currentQueueSource == null) selectTrack(queueIndex, forcePaused = true)
             }
             else rebuildPlayState()
@@ -3261,6 +3331,11 @@ class Engine private constructor(private val app: Context) {
     }
 
     private fun goIdle(sendBye: Boolean, reason: String) {
+        // Пара → соло: бывший Server продолжает ту же музыку в стерео с той же позиции; бывший Point возвращается
+        // к своей очереди на месте, где остановился при создании пары.
+        val leavingRole = role
+        val resumePlaying = leavingRole == Role.SERVER && mode == SourceMode.MUSIC && serverPlay.timeline.playing
+        val resumeFrame = if (leavingRole == Role.SERVER) (if (mode == SourceMode.MUSIC) posFrame() else 0L) else soloResumeFrame
         cancelSyncProbe("pair_disconnected")
         if (soloMode) saveSoloEqProfile(activeSoloEqRouteKey)
         cancelPointFileTransfer()
@@ -3290,9 +3365,12 @@ class Engine private constructor(private val app: Context) {
         rx.reset(); clock.reset()
         calibRunning = false
         discovery.startBrowse()
-        if (!appVisible) hideWhileBackground()   // пару разорвали, пока приложение в фоне
+        if (!appVisible && !resumePlaying) hideWhileBackground()   // пару разорвали, пока приложение в фоне
         ui { copy(phase = Phase.IDLE, soloMode = false, eqAvailable = false, linkOk = false, remembered = record, playing = false, audioMissing = false, calib = CalibUi(),
             loadingTracks = false, loadingTrackId = null, serverDiag = Diag(), pointDiag = Diag()) }
+        telemetry.record("PAIR_TO_SOLO", mapOf("fromRole" to leavingRole.name.lowercase(), "resumedPlaying" to resumePlaying,
+            "positionMs" to resumeFrame * 1000 / SF.SAMPLE_RATE))
+        startSoloPlayback(resumeFrame, resumePlaying)
         toast(reason)
     }
 
@@ -3937,6 +4015,7 @@ class Engine private constructor(private val app: Context) {
         val s = stateJson()
         applyState(s)
         link?.send(s)
+        if (soloMode) { if (serverPlay.timeline.playing) ensureSoloService() else scheduleSoloServiceStop() }
     }
 
     /** Общий для обеих ролей разбор состояния плеера → UI (и параметры рендера на Point). */

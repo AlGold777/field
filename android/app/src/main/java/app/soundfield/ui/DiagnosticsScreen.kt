@@ -94,9 +94,10 @@ fun DiagnosticsScreen(ui: UiState, engine: Engine, onRequestSyncProbe: () -> Uni
         if (diag.valid) "%.1f dBFS".format(diag.outputRmsDbfs) else "—"
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 20.dp).padding(top = 40.dp, bottom = 24.dp)) {
         BackBar("Диагностика", onBack)
-        Subtitle("Обновляется каждую секунду. Этот телефон — ${if (ui.role == Role.SERVER) "Server" else "Point"}.")
+        Subtitle(if (ui.soloMode) "Обновляется каждую секунду. Этот телефон играет один." else "Обновляется каждую секунду. Этот телефон — ${if (ui.role == Role.SERVER) "Server" else "Point"}.")
         Spacer(Modifier.height(16.dp))
 
+        if (!ui.soloMode) {
         SFCard {
             H3("Рассогласование L/R · по оценке часов")
             val est = if (p.valid && s.valid) abs(p.syncErrMs - s.syncErrMs) + p.clockUncMs else null
@@ -159,6 +160,7 @@ fun DiagnosticsScreen(ui: UiState, engine: Engine, onRequestSyncProbe: () -> Uni
                 DiagRow("Скачок модели часов p50 / p95 / max",
                     "%.1f / %.1f / %.1f мкс".format(p.clockModelStepP50Us, p.clockModelStepP95Us, p.clockModelStepMaxUs))
             }
+        }
         }
 
         SFCard {

@@ -46,7 +46,7 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-private enum class Sub { NONE, CALIBRATION, DIAGNOSTICS, EQUALIZER, SPATIAL, STABILITY, LAN_BLOCKED }
+private enum class Sub { NONE, PAIRING, CALIBRATION, DIAGNOSTICS, EQUALIZER, SPATIAL, STABILITY, LAN_BLOCKED }
 
 @Composable
 fun AppRoot(engine: Engine) {
@@ -92,8 +92,9 @@ fun AppRoot(engine: Engine) {
         if (ui.showLanBlocked) sub = Sub.LAN_BLOCKED
         else if (sub == Sub.LAN_BLOCKED) sub = Sub.NONE
     }
-    val showWelcome = !ui.inPair && (!ui.soloMode || ui.phase == app.soundfield.engine.Phase.INCOMING || ui.phase == app.soundfield.engine.Phase.INVITING)
-    if (showWelcome && sub != Sub.STABILITY && sub != Sub.LAN_BLOCKED) sub = Sub.NONE
+    // Главная страница — плеер. Экран подключения закрывается сам, когда пара создана; калибровка бывает только в паре.
+    LaunchedEffect(ui.inPair) { if (ui.inPair && sub == Sub.PAIRING) sub = Sub.NONE }
+    if (!ui.inPair && sub == Sub.CALIBRATION) sub = Sub.NONE
     BackHandler(enabled = sub != Sub.NONE) {
         if (sub == Sub.STABILITY) engine.dismissStabilitySettings()
         if (sub == Sub.LAN_BLOCKED) engine.dismissLanBlockedHint()
@@ -108,7 +109,7 @@ fun AppRoot(engine: Engine) {
                 sub = Sub.NONE
             })
             sub == Sub.LAN_BLOCKED -> LanBlockedScreen(ui.lanBlockedPeerName, ui.lanBlockedDetails, engine)
-            showWelcome -> WelcomeScreen(ui, engine)
+            sub == Sub.PAIRING -> WelcomeScreen(ui, engine, onBack = { sub = Sub.NONE })
             sub == Sub.CALIBRATION -> CalibrationScreen(ui, engine,
                 requestMic = { micLauncher.launch(Manifest.permission.RECORD_AUDIO) }, onBack = { sub = Sub.NONE })
             sub == Sub.DIAGNOSTICS -> DiagnosticsScreen(ui, engine,
@@ -124,9 +125,10 @@ fun AppRoot(engine: Engine) {
             sub == Sub.SPATIAL -> SpatialScreen(ui, engine, onBack = { sub = Sub.NONE })
             else -> PlayerScreen(ui, engine, openCalibration = { sub = Sub.CALIBRATION }, openDiagnostics = { sub = Sub.DIAGNOSTICS },
                 openTrackPicker = { engine.requestTrackPicker() }, openEqualizer = { sub = Sub.EQUALIZER },
-                openSpatial = { sub = Sub.SPATIAL })
+                openSpatial = { sub = Sub.SPATIAL }, openPairing = { sub = Sub.PAIRING })
         }
     }
+    PairingDialogs(ui, engine)
     if (showAudioSourceDialog) {
         AlertDialog(
             onDismissRequest = { showAudioSourceDialog = false },
