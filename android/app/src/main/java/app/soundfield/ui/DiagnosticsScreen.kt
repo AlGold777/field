@@ -41,7 +41,6 @@ import kotlinx.coroutines.delay
 fun DiagnosticsScreen(ui: UiState, engine: Engine, onRequestSyncProbe: () -> Unit, onBack: () -> Unit) {
     var developerMode by rememberSaveable { mutableStateOf(false) }
     var versionTapCount by remember { mutableIntStateOf(0) }
-    var lastVersionTapMs by remember { mutableLongStateOf(0L) }
     var spatialStats by remember { mutableStateOf(engine.spatialDeveloperSnapshot()) }
     var xtcReport by remember { mutableStateOf(engine.xtcDeveloperSnapshot()) }
     var xtcReportLevel by rememberSaveable { mutableStateOf(SpatialLevel.SOFT) }
@@ -368,9 +367,8 @@ fun DiagnosticsScreen(ui: UiState, engine: Engine, onRequestSyncProbe: () -> Uni
         Spacer(Modifier.height(12.dp))
         Text("SoundField ${BuildConfig.VERSION_NAME}", color = SFColors.TextDim, fontSize = 12.sp,
             modifier = Modifier.align(Alignment.CenterHorizontally).clickable {
-                val now = android.os.SystemClock.elapsedRealtime()
-                versionTapCount = if (now - lastVersionTapMs <= 2_000L) versionTapCount + 1 else 1
-                lastVersionTapMs = now
+                // Три нажатия на номер версии без ограничения по времени между ними; счётчик сбрасывается при выходе с экрана.
+                versionTapCount += 1
                 if (versionTapCount >= 3) {
                     developerMode = !developerMode
                     versionTapCount = 0
