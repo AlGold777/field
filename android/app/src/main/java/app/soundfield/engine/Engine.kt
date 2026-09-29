@@ -356,7 +356,7 @@ class Engine private constructor(private val app: Context) {
     private var epoch = 0
     private var preloadEpochCounter = 0
     private var mode = SourceMode.MUSIC
-    private var source: AudioSource = music
+    @Volatile private var source: AudioSource = music
     private var savedFrame = 0L
     private var savedPlaying = false
     private var volL = 1f
@@ -2178,9 +2178,72 @@ class Engine private constructor(private val app: Context) {
                     .put("gMidDb", custom.gMidDb).put("gHighDb", custom.gHighDb).put("gAmbientDb", custom.gAmbientDb)
                     .put("depthDb", custom.depthDb).put("reflectionDb", custom.reflectionDb)) }
                 put("preserveLoudness", clean.preserveLoudness)
+                put("abFixedCompensationDb", spatialAbFixedCompensationDb ?: JSONObject.NULL)
                 put("finished", finished)
             }
         }
+    }
+
+    fun spatialAbCompensationSnapshotDb(): Double = activeSpatialSource?.loudnessCompensationDb ?: 0.0
+
+    fun spatialAbAudition(level: SpatialLevel, session: SpatialAbSession) {
+        spatialAbFixedCompensationDb = session.fixedCompensationDb
+        val settings = session.originalSettings.copy(enabled = level != SpatialLevel.OFF, level = level,
+            custom = null, preserveLoudness = true)
+        pause()
+        seekMs(session.anchorMs)
+        setSpatial(settings, finished = false)
+    }
+
+    fun spatialAbReadyAt(ms: Long, expectedLevel: SpatialLevel): Boolean {
+        val state = ui.value.spatial
+        if (state.level != expectedLevel) return false
+        if (expectedLevel == SpatialLevel.OFF) return activeSpatialSource == null
+        val spatial = activeSpatialSource ?: return false
+        val profileId = if (soloMode) "solo_stereo_speaker" else state.profile
+        val expectedSignature = "${System.identityHashCode(source)}:$profileId:${state.toJson()}:$spatialAbFixedCompensationDb"
+        if (activeSpatialInput !== source || activeSpatialSignature != expectedSignature) return false
+        val frame = (ms.coerceAtLeast(0L) * SF.SAMPLE_RATE / 1_000L).coerceIn(0L, spatial.totalFrames)
+        val target = minOf(spatial.totalFrames, frame + 8L * SF.SAMPLE_RATE)
+        spatial.requestThrough(target)
+        if (frame < spatial.totalFrames) spatial.sample(frame, 0)
+        return spatial.readyFrames >= target
+    }
+
+    fun finishSpatialAb(session: SpatialAbSession) {
+        spatialAbFixedCompensationDb = null
+        setSpatial(session.originalSettings, finished = true)
+        if (session.resumeAfter) play() else pause()
+    }
+
+    fun recordSpatialAbTrial(session: SpatialAbSession, trialIndex: Int, answer: SpatialAbAnswer) = post {
+        val trial = session.trials.getOrNull(trialIndex) ?: return@post
+        if (!answer.complete) return@post
+        telemetry.record("SPATIAL_AB_TRIAL", mapOf("sessionId" to session.id, "trial" to trial.index,
+            "control" to trial.control, "detectedDifference" to answer.detectsDifference,
+            "correct" to (answer.detectsDifference == !trial.control)))
+    }
+
+    fun saveSpatialAbResult(session: SpatialAbSession) = post {
+        if (!session.complete) return@post
+        val trials = org.json.JSONArray()
+        session.trials.zip(session.answers).forEach { (trial, answer) ->
+            trials.put(JSONObject().put("trial", trial.index).put("control", trial.control)
+                .put("variantA", trial.variantA.wire).put("variantB", trial.variantB.wire)
+                .put("detectedDifference", answer.detectsDifference)
+                .put("width", answer.width).put("center", answer.center).put("naturalness", answer.naturalness))
+        }
+        val result = JSONObject().put("sessionId", session.id).put("createdAt", System.currentTimeMillis())
+            .put("comparison", session.comparison.wire).put("anchorMs", session.anchorMs)
+            .put("fixedLoudnessCompensationDb", session.fixedCompensationDb)
+            .put("correctDetections", session.correctDetections).put("trials", trials)
+        val pValue = session.pValue
+        result.put("pValue", pValue)
+        val directory = File(app.filesDir, "spatial_ab").apply { mkdirs() }
+        File(directory, "${System.currentTimeMillis()}_${session.id}.json").writeText(result.toString(2))
+        telemetry.record("SPATIAL_AB_RESULT", mapOf("sessionId" to session.id,
+            "comparison" to session.comparison.wire, "correctDetections" to session.correctDetections,
+            "trials" to session.trials.size, "pValue" to pValue))
     }
 
     fun spatialMeterSnapshot(): Pair<Double, Double> = activeSpatialSource?.let { it.sideMidDb to it.correlation }
@@ -3413,7 +3476,7 @@ class Engine private constructor(private val app: Context) {
 
     private fun spatialSignature(input: AudioSource): String {
         val profileId = if (soloMode) "solo_stereo_speaker" else spatialSettings.profile
-        return "${System.identityHashCode(input)}:$profileId:${spatialSettings.toJson()}"
+        return "${System.identityHashCode(input)}:$profileId:${spatialSettings.toJson()}:$spatialAbFixedCompensationDb"
     }
 
     private fun renderSourceFor(input: AudioSource, startAtFrame: Long = 0L): AudioSource {
@@ -3432,7 +3495,8 @@ class Engine private constructor(private val app: Context) {
         val created = SpatialSource(
             input,
             startAtFrame = startAtFrame.coerceIn(0L, input.totalFrames),
-            spatialConfig = spatialSettings.dspConfig(profileData),
+            spatialConfig = spatialSettings.dspConfig(profileData).copy(
+                fixedLoudnessCompensationDb = spatialAbFixedCompensationDb),
         )
         activeSpatialInput = input
         activeSpatialSource = created
@@ -3458,7 +3522,8 @@ class Engine private constructor(private val app: Context) {
         }
     }
 
-    private var activeSpatialSignature = ""
+    @Volatile private var activeSpatialSignature = ""
+    @Volatile private var spatialAbFixedCompensationDb: Double? = null
 
     private fun applySpatialSettings(next: SpatialSettings, finished: Boolean, reason: String = "user") {
         val clean = next.sanitized()
@@ -3862,6 +3927,8 @@ class Engine private constructor(private val app: Context) {
                 val settings = SpatialSettings(o.optBoolean("enabled", false), SpatialLevel.parse(o.optString("level")),
                     o.optString("profile", if (soloMode) "solo_stereo_speaker" else "pair_wide"), custom,
                     o.optBoolean("preserveLoudness", true)).sanitized()
+                spatialAbFixedCompensationDb = if (o.has("abFixedCompensationDb") && !o.isNull("abFixedCompensationDb"))
+                    o.optDouble("abFixedCompensationDb").coerceIn(-3.0, 3.0) else null
                 applySpatialSettings(settings, o.optBoolean("finished", true),
                     if (soloMode) "solo" else o.optString("originRole", "pair"))
             }

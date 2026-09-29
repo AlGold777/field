@@ -33,7 +33,10 @@ class SpatialSource(
     private val reflectionProcessor = if (spatialConfig.reflectionsEnabled && spatialConfig.reflectionTaps.isNotEmpty())
         SpatialReflectionProcessor(spatialConfig.reflectionTaps, strength = spatialConfig.strength) else null
     private val peakLimiter = SpatialPeakLimiter()
-    private val loudnessCompensator = SpatialLoudnessCompensator(enabled = spatialConfig.enabled && spatialConfig.preserveLoudness)
+    private val loudnessCompensator = SpatialLoudnessCompensator(
+        enabled = spatialConfig.enabled && spatialConfig.preserveLoudness,
+        fixedCompensationDb = spatialConfig.fixedLoudnessCompensationDb,
+    )
     private val window = DoubleArray(FFT_SIZE) { i -> sqrt(0.5 - 0.5 * cos(2.0 * PI * i / FFT_SIZE)) }
     private val realL = DoubleArray(FFT_SIZE)
     private val imagL = DoubleArray(FFT_SIZE)

@@ -9,7 +9,9 @@ import kotlin.math.sqrt
 class SpatialLoudnessCompensator(
     private val sampleRate: Int = 48_000,
     private val enabled: Boolean = true,
+    fixedCompensationDb: Double? = null,
 ) {
+    private val fixedGain = fixedCompensationDb?.coerceIn(-3.0, 3.0)?.let { 10.0.pow(it / 20.0) }
     private val shelf = doubleArrayOf(1.53512485958697, -2.69169618940638, 1.19839281085285,
         -1.69065929318241, 0.73248077421585)
     private val highPass = doubleArrayOf(1.0, -2.0, 1.0, -1.99004745483398, 0.99007225036621)
@@ -23,16 +25,16 @@ class SpatialLoudnessCompensator(
     private var blockFrames = 0
     private var blockInputPower = 0.0
     private var blockOutputPower = 0.0
-    private var gain = 1.0
+    private var gain = fixedGain ?: 1.0
     private val smoothing = 1.0 - exp(-BLOCK_FRAMES / (10.0 * sampleRate))
-    @Volatile var compensationDb: Double = 0.0
+    @Volatile var compensationDb: Double = fixedCompensationDb?.coerceIn(-3.0, 3.0) ?: 0.0
         private set
 
     /** Apply the current gain to output samples, then feed pre-gain levels to the estimator. */
     fun gain(): Double = if (enabled) gain else 1.0
 
     fun observe(inputLeft: Float, inputRight: Float, outputLeft: Float, outputRight: Float) {
-        if (!enabled) return
+        if (!enabled || fixedGain != null) return
         val inL = weighted(inputLeft.toDouble(), states[0])
         val inR = weighted(inputRight.toDouble(), states[1])
         val outL = weighted(outputLeft.toDouble(), states[2])
@@ -95,7 +97,9 @@ class SpatialLoudnessCompensator(
         states.forEach { it.fill(0.0) }
         inputWindow.fill(0.0); outputWindow.fill(0.0)
         windowCount = 0; windowCursor = 0; blockFrames = 0
-        blockInputPower = 0.0; blockOutputPower = 0.0; gain = 1.0; compensationDb = 0.0
+        blockInputPower = 0.0; blockOutputPower = 0.0
+        gain = fixedGain ?: 1.0
+        compensationDb = if (fixedGain == null) 0.0 else 20.0 * kotlin.math.log10(fixedGain)
     }
 
     companion object { private const val BLOCK_FRAMES = 512 }

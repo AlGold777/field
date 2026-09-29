@@ -23,6 +23,7 @@ data class SpatialDspConfig(
     val reflectionsEnabled: Boolean = false,
     val reflectionTaps: List<SpatialReflectionTap> = emptyList(),
     val preserveLoudness: Boolean = true,
+    val fixedLoudnessCompensationDb: Double? = null,
 )
 
 data class SpatialReflectionTap(val leftMs: Double, val rightMs: Double, val gainDb: Double)

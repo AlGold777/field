@@ -6,7 +6,9 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Text
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Button
+import androidx.compose.material3.FilterChip
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableLongStateOf
@@ -17,6 +19,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.unit.sp
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -27,6 +30,10 @@ import app.soundfield.core.BalanceLaw
 import app.soundfield.BuildConfig
 import app.soundfield.engine.Engine
 import app.soundfield.engine.UiState
+import app.soundfield.core.SpatialAbAnswer
+import app.soundfield.core.SpatialAbComparison
+import app.soundfield.core.SpatialAbSession
+import app.soundfield.core.SpatialLevel
 import kotlin.math.abs
 import kotlinx.coroutines.delay
 
@@ -36,12 +43,40 @@ fun DiagnosticsScreen(ui: UiState, engine: Engine, onRequestSyncProbe: () -> Uni
     var versionTapCount by remember { mutableIntStateOf(0) }
     var lastVersionTapMs by remember { mutableLongStateOf(0L) }
     var spatialStats by remember { mutableStateOf(engine.spatialDeveloperSnapshot()) }
+    var abComparison by rememberSaveable { mutableStateOf(SpatialAbComparison.OFF_SOFT.wire) }
+    var abSession by remember { mutableStateOf<SpatialAbSession?>(null) }
+    var abFinishedResult by remember { mutableStateOf<SpatialAbSession?>(null) }
+    var auditionRequest by remember { mutableStateOf<Pair<Long, SpatialLevel>?>(null) }
+    var auditionSequence by remember { mutableLongStateOf(0L) }
     val p = ui.pointDiag; val s = ui.serverDiag
     LaunchedEffect(developerMode, ui.spatialAvailable) {
         while (developerMode && ui.spatialAvailable) {
             spatialStats = engine.spatialDeveloperSnapshot()
             delay(500)
         }
+    }
+    LaunchedEffect(developerMode, ui.spatialAvailable, ui.mode) {
+        if ((!developerMode || !ui.spatialAvailable || ui.mode != app.soundfield.core.SourceMode.MUSIC) && abSession != null)
+            abSession = null
+    }
+    LaunchedEffect(abSession?.id, auditionRequest?.first) {
+        val session = abSession ?: return@LaunchedEffect
+        val request = auditionRequest ?: return@LaunchedEffect
+        engine.spatialAbAudition(request.second, session)
+        var ready = false
+        for (attempt in 0 until 200) {
+            if (engine.spatialAbReadyAt(session.anchorMs, request.second)) { ready = true; break }
+            delay(25)
+        }
+        if (!ready) return@LaunchedEffect
+        engine.play()
+        delay(8_000)
+        engine.pause()
+        auditionRequest = null
+    }
+    DisposableEffect(abSession?.id) {
+        val captured = abSession
+        onDispose { captured?.let(engine::finishSpatialAb) }
     }
     fun c(v: Double, good: Double, warn: Double): Color = when {
         v <= good -> SFColors.Good; v <= warn -> SFColors.Warn; else -> SFColors.Bad
@@ -203,6 +238,87 @@ fun DiagnosticsScreen(ui: UiState, engine: Engine, onRequestSyncProbe: () -> Uni
             }
         }
 
+        if (developerMode && ui.spatialAvailable && ui.role == Role.SERVER) {
+            SFCard {
+                H3("Слепое A/B · разработчик")
+                val activeSession = abSession
+                if (activeSession == null) {
+                    val result = abFinishedResult
+                    if (result != null) {
+                        Subtitle("Распознано ${result.correctDetections} из 8 · p = %.4f".format(result.pValue))
+                        Subtitle("Результат записан в files/spatial_ab.")
+                        Button(onClick = { abFinishedResult = null }) { Text("Новая серия") }
+                    } else {
+                        Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            SpatialAbComparison.entries.forEach { comparison ->
+                                FilterChip(selected = abComparison == comparison.wire,
+                                    onClick = { abComparison = comparison.wire },
+                                    label = { Text(when (comparison) {
+                                        SpatialAbComparison.OFF_SOFT -> "Выкл / Мягко"
+                                        SpatialAbComparison.OFF_STRONG -> "Выкл / Сильно"
+                                        SpatialAbComparison.SOFT_STRONG -> "Мягко / Сильно"
+                                    }) })
+                            }
+                        }
+                        Subtitle("Серия: 6 сравнений и 2 контрольных повтора A=A. Каждый вариант запускает один и тот же фрагмент на 8 секунд.")
+                        Button(enabled = ui.durationMs > 0, onClick = {
+                            val comparison = SpatialAbComparison.entries.first { it.wire == abComparison }
+                            val session = SpatialAbSession.create(comparison, ui.spatial,
+                                engine.positionMs().coerceAtMost((ui.durationMs - 8_000L).coerceAtLeast(0L)),
+                                ui.playing, engine.spatialAbCompensationSnapshotDb())
+                            abFinishedResult = null
+                            abSession = session
+                            engine.pause()
+                            engine.seekMs(session.anchorMs)
+                        }) { Text("Начать серию") }
+                    }
+                } else if (activeSession.complete) {
+                    Subtitle("Распознано ${activeSession.correctDetections} из 8 · p = %.4f".format(activeSession.pValue))
+                    Button(onClick = {
+                        engine.saveSpatialAbResult(activeSession)
+                        abFinishedResult = activeSession
+                        abSession = null
+                    }) { Text("Сохранить результат и восстановить звук") }
+                } else {
+                    val trial = activeSession.trials[activeSession.currentTrial]
+                    var answer by remember(activeSession.id, activeSession.currentTrial) {
+                        mutableStateOf(SpatialAbAnswer())
+                    }
+                    Subtitle("Попытка ${trial.index} из 8")
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Button(onClick = {
+                            auditionSequence++
+                            auditionRequest = auditionSequence to trial.variantA
+                        }) { Text("Прослушать A") }
+                        Button(onClick = {
+                            auditionSequence++
+                            auditionRequest = auditionSequence to trial.variantB
+                        }) { Text("Прослушать B") }
+                    }
+                    Subtitle("Варианты звучат по 8 секунд с одной и той же позиции.")
+                    AbYesNoRow("Слышна разница?", answer.detectsDifference) {
+                        answer = answer.copy(detectsDifference = it)
+                    }
+                    AbPreferenceRow("Где шире?", answer.width) { answer = answer.copy(width = it) }
+                    AbPreferenceRow("Где лучше центр?", answer.center) { answer = answer.copy(center = it) }
+                    AbPreferenceRow("Где естественнее?", answer.naturalness) { answer = answer.copy(naturalness = it) }
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Button(enabled = answer.complete, onClick = {
+                            engine.pause()
+                            engine.recordSpatialAbTrial(activeSession, activeSession.currentTrial, answer)
+                            val next = activeSession.answerCurrent(answer)
+                            if (next.complete) {
+                                engine.saveSpatialAbResult(next)
+                                abFinishedResult = next
+                                abSession = null
+                            } else abSession = next
+                        }) { Text(if (trial.index == 8) "Завершить" else "Следующая") }
+                        Button(onClick = { engine.pause(); abSession = null }) { Text("Отменить") }
+                    }
+                }
+            }
+        }
+
         SFCard {
             H3("Журнал подключения")
             if (ui.connLog.isEmpty()) DiagRow("Событий нет", "—")
@@ -223,6 +339,28 @@ fun DiagnosticsScreen(ui: UiState, engine: Engine, onRequestSyncProbe: () -> Uni
                     versionTapCount = 0
                 }
             }.padding(8.dp))
+    }
+}
+
+@Composable
+private fun AbYesNoRow(label: String, selected: Boolean?, onSelect: (Boolean) -> Unit) {
+    Row(Modifier.fillMaxWidth().padding(top = 6.dp), verticalAlignment = Alignment.CenterVertically) {
+        Text(label, color = SFColors.Text, modifier = Modifier.weight(1f))
+        FilterChip(selected = selected == true, onClick = { onSelect(true) }, label = { Text("Да") })
+        Spacer(Modifier.width(6.dp))
+        FilterChip(selected = selected == false, onClick = { onSelect(false) }, label = { Text("Нет") })
+    }
+}
+
+@Composable
+private fun AbPreferenceRow(label: String, selected: String?, onSelect: (String) -> Unit) {
+    Column(Modifier.fillMaxWidth().padding(top = 4.dp)) {
+        Text(label, color = SFColors.Text, fontSize = 14.sp)
+        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            listOf("a" to "A", "b" to "B", "same" to "Равно").forEach { (value, title) ->
+                FilterChip(selected = selected == value, onClick = { onSelect(value) }, label = { Text(title) })
+            }
+        }
     }
 }
 
