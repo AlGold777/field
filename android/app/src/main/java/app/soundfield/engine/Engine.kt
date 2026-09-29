@@ -345,6 +345,13 @@ class Engine private constructor(private val app: Context) {
     @Volatile private var activeSpatialSource: SpatialSource? = null
     @Volatile private var spatialReprocessFrame = 0L
     @Volatile private var spatialReprocessToken = 0L
+    @Volatile private var spatialBypassedInput: AudioSource? = null
+    @Volatile private var spatialBypassLocked = false
+    private var spatialAutoBypassCount = 0
+    private val spatialAutoBypassPending = AtomicBoolean(false)
+    @Volatile private var spatialPerfInput: AudioSource? = null
+    private var spatialPerfStartedAtMs = 0L
+    private var spatialSlowSinceMs = 0L
     private val spatialProfiles by lazy {
         runCatching { app.assets.open("spatial_profiles.json").bufferedReader().use { SpatialProfiles.parse(it.readText()) } }
             .getOrDefault(emptyMap())
@@ -3472,6 +3479,7 @@ class Engine private constructor(private val app: Context) {
 
     private fun spatialEnabledFor(input: AudioSource): Boolean = input.mode == SourceMode.MUSIC &&
         spatialSettings.enabled && spatialSettings.level != SpatialLevel.OFF && spatialAvailableNow() &&
+        !spatialBypassLocked && spatialBypassedInput !== input &&
         (!soloMode || deviceHasStereoSpeakers())
 
     private fun spatialSignature(input: AudioSource): String {
@@ -3524,6 +3532,71 @@ class Engine private constructor(private val app: Context) {
 
     @Volatile private var activeSpatialSignature = ""
     @Volatile private var spatialAbFixedCompensationDb: Double? = null
+
+    private fun monitorSpatialOverload(spatial: SpatialSource, playing: Boolean, positionFrame: Long, nowMs: Long) {
+        val input = activeSpatialInput
+        if (input == null || activeSpatialSource !== spatial) return
+        if (spatialPerfInput !== input) {
+            spatialPerfInput = input
+            spatialPerfStartedAtMs = nowMs
+            spatialSlowSinceMs = 0L
+        }
+        if (!playing || !spatialSettings.enabled || spatialBypassLocked || spatialBypassedInput === input) {
+            spatialSlowSinceMs = 0L
+            return
+        }
+        val decodedAhead = spatial.decodedReadyFrames - positionFrame
+        val processedBehind = positionFrame - spatial.readyFrames
+        if (nowMs - spatialPerfStartedAtMs >= 750L && decodedAhead >= SF.SAMPLE_RATE / 4 && processedBehind > 0L) {
+            requestSpatialAutoBypass(spatial, input, "processor_underrun", positionFrame)
+            return
+        }
+        val factor = spatial.realtimeFactor
+        if (factor >= 0.01 && factor < 3.0) {
+            if (spatialSlowSinceMs == 0L) spatialSlowSinceMs = nowMs
+            if (nowMs - spatialSlowSinceMs >= 5_000L)
+                requestSpatialAutoBypass(spatial, input, "rt_factor_below_3x", positionFrame)
+        } else spatialSlowSinceMs = 0L
+    }
+
+    private fun requestSpatialAutoBypass(spatial: SpatialSource, input: AudioSource, reason: String, positionFrame: Long) {
+        if (!spatialAutoBypassPending.compareAndSet(false, true)) return
+        post {
+            try {
+                if (activeSpatialSource !== spatial || activeSpatialInput !== input || spatialBypassedInput === input ||
+                    spatialBypassLocked || !spatialSettings.enabled || !spatialAvailableNow()) return@post
+                val timeline = serverPlay.timeline
+                if (!timeline.playing || mode != SourceMode.MUSIC) return@post
+                val requested = timeline.frameAt(System.nanoTime() + SF.LEAD_NS + 200_000_000L).toLong()
+                val frame = requested.coerceIn(0L, maxOf(0L, source.totalFrames - SF.SAMPLE_RATE / 20))
+                val previous = serverPlay.source
+                val fadeFrames = SF.SAMPLE_RATE / 20
+                serverPlay = ServerPlayState(timeline,
+                    CrossfadeAudioSource(previous, input, frame, fadeFrames),
+                    renderChannel(), serverGain(), activeEqConfig())
+                spatialReprocessFrame = frame
+                spatialReprocessToken++
+                spatialBypassedInput = input
+                spatialAutoBypassCount++
+                if (spatialAutoBypassCount >= 3) spatialBypassLocked = true
+                activeSpatialSource = null
+                activeSpatialInput = null
+                activeSpatialSignature = ""
+                spatialSlowSinceMs = 0L
+                closeSpatialLater(spatial)
+                telemetry.record("SPATIAL_AUTO_BYPASS", mapOf(
+                    "reason" to reason, "rtFactor" to spatial.realtimeFactor,
+                    "positionFrame" to positionFrame, "fFrame" to frame,
+                    "restarts" to spatial.restarts, "misses" to spatial.misses,
+                    "overloadsThisSession" to spatialAutoBypassCount,
+                    "lockedUntilRestart" to spatialBypassLocked,
+                    "dspVersion" to DSP_VERSION,
+                ))
+            } finally {
+                spatialAutoBypassPending.set(false)
+            }
+        }
+    }
 
     private fun applySpatialSettings(next: SpatialSettings, finished: Boolean, reason: String = "user") {
         val clean = next.sanitized()
@@ -4153,6 +4226,9 @@ class Engine private constructor(private val app: Context) {
         clearProgressiveBufferState()
         queueIndex = index
         mode = SourceMode.MUSIC
+        spatialBypassedInput = null
+        spatialPerfInput = null
+        spatialSlowSinceMs = 0L
         source = loaded
         currentQueueSource = loaded
         savedFrame = 0
@@ -4753,9 +4829,22 @@ class Engine private constructor(private val app: Context) {
         val playing = if (role == Role.SERVER) serverPlay.timeline.playing else rx.timeline.playing
         val position = if (role == Role.SERVER) serverPlay.timeline.positionFrame(System.nanoTime()).coerceAtLeast(0)
             else if (clock.ready) rx.timeline.positionFrame(clock.toServer(System.nanoTime())).coerceAtLeast(0) else 0L
-        val activeSpatial = if (role == Role.SERVER) serverPlay.source as? SpatialSource else null
+        val activeSpatial = if (role == Role.SERVER) activeSpatialSource else null
+        if (activeSpatial != null) monitorSpatialOverload(activeSpatial, playing, position, nowMs)
+        else {
+            spatialPerfInput = null
+            spatialPerfStartedAtMs = 0L
+            spatialSlowSinceMs = 0L
+        }
         if (activeSpatial != null && (lastSpatialPerfAtMs == 0L || nowMs - lastSpatialPerfAtMs >= 10_000L)) {
             val currentPosition = if (playing) position else activeSpatial.readyFrames
+            val battery = app.getSystemService(Context.BATTERY_SERVICE) as? android.os.BatteryManager
+            val batteryCurrentNowUa = battery?.getLongProperty(android.os.BatteryManager.BATTERY_PROPERTY_CURRENT_NOW)
+                ?.takeUnless { it == Long.MIN_VALUE }
+            val batteryCurrentAverageUa = battery?.getLongProperty(android.os.BatteryManager.BATTERY_PROPERTY_CURRENT_AVERAGE)
+                ?.takeUnless { it == Long.MIN_VALUE }
+            val batteryCapacityPct = battery?.getIntProperty(android.os.BatteryManager.BATTERY_PROPERTY_CAPACITY)
+                ?.takeUnless { it == Int.MIN_VALUE }
             telemetry.record("SPATIAL_PERF", mapOf(
                 "rtFactor" to activeSpatial.realtimeFactor,
                 "cacheAheadMs" to ((activeSpatial.readyFrames - currentPosition).coerceAtLeast(0) * 1000.0 / SF.SAMPLE_RATE),
@@ -4765,6 +4854,9 @@ class Engine private constructor(private val app: Context) {
                 "loudnessCompDb" to activeSpatial.loudnessCompensationDb,
                 "sideMidDb" to activeSpatial.sideMidDb,
                 "corrMin" to activeSpatial.correlation,
+                "batteryCurrentNowUa" to batteryCurrentNowUa,
+                "batteryCurrentAverageUa" to batteryCurrentAverageUa,
+                "batteryCapacityPct" to batteryCapacityPct,
                 "dspVersion" to DSP_VERSION,
             ))
             lastSpatialPerfAtMs = nowMs

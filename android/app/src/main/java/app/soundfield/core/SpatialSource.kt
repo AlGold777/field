@@ -25,6 +25,7 @@ class SpatialSource(
     override val totalFrames get() = inner.totalFrames
     override val readyFrames: Long get() = minOf(inner.readyFrames, processedHead)
     override val complete: Boolean get() = inner.complete && processedHead >= inner.totalFrames
+    val decodedReadyFrames: Long get() = inner.readyFrames
 
     val cacheCapacityFrames: Int = (cacheSeconds.coerceAtLeast(1) * SF.SAMPLE_RATE)
     private val cache = FloatArray(cacheCapacityFrames * 2)
