@@ -26,7 +26,7 @@ from dsp.xtc import apply_xtc
 from signals import generate_synthetic, write_sync_probe
 
 
-PROTO_VERSION = "0.1.2"
+PROTO_VERSION = "0.1.3"
 VARIANT_CODES = ("REF", "ANCHOR_MONO", "ANCHOR_OVER", "W2_LO", "W2_HI", "W2_W3", "W2_W3_W6")
 SUPPORTED_EXTENSIONS = {".wav", ".flac"}
 
