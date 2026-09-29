@@ -43,6 +43,8 @@ fun DiagnosticsScreen(ui: UiState, engine: Engine, onRequestSyncProbe: () -> Uni
     var versionTapCount by remember { mutableIntStateOf(0) }
     var lastVersionTapMs by remember { mutableLongStateOf(0L) }
     var spatialStats by remember { mutableStateOf(engine.spatialDeveloperSnapshot()) }
+    var xtcReport by remember { mutableStateOf(engine.xtcDeveloperSnapshot()) }
+    var xtcReportLevel by rememberSaveable { mutableStateOf(SpatialLevel.SOFT) }
     var abComparison by rememberSaveable { mutableStateOf(SpatialAbComparison.OFF_SOFT.wire) }
     var abSession by remember { mutableStateOf<SpatialAbSession?>(null) }
     var abFinishedResult by remember { mutableStateOf<SpatialAbSession?>(null) }
@@ -52,6 +54,7 @@ fun DiagnosticsScreen(ui: UiState, engine: Engine, onRequestSyncProbe: () -> Uni
     LaunchedEffect(developerMode, ui.spatialAvailable) {
         while (developerMode && ui.spatialAvailable) {
             spatialStats = engine.spatialDeveloperSnapshot()
+            xtcReport = engine.xtcDeveloperSnapshot()
             delay(500)
         }
     }
@@ -234,7 +237,33 @@ fun DiagnosticsScreen(ui: UiState, engine: Engine, onRequestSyncProbe: () -> Uni
                 DiagRow("Запас кэша", "%.0f мс".format(spatialStats.cacheAheadMs))
                 DiagRow("Перезапуски / недоборы", "${spatialStats.restarts} / ${spatialStats.misses}")
                 DiagRow("Ограничитель / компенсация", "%.1f / %+.1f дБ".format(spatialStats.limiterDb, spatialStats.loudnessCompDb))
+                if (ui.soloMode) {
+                    DiagRow("XTC в обработке", if (spatialStats.xtcApplied) "да" else "нет")
+                    if (spatialStats.xtcDesignTimedOut) DiagRow("Расчёт XTC", "превышено 200 мс", SFColors.Warn)
+                }
                 DiagRow("Версия", app.soundfield.dsp.DSP_VERSION)
+            }
+            if (ui.soloMode) {
+                SFCard {
+                    H3("XTC · модельная оценка")
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        listOf(SpatialLevel.SOFT, SpatialLevel.STRONG).forEach { level ->
+                            FilterChip(selected = xtcReportLevel == level,
+                                onClick = { xtcReportLevel = level },
+                                label = { Text(if (level == SpatialLevel.SOFT) "Мягко" else "Сильно") })
+                        }
+                    }
+                    Button(onClick = { engine.requestXtcDeveloperReport(xtcReportLevel) }) {
+                        Text(if (xtcReport.status == "расчёт") "Считаю…" else "Рассчитать отчёт")
+                    }
+                    if (xtcReport.status == "готово") {
+                        DiagRow("Расстояние динамиков", "%.2f м".format(xtcReport.spacingMeters))
+                        DiagRow("β / время расчёта", "%.4f / %.0f мс".format(xtcReport.beta, xtcReport.designMs))
+                        DiagRow("Медиана / худшая точка", "%.1f / %.1f дБ".format(
+                            xtcReport.predictedMedianDb, xtcReport.predictedWorstDb))
+                    } else if (xtcReport.status != "не рассчитано") Subtitle(xtcReport.status)
+                    Subtitle("Это оценка акустической модели. Она не подтверждает модель телефона и не включает XTC без xtcVerified.")
+                }
             }
         }
 

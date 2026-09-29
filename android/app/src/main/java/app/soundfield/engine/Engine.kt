@@ -40,6 +40,8 @@ import app.soundfield.diagnostics.TelemetryText
 import app.soundfield.dsp.DSP_VERSION
 import app.soundfield.dsp.SpatialProfile
 import app.soundfield.dsp.SpatialProfiles
+import app.soundfield.dsp.XtcFilterDesigner
+import app.soundfield.dsp.XtcFilterSet
 import app.soundfield.audio.AudioOutput
 import app.soundfield.audio.AudioFileDecoder
 import app.soundfield.audio.MicRecorder
@@ -349,6 +351,7 @@ class Engine private constructor(private val app: Context) {
     @Volatile private var spatialBypassLocked = false
     private var spatialAutoBypassCount = 0
     private val spatialAutoBypassPending = AtomicBoolean(false)
+    @Volatile private var xtcReport = XtcDeveloperReport()
     @Volatile private var spatialPerfInput: AudioSource? = null
     private var spatialPerfStartedAtMs = 0L
     private var spatialSlowSinceMs = 0L
@@ -2267,6 +2270,8 @@ class Engine private constructor(private val app: Context) {
             correlation = current?.correlation ?: 1.0,
             limiterDb = current?.limiterReductionDb ?: 0.0,
             loudnessCompDb = current?.loudnessCompensationDb ?: 0.0,
+            xtcApplied = current?.xtcApplied ?: false,
+            xtcDesignTimedOut = current?.xtcDesignTimedOut ?: false,
         )
     }
 
@@ -3457,7 +3462,45 @@ class Engine private constructor(private val app: Context) {
     private fun deviceHasStereoSpeakers(): Boolean = deviceSpeakerRecord()?.optBoolean("stereoSpeakers")
         ?: audio.builtInSpeakerSupportsStereo()
 
+    private fun deviceSpeakerSpacingM(): Double = deviceSpeakerRecord()?.optDouble("spacingM", 0.14)
+        ?.takeIf { it > 0.0 } ?: 0.14
+
     private fun deviceXtcVerified(): Boolean = deviceSpeakerRecord()?.optBoolean("xtcVerified") ?: false
+
+    private fun xtcBeta(level: SpatialLevel, profileBeta: Double): Double = when (level) {
+        SpatialLevel.SOFT -> profileBeta
+        SpatialLevel.STRONG -> profileBeta / 3.0
+        SpatialLevel.OFF -> profileBeta
+    }
+
+    fun xtcDeveloperSnapshot(): XtcDeveloperReport = xtcReport
+
+    /** Model-only report for the hidden developer diagnostics; it does not mark a device verified. */
+    fun requestXtcDeveloperReport(level: SpatialLevel) {
+        if (!soloMode || mode != SourceMode.MUSIC || !spatialAvailableNow() || level == SpatialLevel.OFF) return
+        val profileBeta = spatialProfile("solo_stereo_speaker").xtcBeta ?: 0.06
+        val beta = xtcBeta(level, profileBeta)
+        val spacing = deviceSpeakerSpacingM()
+        xtcReport = XtcDeveloperReport(status = "расчёт")
+        XtcFilterDesigner.request(Build.MODEL, spacing, beta).whenComplete { design, error ->
+            if (error != null || design == null) {
+                xtcReport = XtcDeveloperReport(status = "ошибка расчёта")
+                telemetry.record("XTC_DESIGN", mapOf("spacing" to spacing, "beta" to beta, "status" to "error"), error = error)
+            } else {
+                xtcReport = XtcDeveloperReport("готово", design.spacingMeters, design.beta, design.designMs,
+                    design.predictedMedianDb, design.predictedWorstDb)
+                recordXtcDesign(design, "developer_report")
+            }
+        }
+    }
+
+    private fun recordXtcDesign(design: XtcFilterSet, source: String) {
+        telemetry.record("XTC_DESIGN", mapOf(
+            "spacing" to design.spacingMeters, "beta" to design.beta, "designMs" to design.designMs,
+            "predictedMedianDb" to design.predictedMedianDb, "predictedWorstDb" to design.predictedWorstDb,
+            "model" to Build.MODEL, "source" to source, "modelOnly" to true,
+        ))
+    }
 
     private fun spatialAvailableNow(): Boolean = when {
         soloMode -> mode == SourceMode.MUSIC && audio.isBuiltInSpeakerRoute() && deviceHasStereoSpeakers()
@@ -3500,11 +3543,16 @@ class Engine private constructor(private val app: Context) {
         val old = activeSpatialSource
         val profileId = if (soloMode) "solo_stereo_speaker" else spatialSettings.profile
         val profileData = spatialProfile(profileId)
+        val xtcDesign = if (soloMode && deviceXtcVerified() && spatialSettings.enabled && profileData.xtcBeta != null) {
+            XtcFilterDesigner.request(Build.MODEL, deviceSpeakerSpacingM(), xtcBeta(spatialSettings.level, profileData.xtcBeta))
+        } else null
+        xtcDesign?.thenAccept { recordXtcDesign(it, "verified_playback") }
         val created = SpatialSource(
             input,
             startAtFrame = startAtFrame.coerceIn(0L, input.totalFrames),
             spatialConfig = spatialSettings.dspConfig(profileData).copy(
                 fixedLoudnessCompensationDb = spatialAbFixedCompensationDb),
+            xtcDesign = xtcDesign,
         )
         activeSpatialInput = input
         activeSpatialSource = created
@@ -4854,6 +4902,8 @@ class Engine private constructor(private val app: Context) {
                 "loudnessCompDb" to activeSpatial.loudnessCompensationDb,
                 "sideMidDb" to activeSpatial.sideMidDb,
                 "corrMin" to activeSpatial.correlation,
+                "xtcApplied" to activeSpatial.xtcApplied,
+                "xtcDesignTimedOut" to activeSpatial.xtcDesignTimedOut,
                 "batteryCurrentNowUa" to batteryCurrentNowUa,
                 "batteryCurrentAverageUa" to batteryCurrentAverageUa,
                 "batteryCapacityPct" to batteryCapacityPct,

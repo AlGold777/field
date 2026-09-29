@@ -287,6 +287,17 @@ data class SpatialDeveloperSnapshot(
     val correlation: Double,
     val limiterDb: Double,
     val loudnessCompDb: Double,
+    val xtcApplied: Boolean = false,
+    val xtcDesignTimedOut: Boolean = false,
+)
+
+data class XtcDeveloperReport(
+    val status: String = "не рассчитано",
+    val spacingMeters: Double = 0.0,
+    val beta: Double = 0.0,
+    val designMs: Double = 0.0,
+    val predictedMedianDb: Double = 0.0,
+    val predictedWorstDb: Double = 0.0,
 )
 
 data class UiState(
