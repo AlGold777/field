@@ -1,6 +1,7 @@
 package app.soundfield.core
 
 import java.util.concurrent.atomic.AtomicLong
+import app.soundfield.dsp.WindowedSinc
 
 /**
  * Рендер на Server: канал serverCh текущего источника, по общей временной шкале.
@@ -26,16 +27,19 @@ class ServerRenderer(
         if (!tl.playing) {
             java.util.Arrays.fill(out, 0, n, 0f); corrector.reset(); finish(out, n, st.gain, st.equalizer); return
         }
-        corrector.plan(tl.frameAt(presentLocalNs), n)
+        corrector.plan(tl.frameAt(presentLocalNs) - WindowedSinc.GROUP_DELAY_FRAMES, n)
         val src = st.source
         var sourceMissing = 0L
         val progressive = src as? SegmentedPcmSource
         for (i in 0 until n) {
-            val f = corrector.frame(i, n)
+            val position = corrector.position(i)
+            val f = kotlin.math.floor(position + 0.5).toLong()
             val g = tl.envelope(f)
             if (g == 0f) out[i] = 0f else {
-                val sample = if (st.channel == Ch.BOTH) (src.sample(f, Ch.L) + src.sample(f, Ch.R)) * 0.5f
-                    else src.sample(f, st.channel)
+                val sample = if (st.channel == Ch.BOTH) {
+                    (WindowedSinc.interpolate(position) { src.sample(it, Ch.L) } +
+                        WindowedSinc.interpolate(position) { src.sample(it, Ch.R) }) * 0.5f
+                } else WindowedSinc.interpolate(position) { src.sample(it, st.channel) }
                 out[i] = sample * g
                 if (progressive != null && !progressive.complete && f < progressive.totalFrames && f >= progressive.readyFrames) {
                     sourceMissing++
@@ -99,13 +103,16 @@ class PointRenderer(
             java.util.Arrays.fill(out, 0, n, 0f); corrector.reset(); finish(out, n, p); return
         }
         val serverNs = clock.toServer(presentLocalNs) - p.trimNs
-        corrector.plan(tl.frameAt(serverNs), n)
+        corrector.plan(tl.frameAt(serverNs) - WindowedSinc.GROUP_DELAY_FRAMES, n)
         var missing = 0
         for (i in 0 until n) {
-            val f = corrector.frame(i, n)
+            val position = corrector.position(i)
+            val f = kotlin.math.floor(position + 0.5).toLong()
             val g = tl.envelope(f)
             if (g == 0f) { out[i] = 0f; continue }
-            val s = if (audioPath() == "tcp") tcpAudio.read(tl.epoch, f) else rx.read(f)
+            val s = WindowedSinc.interpolate(position) { frame ->
+                if (audioPath() == "tcp") tcpAudio.read(tl.epoch, frame) else rx.read(frame)
+            }
             if (s.isNaN()) {
                 out[i] = 0f
                 if (p.totalFrames <= 0 || f < p.totalFrames) missing++

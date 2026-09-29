@@ -20,6 +20,46 @@ import kotlin.math.sqrt
  *
  * add*() — из сетевого потока, toServer() — из аудиопотока (модель публикуется через @Volatile).
  */
+internal class ClockModelSmoother {
+    private class Active(val model: ClockSync.Model, val startNs: Long, val correctionNs: Double)
+    @Volatile private var active: Active? = null
+
+    fun reset(model: ClockSync.Model = ClockSync.Model(0, 0.0, 0.0, false), atNs: Long = 0L) {
+        active = if (model.ready) Active(model, atNs, 0.0) else null
+    }
+
+    fun deltaTo(next: ClockSync.Model, nowNs: Long): Double {
+        val old = active ?: return 0.0
+        return rawOffset(next, nowNs) - offsetAt(old, nowNs)
+    }
+
+    fun update(next: ClockSync.Model, nowNs: Long, immediate: Boolean) {
+        val old = active
+        val oldOffset = old?.let { offsetAt(it, nowNs) }
+        val correction = if (immediate || oldOffset == null) 0.0 else oldOffset - rawOffset(next, nowNs)
+        active = Active(next, nowNs, correction)
+    }
+
+    fun toServer(localNs: Long): Long {
+        val state = active ?: return localNs
+        return (localNs + offsetAt(state, localNs)).toLong()
+    }
+
+    private fun offsetAt(state: Active, localNs: Long): Double {
+        val base = rawOffset(state.model, localNs)
+        val elapsed = (localNs - state.startNs).coerceAtLeast(0L).toDouble()
+        val maxChange = elapsed * MAX_MODEL_SLEW_NS_PER_NS
+        val initial = state.correctionNs
+        val correction = if (initial > 0.0) (initial - maxChange).coerceAtLeast(0.0)
+            else (initial + maxChange).coerceAtMost(0.0)
+        return base + correction
+    }
+
+    private fun rawOffset(model: ClockSync.Model, localNs: Long) = model.a + model.b * (localNs - model.ref)
+
+    companion object { private const val MAX_MODEL_SLEW_NS_PER_NS = 2e-6 }
+}
+
 class ClockSync {
 
     private class Bucket(val start: Long) {
@@ -32,8 +72,11 @@ class ClockSync {
     }
 
     class Model(val ref: Long, val a: Double, val b: Double, val ready: Boolean)
-
     @Volatile var model = Model(0, 0.0, 0.0, false); private set
+    private val smoothed = ClockModelSmoother()
+    private var connectionStartNs = Long.MIN_VALUE
+    private val modelStepsUs = ArrayDeque<Double>()
+    private val pendingModelStepsUs = ArrayDeque<Double>()
 
     private val buckets = ArrayDeque<Bucket>()
     private val rtts = ArrayDeque<Double>()
@@ -46,10 +89,19 @@ class ClockSync {
     @Volatile var pongs = 0L; private set
     /** Оценка погрешности offset, мс (половина разности «лучший RTT − 2·физическая задержка» ~ разброс корзин). */
     @Volatile var uncertaintyMs = 0.0; private set
+    @Volatile var lastModelStepUs = 0.0; private set
+    @Volatile var modelStepP50Us = 0.0; private set
+    @Volatile var modelStepP95Us = 0.0; private set
+    @Volatile var modelStepMaxUs = 0.0; private set
 
     fun reset() = synchronized(lock) {
         buckets.clear(); rtts.clear(); pongs = 0
         model = Model(0, 0.0, 0.0, false)
+        smoothed.reset()
+        connectionStartNs = Long.MIN_VALUE
+        modelStepsUs.clear()
+        pendingModelStepsUs.clear()
+        lastModelStepUs = 0.0; modelStepP50Us = 0.0; modelStepP95Us = 0.0; modelStepMaxUs = 0.0
     }
 
     private fun bucketFor(local: Long): Bucket {
@@ -69,6 +121,7 @@ class ClockSync {
         val rtt = (t4 - t1) - (t3 - t2)
         if (rtt < 0 || rtt > 2_000_000_000L) return
         synchronized(lock) {
+            if (connectionStartNs == Long.MIN_VALUE) connectionStartNs = t1
             pongs++
             val bf = bucketFor(t1)
             bf.minFwd = minOf(bf.minFwd, t2 - t1); bf.nFwd++
@@ -85,6 +138,7 @@ class ClockSync {
     fun addOneWay(sendServerNs: Long, arrivalLocal: Long) {
         synchronized(lock) {
             if (buckets.isEmpty()) return
+            if (connectionStartNs == Long.MIN_VALUE) connectionStartNs = arrivalLocal
             val b = bucketFor(arrivalLocal)
             val d = arrivalLocal - sendServerNs
             b.nBwd++
@@ -124,7 +178,24 @@ class ClockSync {
             uncertaintyMs = (best.quality - qMin) / 2e6 + (qMin / 1e6) * 0.1
         }
         driftPpm = b * 1e6
-        model = Model(ref, a, b, true)
+        val next = Model(ref, a, b, true)
+        val now = System.nanoTime()
+        val deltaNs = smoothed.deltaTo(next, now)
+        lastModelStepUs = abs(deltaNs) / 1_000.0
+        modelStepsUs.addLast(lastModelStepUs)
+        while (modelStepsUs.size > 120) modelStepsUs.removeFirst()
+        pendingModelStepsUs.addLast(lastModelStepUs)
+        while (pendingModelStepsUs.size > 120) pendingModelStepsUs.removeFirst()
+        val sorted = modelStepsUs.sorted()
+        modelStepP50Us = percentile(sorted, 0.50)
+        modelStepP95Us = percentile(sorted, 0.95)
+        modelStepMaxUs = sorted.lastOrNull() ?: 0.0
+
+        val forceImmediate = !model.ready ||
+            connectionStartNs == Long.MIN_VALUE || now - connectionStartNs < INITIAL_SLEW_EXEMPT_NS ||
+            abs(deltaNs) > ROUTE_CHANGE_THRESHOLD_NS
+        smoothed.update(next, now, forceImmediate)
+        model = next
     }
 
     private fun sq(x: Double) = x * x
@@ -133,13 +204,26 @@ class ClockSync {
 
     /** Перевод локального монотонного времени Point во время Server. */
     fun toServer(localNs: Long): Long {
-        val m = model
-        return localNs + (m.a + m.b * (localNs - m.ref)).toLong()
+        return smoothed.toServer(localNs)
+    }
+
+    private fun percentile(sorted: List<Double>, percentile: Double): Double {
+        if (sorted.isEmpty()) return 0.0
+        return sorted[((sorted.size - 1) * percentile).toInt().coerceIn(0, sorted.lastIndex)]
+    }
+
+    /** Drain model updates for batched telemetry on the engine thread. */
+    fun takeModelStepsUs(): List<Double> = synchronized(lock) {
+        val result = pendingModelStepsUs.toList()
+        pendingModelStepsUs.clear()
+        result
     }
 
     companion object {
         const val BUCKET_NS = 2_000_000_000L
         const val MAX_BUCKETS = 40
         const val MAX_DRIFT = 300e-6
+        private const val INITIAL_SLEW_EXEMPT_NS = 12_000_000_000L
+        private const val ROUTE_CHANGE_THRESHOLD_NS = 2_000_000.0
     }
 }

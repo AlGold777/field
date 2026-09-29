@@ -89,13 +89,17 @@ fun PlayerScreen(ui: UiState, engine: Engine, openCalibration: () -> Unit, openD
 
             // --- индикатор синхронизации ---
             val pd = ui.pointDiag; val sd = ui.serverDiag
-            val lrEst = if (pd.valid && sd.valid) abs(pd.syncErrMs - sd.syncErrMs) + pd.clockUncMs else null
+            val lrEstUs = if (pd.valid && sd.valid) abs(pd.syncErrUs - sd.syncErrUs) + pd.clockUncMs * 1_000.0 else null
             Row(Modifier.fillMaxWidth().clip(CircleShape).background(SFColors.Card).clickable { openDiagnostics() }
                 .padding(horizontal = 16.dp, vertical = 10.dp), horizontalArrangement = Arrangement.Center) {
                 Text(
-                    if (lrEst == null) "⚡ Синхронизация часов…"
-                    else "⚡ L/R: ±%.1f мс • RTT %.0f мс • буфер %.0f мс".format(lrEst, pd.rttMs, pd.bufferMs),
-                    color = if (lrEst != null && lrEst < 2) SFColors.Good else SFColors.Warn, fontSize = 13.sp)
+                    if (lrEstUs == null) "⚡ Синхронизация часов…"
+                    else {
+                        val estimate = if (lrEstUs < 1_000.0) "±%.0f мкс".format(lrEstUs)
+                            else "±%.2f мс".format(lrEstUs / 1_000.0)
+                        "⚡ L/R: $estimate по оценке часов • RTT %.0f мс • буфер %.0f мс".format(pd.rttMs, pd.bufferMs)
+                    },
+                    color = if (lrEstUs != null && lrEstUs < 2_000.0) SFColors.Good else SFColors.Warn, fontSize = 13.sp)
             }
             Spacer(Modifier.height(20.dp))
         }

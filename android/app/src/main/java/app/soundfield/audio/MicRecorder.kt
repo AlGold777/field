@@ -18,7 +18,9 @@ class MicRecorder(private val ctx: Context) {
     class Recording(val samples: FloatArray, val sampleRate: Int, val startNs: Long)
 
     @SuppressLint("MissingPermission")
-    fun record(durationMs: Long, onStarted: () -> Unit): Recording {
+    fun record(durationMs: Long, onStarted: () -> Unit): Recording = record(durationMs, onStarted) { true }
+
+    fun record(durationMs: Long, onStarted: () -> Unit, shouldContinue: () -> Boolean): Recording {
         val sr = 48_000
         val am = ctx.getSystemService(Context.AUDIO_SERVICE) as AudioManager
         val unprocessed = am.getProperty(AudioManager.PROPERTY_SUPPORT_AUDIO_SOURCE_UNPROCESSED) == "true"
@@ -33,7 +35,7 @@ class MicRecorder(private val ctx: Context) {
         var startNs = 0L
         rec.startRecording()
         try {
-            while (pos < total) {
+            while (pos < total && shouldContinue() && !Thread.currentThread().isInterrupted) {
                 val r = rec.read(out, pos, minOf(chunk, total - pos), AudioRecord.READ_BLOCKING)
                 if (r <= 0) break
                 if (pos == 0) {

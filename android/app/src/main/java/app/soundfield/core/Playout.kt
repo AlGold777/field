@@ -60,52 +60,56 @@ class Timeline(
 }
 
 /**
- * Держит фактическую позицию чтения аудиовыхода рядом с «идеальной» (вычисленной по часам).
- * Ошибка сглаживается; при |ошибке| > порога — пропуск или повтор одного сэмпла за колбэк
- * (≤ 1/240 → незаметно на слух). При ошибке > 20 мс — жёсткий прыжок (старт, seek, потеря связи).
- * Вызывается только из аудиопотока.
+ * Fractional-frame PI playout correction. The audio callback reads through a 32-tap sinc
+ * interpolator, avoiding the clicks caused by dropping or duplicating one whole sample.
+ * Called only from the audio thread.
  */
 class PlayoutCorrector {
-    private var readPos = Long.MIN_VALUE
+    private var readPos = Double.NaN
     private var filt = 0.0
-    var start = 0L; private set
-    var adjust = 0; private set
+    private var integral = 0.0
+    private var start = 0.0
+    private var step = 1.0
 
-    @Volatile var syncErrorMs = 0.0; private set
+    @Volatile var syncErrorUs = 0.0; private set
     @Volatile var hardJumps = 0; private set
     @Volatile var slewEvents = 0L; private set
 
-    fun reset() { readPos = Long.MIN_VALUE; filt = 0.0 }
+    fun reset() { readPos = Double.NaN; filt = 0.0; integral = 0.0; step = 1.0 }
 
     /** ideal — дробный индекс кадра, который должен прозвучать первым в этом буфере. */
     fun plan(ideal: Double, n: Int) {
-        if (readPos == Long.MIN_VALUE || abs(ideal - readPos) > SF.HARD_RESYNC_FRAMES) {
-            if (readPos != Long.MIN_VALUE) hardJumps++
-            readPos = floor(ideal + 0.5).toLong()
+        if (readPos.isNaN() || abs(ideal - readPos) > SF.HARD_RESYNC_FRAMES) {
+            if (!readPos.isNaN()) hardJumps++
+            readPos = ideal
             filt = 0.0
+            integral = 0.0
         }
         val err = ideal - readPos
         filt += 0.1 * (err - filt)
-        adjust = when {
-            filt > SF.SLEW_THRESHOLD_FRAMES -> 1     // отстаём — пропустить сэмпл
-            filt < -SF.SLEW_THRESHOLD_FRAMES -> -1   // спешим — повторить сэмпл
-            else -> 0
-        }
-        if (adjust != 0) slewEvents++
+        val dt = n.coerceAtLeast(1).toDouble() / SF.SAMPLE_RATE
+        val errorSeconds = filt / SF.SAMPLE_RATE
+        integral = (integral + errorSeconds * dt).coerceIn(-0.05, 0.05)
+        // Critically damped 3-second loop; 100 us phase error initially asks for about 67 ppm.
+        val correction = (KP_PER_SECOND * errorSeconds + KI_PER_SECOND2 * integral)
+            .coerceIn(-MAX_RATE_CORRECTION, MAX_RATE_CORRECTION)
+        step = 1.0 + correction
+        if (abs(correction) > 1e-6) slewEvents++
         start = readPos
-        readPos += n + adjust
-        filt -= adjust
-        syncErrorMs = filt * 1000.0 / SF.SAMPLE_RATE
+        readPos += n * step
+        syncErrorUs = filt * 1e6 / SF.SAMPLE_RATE
     }
 
-    /** Индекс кадра для i-го сэмпла буфера с учётом пропуска/повтора в середине. */
-    fun frame(i: Int, n: Int): Long {
-        val half = n / 2
-        return when {
-            adjust > 0 && i >= half -> start + i + 1
-            adjust < 0 && i > half -> start + i - 1
-            else -> start + i
-        }
+    /** Fractional index for one output frame in the current callback. */
+    fun position(i: Int): Double = start + i * step
+
+    /** Compatibility helper for position-only UI/telemetry call sites. */
+    fun frame(i: Int, @Suppress("UNUSED_PARAMETER") n: Int): Long = floor(position(i) + 0.5).toLong()
+
+    companion object {
+        private const val KP_PER_SECOND = 2.0 / 3.0
+        private const val KI_PER_SECOND2 = 1.0 / 9.0
+        private const val MAX_RATE_CORRECTION = 200e-6
     }
 }
 

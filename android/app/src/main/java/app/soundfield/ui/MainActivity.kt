@@ -21,6 +21,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Modifier
+import androidx.core.content.ContextCompat
 import androidx.compose.ui.platform.LocalContext
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import app.soundfield.engine.Engine
@@ -52,11 +53,17 @@ fun AppRoot(engine: Engine) {
     val ui by engine.ui.collectAsStateWithLifecycle()
     val ctx = LocalContext.current
     var sub by remember { mutableStateOf(Sub.NONE) }
+    var syncProbeAfterPermission by remember { mutableStateOf(false) }
 
     val notifLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) {}
     val micLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
-        if (granted) engine.micPermissionGranted()
-        else Toast.makeText(ctx, "Без микрофона доступна только ручная калибровка", Toast.LENGTH_LONG).show()
+        if (granted) {
+            engine.micPermissionGranted()
+            if (syncProbeAfterPermission) engine.startSyncProbe()
+        }
+        syncProbeAfterPermission = false
+        if (!granted)
+            Toast.makeText(ctx, "Без микрофона доступна только ручная калибровка", Toast.LENGTH_LONG).show()
     }
     val audioFilesLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
         if (uris.isNotEmpty()) engine.addAudioFiles(uris)
@@ -104,7 +111,15 @@ fun AppRoot(engine: Engine) {
             showWelcome -> WelcomeScreen(ui, engine)
             sub == Sub.CALIBRATION -> CalibrationScreen(ui, engine,
                 requestMic = { micLauncher.launch(Manifest.permission.RECORD_AUDIO) }, onBack = { sub = Sub.NONE })
-            sub == Sub.DIAGNOSTICS -> DiagnosticsScreen(ui, engine, onBack = { sub = Sub.NONE })
+            sub == Sub.DIAGNOSTICS -> DiagnosticsScreen(ui, engine,
+                onRequestSyncProbe = {
+                    if (ContextCompat.checkSelfPermission(ctx, Manifest.permission.RECORD_AUDIO) == android.content.pm.PackageManager.PERMISSION_GRANTED)
+                        engine.startSyncProbe()
+                    else {
+                        syncProbeAfterPermission = true
+                        micLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                    }
+                }, onBack = { sub = Sub.NONE })
             sub == Sub.EQUALIZER -> EqualizerScreen(ui, engine, onBack = { sub = Sub.NONE })
             else -> PlayerScreen(ui, engine, openCalibration = { sub = Sub.CALIBRATION }, openDiagnostics = { sub = Sub.DIAGNOSTICS },
                 openTrackPicker = { engine.requestTrackPicker() }, openEqualizer = { sub = Sub.EQUALIZER })

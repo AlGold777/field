@@ -118,6 +118,43 @@ class ChannelTestSource : AudioSource {
     }
 }
 
+/** Two-second-spaced-independent probe pairs: L chirp, then R chirp 100 ms later. */
+class SyncProbeSource : AudioSource {
+    override val mode = SourceMode.SYNC_PROBE
+    override val title = "Замер синхронизации"
+    override val artist = "Внутренний режим разработчика"
+    override val totalFrames = SF.SAMPLE_RATE * TRIALS.toLong()
+    private val chirp = makeChirp()
+
+    override fun sample(frame: Long, ch: Int): Float {
+        if (frame < 0 || frame >= totalFrames || ch !in Ch.L..Ch.R) return 0f
+        val trial = frame / SF.SAMPLE_RATE
+        val offset = (frame % SF.SAMPLE_RATE).toInt()
+        val start = if (ch == Ch.L) 0 else SECOND_CHIRP_OFFSET_FRAMES
+        val inChirp = offset - start
+        return if (trial < TRIALS && inChirp in chirp.indices) chirp[inChirp] else 0f
+    }
+
+    companion object {
+        const val TRIALS = 120
+        const val CHIRP_FRAMES = 960
+        const val SECOND_CHIRP_OFFSET_FRAMES = 4_800
+
+        fun makeChirp(): FloatArray {
+            val n = CHIRP_FRAMES
+            val duration = n.toDouble() / SF.SAMPLE_RATE
+            val f0 = 1_000.0
+            val f1 = 6_000.0
+            return FloatArray(n) { i ->
+                val t = i.toDouble() / SF.SAMPLE_RATE
+                val phase = 2.0 * PI * (f0 * t + (f1 - f0) * t * t / (2.0 * duration))
+                val window = 0.5 - 0.5 * cos(2.0 * PI * i / (n - 1))
+                (0.4 * sin(phase) * window).toFloat()
+            }
+        }
+    }
+}
+
 /** Минимальный WAV-парсер: PCM 16 бит, моно/стерео; приводит к 48 кГц стерео. */
 object Wav {
     class Decoded(val pcm: ShortArray, val sampleRate: Int)

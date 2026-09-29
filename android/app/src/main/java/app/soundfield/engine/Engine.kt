@@ -377,6 +377,10 @@ class Engine private constructor(private val app: Context) {
     @Volatile private var serverFileTransferToken = ""
     private val serverRenderer = ServerRenderer { serverPlay }
     private var calibRunning = false
+    @Volatile private var syncProbeActive = false
+    private var syncProbeOp: String? = null
+    private var syncProbeSavedPointChannel = Ch.R
+    private var syncProbePreviousAudioPath = "udp"
     private var pointClockReady = false
     private val resent = AtomicLong()
     private val sendLock = Any()
@@ -1443,6 +1447,7 @@ class Engine private constructor(private val app: Context) {
     fun resetTrim() = cmd("trim") { put("ms", 0.0); put("reset", true) }
     fun calibrate() = cmd("calibrate")
     fun measure() = cmd("measure")
+    fun startSyncProbe() = cmd("syncProbe")
     fun setLevelTrim(device: String, db: Float) = cmd("levelTrim") { put("dev", device); put("db", db.toDouble()) }
     fun setLevelOffsetDb(db: Float, finished: Boolean = false) {
         sendGainCommand("levelOffset", finished) {
@@ -3103,6 +3108,7 @@ class Engine private constructor(private val app: Context) {
     }
 
     private fun goIdle(sendBye: Boolean, reason: String) {
+        cancelSyncProbe("pair_disconnected")
         if (soloMode) saveSoloEqProfile(activeSoloEqRouteKey)
         cancelPointFileTransfer()
         abortIncomingFileTransfer("pair disconnected")
@@ -3287,13 +3293,15 @@ class Engine private constructor(private val app: Context) {
     // ================================================================== Server: шкала и команды
     private fun serverChannel() = Ch.other(pointChannel)
     private fun balanceGain(channel: Int) = if (mode == SourceMode.MUSIC) BalanceLaw.gain(channel, balance) else 1f
-    private fun serverGain() = if (soloMode) AudioGain.taper(master)
+    private fun serverGain() = if (mode == SourceMode.SYNC_PROBE) 0.6f else if (soloMode) AudioGain.taper(master)
         else AudioGain.taper(master) * AudioGain.fromDb(levelTrimServerDb) * balanceGain(serverChannel())
-    private fun pointGain() = AudioGain.taper(master) * AudioGain.fromDb(levelTrimPointDb) * balanceGain(pointChannel)
+    private fun pointGain() = if (mode == SourceMode.SYNC_PROBE) 0.6f
+        else AudioGain.taper(master) * AudioGain.fromDb(levelTrimPointDb) * balanceGain(pointChannel)
 
     private fun eqAvailableInPair() = soloMode ||
         (phase in setOf(Phase.PAIRED, Phase.RECONNECTING) && "eq" in negotiatedCapabilities)
-    private fun activeEqConfig() = if (phase in setOf(Phase.PAIRED, Phase.RECONNECTING) && !eqAvailableInPair()) EqConfig.neutral() else eqConfig
+    private fun activeEqConfig() = if (mode != SourceMode.MUSIC ||
+        (phase in setOf(Phase.PAIRED, Phase.RECONNECTING) && !eqAvailableInPair())) EqConfig.neutral() else eqConfig
 
     private fun eqSettingsJson(settings: EqSettings): JSONObject = JSONObject().apply {
         val clean = settings.sanitized()
@@ -3395,7 +3403,7 @@ class Engine private constructor(private val app: Context) {
     }
 
     private fun newEpoch(playing: Boolean, frame: Long, anchorNs: Long) {
-        if (playing && phase == Phase.PAIRED && role == Role.SERVER &&
+        if (playing && mode != SourceMode.SYNC_PROBE && phase == Phase.PAIRED && role == Role.SERVER &&
             "tcpAudio" in negotiatedCapabilities && serverTcpAudioSocket?.let { it.isConnected && !it.isClosed } == true) {
             beginTcpAudioPreload(frame)
             return
@@ -3530,6 +3538,7 @@ class Engine private constructor(private val app: Context) {
         val b = o.optDouble("balance", 0.5).toFloat().coerceIn(0f, 1f)
         val pCh = Ch.parse(o.optString("pointCh", "R"))
         val trim = o.optDouble("trimMs", 0.0)
+        val incomingMode = SourceMode.fromWire(o.optString("mode"))
         val incomingEq = parseEqSettings(o.optJSONObject("eq"))
         if (role == Role.POINT) {
             if (incomingEq != eqSettings) {
@@ -3540,14 +3549,14 @@ class Engine private constructor(private val app: Context) {
                 didAcknowledgeGainLaw = true
                 link?.send(JSONObject().put("t", "gainAck").put("law", 2))
             }
-            val gain = if (o.has("pointGain")) o.optDouble("pointGain").toFloat().coerceIn(0f, 1f)
+            val gain = if (incomingMode == SourceMode.SYNC_PROBE) 0.6f else if (o.has("pointGain")) o.optDouble("pointGain").toFloat().coerceIn(0f, 1f)
                 else m * (if (pCh == Ch.L) vL else vR) * LegacyBalanceLaw.gain(pCh, b)
             pointParams = PointParams(gain, (trim * 1e6).toLong(), dur,
-                if (eqAvailableInPair()) eqConfig else EqConfig.neutral())
+                if (incomingMode == SourceMode.MUSIC && eqAvailableInPair()) eqConfig else EqConfig.neutral())
         }
         val progress = if (o.isNull("decodeProgress")) null else o.optDouble("decodeProgress").toFloat().coerceIn(0f, 1f)
         ui { copy(playing = playing, durationMs = dur * 1000 / SF.SAMPLE_RATE, title = o.optString("title"),
-            artist = o.optString("artist"), mode = SourceMode.fromWire(o.optString("mode")), audioBuffering = o.optBoolean("audioBuffering"),
+            artist = o.optString("artist"), mode = incomingMode, audioBuffering = o.optBoolean("audioBuffering"),
             queueIndex = o.optInt("queueIndex", -1), undoText = o.optString("undo", ""),
             volL = vL, volR = vR, master = m, balance = b, pointChannel = pCh, trimMs = trim, decodingProgress = progress,
             levelTrimServerDb = o.optDouble("levelTrimServerDb", 0.0).toFloat(), levelTrimPointDb = o.optDouble("levelTrimPointDb", 0.0).toFloat(),
@@ -3655,6 +3664,7 @@ class Engine private constructor(private val app: Context) {
             }
             "calibrate" -> startCalibration(apply = true)
             "measure" -> startCalibration(apply = false)
+            "syncProbe" -> startSyncProbeInternal()
             "metronome" -> if (o.optBoolean("on")) startTestMode(MetronomeSource()) else if (mode == SourceMode.METRONOME) restoreMusic(false)
             "lrtest" -> startTestMode(ChannelTestSource())
             "levelTrim" -> {
@@ -3764,11 +3774,26 @@ class Engine private constructor(private val app: Context) {
     }
 
     private fun restoreMusic(resume: Boolean) {
+        if (mode == SourceMode.SYNC_PROBE) cancelSyncProbe("playback_interrupted")
         clearProgressiveBufferState()
         mode = SourceMode.MUSIC
         source = if (queueIndex in queue.indices) currentQueueSource ?: music else music
         val now = System.nanoTime()
         newEpoch(resume, savedFrame, if (resume) now + SF.START_DELAY_NS else now)
+    }
+
+    private fun cancelSyncProbe(reason: String) {
+        if (!syncProbeActive) return
+        syncProbeActive = false
+        val op = syncProbeOp
+        syncProbeOp = null
+        pointChannel = syncProbeSavedPointChannel
+        if (currentAudioPath != syncProbePreviousAudioPath)
+            setAudioPath(syncProbePreviousAudioPath, "sync_probe_cancel", notifyPeer = reason != "pair_disconnected")
+        mode = SourceMode.MUSIC
+        source = if (queueIndex in queue.indices) currentQueueSource ?: music else music
+        ui { copy(syncProbeRunning = false, syncProbeResult = "Замер отменён") }
+        telemetry.record("SYNC_PROBE_RESULT", mapOf("valid" to false, "reason" to reason), op = op)
     }
 
     private var pauseTask: ScheduledFuture<*>? = null
@@ -4265,6 +4290,84 @@ class Engine private constructor(private val app: Context) {
         }
     }
 
+    /** Developer-only acoustic sync probe; the ordinary player never exposes this action. */
+    private fun startSyncProbeInternal() {
+        if (syncProbeActive || role != Role.SERVER || soloMode || phase != Phase.PAIRED || calibRunning) return
+        if (ContextCompat.checkSelfPermission(app, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            telemetry.record("SYNC_PROBE_RESULT", mapOf("valid" to false, "reason" to "microphone_permission"))
+            toast("Для замера нужна запись с микрофона Server")
+            return
+        }
+        if (mode == SourceMode.MUSIC) {
+            savedFrame = posFrame()
+            savedPlaying = serverPlay.timeline.running
+        } else {
+            restoreMusic(false)
+            savedFrame = posFrame()
+            savedPlaying = false
+        }
+        syncProbeActive = true
+        syncProbeOp = java.util.UUID.randomUUID().toString()
+        syncProbeSavedPointChannel = pointChannel
+        syncProbePreviousAudioPath = currentAudioPath
+        pointChannel = Ch.R
+        if (currentAudioPath != "udp") setAudioPath("udp", "sync_probe")
+        clearProgressiveBufferState()
+        cancelScheduledPause()
+        mode = SourceMode.SYNC_PROBE
+        source = SyncProbeSource()
+        newEpoch(false, 0, System.nanoTime())
+        ui { copy(syncProbeRunning = true, syncProbeResult = "Подготовка записи…") }
+        val op = syncProbeOp
+        telemetry.record("SYNC_PROBE_START", mapOf("trials" to SyncProbeSource.TRIALS, "role" to "server"), op = op)
+        val anchor = AtomicLong(0L)
+        io.execute {
+            try {
+                val recording = mic.record(SyncProbeSource.TRIALS * 1_000L, onStarted = {
+                    val startNs = System.nanoTime() + 700_000_000L
+                    anchor.set(startNs)
+                    post {
+                        if (!syncProbeActive) return@post
+                        newEpoch(true, 0, startNs)
+                        ui { copy(syncProbeResult = "Запись: 120 пар сигналов…") }
+                    }
+                }, shouldContinue = { syncProbeActive })
+                if (!syncProbeActive) return@execute
+                val result = SyncProbeAnalyzer.analyze(recording.samples, recording.sampleRate,
+                    recording.startNs, anchor.get())
+                post { finishSyncProbe(result) }
+            } catch (e: Exception) {
+                Log.e(TAG, "sync probe", e)
+                post { finishSyncProbe(SyncProbeResult(false,
+                    if (e is SecurityException) "microphone_permission" else "recording_error")) }
+            }
+        }
+    }
+
+    private fun finishSyncProbe(result: SyncProbeResult) {
+        if (!syncProbeActive) return
+        syncProbeActive = false
+        val op = syncProbeOp
+        syncProbeOp = null
+        pointChannel = syncProbeSavedPointChannel
+        if (syncProbePreviousAudioPath != currentAudioPath) setAudioPath(syncProbePreviousAudioPath, "sync_probe_complete")
+        mode = SourceMode.MUSIC
+        source = if (queueIndex in queue.indices) currentQueueSource ?: music else music
+        restoreMusic(savedPlaying)
+        val text = if (!result.valid) {
+            if (result.reason == "recording_clipped") "Запись перегружена — уменьшите громкость и повторите замер"
+            else "Замер не получился: найдено ${result.trials} пар сигналов"
+        } else "Медиана ${"%+.2f".format(result.medianMs)} мс (геометрия и задержки); " +
+            "σ ${"%.1f".format(result.sigmaUs)} мкс · p95 ${"%.1f".format(result.p95Us)} мкс · " +
+            "max ${"%.1f".format(result.maxUs)} мкс · ppm ${"%+.1f".format(result.ppm)}"
+        ui { copy(syncProbeRunning = false, syncProbeResult = text) }
+        telemetry.record("SYNC_PROBE_RESULT", mapOf(
+            "valid" to result.valid, "reason" to result.reason, "trials" to result.trials,
+            "medianMs" to result.medianMs, "sigmaUs" to result.sigmaUs,
+            "p95Us" to result.p95Us, "maxUs" to result.maxUs, "ppm" to result.ppm,
+        ), op = op)
+    }
+
     private fun finishCalibration(res: CalibrationAnalyzer.Result, apply: Boolean, trimUsed: Long) {
         calibRunning = false
         val op = calibrationOp
@@ -4408,7 +4511,7 @@ class Engine private constructor(private val app: Context) {
 
         val localDiag = if (role == Role.SERVER) {
             Diag(
-                underruns = audioUnderruns + serverRenderer.underruns.get(), syncErrMs = serverRenderer.corrector.syncErrorMs,
+                underruns = audioUnderruns + serverRenderer.underruns.get(), syncErrUs = serverRenderer.corrector.syncErrorUs,
                 latencyMs = audio.latencyMs, resent = resent.get(), clockReady = pointClockReady,
                 audioAgeMs = currentUi.pointDiag.audioAgeMs, valid = true,
                 audioPath = currentAudioPath, clockPath = currentClockPath,
@@ -4446,7 +4549,9 @@ class Engine private constructor(private val app: Context) {
                 rttMs = clock.rttAvgMs, rttJitterMs = clock.rttJitterMs, jitterMs = rx.jitterMs, lossPct = loss,
                 recovered = rx.recovered, late = rx.late, stale = rx.stale, bufferMs = rx.bufferMs,
                 driftPpm = clock.driftPpm, clockUncMs = clock.uncertaintyMs,
-                underruns = pointRenderer.underrunEvents.get() + audioUnderruns, syncErrMs = pointRenderer.corrector.syncErrorMs,
+                underruns = pointRenderer.underrunEvents.get() + audioUnderruns, syncErrUs = pointRenderer.corrector.syncErrorUs,
+                clockModelStepP50Us = clock.modelStepP50Us, clockModelStepP95Us = clock.modelStepP95Us,
+                clockModelStepMaxUs = clock.modelStepMaxUs,
                 latencyMs = audio.latencyMs, clockReady = clock.ready, resent = currentUi.serverDiag.resent,
                 audioAgeMs = lastAudioRxAt.get().let { if (it == 0L) -1 else nowMs - it }, valid = true,
                 audioPath = currentAudioPath, clockPath = currentClockPath,
@@ -4468,6 +4573,14 @@ class Engine private constructor(private val app: Context) {
                 trimMs = pointParams.trimNs / 1e6, hardJumps = pointRenderer.corrector.hardJumps, slewEvents = slewDelta,
                 decodeComplete = currentUi.serverDiag.decodeComplete, decodeTotalFrames = currentUi.serverDiag.decodeTotalFrames,
             )
+        }
+        if (role == Role.POINT) {
+            val modelSteps = clock.takeModelStepsUs()
+            if (modelSteps.isNotEmpty()) telemetry.record("CLOCK_MODEL_STEP", mapOf(
+                "count" to modelSteps.size, "absDeltaUs" to modelSteps,
+                "p50Us" to clock.modelStepP50Us, "p95Us" to clock.modelStepP95Us,
+                "maxUs" to clock.modelStepMaxUs,
+            ))
         }
         if (role == Role.SERVER) ui { copy(serverDiag = localDiag) } else ui { copy(pointDiag = localDiag) }
 
@@ -4584,8 +4697,11 @@ class Engine private constructor(private val app: Context) {
             ),
             "sync" to mapOf(
                 "offsetMs" to pointDiag.offsetMs, "driftPpm" to pointDiag.driftPpm,
-                "uncertaintyMs" to pointDiag.clockUncMs, "syncErrMsServer" to serverDiag.syncErrMs,
-                "syncErrMsPoint" to pointDiag.syncErrMs, "hardJumps" to serverDiag.hardJumps + pointDiag.hardJumps,
+                "uncertaintyMs" to pointDiag.clockUncMs, "syncErrUsServer" to serverDiag.syncErrUs,
+                "syncErrUsPoint" to pointDiag.syncErrUs,
+                "clockModelStepUs" to mapOf("p50" to pointDiag.clockModelStepP50Us,
+                    "p95" to pointDiag.clockModelStepP95Us, "max" to pointDiag.clockModelStepMaxUs),
+                "hardJumps" to serverDiag.hardJumps + pointDiag.hardJumps,
                 "slewEventsPerSec" to serverDiag.slewEvents + pointDiag.slewEvents, "trimMs" to pointDiag.trimMs,
             ),
             "buffers" to mapOf(
@@ -4664,8 +4780,8 @@ class Engine private constructor(private val app: Context) {
             playing && (diag.musicMuted || diag.musicVolume == 0)
         }.map { (device, diag) -> mapOf("device" to device, "volume" to diag.musicVolume, "muted" to diag.musicMuted) }
         if (muted.isNotEmpty()) violation("OUTPUT_MUTED", mapOf("devices" to muted))
-        val syncErrors = mapOf("serverMs" to serverDiag.syncErrMs, "pointMs" to pointDiag.syncErrMs)
-        if (phase == Phase.PAIRED && playing && (abs(serverDiag.syncErrMs) > 2.0 || abs(pointDiag.syncErrMs) > 2.0)) {
+        val syncErrors = mapOf("serverUs" to serverDiag.syncErrUs, "pointUs" to pointDiag.syncErrUs)
+        if (phase == Phase.PAIRED && playing && (abs(serverDiag.syncErrUs) > 2_000.0 || abs(pointDiag.syncErrUs) > 2_000.0)) {
             violation("SYNC_ERROR", syncErrors)
         }
         if (phase == Phase.PAIRED && playing && serverDiag.decodeTotalFrames >= 120L * SF.SAMPLE_RATE &&

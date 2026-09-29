@@ -143,7 +143,10 @@ data class Diag(
     val driftPpm: Double = 0.0,
     val clockUncMs: Double = 0.0,
     val underruns: Long = 0,
-    val syncErrMs: Double = 0.0,
+    val syncErrUs: Double = 0.0,
+    val clockModelStepP50Us: Double = 0.0,
+    val clockModelStepP95Us: Double = 0.0,
+    val clockModelStepMaxUs: Double = 0.0,
     val latencyMs: Double = 0.0,
     val resent: Long = 0,
     val clockReady: Boolean = false,
@@ -186,12 +189,17 @@ data class Diag(
     val decodeComplete: Boolean = true,
     val decodeTotalFrames: Long = -1,
 ) {
+    val syncErrMs: Double get() = syncErrUs / 1_000.0
+
     fun toJson(t: String): JSONObject = JSONObject().apply {
         put("t", t); put("rtt", rttMs); put("rttJit", rttJitterMs); put("jitter", jitterMs); put("loss", lossPct)
         put("recovered", recovered); put("late", late); put("stale", stale); put("buffer", bufferMs)
         put("audioPath", audioPath); put("clockPath", clockPath)
         put("audioBufferSeconds", audioBufferSeconds); put("audioFillFramesPerSec", audioFillFramesPerSec)
-        put("drift", driftPpm); put("unc", clockUncMs); put("underruns", underruns); put("syncErr", syncErrMs)
+        put("drift", driftPpm); put("unc", clockUncMs); put("underruns", underruns)
+        put("syncErrUs", syncErrUs); put("syncErr", syncErrMs)
+        put("clockModelStepP50Us", clockModelStepP50Us); put("clockModelStepP95Us", clockModelStepP95Us)
+        put("clockModelStepMaxUs", clockModelStepMaxUs)
         put("latency", latencyMs); put("resent", resent); put("clockReady", clockReady); put("audioAge", audioAgeMs)
         put("pairTag", pairTag); put("sessionId", sessionId); put("epoch", epoch); put("trackTag", trackTag)
         put("playbackPhase", playbackPhase); put("playing", playing)
@@ -218,7 +226,11 @@ data class Diag(
             audioPath = o.optString("audioPath", "udp"), clockPath = o.optString("clockPath", "udp"),
             audioBufferSeconds = o.optDouble("audioBufferSeconds"),
             audioFillFramesPerSec = o.optDouble("audioFillFramesPerSec"),
-            clockUncMs = o.optDouble("unc"), underruns = o.optLong("underruns"), syncErrMs = o.optDouble("syncErr"),
+            clockUncMs = o.optDouble("unc"), underruns = o.optLong("underruns"),
+            syncErrUs = if (o.has("syncErrUs")) o.optDouble("syncErrUs") else o.optDouble("syncErr") * 1_000.0,
+            clockModelStepP50Us = o.optDouble("clockModelStepP50Us"),
+            clockModelStepP95Us = o.optDouble("clockModelStepP95Us"),
+            clockModelStepMaxUs = o.optDouble("clockModelStepMaxUs"),
             latencyMs = o.optDouble("latency"), resent = o.optLong("resent"), clockReady = o.optBoolean("clockReady"),
             audioAgeMs = o.optLong("audioAge", -1), valid = true,
             pairTag = o.optString("pairTag"), sessionId = o.optInt("sessionId"), epoch = o.optInt("epoch"),
@@ -322,6 +334,8 @@ data class UiState(
     val calib: CalibUi = CalibUi(),
     val serverDiag: Diag = Diag(),
     val pointDiag: Diag = Diag(),
+    val syncProbeRunning: Boolean = false,
+    val syncProbeResult: String = "",
     // уведомления
     val message: String = "",
     val messageId: Int = 0,

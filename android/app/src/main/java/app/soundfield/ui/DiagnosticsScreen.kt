@@ -5,6 +5,15 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Text
 import androidx.compose.material3.Switch
+import androidx.compose.material3.Button
+import androidx.compose.foundation.clickable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableLongStateOf
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.unit.sp
 import androidx.compose.runtime.Composable
@@ -20,7 +29,10 @@ import app.soundfield.engine.UiState
 import kotlin.math.abs
 
 @Composable
-fun DiagnosticsScreen(ui: UiState, engine: Engine, onBack: () -> Unit) {
+fun DiagnosticsScreen(ui: UiState, engine: Engine, onRequestSyncProbe: () -> Unit, onBack: () -> Unit) {
+    var developerMode by rememberSaveable { mutableStateOf(false) }
+    var versionTapCount by remember { mutableIntStateOf(0) }
+    var lastVersionTapMs by remember { mutableLongStateOf(0L) }
     val p = ui.pointDiag; val s = ui.serverDiag
     fun c(v: Double, good: Double, warn: Double): Color = when {
         v <= good -> SFColors.Good; v <= warn -> SFColors.Warn; else -> SFColors.Bad
@@ -39,7 +51,7 @@ fun DiagnosticsScreen(ui: UiState, engine: Engine, onBack: () -> Unit) {
         Spacer(Modifier.height(16.dp))
 
         SFCard {
-            H3("Рассогласование L/R")
+            H3("Рассогласование L/R · по оценке часов")
             val est = if (p.valid && s.valid) abs(p.syncErrMs - s.syncErrMs) + p.clockUncMs else null
             DiagRow("Оценка по часам", est?.let { "±%.2f мс".format(it) } ?: "—", est?.let { c(it, 2.0, 5.0) } ?: SFColors.Text)
             DiagRow("Акустически измерено", ui.calib.lastMeasuredMs?.let { "%+.1f мс".format(it) } ?: "не измерялось",
@@ -97,6 +109,8 @@ fun DiagnosticsScreen(ui: UiState, engine: Engine, onBack: () -> Unit) {
                 DiagRow("Clock drift", "%+.1f ppm".format(p.driftPpm))
                 DiagRow("Точность часов", "±%.2f мс".format(p.clockUncMs), c(p.clockUncMs, 1.0, 3.0))
                 DiagRow("Часы синхронизированы", if (p.clockReady) "да" else "нет", if (p.clockReady) SFColors.Good else SFColors.Warn)
+                DiagRow("Скачок модели часов p50 / p95 / max",
+                    "%.1f / %.1f / %.1f мкс".format(p.clockModelStepP50Us, p.clockModelStepP95Us, p.clockModelStepMaxUs))
             }
         }
 
@@ -106,8 +120,8 @@ fun DiagnosticsScreen(ui: UiState, engine: Engine, onBack: () -> Unit) {
             DiagRow("Звук на выходе · Point", signalText(p), signalColor(p))
             DiagRow("Сигнал канала Server → Point", if (s.valid) "%.1f dBFS".format(s.serverChannelRmsDbfs) else "—",
                 if (s.serverChannelRmsDbfs > -50.0) SFColors.Good else SFColors.TextDim)
-            DiagRow("Ошибка воспроизведения Server", if (s.valid) "%+.2f мс".format(s.syncErrMs) else "—")
-            DiagRow("Ошибка воспроизведения Point", if (p.valid) "%+.2f мс".format(p.syncErrMs) else "—")
+            DiagRow("Ошибка воспроизведения Server", if (s.valid) syncErrorText(s.syncErrUs) else "—")
+            DiagRow("Ошибка воспроизведения Point", if (p.valid) syncErrorText(p.syncErrUs) else "—")
             DiagRow("Underrun Server", if (s.valid) "${s.underruns}" else "—", if (s.underruns > 0) SFColors.Warn else SFColors.Text)
             DiagRow("Underrun Point", if (p.valid) "${p.underruns}" else "—", if (p.underruns > 0) SFColors.Warn else SFColors.Text)
             DiagRow("Выходная задержка Server", if (s.valid) "%.1f мс".format(s.latencyMs) else "—")
@@ -135,7 +149,17 @@ fun DiagnosticsScreen(ui: UiState, engine: Engine, onBack: () -> Unit) {
             DiagRow("Суммарный простой", "%.1f с".format(ui.freezeDurationMs / 1000.0))
         }
 
-        if (BuildConfig.DEBUG && ui.inPair) {
+        if (developerMode && ui.inPair && ui.role == Role.SERVER) {
+            SFCard {
+                H3("Инструменты разработчика")
+                Button(onClick = onRequestSyncProbe, enabled = !ui.syncProbeRunning) {
+                    Text(if (ui.syncProbeRunning) "Замер выполняется…" else "Замер синхронизации (2 мин)")
+                }
+                if (ui.syncProbeRunning || ui.syncProbeResult.isNotBlank()) Subtitle(ui.syncProbeResult)
+            }
+        }
+
+        if (developerMode && BuildConfig.DEBUG && ui.inPair) {
             SFCard {
                 H3("Тестовые сбои · debug")
                 when (ui.role) {
@@ -166,5 +190,19 @@ fun DiagnosticsScreen(ui: UiState, engine: Engine, onBack: () -> Unit) {
         }
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Center) { ProblemMarkButton(engine) }
         TelemetryButton(ui, engine)
+        Spacer(Modifier.height(12.dp))
+        Text("SoundField ${BuildConfig.VERSION_NAME}", color = SFColors.TextDim, fontSize = 12.sp,
+            modifier = Modifier.align(Alignment.CenterHorizontally).clickable {
+                val now = android.os.SystemClock.elapsedRealtime()
+                versionTapCount = if (now - lastVersionTapMs <= 2_000L) versionTapCount + 1 else 1
+                lastVersionTapMs = now
+                if (versionTapCount >= 3) {
+                    developerMode = !developerMode
+                    versionTapCount = 0
+                }
+            }.padding(8.dp))
     }
 }
+
+private fun syncErrorText(errorUs: Double): String = if (kotlin.math.abs(errorUs) < 1_000.0)
+    "%+.1f мкс".format(errorUs) else "%+.3f мс".format(errorUs / 1_000.0)
