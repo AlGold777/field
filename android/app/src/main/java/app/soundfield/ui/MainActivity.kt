@@ -46,7 +46,7 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-private enum class Sub { NONE, CALIBRATION, DIAGNOSTICS, EQUALIZER, STABILITY, LAN_BLOCKED }
+private enum class Sub { NONE, CALIBRATION, DIAGNOSTICS, EQUALIZER, SPATIAL, STABILITY, LAN_BLOCKED }
 
 @Composable
 fun AppRoot(engine: Engine) {
@@ -121,8 +121,10 @@ fun AppRoot(engine: Engine) {
                     }
                 }, onBack = { sub = Sub.NONE })
             sub == Sub.EQUALIZER -> EqualizerScreen(ui, engine, onBack = { sub = Sub.NONE })
+            sub == Sub.SPATIAL -> SpatialScreen(ui, engine, onBack = { sub = Sub.NONE })
             else -> PlayerScreen(ui, engine, openCalibration = { sub = Sub.CALIBRATION }, openDiagnostics = { sub = Sub.DIAGNOSTICS },
-                openTrackPicker = { engine.requestTrackPicker() }, openEqualizer = { sub = Sub.EQUALIZER })
+                openTrackPicker = { engine.requestTrackPicker() }, openEqualizer = { sub = Sub.EQUALIZER },
+                openSpatial = { sub = Sub.SPATIAL })
         }
     }
     if (showAudioSourceDialog) {

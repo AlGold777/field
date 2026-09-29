@@ -3,6 +3,7 @@ package app.soundfield.core
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import app.soundfield.dsp.SpatialDspConfig
 import kotlin.math.PI
 import kotlin.math.sin
 
@@ -62,6 +63,28 @@ class SpatialSourceTest {
         }
     }
 
+    @Test fun widthDoesNotSeparateACommonMonoSignalAndPreservesTheSum() {
+        val frames = SF.SAMPLE_RATE.toLong()
+        val mono = MonoSource(frames)
+        SpatialSource(mono, spatialConfig = SpatialDspConfig(
+            enabled = true, gMidDb = 5.0, gHighDb = 3.0, gAmbientDb = 3.0,
+        )).use { spatial ->
+            spatial.requestThrough(frames)
+            await("width processing") { spatial.complete || spatial.processingError != null }
+            spatial.processingError?.let { throw AssertionError("spatial worker failed", it) }
+            var maxChannelDifference = 0f
+            var maxSumDifference = 0f
+            for (frame in 0 until frames step 73) {
+                val left = spatial.sample(frame, Ch.L)
+                val right = spatial.sample(frame, Ch.R)
+                maxChannelDifference = maxOf(maxChannelDifference, kotlin.math.abs(left - right))
+                maxSumDifference = maxOf(maxSumDifference, kotlin.math.abs(left + right - 2f * mono.sample(frame, Ch.L)))
+            }
+            assertTrue("common center must remain centered", maxChannelDifference < 2e-6f)
+            assertTrue("width layer must preserve M", maxSumDifference < 2e-6f)
+        }
+    }
+
     private fun await(label: String, condition: () -> Boolean) {
         val deadline = System.nanoTime() + 5_000_000_000L
         while (!condition() && System.nanoTime() < deadline) Thread.sleep(2)
@@ -93,5 +116,9 @@ class SpatialSourceTest {
 
         override fun sample(frame: Long, ch: Int): Float =
             if (frame < readyFrames) super.sample(frame, ch) else Float.NaN
+    }
+
+    private class MonoSource(total: Long) : ProceduralSource(total) {
+        override fun sample(frame: Long, ch: Int): Float = super.sample(frame, Ch.L)
     }
 }

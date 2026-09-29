@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "devices": {
+    "Xiaomi 14 Ultra": {
+      "stereoSpeakers": true,
+      "spacingM": 0.15,
+      "rotationHandledBySystem": true,
+      "xtcVerified": false
+    },
+    "Redmi 14C": {
+      "stereoSpeakers": false,
+      "spacingM": 0.0,
+      "rotationHandledBySystem": true,
+      "xtcVerified": false
+    }
+  }
+}

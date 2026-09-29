@@ -3,6 +3,7 @@ package app.soundfield.ui
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.foundation.layout.*
@@ -33,6 +34,8 @@ import app.soundfield.core.Ch
 import app.soundfield.core.Role
 import app.soundfield.core.SourceMode
 import app.soundfield.core.BalanceLaw
+import app.soundfield.core.SpatialLevel
+import app.soundfield.core.SpatialSettings
 import app.soundfield.engine.Engine
 import app.soundfield.engine.Phase
 import app.soundfield.engine.UiState
@@ -43,7 +46,7 @@ import java.util.Locale
 
 @Composable
 fun PlayerScreen(ui: UiState, engine: Engine, openCalibration: () -> Unit, openDiagnostics: () -> Unit,
-    openTrackPicker: () -> Unit, openEqualizer: () -> Unit) {
+    openTrackPicker: () -> Unit, openEqualizer: () -> Unit, openSpatial: () -> Unit) {
     var confirmDisconnect by remember { mutableStateOf(false) }
     var pos by remember { mutableLongStateOf(0L) }
     var dragging by remember { mutableStateOf<Float?>(null) }
@@ -234,6 +237,7 @@ fun PlayerScreen(ui: UiState, engine: Engine, openCalibration: () -> Unit, openD
             }
             if (!ui.soloMode) LaunchedEffect(balance) { if (!balanceDragging) wasInCenter = abs(balance - 0.5f) < 0.015f }
             EqualizerCompactBlock(ui, engine, openEqualizer)
+            SpatialCompactBlock(ui, engine, openSpatial)
         }
 
         Row(Modifier.fillMaxWidth().padding(bottom = 12.dp).height(48.dp), horizontalArrangement = Arrangement.spacedBy(8.dp),

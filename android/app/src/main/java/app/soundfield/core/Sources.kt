@@ -19,6 +19,11 @@ interface AudioSource {
     fun sample(frame: Long, ch: Int): Float
 }
 
+/** Sources with a forward worker can precompute frames before a consumer reads them. */
+interface PrefetchableAudioSource {
+    fun requestThrough(frameExclusive: Long)
+}
+
 /** Декодированный стереофайл (int16 interleaved). */
 class PcmSource(
     private val pcm: ShortArray, override val title: String, override val artist: String,

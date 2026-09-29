@@ -15,6 +15,7 @@ import android.os.Looper
 import android.os.Process
 import app.soundfield.core.AudioPlayoutClock
 import app.soundfield.core.RenderSource
+import app.soundfield.core.StereoRenderSource
 import app.soundfield.core.SF
 import app.soundfield.diagnostics.AtomicSignalMeter
 import app.soundfield.diagnostics.SignalWindow
@@ -89,6 +90,12 @@ class AudioOutput(private val ctx: Context) {
             else -> "other:${device.type}:${device.address.ifBlank { device.productName.toString() }}"
         }
     }
+
+    fun isBuiltInSpeakerRoute(): Boolean = routeKey() == "speaker"
+
+    fun builtInSpeakerSupportsStereo(): Boolean = am.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
+        .firstOrNull { it.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER || it.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER_SAFE }
+        ?.channelCounts?.contains(2) == true
 
     internal data class Window(
         val signal: SignalWindow,
@@ -212,15 +219,17 @@ class AudioOutput(private val ctx: Context) {
 
     private fun playTrack() {
         val sr = SF.SAMPLE_RATE
-        val minBuf = AudioTrack.getMinBufferSize(sr, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_FLOAT)
+        val channels = if (preferPhoneSpeaker) 1 else 2
+        val channelMask = if (channels == 1) AudioFormat.CHANNEL_OUT_MONO else AudioFormat.CHANNEL_OUT_STEREO
+        val minBuf = AudioTrack.getMinBufferSize(sr, channelMask, AudioFormat.ENCODING_PCM_FLOAT)
         val t = AudioTrack.Builder()
             .setAudioAttributes(AudioAttributes.Builder()
                 .setUsage(AudioAttributes.USAGE_MEDIA)
                 .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC).build())
             .setAudioFormat(AudioFormat.Builder()
                 .setSampleRate(sr).setEncoding(AudioFormat.ENCODING_PCM_FLOAT)
-                .setChannelMask(AudioFormat.CHANNEL_OUT_MONO).build())
-            .setBufferSizeInBytes(maxOf(minBuf, 2048 * 4))
+                .setChannelMask(channelMask).build())
+            .setBufferSizeInBytes(maxOf(minBuf, 2048 * channels * 4))
             .setTransferMode(AudioTrack.MODE_STREAM)
             .setPerformanceMode(AudioTrack.PERFORMANCE_MODE_LOW_LATENCY)
             .build()
@@ -231,7 +240,8 @@ class AudioOutput(private val ctx: Context) {
             timestampGeneration.incrementAndGet()
             pinSpeaker()
             val n = 240 // 5 мс на блок
-            val buf = FloatArray(n)
+            val buf = FloatArray(n * channels)
+            val mono = if (channels == 1) buf else FloatArray(n)
             val ts = AudioTimestamp()
             val timing = AudioPlayoutClock(sr, t.bufferSizeInFrames)
             var lastPoll = Long.MIN_VALUE
@@ -279,19 +289,27 @@ class AudioOutput(private val ctx: Context) {
                 timestampOk = timing.timestampOk
                 latencyMs = (present - now) / 1e6
                 val src = source
-                if (src != null) src.render(buf, n, present) else java.util.Arrays.fill(buf, 0f)
+                if (src == null) java.util.Arrays.fill(buf, 0f)
+                else if (channels == 1) src.render(buf, n, present)
+                else if (src is StereoRenderSource) src.renderStereo(buf, n, present)
+                else {
+                    src.render(mono, n, present)
+                    for (i in 0 until n) { buf[i * 2] = mono[i]; buf[i * 2 + 1] = mono[i] }
+                }
                 var off = 0
+                val writeCount = n * channels
                 var lastWrite = now
-                while (off < n && active()) {
-                    val r = t.write(buf, off, n - off, AudioTrack.WRITE_NON_BLOCKING)
+                while (off < writeCount && active()) {
+                    val r = t.write(buf, off, writeCount - off, AudioTrack.WRITE_NON_BLOCKING)
                     check(r >= 0) { "AudioTrack.write failed: $r" }
-                    if (r == 0) {
+                    val written = r - r % channels
+                    if (written == 0) {
                         check(System.nanoTime() - lastWrite < 2_000_000_000L) { "AudioTrack.write stalled" }
                         Thread.sleep(2)
                     } else {
-                        outputSignal.add(buf, off, r)
-                        off += r
-                        timing.accepted(r)
+                        outputSignal.add(buf, off, written)
+                        off += written
+                        timing.accepted(written / channels)
                         lastWrite = System.nanoTime()
                     }
                 }

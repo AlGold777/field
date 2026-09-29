@@ -129,3 +129,9 @@ class GainRamp {
 interface RenderSource {
     fun render(out: FloatArray, n: Int, presentLocalNs: Long)
 }
+
+/** Optional stereo output path used by the local player on stereo-capable routes. */
+interface StereoRenderSource : RenderSource {
+    /** Writes interleaved L/R samples for [n] frames. */
+    fun renderStereo(interleaved: FloatArray, n: Int, presentLocalNs: Long)
+}

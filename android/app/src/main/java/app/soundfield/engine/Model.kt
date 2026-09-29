@@ -6,6 +6,7 @@ import app.soundfield.core.SourceMode
 import app.soundfield.core.EqMagnet
 import app.soundfield.core.EqSettings
 import app.soundfield.core.EqPreset
+import app.soundfield.core.SpatialSettings
 import org.json.JSONObject
 import java.net.InetAddress
 
@@ -58,6 +59,7 @@ data class PairRecord(
     val levelCalib: LevelCalib = LevelCalib(),
     val lastSuccessfulNetworkId: String? = null,
     val eq: EqSettings = EqSettings(),
+    val spatial: SpatialSettings = SpatialSettings(),
 ) {
     fun toJson(): String = JSONObject().apply {
         put("key", key); put("peerId", peerId); put("peerName", peerName); put("peerPlatform", peerPlatform)
@@ -80,6 +82,7 @@ data class PairRecord(
             put("preserveLoudness", eq.preserveLoudness)
             put("bypass", eq.bypass)
         })
+        put("spatial", spatial.toJson())
     }.toString()
 
     companion object {
@@ -117,6 +120,7 @@ data class PairRecord(
                             bypass = eqObject.optBoolean("bypass", false),
                         ).sanitized()
                     } ?: EqSettings(),
+                    SpatialSettings.fromJson(it.optJSONObject("spatial")),
                 )
             }
         } catch (e: Exception) { null }
@@ -274,6 +278,15 @@ fun trackLabel(title: String, artist: String): String =
 /** Сохранённый плейлист (хранится внутри приложения, в filesDir/playlists). */
 data class PlaylistInfo(val id: String, val name: String, val count: Int, val savedAt: Long)
 
+data class SpatialDeveloperSnapshot(
+    val realtimeFactor: Double,
+    val cacheAheadMs: Double,
+    val restarts: Long,
+    val misses: Long,
+    val sideMidDb: Double,
+    val correlation: Double,
+)
+
 data class UiState(
     val myId: String = "",
     val myName: String = "",
@@ -358,6 +371,8 @@ data class UiState(
     val eqSpectrumDb: List<Float> = emptyList(),
     val customEqPresets: List<EqPreset> = emptyList(),
     val eqCurveDb: List<Float> = List(256) { 0f },
+    val spatial: SpatialSettings = SpatialSettings(),
+    val spatialAvailable: Boolean = false,
     val freezeCount: Int = 0,
     val freezeDurationMs: Long = 0,
     val showStabilitySettings: Boolean = false,

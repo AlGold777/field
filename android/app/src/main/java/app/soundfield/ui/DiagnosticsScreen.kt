@@ -17,6 +17,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.unit.sp
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.unit.dp
@@ -27,13 +28,21 @@ import app.soundfield.BuildConfig
 import app.soundfield.engine.Engine
 import app.soundfield.engine.UiState
 import kotlin.math.abs
+import kotlinx.coroutines.delay
 
 @Composable
 fun DiagnosticsScreen(ui: UiState, engine: Engine, onRequestSyncProbe: () -> Unit, onBack: () -> Unit) {
     var developerMode by rememberSaveable { mutableStateOf(false) }
     var versionTapCount by remember { mutableIntStateOf(0) }
     var lastVersionTapMs by remember { mutableLongStateOf(0L) }
+    var spatialStats by remember { mutableStateOf(engine.spatialDeveloperSnapshot()) }
     val p = ui.pointDiag; val s = ui.serverDiag
+    LaunchedEffect(developerMode, ui.spatialAvailable) {
+        while (developerMode && ui.spatialAvailable) {
+            spatialStats = engine.spatialDeveloperSnapshot()
+            delay(500)
+        }
+    }
     fun c(v: Double, good: Double, warn: Double): Color = when {
         v <= good -> SFColors.Good; v <= warn -> SFColors.Warn; else -> SFColors.Bad
     }
@@ -178,6 +187,18 @@ fun DiagnosticsScreen(ui: UiState, engine: Engine, onRequestSyncProbe: () -> Uni
                         Subtitle("UDP продолжит поступать. Ожидается POINT_SILENT_OUTPUT.")
                     }
                 }
+            }
+        }
+
+        if (developerMode && ui.spatialAvailable) {
+            SFCard {
+                H3("Пространство · разработчик")
+                DiagRow("Side / Mid", "%+.1f дБ".format(spatialStats.sideMidDb))
+                DiagRow("Корреляция L/R", "%.3f".format(spatialStats.correlation))
+                DiagRow("Скорость DSP", "%.1f×".format(spatialStats.realtimeFactor))
+                DiagRow("Запас кэша", "%.0f мс".format(spatialStats.cacheAheadMs))
+                DiagRow("Перезапуски / недоборы", "${spatialStats.restarts} / ${spatialStats.misses}")
+                DiagRow("Версия", app.soundfield.dsp.DSP_VERSION)
             }
         }
 

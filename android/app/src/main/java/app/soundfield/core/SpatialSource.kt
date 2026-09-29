@@ -1,6 +1,8 @@
 package app.soundfield.core
 
 import app.soundfield.dsp.Radix2Fft
+import app.soundfield.dsp.SpatialDspConfig
+import app.soundfield.dsp.SpatialProcessor
 import kotlin.math.PI
 import kotlin.math.cos
 import kotlin.math.sqrt
@@ -10,7 +12,8 @@ class SpatialSource(
     private val inner: AudioSource,
     private val startAtFrame: Long = 0L,
     cacheSeconds: Int = DEFAULT_CACHE_SECONDS,
-) : AudioSource, AutoCloseable {
+    spatialConfig: SpatialDspConfig = SpatialDspConfig(),
+) : AudioSource, AutoCloseable, PrefetchableAudioSource {
     override val mode get() = inner.mode
     override val title get() = inner.title
     override val artist get() = inner.artist
@@ -21,6 +24,7 @@ class SpatialSource(
     val cacheCapacityFrames: Int = (cacheSeconds.coerceAtLeast(1) * SF.SAMPLE_RATE)
     private val cache = FloatArray(cacheCapacityFrames * 2)
     private val fft = Radix2Fft(FFT_SIZE)
+    private val spatialProcessor = SpatialProcessor(spatialConfig)
     private val window = DoubleArray(FFT_SIZE) { i -> sqrt(0.5 - 0.5 * cos(2.0 * PI * i / FFT_SIZE)) }
     private val realL = DoubleArray(FFT_SIZE)
     private val imagL = DoubleArray(FFT_SIZE)
@@ -41,6 +45,8 @@ class SpatialSource(
         private set
     @Volatile var realtimeFactor = 0.0
         private set
+    val sideMidDb: Double get() = spatialProcessor.sideMidDb
+    val correlation: Double get() = spatialProcessor.correlation
     private val missCount = java.util.concurrent.atomic.AtomicLong()
     val misses: Long get() = missCount.get()
     private val restartCount = java.util.concurrent.atomic.AtomicLong()
@@ -60,7 +66,7 @@ class SpatialSource(
     }
 
     /** Ask the processor to make this exclusive frame position available. Safe from consumer threads. */
-    fun requestThrough(frameExclusive: Long) {
+    override fun requestThrough(frameExclusive: Long) {
         val target = frameExclusive.coerceIn(startAtFrame, inner.totalFrames)
         while (true) {
             val previous = requestedHead.get()
@@ -90,12 +96,13 @@ class SpatialSource(
                 val sourceComplete = inner.complete
                 val wanted = requestedHead.get()
                 var progressed = false
-                while (workerRunning.get() && nextFrameStart < wanted && nextFrameStart < inner.totalFrames &&
+                while (workerRunning.get() && nextFrameStart - spatialProcessor.lookaheadHops * HOP_SIZE < wanted &&
+                    nextFrameStart - spatialProcessor.lookaheadHops * HOP_SIZE < inner.totalFrames &&
                     (sourceComplete || nextFrameStart + FFT_SIZE <= ready)) {
                     if (restartAtFrame.get() != NO_RESTART) break
                     val frameStartedAt = System.nanoTime()
-                    processFrame(nextFrameStart)
-                    publishHop(nextFrameStart)
+                    val outputStart = processFrame(nextFrameStart)
+                    if (outputStart != null) publishHop(outputStart)
                     nextFrameStart += HOP_SIZE
                     val processingNs = (System.nanoTime() - frameStartedAt).coerceAtLeast(1L)
                     val instantFactor = HOP_SIZE.toDouble() * 1e9 / (processingNs * SF.SAMPLE_RATE)
@@ -127,6 +134,7 @@ class SpatialSource(
         java.util.Arrays.fill(accumulationL, 0.0)
         java.util.Arrays.fill(accumulationR, 0.0)
         java.util.Arrays.fill(accumulationWeight, 0.0)
+        spatialProcessor.reset()
         processedHead = warmupStart
         realtimeFactor = 0.0
         restartCount.incrementAndGet()
@@ -136,7 +144,7 @@ class SpatialSource(
 
     private fun initialFrameStart(): Long = aligned(maxOf(0L, startAtFrame - WARMUP_FRAMES)) - 3L * HOP_SIZE
 
-    private fun processFrame(frameStart: Long) {
+    private fun processFrame(frameStart: Long): Long? {
         for (i in 0 until FFT_SIZE) {
             val frame = frameStart + i
             val left = if (frame < 0L || frame >= inner.totalFrames) 0f else inner.sample(frame, 0)
@@ -148,11 +156,12 @@ class SpatialSource(
         }
         fft.transform(realL, imagL)
         fft.transform(realR, imagR)
-        // S2 is the measured identity path. Later stages modify the spectra before inverse FFT.
+        if (!spatialProcessor.process(realL, imagL, realR, imagR)) return null
         fft.transform(realL, imagL, inverse = true)
         fft.transform(realR, imagR, inverse = true)
+        val outputStart = frameStart - spatialProcessor.lookaheadHops * HOP_SIZE
         for (i in 0 until FFT_SIZE) {
-            val frame = frameStart + i
+            val frame = outputStart + i
             if (frame < 0L || frame >= inner.totalFrames) continue
             val index = (frame.toInt() and accumulationMask)
             val w = window[i]
@@ -160,6 +169,7 @@ class SpatialSource(
             accumulationR[index] += realR[i] * w
             accumulationWeight[index] += w * w
         }
+        return outputStart
     }
 
     private fun publishHop(frameStart: Long) {
@@ -202,5 +212,37 @@ class SpatialSource(
             while (result < value) result = result shl 1
             return result
         }
+    }
+}
+
+/** Keeps old audio before a scheduled update and crossfades to a freshly warmed source. */
+class CrossfadeAudioSource(
+    val previous: AudioSource,
+    val next: AudioSource,
+    val startFrame: Long,
+    fadeFrames: Int = SF.SAMPLE_RATE / 20,
+) : AudioSource, PrefetchableAudioSource {
+    private val fadeLength = fadeFrames.coerceAtLeast(1).toLong()
+    override val mode get() = next.mode
+    override val title get() = next.title
+    override val artist get() = next.artist
+    override val totalFrames get() = next.totalFrames
+    override val readyFrames get() = if (next.readyFrames >= startFrame + fadeLength)
+        next.readyFrames else minOf(previous.readyFrames, next.readyFrames)
+    override val complete get() = next.complete && readyFrames >= totalFrames
+
+    override fun requestThrough(frameExclusive: Long) {
+        (previous as? PrefetchableAudioSource)?.requestThrough(frameExclusive)
+        (next as? PrefetchableAudioSource)?.requestThrough(frameExclusive)
+    }
+
+    override fun sample(frame: Long, ch: Int): Float {
+        if (frame < startFrame) return previous.sample(frame, ch)
+        val mix = ((frame - startFrame).toDouble() / fadeLength).coerceIn(0.0, 1.0).toFloat()
+        if (mix >= 1f) return next.sample(frame, ch)
+        val old = previous.sample(frame, ch)
+        val fresh = next.sample(frame, ch)
+        if (old.isNaN() || fresh.isNaN()) return Float.NaN
+        return old * (1f - mix) + fresh * mix
     }
 }

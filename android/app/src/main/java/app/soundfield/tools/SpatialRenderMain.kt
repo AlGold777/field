@@ -8,6 +8,7 @@ import app.soundfield.core.SpatialSource
 import app.soundfield.core.SourceMode
 import app.soundfield.core.Wav
 import app.soundfield.dsp.DSP_VERSION
+import app.soundfield.dsp.SpatialProfiles
 import java.io.BufferedOutputStream
 import java.io.DataOutputStream
 import java.io.File
@@ -30,6 +31,14 @@ object SpatialRenderMain {
             "Unsupported profile: $profile"
         }
 
+        val profileFile = listOf(
+            File("app/src/main/assets/spatial_profiles.json"),
+            File("android/app/src/main/assets/spatial_profiles.json"),
+        ).firstOrNull { it.isFile }
+        val profileData = profileFile?.readText()?.let { SpatialProfiles.parse(it)[profile] }
+            ?: SpatialProfiles.fallback(profile)
+        val strength = if (level == "soft") 0.6 else 1.4
+
         val decoded = Wav.decode(input.readBytes())
         val source: AudioSource = PcmSource(decoded.pcm, input.nameWithoutExtension, "Local WAV")
         require(source.mode == SourceMode.MUSIC)
@@ -39,7 +48,7 @@ object SpatialRenderMain {
         val processed = File(tracks, "$fragment-SPATIAL.wav")
         val reference = File(tracks, "$fragment-REF.wav")
         writeWav(reference, source) { frame, channel -> source.sample(frame, channel) }
-        SpatialSource(source).use { spatial ->
+        SpatialSource(source, spatialConfig = profileData.dspConfig(enabled = profile != "off", strength = strength)).use { spatial ->
             spatial.requestThrough(source.totalFrames)
             val deadline = System.nanoTime() + 30_000_000_000L
             while (!spatial.complete && spatial.processingError == null && System.nanoTime() < deadline) Thread.sleep(2)
@@ -64,7 +73,7 @@ object SpatialRenderMain {
                 "W2_HI" -> "hi"
                 else -> null
             }
-            val setting = "{\"kind\":${quoted(kind)},\"role\":\"stage2_identity\"" +
+            val setting = "{\"kind\":${quoted(kind)},\"role\":\"spatial_pipeline\"" +
                 (variantProfile?.let { ",\"profile\":${quoted(it)}" } ?: "") + "}"
             variantEntries += "${quoted(variant)}:$setting"
             val name = "$fragment-$variant.wav"

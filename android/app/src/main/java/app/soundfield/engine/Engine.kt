@@ -38,6 +38,8 @@ import app.soundfield.diagnostics.AtomicSignalMeter
 import app.soundfield.diagnostics.TelemetryIdentifiers
 import app.soundfield.diagnostics.TelemetryText
 import app.soundfield.dsp.DSP_VERSION
+import app.soundfield.dsp.SpatialProfile
+import app.soundfield.dsp.SpatialProfiles
 import app.soundfield.audio.AudioOutput
 import app.soundfield.audio.AudioFileDecoder
 import app.soundfield.audio.MicRecorder
@@ -286,6 +288,7 @@ class Engine private constructor(private val app: Context) {
     @Volatile private var sessionId = 0
     private var record: PairRecord? = PairRecord.fromJson(prefs.getString("pair", null))
     private var eqSettings = record?.eq ?: EqSettings()
+    private var spatialSettings = record?.spatial ?: SpatialSettings()
     @Volatile private var eqConfig = EqualizerMath.config(eqSettings)
     private var reconnectTask: ScheduledFuture<*>? = null
     private var reconnectSince = 0L
@@ -338,6 +341,18 @@ class Engine private constructor(private val app: Context) {
 
     // ------------------------------------------------------------------ Server
     @Volatile private var serverPlay = ServerPlayState(Timeline.NONE, music, Ch.L, 0.8f, eqConfig)
+    @Volatile private var activeSpatialInput: AudioSource? = null
+    @Volatile private var activeSpatialSource: SpatialSource? = null
+    @Volatile private var spatialReprocessFrame = 0L
+    @Volatile private var spatialReprocessToken = 0L
+    private val spatialProfiles by lazy {
+        runCatching { app.assets.open("spatial_profiles.json").bufferedReader().use { SpatialProfiles.parse(it.readText()) } }
+            .getOrDefault(emptyMap())
+    }
+    private val spatialDeviceTable by lazy {
+        runCatching { app.assets.open("device_speakers.json").bufferedReader().use { JSONObject(it.readText()).optJSONObject("devices") } }
+            .getOrNull()
+    }
     private var epoch = 0
     private var preloadEpochCounter = 0
     private var mode = SourceMode.MUSIC
@@ -457,6 +472,10 @@ class Engine private constructor(private val app: Context) {
         Thread({ tcpAudioAcceptLoop() }, "sf-tcp-audio-accept").apply { isDaemon = true; start() }
         Thread({ udpLoop() }, "sf-udp").apply { isDaemon = true; priority = Thread.MAX_PRIORITY - 1; start() }
         Thread({ tickLoop() }, "sf-tick").apply { isDaemon = true; priority = Thread.MAX_PRIORITY - 1; start() }
+        val systemEffects = runCatching { android.media.audiofx.AudioEffect.queryEffects()?.map { effect ->
+            mapOf("name" to effect.name, "implementor" to effect.implementor, "type" to effect.type.toString())
+        }.orEmpty() }.getOrDefault(emptyList())
+        telemetry.record("SYSTEM_EFFECTS_SEEN", mapOf("model" to Build.MODEL, "effects" to systemEffects))
         discovery.advertise(tcp.localPort, myName)
         discovery.startBrowse()
         ex.scheduleAtFixedRate({ try { heartbeat() } catch (t: Throwable) { Log.e(TAG, "hb", t); telemetry.event("HEARTBEAT_EXCEPTION", error = t) } }, 1, 1, TimeUnit.SECONDS)
@@ -465,7 +484,8 @@ class Engine private constructor(private val app: Context) {
             freezeCount = processFreezeCount, freezeDurationMs = processFreezeTotalMs,
             title = music.title, artist = music.artist, queueExpanded = prefs.getBoolean("queueExpanded", false),
             eq = eqSettings, eqExpanded = prefs.getBoolean("eqExpanded", false), eqPreampDb = eqConfig.preampDb.toFloat(),
-            eqRouteLabel = audio.routeLabel(), customEqPresets = readCustomEqPresets(), eqCurveDb = eqConfig.curveDb.map { it.toFloat() }) }
+            eqRouteLabel = audio.routeLabel(), customEqPresets = readCustomEqPresets(), eqCurveDb = eqConfig.curveDb.map { it.toFloat() },
+            spatial = spatialSettings, spatialAvailable = spatialAvailableNow()) }
         watchNetwork()
         log("Запуск: TCP ${tcp.localPort}, UDP ${udp.localPort}")
         if (autoResume && record != null) post { startAutoResume() }
@@ -584,7 +604,7 @@ class Engine private constructor(private val app: Context) {
     }
 
     private fun localCapabilitiesJson() = org.json.JSONArray().also { array ->
-        listOf("addrs", "tcpClock", "tcpAudio", "eq").forEach(array::put)
+        listOf("addrs", "tcpClock", "tcpAudio", "eq", "spatialV1").forEach(array::put)
     }
 
     private fun updatePeerAddressBook(addresses: List<PeerAddress>) {
@@ -910,6 +930,7 @@ class Engine private constructor(private val app: Context) {
         var startFrameOnWire = Long.MIN_VALUE
         var trackOnWire = ""
         var cursor = 0L
+        var observedSpatialReprocess = spatialReprocessToken
         try {
             val out = DataOutputStream(BufferedOutputStream(socket.getOutputStream(), 64 * 1024))
             while (!socket.isClosed && serverTcpAudioSocket === socket && phase == Phase.PAIRED) {
@@ -929,6 +950,11 @@ class Engine private constructor(private val app: Context) {
                     cursor = if (isPreload) start else if (timeline.playing)
                         maxOf(start, timeline.positionFrame(System.nanoTime()).toLong().coerceAtLeast(0)) else start
                 }
+                val currentReprocess = spatialReprocessToken
+                if (!isPreload && currentReprocess != observedSpatialReprocess) {
+                    cursor = spatialReprocessFrame.coerceIn(start, audioSource.totalFrames)
+                    observedSpatialReprocess = currentReprocess
+                }
                 if (!isPreload && !timeline.playing) {
                     Thread.sleep(40)
                     continue
@@ -937,7 +963,7 @@ class Engine private constructor(private val app: Context) {
                 val playback = if (timeline.playing && timeline.epoch == activeEpoch)
                     timeline.positionFrame(now).toLong().coerceAtLeast(start) else start
                 val target = minOf(audioSource.totalFrames, (if (isPreload) start else playback) + TCP_AUDIO_TARGET_FRAMES)
-                (audioSource as? SpatialSource)?.requestThrough(target)
+                (audioSource as? PrefetchableAudioSource)?.requestThrough(target)
                 val ready = audioSource.readyFrames
                 val limit = minOf(target, ready, audioSource.totalFrames)
                 if (cursor >= limit) {
@@ -1342,6 +1368,9 @@ class Engine private constructor(private val app: Context) {
         balance = 0.5f
         activeSoloEqRouteKey = ""
         val routeKey = audio.routeKey()
+        spatialSettings = if (routeKey.isNotBlank() && routeKey != "unknown") {
+            SpatialSettings.fromJson(runCatching { prefs.getString("soloSpatial:$routeKey", null)?.let(::JSONObject) }.getOrNull())
+        } else SpatialSettings()
         if (routeKey != "unknown") applySoloEqRoute(routeKey, savePrevious = false)
         else {
             eqSettings = EqSettings()
@@ -1358,7 +1387,8 @@ class Engine private constructor(private val app: Context) {
             title = source.title, artist = source.artist, durationMs = source.totalFrames * 1000 / SF.SAMPLE_RATE,
             mode = SourceMode.MUSIC, eq = eqSettings, eqAvailable = true, eqRouteLabel = audio.routeLabel(),
             eqPreampDb = eqConfig.preampDb.toFloat(), eqCurveDb = eqConfig.curveDb.map { it.toFloat() },
-            queueTracks = queue.map { QueueTrackUi(it.id, it.title, it.artist) }, queueIndex = queueIndex) }
+            queueTracks = queue.map { QueueTrackUi(it.id, it.title, it.artist) }, queueIndex = queueIndex,
+            spatial = spatialSettings, spatialAvailable = spatialAvailableNow()) }
         telemetry.record("EQ_ROUTE_PROFILE", mapOf("route" to audio.routeLabel(), "applied" to true))
         later(350) { if (soloMode) applySoloEqRoute(audio.routeKey(), savePrevious = true) }
         PlaybackService.refresh(app)
@@ -1470,10 +1500,17 @@ class Engine private constructor(private val app: Context) {
     private fun handleAudioRouteChanged() {
         if (soloMode) {
             applySoloEqRoute(audio.routeKey(), savePrevious = true)
-            ui { copy(eqRouteLabel = audio.routeLabel()) }
+            val routeKey = audio.routeKey()
+            spatialSettings = if (routeKey.isNotBlank() && routeKey != "unknown")
+                SpatialSettings.fromJson(runCatching { prefs.getString("soloSpatial:$routeKey", null)?.let(::JSONObject) }.getOrNull())
+                else SpatialSettings()
+            refreshSpatialAvailability()
+            rebuildPlayState()
+            ui { copy(eqRouteLabel = audio.routeLabel(), spatial = spatialSettings) }
             return
         }
-        if (!ui.value.inPair) return
+        if (!ui.value.inPair) { refreshSpatialAvailability(); return }
+        refreshSpatialAvailability()
         if (role == Role.POINT) { cmd("routeChanged"); return }
         resetCalibrationsForRoute()
     }
@@ -2128,6 +2165,39 @@ class Engine private constructor(private val app: Context) {
             }
         }
     }
+
+    fun setSpatial(settings: SpatialSettings, finished: Boolean = true) {
+        val clean = settings.sanitized()
+        if (!ui.value.spatialAvailable) return
+        ui { copy(spatial = clean) }
+        sendGainCommand("spatial", finished) {
+            if (soloMode) post { applySpatialSettings(clean, finished) }
+            else cmd("spatial", telemetry = finished) {
+                put("enabled", clean.enabled); put("level", clean.level.wire); put("profile", clean.profile)
+                clean.custom?.let { custom -> put("custom", JSONObject()
+                    .put("gMidDb", custom.gMidDb).put("gHighDb", custom.gHighDb).put("gAmbientDb", custom.gAmbientDb)
+                    .put("depthDb", custom.depthDb).put("reflectionDb", custom.reflectionDb)) }
+                put("finished", finished)
+            }
+        }
+    }
+
+    fun spatialMeterSnapshot(): Pair<Double, Double> = activeSpatialSource?.let { it.sideMidDb to it.correlation }
+        ?: (0.0 to 1.0)
+
+    fun spatialDeveloperSnapshot(): SpatialDeveloperSnapshot {
+        val current = activeSpatialSource
+        return SpatialDeveloperSnapshot(
+            realtimeFactor = current?.realtimeFactor ?: 0.0,
+            cacheAheadMs = current?.let { (it.readyFrames - positionFrameSnapshot()).coerceAtLeast(0) * 1000.0 / SF.SAMPLE_RATE } ?: 0.0,
+            restarts = current?.restarts ?: 0,
+            misses = current?.misses ?: 0,
+            sideMidDb = current?.sideMidDb ?: 0.0,
+            correlation = current?.correlation ?: 1.0,
+        )
+    }
+
+    fun resetSpatial() = setSpatial(SpatialSettings(profile = if (soloMode) "solo_stereo_speaker" else "pair_wide"))
 
     private fun applySoloEq(settings: EqSettings, finished: Boolean) {
         if (!soloMode) return
@@ -2936,7 +3006,7 @@ class Engine private constructor(private val app: Context) {
         l.tag = "paired"
         link = l
         role = r; peerId = pid; peerName = pname; peerPlatform = pplat
-        negotiatedCapabilities = peerCapabilities.intersect(setOf("addrs", "tcpClock", "tcpAudio", "eq"))
+        negotiatedCapabilities = peerCapabilities.intersect(setOf("addrs", "tcpClock", "tcpAudio", "eq", "spatialV1"))
         phase = Phase.PAIRED
         zeroSendRenewStreak = 0
         udpNetworkRebindAttempted = false
@@ -2972,6 +3042,7 @@ class Engine private constructor(private val app: Context) {
         peerUnreachableReported = false
         reconnectCandidateHistory.clear()
         persistRecord()
+        if (!continuing) spatialSettings = record?.spatial ?: SpatialSettings()
         setAutoResume(true)
         requestDozeExemption()
         if (!discovery.advertising) discovery.advertise(tcp.localPort, myName)
@@ -3153,7 +3224,8 @@ class Engine private constructor(private val app: Context) {
     private fun saveServerParams() {
         record = record?.copy(pointChannel = pointChannel, trimMs = trimNs / 1e6, volL = volL, volR = volR,
             master = master, balance = balance, levelTrimServerDb = levelTrimServerDb, levelTrimPointDb = levelTrimPointDb,
-            volTaper = 2, levelTrimVersion = 1, delayCalib = delayCalib, levelCalib = levelCalib, eq = eqSettings)
+            volTaper = 2, levelTrimVersion = 1, delayCalib = delayCalib, levelCalib = levelCalib,
+            eq = eqSettings, spatial = spatialSettings)
         persistRecord()
     }
 
@@ -3179,7 +3251,7 @@ class Engine private constructor(private val app: Context) {
             // --- на Point ---
             "session" -> if (role == Role.POINT) {
                 peerCapabilities = parsePeerCaps(o)
-                negotiatedCapabilities = peerCapabilities.intersect(setOf("addrs", "tcpClock", "tcpAudio", "eq"))
+                negotiatedCapabilities = peerCapabilities.intersect(setOf("addrs", "tcpClock", "tcpAudio", "eq", "spatialV1"))
                 updatePeerAddressBook(parsePeerAddresses(o))
                 val newSession = o.getInt("session")
                 if (sessionId != newSession) {
@@ -3239,7 +3311,7 @@ class Engine private constructor(private val app: Context) {
             }
             "network-addresses" -> {
                 peerCapabilities = parsePeerCaps(o)
-                negotiatedCapabilities = peerCapabilities.intersect(setOf("addrs", "tcpClock", "tcpAudio", "eq"))
+                negotiatedCapabilities = peerCapabilities.intersect(setOf("addrs", "tcpClock", "tcpAudio", "eq", "spatialV1"))
                 updatePeerAddressBook(parsePeerAddresses(o))
                 telemetry.record("PEER_ADDRESSES_RECEIVED", mapOf("count" to parsePeerAddresses(o).size,
                     "networkIds" to parsePeerAddresses(o).map { it.networkId }.distinct()))
@@ -3303,6 +3375,122 @@ class Engine private constructor(private val app: Context) {
 
     private fun eqAvailableInPair() = soloMode ||
         (phase in setOf(Phase.PAIRED, Phase.RECONNECTING) && "eq" in negotiatedCapabilities)
+
+    private fun spatialAvailableInPair() = mode == SourceMode.MUSIC && phase in setOf(Phase.PAIRED, Phase.RECONNECTING) &&
+        "spatialV1" in negotiatedCapabilities && audio.isBuiltInSpeakerRoute()
+
+    private fun deviceSpeakerRecord(): JSONObject? = spatialDeviceTable?.optJSONObject(Build.MODEL)
+
+    private fun deviceHasStereoSpeakers(): Boolean = deviceSpeakerRecord()?.optBoolean("stereoSpeakers")
+        ?: audio.builtInSpeakerSupportsStereo()
+
+    private fun deviceXtcVerified(): Boolean = deviceSpeakerRecord()?.optBoolean("xtcVerified") ?: false
+
+    private fun spatialAvailableNow(): Boolean = when {
+        soloMode -> mode == SourceMode.MUSIC && audio.isBuiltInSpeakerRoute() && deviceHasStereoSpeakers()
+            && app.resources.configuration.orientation == android.content.res.Configuration.ORIENTATION_LANDSCAPE
+        else -> spatialAvailableInPair()
+    }
+
+    private fun refreshSpatialAvailability() {
+        val available = spatialAvailableNow()
+        if (ui.value.spatialAvailable != available || ui.value.spatial != spatialSettings)
+            ui { copy(spatialAvailable = available, spatial = spatialSettings) }
+    }
+
+    private fun spatialProfile(id: String): SpatialProfile = spatialProfiles[id] ?: SpatialProfiles.fallback(id)
+
+    private fun spatialSettingsForWire(): SpatialSettings {
+        return spatialSettings.sanitized()
+    }
+
+    private fun spatialEnabledFor(input: AudioSource): Boolean = input.mode == SourceMode.MUSIC &&
+        spatialSettings.enabled && spatialSettings.level != SpatialLevel.OFF && spatialAvailableNow() &&
+        (!soloMode || deviceHasStereoSpeakers())
+
+    private fun spatialSignature(input: AudioSource): String {
+        val profileId = if (soloMode) "solo_stereo_speaker" else spatialSettings.profile
+        return "${System.identityHashCode(input)}:$profileId:${spatialSettings.toJson()}"
+    }
+
+    private fun renderSourceFor(input: AudioSource, startAtFrame: Long = 0L): AudioSource {
+        if (!spatialEnabledFor(input)) {
+            val old = activeSpatialSource
+            activeSpatialSource = null; activeSpatialInput = null; activeSpatialSignature = ""
+            old?.let(::closeSpatialLater)
+            return input
+        }
+        val signature = spatialSignature(input)
+        if (activeSpatialInput === input && activeSpatialSignature == signature)
+            return activeSpatialSource ?: input
+        val old = activeSpatialSource
+        val profileId = if (soloMode) "solo_stereo_speaker" else spatialSettings.profile
+        val profileData = spatialProfile(profileId)
+        val created = SpatialSource(
+            input,
+            startAtFrame = startAtFrame.coerceIn(0L, input.totalFrames),
+            spatialConfig = spatialSettings.dspConfig(profileData),
+        )
+        activeSpatialInput = input
+        activeSpatialSource = created
+        activeSpatialSignature = signature
+        if (old != null && old !== created) closeSpatialLater(old)
+        return created
+    }
+
+    private fun currentRenderedSource(): AudioSource {
+        val current = serverPlay.source
+        if (current is CrossfadeAudioSource) return current
+        return renderSourceFor(source)
+    }
+
+    private fun closeSpatialLater(source: AudioSource) {
+        later(5_000) { io.execute { closeSpatialTree(source) } }
+    }
+
+    private fun closeSpatialTree(source: AudioSource) {
+        when (source) {
+            is SpatialSource -> source.close()
+            is CrossfadeAudioSource -> { closeSpatialTree(source.previous); closeSpatialTree(source.next) }
+        }
+    }
+
+    private var activeSpatialSignature = ""
+
+    private fun applySpatialSettings(next: SpatialSettings, finished: Boolean, reason: String = "user") {
+        val clean = next.sanitized()
+        if (!spatialAvailableNow()) return
+        val previousSource = serverPlay.source
+        val timeline = serverPlay.timeline
+        val now = System.nanoTime()
+        val isPlaying = timeline.playing && mode == SourceMode.MUSIC
+        val fadeFrames = SF.SAMPLE_RATE / 20
+        val requested = if (isPlaying) timeline.frameAt(now + SF.LEAD_NS + 200_000_000L).toLong() else posFrame()
+        val f = if (isPlaying) requested.coerceIn(0L, maxOf(0L, source.totalFrames - fadeFrames))
+            else requested.coerceIn(0L, source.totalFrames)
+        spatialSettings = clean
+        val renderStart = if (isPlaying) (f - fadeFrames).coerceAtLeast(0L) else 0L
+        val updated = renderSourceFor(source, renderStart)
+        val appliedSource = if (isPlaying) CrossfadeAudioSource(previousSource, updated, f, fadeFrames) else updated
+        spatialReprocessFrame = f
+        spatialReprocessToken++
+        serverPlay = ServerPlayState(timeline, appliedSource, renderChannel(), serverGain(), activeEqConfig())
+        if (finished) {
+            if (soloMode) prefs.edit().putString("soloSpatial:${audio.routeKey()}", clean.toJson().toString()).apply()
+            else saveServerParams()
+            telemetry.record("SPATIAL_CONFIG", mapOf("profile" to clean.profile, "level" to clean.level.wire,
+                "params" to clean.custom?.let { mapOf("gMidDb" to it.gMidDb, "gHighDb" to it.gHighDb,
+                    "gAmbientDb" to it.gAmbientDb, "depthDb" to it.depthDb, "reflectionDb" to it.reflectionDb) },
+                "dspVersion" to DSP_VERSION, "profilesVersion" to SpatialProfiles.VERSION,
+                "reason" to reason, "fFrame" to f))
+        }
+        ui { copy(spatial = clean, spatialAvailable = spatialAvailableNow()) }
+        telemetry.record("SPATIAL_REPROCESS", mapOf("reason" to reason, "fFrame" to f,
+            "delayMs" to if (isPlaying) (f - posFrame()).coerceAtLeast(0) * 1000.0 / SF.SAMPLE_RATE else 0,
+            "tcpResendFrames" to if (currentAudioPath == "tcp" && isPlaying) (source.totalFrames - f).coerceAtLeast(0) else 0))
+        publishState()
+        if (isPlaying) closeSpatialLater(previousSource)
+    }
     private fun activeEqConfig() = if (mode != SourceMode.MUSIC ||
         (phase in setOf(Phase.PAIRED, Phase.RECONNECTING) && !eqAvailableInPair())) EqConfig.neutral() else eqConfig
 
@@ -3336,7 +3524,7 @@ class Engine private constructor(private val app: Context) {
     private fun renderChannel() = if (soloMode) Ch.BOTH else serverChannel()
 
     private fun rebuildPlayState() {
-        serverPlay = ServerPlayState(serverPlay.timeline, source, renderChannel(), serverGain(), activeEqConfig())
+        serverPlay = ServerPlayState(serverPlay.timeline, currentRenderedSource(), renderChannel(), serverGain(), activeEqConfig())
     }
 
     private fun sendSession(target: ControlLink? = link) {
@@ -3418,7 +3606,8 @@ class Engine private constructor(private val app: Context) {
     private fun commitEpoch(playing: Boolean, frame: Long, anchorNs: Long, newEpoch: Int) {
         epoch = newEpoch
         preloadEpochCounter = maxOf(preloadEpochCounter, newEpoch)
-        serverPlay = ServerPlayState(Timeline(epoch, playing, frame, anchorNs), source, renderChannel(), serverGain(), activeEqConfig())
+        val rendered = renderSourceFor(source, frame.coerceAtLeast(0L))
+        serverPlay = ServerPlayState(Timeline(epoch, playing, frame, anchorNs), rendered, renderChannel(), serverGain(), activeEqConfig())
         audio.playbackActive = playing
         if (role == Role.POINT) tcpAudioBuffer.activate(epoch)
         sendTimeline()
@@ -3429,7 +3618,7 @@ class Engine private constructor(private val app: Context) {
         tcpAudioPreloadTask?.cancel(false)
         val targetEpoch = maxOf(epoch + 1, preloadEpochCounter + 1).also { preloadEpochCounter = it }
         val itemId = queue.getOrNull(queueIndex)?.id.orEmpty()
-        val preload = AudioPreload(targetEpoch, frame.coerceAtLeast(0), source, pointChannel, itemId,
+        val preload = AudioPreload(targetEpoch, frame.coerceAtLeast(0), renderSourceFor(source, frame.coerceAtLeast(0)), pointChannel, itemId,
             SystemClock.elapsedRealtime())
         tcpAudioPreload = preload
         telemetry.record("START_WAIT", mapOf("epoch" to targetEpoch, "startFrame" to preload.startFrame,
@@ -3481,6 +3670,7 @@ class Engine private constructor(private val app: Context) {
             .put("levelTrimServerDb", levelTrimServerDb.toDouble()).put("levelTrimPointDb", levelTrimPointDb.toDouble())
             .put("levelMeasureText", levelMeasureText)
             .put("eq", eqSettingsJson(eqSettingsForWire()))
+            .put("spatial", spatialSettingsForWire().toJson())
             .put("eqPreampDb", activeEqConfig().preampDb)
             .put("delayCalib", JSONObject().put("state", delayCalib.state).put("atMs", delayCalib.atMs).put("spreadMs", delayCalib.spreadMs))
             .put("levelCalib", JSONObject().put("state", levelCalib.state).put("atMs", levelCalib.atMs).put("db", levelCalib.db))
@@ -3543,10 +3733,16 @@ class Engine private constructor(private val app: Context) {
         val trim = o.optDouble("trimMs", 0.0)
         val incomingMode = SourceMode.fromWire(o.optString("mode"))
         val incomingEq = parseEqSettings(o.optJSONObject("eq"))
+        val incomingSpatial = SpatialSettings.fromJson(o.optJSONObject("spatial"))
         if (role == Role.POINT) {
             if (incomingEq != eqSettings) {
                 eqSettings = incomingEq
                 eqConfig = EqualizerMath.config(eqSettings)
+            }
+            if (spatialSettings != incomingSpatial) {
+                spatialSettings = incomingSpatial
+                record = record?.copy(spatial = incomingSpatial)
+                if (record != null) persistRecord()
             }
             if (o.has("pointGain") && !didAcknowledgeGainLaw) {
                 didAcknowledgeGainLaw = true
@@ -3568,6 +3764,8 @@ class Engine private constructor(private val app: Context) {
             levelMeasureText = o.optString("levelMeasureText", ""),
             eq = if (role == Role.SERVER) eqSettingsForWire() else incomingEq,
             eqAvailable = eqAvailableInPair(),
+            spatial = if (role == Role.SERVER) spatialSettingsForWire() else incomingSpatial,
+            spatialAvailable = spatialAvailableNow(),
             eqPreampDb = o.optDouble("eqPreampDb", 0.0).toFloat(),
             eqRouteLabel = audio.routeLabel(), eqCurveDb = activeEqConfig().curveDb.map { it.toFloat() },
             gainLaw = if (role == Role.POINT) if (o.has("pointGain")) 2 else 1 else o.optInt("peerGainLaw", 1)) }
@@ -3650,6 +3848,17 @@ class Engine private constructor(private val app: Context) {
                     ))
                 }
                 publishState()
+            }
+            "spatial" -> {
+                if (!spatialAvailableNow()) return
+                val customJson = o.optJSONObject("custom")
+                val custom = customJson?.let { c -> SpatialCustom(
+                    c.optDouble("gMidDb", 3.0), c.optDouble("gHighDb", 2.0), c.optDouble("gAmbientDb", 2.0),
+                    c.optDouble("depthDb", -2.0), c.optDouble("reflectionDb", -17.0)) }
+                val settings = SpatialSettings(o.optBoolean("enabled", false), SpatialLevel.parse(o.optString("level")),
+                    o.optString("profile", if (soloMode) "solo_stereo_speaker" else "pair_wide"), custom).sanitized()
+                applySpatialSettings(settings, o.optBoolean("finished", true),
+                    if (soloMode) "solo" else o.optString("originRole", "pair"))
             }
             "swap" -> {
                 if (calibRunning) return
@@ -3740,7 +3949,7 @@ class Engine private constructor(private val app: Context) {
         // замолкал сразу, а Point — только когда до него доходила команда (на 10–200 мс позже), со щелчком.
         val at = System.nanoTime() + SF.PAUSE_LEAD_NS
         val stop = maxOf(tl.anchorFrame, tl.frameAt(at).toLong()).coerceAtMost(source.totalFrames)
-        serverPlay = ServerPlayState(Timeline(tl.epoch, true, tl.anchorFrame, tl.anchorNs, stop), source, renderChannel(), serverGain(), activeEqConfig())
+        serverPlay = ServerPlayState(Timeline(tl.epoch, true, tl.anchorFrame, tl.anchorNs, stop), currentRenderedSource(), renderChannel(), serverGain(), activeEqConfig())
         sendTimeline()
         publishState()
         pauseTask?.cancel(false)
@@ -4224,7 +4433,7 @@ class Engine private constructor(private val app: Context) {
                 } else {
                     progressiveStopFrame = scheduled
                     serverPlay = ServerPlayState(
-                        Timeline(tl.epoch, true, tl.anchorFrame, tl.anchorNs, scheduled), source, renderChannel(), serverGain(), activeEqConfig())
+                        Timeline(tl.epoch, true, tl.anchorFrame, tl.anchorNs, scheduled), currentRenderedSource(), renderChannel(), serverGain(), activeEqConfig())
                     sendTimeline(); publishState()
                 }
                 return
@@ -4941,7 +5150,7 @@ class Engine private constructor(private val app: Context) {
         if (!tl.playing) return
         if (tl.epoch != sentEpoch) { sentEpoch = tl.epoch; nextFrame = tl.anchorFrame }
         val requestedTarget = minOf(tl.frameAt(System.nanoTime() + SF.LEAD_NS).toLong(), st.source.totalFrames)
-        (st.source as? SpatialSource)?.requestThrough(requestedTarget)
+        (st.source as? PrefetchableAudioSource)?.requestThrough(requestedTarget)
         val target = minOf(requestedTarget, st.source.readyFrames)
         var k = 0
         while (nextFrame < target && k < 40) {

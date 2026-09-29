@@ -1,0 +1,49 @@
+{
+  "version": 1,
+  "profiles": {
+    "pair_wide": {
+      "gMidDb": 3.0,
+      "gHighDb": 2.0,
+      "gAmbientDb": 2.0,
+      "depthDb": -2.0,
+      "reflectionsEnabled": true,
+      "reflectionTaps": [
+        {"leftMs": 7.2, "rightMs": 10.5, "gainDb": -17.0},
+        {"leftMs": 13.4, "rightMs": 18.1, "gainDb": -16.0},
+        {"leftMs": 21.0, "rightMs": 15.7, "gainDb": -18.0}
+      ],
+      "xtcBeta": null
+    },
+    "pair_near": {
+      "gMidDb": 5.0,
+      "gHighDb": 3.0,
+      "gAmbientDb": 3.0,
+      "depthDb": -1.5,
+      "reflectionsEnabled": true,
+      "reflectionTaps": [
+        {"leftMs": 5.0, "rightMs": 7.5, "gainDb": -17.0},
+        {"leftMs": 9.0, "rightMs": 12.0, "gainDb": -16.0},
+        {"leftMs": 14.0, "rightMs": 11.5, "gainDb": -18.0}
+      ],
+      "xtcBeta": null
+    },
+    "solo_stereo_speaker": {
+      "gMidDb": 2.0,
+      "gHighDb": 2.0,
+      "gAmbientDb": 2.0,
+      "depthDb": -1.0,
+      "reflectionsEnabled": false,
+      "reflectionTaps": [],
+      "xtcBeta": 0.06
+    },
+    "off": {
+      "gMidDb": 0.0,
+      "gHighDb": 0.0,
+      "gAmbientDb": 0.0,
+      "depthDb": 0.0,
+      "reflectionsEnabled": false,
+      "reflectionTaps": [],
+      "xtcBeta": null
+    }
+  }
+}
