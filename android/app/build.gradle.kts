@@ -12,8 +12,8 @@ android {
         applicationId = "app.soundfield"
         minSdk = 26
         targetSdk = 35
-        versionCode = 30
-        versionName = "1.9.0-s1"
+        versionCode = 31
+        versionName = "1.9.0-s2"
     }
 
     buildTypes {
@@ -33,6 +33,14 @@ android {
         buildConfig = true
     }
     androidResources { noCompress += "wav" }
+}
+
+tasks.register<JavaExec>("spatialRender") {
+    group = "verification"
+    description = "Render WAV files through the app's JVM SpatialSource pipeline."
+    dependsOn("compileDebugKotlin")
+    classpath = files(layout.buildDirectory.dir("tmp/kotlin-classes/debug")) + configurations.getByName("debugRuntimeClasspath")
+    mainClass.set("app.soundfield.tools.SpatialRenderMain")
 }
 
 dependencies {

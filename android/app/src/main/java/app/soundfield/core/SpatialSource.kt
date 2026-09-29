@@ -1,0 +1,206 @@
+package app.soundfield.core
+
+import app.soundfield.dsp.Radix2Fft
+import kotlin.math.PI
+import kotlin.math.cos
+import kotlin.math.sqrt
+
+/** Streaming STFT→ISTFT source. S2 deliberately applies the identity transform. */
+class SpatialSource(
+    private val inner: AudioSource,
+    private val startAtFrame: Long = 0L,
+    cacheSeconds: Int = DEFAULT_CACHE_SECONDS,
+) : AudioSource, AutoCloseable {
+    override val mode get() = inner.mode
+    override val title get() = inner.title
+    override val artist get() = inner.artist
+    override val totalFrames get() = inner.totalFrames
+    override val readyFrames: Long get() = minOf(inner.readyFrames, processedHead)
+    override val complete: Boolean get() = inner.complete && processedHead >= inner.totalFrames
+
+    val cacheCapacityFrames: Int = (cacheSeconds.coerceAtLeast(1) * SF.SAMPLE_RATE)
+    private val cache = FloatArray(cacheCapacityFrames * 2)
+    private val fft = Radix2Fft(FFT_SIZE)
+    private val window = DoubleArray(FFT_SIZE) { i -> sqrt(0.5 - 0.5 * cos(2.0 * PI * i / FFT_SIZE)) }
+    private val realL = DoubleArray(FFT_SIZE)
+    private val imagL = DoubleArray(FFT_SIZE)
+    private val realR = DoubleArray(FFT_SIZE)
+    private val imagR = DoubleArray(FFT_SIZE)
+    private val accumulationCapacity = nextPowerOfTwo(FFT_SIZE + HOP_SIZE)
+    private val accumulationMask = accumulationCapacity - 1
+    private val accumulationL = DoubleArray(accumulationCapacity)
+    private val accumulationR = DoubleArray(accumulationCapacity)
+    private val accumulationWeight = DoubleArray(accumulationCapacity)
+    private val workerRunning = java.util.concurrent.atomic.AtomicBoolean(true)
+    private val requestedHead = java.util.concurrent.atomic.AtomicLong(
+        minOf(inner.totalFrames, startAtFrame + cacheCapacityFrames).coerceAtLeast(startAtFrame),
+    )
+
+    @Volatile private var processedHead = initialProcessingHead()
+    @Volatile var processingError: Throwable? = null
+        private set
+    @Volatile var realtimeFactor = 0.0
+        private set
+    private val missCount = java.util.concurrent.atomic.AtomicLong()
+    val misses: Long get() = missCount.get()
+    private val restartCount = java.util.concurrent.atomic.AtomicLong()
+    val restarts: Long get() = restartCount.get()
+    private val restartAtFrame = java.util.concurrent.atomic.AtomicLong(NO_RESTART)
+    private var nextFrameStart = initialFrameStart()
+    private val thread: Thread
+
+    init {
+        require(startAtFrame in 0..inner.totalFrames)
+        require(cacheCapacityFrames >= HOP_SIZE)
+        thread = Thread(::processLoop, "sf-spatial").apply {
+            priority = minOf(Thread.MAX_PRIORITY, Thread.NORM_PRIORITY + 1)
+            isDaemon = true
+            start()
+        }
+    }
+
+    /** Ask the processor to make this exclusive frame position available. Safe from consumer threads. */
+    fun requestThrough(frameExclusive: Long) {
+        val target = frameExclusive.coerceIn(startAtFrame, inner.totalFrames)
+        while (true) {
+            val previous = requestedHead.get()
+            if (target <= previous || requestedHead.compareAndSet(previous, target)) break
+        }
+    }
+
+    override fun sample(frame: Long, ch: Int): Float {
+        if (ch !in 0..1 || frame < startAtFrame || frame >= inner.totalFrames) return 0f
+        requestThrough(frame + 1)
+        var head = processedHead
+        val firstCached = maxOf(startAtFrame, head - cacheCapacityFrames)
+        if (frame < firstCached || frame >= head) {
+            missCount.incrementAndGet()
+            if (frame < firstCached || frame - head >= cacheCapacityFrames) scheduleRestart(frame)
+            return Float.NaN
+        }
+        val index = ((frame % cacheCapacityFrames) * 2L + ch).toInt()
+        return cache[index]
+    }
+
+    private fun processLoop() {
+        try {
+            while (workerRunning.get()) {
+                applyPendingRestart()
+                val ready = inner.readyFrames.coerceAtLeast(0L)
+                val sourceComplete = inner.complete
+                val wanted = requestedHead.get()
+                var progressed = false
+                while (workerRunning.get() && nextFrameStart < wanted && nextFrameStart < inner.totalFrames &&
+                    (sourceComplete || nextFrameStart + FFT_SIZE <= ready)) {
+                    if (restartAtFrame.get() != NO_RESTART) break
+                    val frameStartedAt = System.nanoTime()
+                    processFrame(nextFrameStart)
+                    publishHop(nextFrameStart)
+                    nextFrameStart += HOP_SIZE
+                    val processingNs = (System.nanoTime() - frameStartedAt).coerceAtLeast(1L)
+                    val instantFactor = HOP_SIZE.toDouble() * 1e9 / (processingNs * SF.SAMPLE_RATE)
+                    realtimeFactor = if (realtimeFactor <= 0.0) instantFactor
+                        else realtimeFactor * 0.9 + instantFactor * 0.1
+                    progressed = true
+                }
+                if (!progressed) Thread.sleep(2)
+            }
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+        } catch (t: Throwable) {
+            processingError = t
+            workerRunning.set(false)
+        }
+    }
+
+    private fun scheduleRestart(frame: Long) {
+        val target = frame.coerceIn(startAtFrame, inner.totalFrames)
+        restartAtFrame.set(target)
+        requestThrough(target + 1)
+    }
+
+    private fun applyPendingRestart() {
+        val target = restartAtFrame.getAndSet(NO_RESTART)
+        if (target == NO_RESTART) return
+        val warmupStart = maxOf(startAtFrame, target - WARMUP_FRAMES)
+        nextFrameStart = aligned(warmupStart) - 3L * HOP_SIZE
+        java.util.Arrays.fill(accumulationL, 0.0)
+        java.util.Arrays.fill(accumulationR, 0.0)
+        java.util.Arrays.fill(accumulationWeight, 0.0)
+        processedHead = warmupStart
+        realtimeFactor = 0.0
+        restartCount.incrementAndGet()
+    }
+
+    private fun initialProcessingHead(): Long = maxOf(0L, startAtFrame - WARMUP_FRAMES)
+
+    private fun initialFrameStart(): Long = aligned(maxOf(0L, startAtFrame - WARMUP_FRAMES)) - 3L * HOP_SIZE
+
+    private fun processFrame(frameStart: Long) {
+        for (i in 0 until FFT_SIZE) {
+            val frame = frameStart + i
+            val left = if (frame < 0L || frame >= inner.totalFrames) 0f else inner.sample(frame, 0)
+            val right = if (frame < 0L || frame >= inner.totalFrames) 0f else inner.sample(frame, 1)
+            realL[i] = (if (left.isNaN()) 0f else left) * window[i]
+            imagL[i] = 0.0
+            realR[i] = (if (right.isNaN()) 0f else right) * window[i]
+            imagR[i] = 0.0
+        }
+        fft.transform(realL, imagL)
+        fft.transform(realR, imagR)
+        // S2 is the measured identity path. Later stages modify the spectra before inverse FFT.
+        fft.transform(realL, imagL, inverse = true)
+        fft.transform(realR, imagR, inverse = true)
+        for (i in 0 until FFT_SIZE) {
+            val frame = frameStart + i
+            if (frame < 0L || frame >= inner.totalFrames) continue
+            val index = (frame.toInt() and accumulationMask)
+            val w = window[i]
+            accumulationL[index] += realL[i] * w
+            accumulationR[index] += realR[i] * w
+            accumulationWeight[index] += w * w
+        }
+    }
+
+    private fun publishHop(frameStart: Long) {
+        val blockEnd = minOf(frameStart + HOP_SIZE, inner.totalFrames)
+        val blockStart = maxOf(frameStart, 0L)
+        for (frame in blockStart until blockEnd) {
+            val accumulationIndex = frame.toInt() and accumulationMask
+            val weight = accumulationWeight[accumulationIndex]
+            val left = if (weight > 1e-12) (accumulationL[accumulationIndex] / weight).toFloat() else 0f
+            val right = if (weight > 1e-12) (accumulationR[accumulationIndex] / weight).toFloat() else 0f
+            if (frame >= startAtFrame) {
+                val cacheIndex = ((frame % cacheCapacityFrames) * 2L).toInt()
+                cache[cacheIndex] = left
+                cache[cacheIndex + 1] = right
+            }
+            accumulationL[accumulationIndex] = 0.0
+            accumulationR[accumulationIndex] = 0.0
+            accumulationWeight[accumulationIndex] = 0.0
+        }
+        if (blockEnd > processedHead) processedHead = blockEnd
+    }
+
+    override fun close() {
+        if (!workerRunning.getAndSet(false)) return
+        thread.interrupt()
+        if (Thread.currentThread() !== thread) thread.join(250)
+    }
+
+    private fun aligned(frame: Long): Long = frame - frame % HOP_SIZE
+
+    companion object {
+        const val FFT_SIZE = 2_048
+        const val HOP_SIZE = 512
+        const val WARMUP_FRAMES = SF.SAMPLE_RATE
+        const val DEFAULT_CACHE_SECONDS = 40
+        private const val NO_RESTART = Long.MIN_VALUE
+
+        private fun nextPowerOfTwo(value: Int): Int {
+            var result = 1
+            while (result < value) result = result shl 1
+            return result
+        }
+    }
+}

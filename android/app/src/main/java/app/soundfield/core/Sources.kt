@@ -13,6 +13,9 @@ interface AudioSource {
     val title: String
     val artist: String
     val totalFrames: Long
+    /** Absolute frame count available without blocking. Progressive sources may be shorter than totalFrames. */
+    val readyFrames: Long get() = totalFrames
+    val complete: Boolean get() = true
     fun sample(frame: Long, ch: Int): Float
 }
 

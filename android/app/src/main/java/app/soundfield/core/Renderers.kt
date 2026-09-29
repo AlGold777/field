@@ -30,7 +30,7 @@ class ServerRenderer(
         corrector.plan(tl.frameAt(presentLocalNs) - WindowedSinc.GROUP_DELAY_FRAMES, n)
         val src = st.source
         var sourceMissing = 0L
-        val progressive = src as? SegmentedPcmSource
+        val readyFrames = src.readyFrames
         for (i in 0 until n) {
             val position = corrector.position(i)
             val f = kotlin.math.floor(position + 0.5).toLong()
@@ -40,8 +40,11 @@ class ServerRenderer(
                     (WindowedSinc.interpolate(position) { src.sample(it, Ch.L) } +
                         WindowedSinc.interpolate(position) { src.sample(it, Ch.R) }) * 0.5f
                 } else WindowedSinc.interpolate(position) { src.sample(it, st.channel) }
-                out[i] = sample * g
-                if (progressive != null && !progressive.complete && f < progressive.totalFrames && f >= progressive.readyFrames) {
+                if (sample.isNaN()) {
+                    out[i] = 0f
+                } else out[i] = sample * g
+                if (!src.complete && f < src.totalFrames &&
+                    (sample.isNaN() || f >= readyFrames)) {
                     sourceMissing++
                 }
             }

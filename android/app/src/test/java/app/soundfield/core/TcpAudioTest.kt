@@ -53,6 +53,17 @@ class TcpAudioTest {
         assertTrue(TcpAudioBuffer().capacitySeconds >= 40.0)
     }
 
+    @Test fun sameEpochFramesCanBeReprocessedAndOverwritten() {
+        val buffer = TcpAudioBuffer(capacityPow2 = 5)
+        buffer.activate(9)
+        buffer.write(TcpAudioChunk(9, "track", 480, shortArrayOf(100, 200, 300, 400)))
+        buffer.write(TcpAudioChunk(9, "track", 480, shortArrayOf(-100, -200, -300, -400)))
+
+        assertEquals(-100 / 32768f, buffer.read(9, 480), 0.00001f)
+        assertEquals(-200 / 32768f, buffer.read(9, 481), 0.00001f)
+        assertEquals(4, buffer.contiguousFrames(9, 480, 10))
+    }
+
     @Test fun startPolicyRequiresHalfSecondOfContiguousAudio() {
         assertFalse(TcpAudioStartPolicy.ready(23_999, 24_000))
         assertTrue(TcpAudioStartPolicy.ready(24_000, 24_000))

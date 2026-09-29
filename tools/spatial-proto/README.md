@@ -114,6 +114,18 @@ python score.py --key out/<дата>/key.json \
 
 ## Диагностика алгоритмов на готовом рендере
 
+Рендер из Android-приложения можно создать тем же JVM-источником обработки (телефон не требуется):
+
+```bash
+cd android
+./gradlew :app:spatialRender --args="--in /путь/к/треку.wav --level soft --profile pair_wide --out /путь/к/результату"
+cd ../tools/spatial-proto
+python evaluate_algorithms.py /путь/к/результату --output /путь/к/анализу
+```
+
+В версии Android 1.9.0-s2 задача проверяет потоковый identity-тракт, поэтому варианты `W2_*` в `tracks/` совпадают
+с REF. После добавления слоёв ширины и глубины эта же задача будет рендерить их из актуального DSP приложения.
+
 ```bash
 python evaluate_algorithms.py out/ui/<run-id> --output out/evaluation
 ```

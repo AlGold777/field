@@ -138,9 +138,9 @@ class SegmentedPcmSource(
     override val mode = SourceMode.MUSIC
     @Volatile override var totalFrames: Long = estimatedFrames.coerceAtLeast(0)
         private set
-    @Volatile var readyFrames: Long = 0
+    @Volatile override var readyFrames: Long = 0
         private set
-    @Volatile var complete: Boolean = false
+    @Volatile override var complete: Boolean = false
         private set
     private val segments = ConcurrentHashMap<Long, MappedByteBuffer>()
 

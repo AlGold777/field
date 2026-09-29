@@ -37,6 +37,7 @@ import app.soundfield.diagnostics.AtomicLatencyWindow
 import app.soundfield.diagnostics.AtomicSignalMeter
 import app.soundfield.diagnostics.TelemetryIdentifiers
 import app.soundfield.diagnostics.TelemetryText
+import app.soundfield.dsp.DSP_VERSION
 import app.soundfield.audio.AudioOutput
 import app.soundfield.audio.AudioFileDecoder
 import app.soundfield.audio.MicRecorder
@@ -320,6 +321,7 @@ class Engine private constructor(private val app: Context) {
     private var lastLimiterWindowAtMs = 0L
     private var limiterWindowCount = 0L
     private var limiterWindowMaxDb = 0.0
+    private var lastSpatialPerfAtMs = 0L
     private val udpPackets = AtomicLong()
     private val udpInvalid = AtomicLong()
     private val udpOtherSession = AtomicLong()
@@ -935,7 +937,8 @@ class Engine private constructor(private val app: Context) {
                 val playback = if (timeline.playing && timeline.epoch == activeEpoch)
                     timeline.positionFrame(now).toLong().coerceAtLeast(start) else start
                 val target = minOf(audioSource.totalFrames, (if (isPreload) start else playback) + TCP_AUDIO_TARGET_FRAMES)
-                val ready = (audioSource as? SegmentedPcmSource)?.readyFrames ?: audioSource.totalFrames
+                (audioSource as? SpatialSource)?.requestThrough(target)
+                val ready = audioSource.readyFrames
                 val limit = minOf(target, ready, audioSource.totalFrames)
                 if (cursor >= limit) {
                     Thread.sleep(30)
@@ -4469,6 +4472,18 @@ class Engine private constructor(private val app: Context) {
         val playing = if (role == Role.SERVER) serverPlay.timeline.playing else rx.timeline.playing
         val position = if (role == Role.SERVER) serverPlay.timeline.positionFrame(System.nanoTime()).coerceAtLeast(0)
             else if (clock.ready) rx.timeline.positionFrame(clock.toServer(System.nanoTime())).coerceAtLeast(0) else 0L
+        val activeSpatial = if (role == Role.SERVER) serverPlay.source as? SpatialSource else null
+        if (activeSpatial != null && (lastSpatialPerfAtMs == 0L || nowMs - lastSpatialPerfAtMs >= 10_000L)) {
+            val currentPosition = if (playing) position else activeSpatial.readyFrames
+            telemetry.record("SPATIAL_PERF", mapOf(
+                "rtFactor" to activeSpatial.realtimeFactor,
+                "cacheAheadMs" to ((activeSpatial.readyFrames - currentPosition).coerceAtLeast(0) * 1000.0 / SF.SAMPLE_RATE),
+                "restarts" to activeSpatial.restarts,
+                "misses" to activeSpatial.misses,
+                "dspVersion" to DSP_VERSION,
+            ))
+            lastSpatialPerfAtMs = nowMs
+        }
         val progressive = if (role == Role.SERVER) serverPlay.source as? SegmentedPcmSource else null
         val readyFrames = progressive?.readyFrames ?: -1L
         val decodeTrack = currentDecodeTrackTag()
@@ -4899,7 +4914,8 @@ class Engine private constructor(private val app: Context) {
         if (!tl.playing) return
         val start = tl.frameAt(System.nanoTime() + SF.LEAD_NS).toLong().coerceAtLeast(0)
         if (start >= st.source.totalFrames) return
-        val count = minOf((SF.SAMPLE_RATE / 10).toLong(), st.source.totalFrames - start).toInt()
+        val count = minOf((SF.SAMPLE_RATE / 10).toLong(), st.source.totalFrames - start,
+            st.source.readyFrames - start).coerceAtLeast(0L).toInt()
         if (count <= 0) return
         val channel = Ch.other(st.channel)
         val samples = FloatArray(count) { index ->
@@ -4910,7 +4926,8 @@ class Engine private constructor(private val app: Context) {
     }
 
     private fun packet(st: ServerPlayState, tl: Timeline, seq: Int, start: Long, flags: Int): ByteArray {
-        val count = minOf(SF.PACKET_FRAMES.toLong(), st.source.totalFrames - start).toInt().coerceAtLeast(0)
+        val count = minOf(SF.PACKET_FRAMES.toLong(), st.source.totalFrames - start,
+            st.source.readyFrames - start).toInt().coerceAtLeast(0)
         val pCh = Ch.other(st.channel)
         val s = ShortArray(count) { i -> (st.source.sample(start + i, pCh) * 32767f).roundToInt().coerceIn(-32768, 32767).toShort() }
         return Wire.audio(sessionId, tl.epoch, seq, start, tl.timeOf(start), System.nanoTime(), flags, s, count)
@@ -4923,7 +4940,9 @@ class Engine private constructor(private val app: Context) {
         val tl = st.timeline
         if (!tl.playing) return
         if (tl.epoch != sentEpoch) { sentEpoch = tl.epoch; nextFrame = tl.anchorFrame }
-        val target = minOf(tl.frameAt(System.nanoTime() + SF.LEAD_NS).toLong(), st.source.totalFrames)
+        val requestedTarget = minOf(tl.frameAt(System.nanoTime() + SF.LEAD_NS).toLong(), st.source.totalFrames)
+        (st.source as? SpatialSource)?.requestThrough(requestedTarget)
+        val target = minOf(requestedTarget, st.source.readyFrames)
         var k = 0
         while (nextFrame < target && k < 40) {
             val seq = sendSeq++
