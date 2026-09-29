@@ -43,59 +43,62 @@ import java.util.Locale
 
 @Composable
 fun PlayerScreen(ui: UiState, engine: Engine, openCalibration: () -> Unit, openDiagnostics: () -> Unit,
-    openTrackPicker: () -> Unit) {
+    openTrackPicker: () -> Unit, openEqualizer: () -> Unit) {
     var confirmDisconnect by remember { mutableStateOf(false) }
     var pos by remember { mutableLongStateOf(0L) }
     var dragging by remember { mutableStateOf<Float?>(null) }
     val swipeThreshold = with(LocalDensity.current) { 48.dp.toPx() }
-    LaunchedEffect(ui.inPair) { if (ui.inPair) while (true) { pos = engine.positionMs(); delay(200) } }
+    LaunchedEffect(ui.inPair, ui.soloMode) { if (ui.inPair || ui.soloMode) while (true) { pos = engine.positionMs(); delay(200) } }
 
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 20.dp).padding(top = 40.dp, bottom = 24.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             when {
+                ui.soloMode -> PairStatusButton("Соло · этот телефон", SFColors.Accent1, { engine.stopSolo() })
                 ui.phase == Phase.RECONNECTING && ui.role == Role.POINT -> PairStatusButton("Переподключение…", SFColors.Warn, { confirmDisconnect = true })
                 ui.phase == Phase.RECONNECTING -> PairStatusButton("Ждём «${ui.peerName}»", SFColors.Warn, { confirmDisconnect = true })
                 else -> PairStatusButton("Стереопара активна", SFColors.Good, { confirmDisconnect = true })
             }
             Spacer(Modifier.weight(1f))
-            Badge(if (ui.role == Role.SERVER) "SERVER" else "POINT", SFColors.Master)
+            if (!ui.soloMode) Badge(if (ui.role == Role.SERVER) "SERVER" else "POINT", SFColors.Master)
         }
 
-        if (ui.multiWifiWarning.isNotBlank()) {
+        if (!ui.soloMode && ui.multiWifiWarning.isNotBlank()) {
             Text(ui.multiWifiWarning, color = SFColors.Warn, fontSize = 12.sp, lineHeight = 17.sp,
                 modifier = Modifier.fillMaxWidth().padding(top = 10.dp)
                     .clip(RoundedCornerShape(10.dp)).background(SFColors.Warn.copy(alpha = 0.12f)).padding(12.dp))
         }
 
         // --- стереосцена ---
-        val serverCh = Ch.other(ui.pointChannel)
-        val leftIsMe = ui.myChannel == Ch.L
-        val leftName = if (leftIsMe) "Этот телефон" else ui.peerName
-        val rightName = if (!leftIsMe) "Этот телефон" else ui.peerName
-        fun roleOf(ch: Int) = if (ch == serverCh) "Server" else "Point"
-        Row(Modifier.fillMaxWidth().padding(vertical = 28.dp), horizontalArrangement = Arrangement.SpaceEvenly,
-            verticalAlignment = Alignment.CenterVertically) {
-            SpeakerCircle("L", Ch.L, ui.playing, leftName, roleOf(Ch.L), leftIsMe) { engine.swapChannels() }
-            Box(Modifier.width(48.dp).height(44.dp).offset(y = (-20).dp)
-                .clickable(role = androidx.compose.ui.semantics.Role.Button,
-                    onClickLabel = "Поменять каналы L и R") { engine.swapChannels() },
-                contentAlignment = Alignment.Center) {
-                Box(Modifier.width(40.dp).height(2.dp).background(SFColors.accent))
+        if (!ui.soloMode) {
+            val serverCh = Ch.other(ui.pointChannel)
+            val leftIsMe = ui.myChannel == Ch.L
+            val leftName = if (leftIsMe) "Этот телефон" else ui.peerName
+            val rightName = if (!leftIsMe) "Этот телефон" else ui.peerName
+            fun roleOf(ch: Int) = if (ch == serverCh) "Server" else "Point"
+            Row(Modifier.fillMaxWidth().padding(vertical = 28.dp), horizontalArrangement = Arrangement.SpaceEvenly,
+                verticalAlignment = Alignment.CenterVertically) {
+                SpeakerCircle("L", Ch.L, ui.playing, leftName, roleOf(Ch.L), leftIsMe) { engine.swapChannels() }
+                Box(Modifier.width(48.dp).height(44.dp).offset(y = (-20).dp)
+                    .clickable(role = androidx.compose.ui.semantics.Role.Button,
+                        onClickLabel = "Поменять каналы L и R") { engine.swapChannels() },
+                    contentAlignment = Alignment.Center) {
+                    Box(Modifier.width(40.dp).height(2.dp).background(SFColors.accent))
+                }
+                SpeakerCircle("R", Ch.R, ui.playing, rightName, roleOf(Ch.R), !leftIsMe) { engine.swapChannels() }
             }
-            SpeakerCircle("R", Ch.R, ui.playing, rightName, roleOf(Ch.R), !leftIsMe) { engine.swapChannels() }
-        }
 
-        // --- индикатор синхронизации ---
-        val pd = ui.pointDiag; val sd = ui.serverDiag
-        val lrEst = if (pd.valid && sd.valid) abs(pd.syncErrMs - sd.syncErrMs) + pd.clockUncMs else null
-        Row(Modifier.fillMaxWidth().clip(CircleShape).background(SFColors.Card).clickable { openDiagnostics() }
-            .padding(horizontal = 16.dp, vertical = 10.dp), horizontalArrangement = Arrangement.Center) {
-            Text(
-                if (lrEst == null) "⚡ Синхронизация часов…"
-                else "⚡ L/R: ±%.1f мс • RTT %.0f мс • буфер %.0f мс".format(lrEst, pd.rttMs, pd.bufferMs),
-                color = if (lrEst != null && lrEst < 2) SFColors.Good else SFColors.Warn, fontSize = 13.sp)
+            // --- индикатор синхронизации ---
+            val pd = ui.pointDiag; val sd = ui.serverDiag
+            val lrEst = if (pd.valid && sd.valid) abs(pd.syncErrMs - sd.syncErrMs) + pd.clockUncMs else null
+            Row(Modifier.fillMaxWidth().clip(CircleShape).background(SFColors.Card).clickable { openDiagnostics() }
+                .padding(horizontal = 16.dp, vertical = 10.dp), horizontalArrangement = Arrangement.Center) {
+                Text(
+                    if (lrEst == null) "⚡ Синхронизация часов…"
+                    else "⚡ L/R: ±%.1f мс • RTT %.0f мс • буфер %.0f мс".format(lrEst, pd.rttMs, pd.bufferMs),
+                    color = if (lrEst != null && lrEst < 2) SFColors.Good else SFColors.Warn, fontSize = 13.sp)
+            }
+            Spacer(Modifier.height(20.dp))
         }
-        Spacer(Modifier.height(20.dp))
 
         if (ui.mode != SourceMode.MUSIC) {
             SFCard {
@@ -146,7 +149,7 @@ fun PlayerScreen(ui: UiState, engine: Engine, openCalibration: () -> Unit, openD
                 Text("Отменить передачу", color = SFColors.Warn, fontSize = 12.sp)
             }
         }
-        if (ui.audioMissing) {
+        if (!ui.soloMode && ui.audioMissing) {
             Text("Нет аудио на Point · восстанавливаем соединение", color = SFColors.Warn,
                 fontSize = 12.sp, textAlign = TextAlign.Center, modifier = Modifier.fillMaxWidth())
         }
@@ -191,13 +194,13 @@ fun PlayerScreen(ui: UiState, engine: Engine, openCalibration: () -> Unit, openD
                 enabled = ui.mode != SourceMode.LEVEL_MEASURE,
                 onChange = { m = it; engine.setVolume("M", it, finished = false) },
                 onDone = { engine.setVolume("M", m, finished = true) })
-            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+            if (!ui.soloMode) Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                 Text("Баланс между телефонами", color = SFColors.TextDim, fontSize = 14.sp, modifier = Modifier.weight(1f))
                 TextButton(onClick = {
                     balance = 0.5f; wasInCenter = true; engine.setBalance(0.5f, finished = true)
                 }) { Text(balanceLabel(balance), color = SFColors.Accent1, fontSize = 14.sp, fontWeight = FontWeight.SemiBold) }
             }
-            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+            if (!ui.soloMode) Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                 Text("L", color = SFColors.LeftText, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
                 Slider(
                     value = balance,
@@ -225,19 +228,22 @@ fun PlayerScreen(ui: UiState, engine: Engine, openCalibration: () -> Unit, openD
                 )
                 Text("R", color = SFColors.RightText, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
             }
-            LaunchedEffect(balance) { if (!balanceDragging) wasInCenter = abs(balance - 0.5f) < 0.015f }
+            if (!ui.soloMode) LaunchedEffect(balance) { if (!balanceDragging) wasInCenter = abs(balance - 0.5f) < 0.015f }
+            EqualizerCompactBlock(ui, engine, openEqualizer)
         }
 
         Row(Modifier.fillMaxWidth().padding(bottom = 12.dp).height(48.dp), horizontalArrangement = Arrangement.spacedBy(8.dp),
             verticalAlignment = Alignment.CenterVertically) {
-            PlayerActionButton("Калибровка", Modifier.weight(1f), openCalibration)
-            PlayerActionButton("Диагностика", Modifier.weight(1f), openDiagnostics)
+            if (!ui.soloMode) {
+                PlayerActionButton("Калибровка", Modifier.weight(1f), openCalibration)
+                PlayerActionButton("Диагностика", Modifier.weight(1f), openDiagnostics)
+            }
             TelemetryIconButton(ui, engine)
         }
         ui.telemetryFile?.let { Subtitle("Сохранено: $it", modifier = Modifier.padding(bottom = 8.dp)) }
     }
 
-    if (confirmDisconnect) {
+    if (confirmDisconnect && ui.inPair) {
         AlertDialog(
             onDismissRequest = { confirmDisconnect = false },
             title = { Text("Вы хотите разорвать пару?") },

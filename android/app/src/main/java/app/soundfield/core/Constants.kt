@@ -27,11 +27,12 @@ enum class Role { SERVER, POINT;
     companion object { fun fromWire(s: String?) = if (s == "server") SERVER else POINT }
 }
 
-/** Канал: 0 = левый, 1 = правый. */
+/** Канал: 0 = левый, 1 = правый, 2 = моно-сумма L/R для локального воспроизведения. */
 object Ch {
     const val L = 0
     const val R = 1
-    fun name(ch: Int) = if (ch == L) "L" else "R"
+    const val BOTH = 2
+    fun name(ch: Int) = when (ch) { L -> "L"; R -> "R"; else -> "L+R" }
     fun parse(s: String?) = if (s == "L") L else R
     fun other(ch: Int) = 1 - ch
 }

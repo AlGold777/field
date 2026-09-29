@@ -43,6 +43,14 @@ fun WelcomeScreen(ui: UiState, engine: Engine) {
             Spacer(Modifier.height(12.dp))
         }
 
+        if (!ui.soloMode) {
+            SFCard(Modifier.clickable { engine.startSolo() }) {
+                H3("Слушать на этом телефоне")
+                Subtitle("Открыть локальный плеер и слушать музыку без пары")
+            }
+            Spacer(Modifier.height(12.dp))
+        }
+
         SearchingDots()
         H3("Телефоны рядом")
         if (ui.nearby.isEmpty()) {

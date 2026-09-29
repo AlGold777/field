@@ -6,6 +6,7 @@ import android.media.AudioDeviceCallback
 import android.media.AudioDeviceInfo
 import android.media.AudioFormat
 import android.media.AudioManager
+import android.media.AudioRouting
 import android.media.AudioTimestamp
 import android.media.AudioTrack
 import android.os.Build
@@ -32,6 +33,8 @@ import java.util.concurrent.atomic.AtomicReference
 class AudioOutput(private val ctx: Context) {
     @Volatile var source: RenderSource? = null
     @Volatile var playbackActive: Boolean = false
+    /** Стереопара выводит каналы через встроенный динамик; соло следует системному аудиомаршруту. */
+    @Volatile var preferPhoneSpeaker: Boolean = true
     @Volatile var onRouteChanged: (() -> Unit)? = null
     @Volatile var latencyMs = 0.0; private set
     @Volatile var underruns = 0L; private set
@@ -56,8 +59,36 @@ class AudioOutput(private val ctx: Context) {
         override fun onAudioDevicesAdded(added: Array<out AudioDeviceInfo>) { pinSpeaker(); scheduleRouteCheck() }
         override fun onAudioDevicesRemoved(removed: Array<out AudioDeviceInfo>) { pinSpeaker(); scheduleRouteCheck() }
     }
+    private val routingListener = AudioRouting.OnRoutingChangedListener { scheduleRouteCheck() }
 
     val isRunning get() = thread?.isAlive == true
+
+    fun routeLabel(): String {
+        val device = if (Build.VERSION.SDK_INT >= 23) track?.routedDevice else null
+        val name = device?.productName?.toString()?.takeIf { it.isNotBlank() }
+        return when (device?.type) {
+            AudioDeviceInfo.TYPE_BUILTIN_SPEAKER, AudioDeviceInfo.TYPE_BUILTIN_SPEAKER_SAFE -> "Динамик телефона"
+            AudioDeviceInfo.TYPE_WIRED_HEADSET, AudioDeviceInfo.TYPE_WIRED_HEADPHONES -> name ?: "Проводные наушники"
+            AudioDeviceInfo.TYPE_BLUETOOTH_A2DP, AudioDeviceInfo.TYPE_BLUETOOTH_SCO,
+            AudioDeviceInfo.TYPE_BLE_HEADSET, AudioDeviceInfo.TYPE_BLE_SPEAKER -> name ?: "Bluetooth"
+            null -> "Аудиовыход не определён"
+            else -> name ?: "Внешний аудиовыход"
+        }
+    }
+
+    /** Stable local profile key. Bluetooth devices use their address when available. */
+    fun routeKey(): String {
+        val device = if (Build.VERSION.SDK_INT >= 23) track?.routedDevice else null
+        return when (device?.type) {
+            AudioDeviceInfo.TYPE_BUILTIN_SPEAKER, AudioDeviceInfo.TYPE_BUILTIN_SPEAKER_SAFE -> "speaker"
+            AudioDeviceInfo.TYPE_WIRED_HEADSET, AudioDeviceInfo.TYPE_WIRED_HEADPHONES -> "wired"
+            AudioDeviceInfo.TYPE_BLUETOOTH_A2DP, AudioDeviceInfo.TYPE_BLUETOOTH_SCO,
+            AudioDeviceInfo.TYPE_BLE_HEADSET, AudioDeviceInfo.TYPE_BLE_SPEAKER ->
+                "bluetooth:${device.address.takeIf { it.isNotBlank() } ?: device.productName.toString()}"
+            null -> "unknown"
+            else -> "other:${device.type}:${device.address.ifBlank { device.productName.toString() }}"
+        }
+    }
 
     internal data class Window(
         val signal: SignalWindow,
@@ -113,8 +144,13 @@ class AudioOutput(private val ctx: Context) {
         thread!!.start()
     }
 
-    private fun currentRouteSignature(): String = am.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
-        .filter { it.isSink }.sortedBy { it.id }.joinToString("|") { "${it.type}:${it.address}" }
+    private fun currentRouteSignature(): String {
+        val selected = if (Build.VERSION.SDK_INT >= 23) track?.routedDevice
+            ?.let { "${it.type}:${it.address}:${it.productName}" } ?: "unknown" else "unknown"
+        val available = am.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
+            .filter { it.isSink }.sortedBy { it.id }.joinToString("|") { "${it.type}:${it.address}" }
+        return "$selected#$available"
+    }
 
     private fun scheduleRouteCheck() {
         routeHandler.post {
@@ -145,6 +181,10 @@ class AudioOutput(private val ctx: Context) {
     /** Стереопара звучит именно из динамика телефона, а не из подключённых наушников. */
     private fun pinSpeaker() {
         val t = track ?: return
+        if (!preferPhoneSpeaker) {
+            try { t.setPreferredDevice(null) } catch (_: Exception) {}
+            return
+        }
         val outs = am.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
         val spk = outs.firstOrNull { it.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER }
             ?: if (Build.VERSION.SDK_INT >= 30) outs.firstOrNull { it.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER_SAFE } else null
@@ -187,6 +227,7 @@ class AudioOutput(private val ctx: Context) {
         try {
             check(t.state == AudioTrack.STATE_INITIALIZED) { "AudioTrack is not initialized" }
             track = t
+            if (Build.VERSION.SDK_INT >= 23) t.addOnRoutingChangedListener(routingListener, routeHandler)
             timestampGeneration.incrementAndGet()
             pinSpeaker()
             val n = 240 // 5 мс на блок
@@ -260,6 +301,7 @@ class AudioOutput(private val ctx: Context) {
             timestampOk = false
             latencyMs = 0.0
             if (track === t) track = null
+            if (Build.VERSION.SDK_INT >= 23) try { t.removeOnRoutingChangedListener(routingListener) } catch (_: Exception) {}
             try { t.pause(); t.flush(); t.stop() } catch (_: Exception) {}
             t.release()
         }

@@ -3,6 +3,9 @@ package app.soundfield.engine
 import app.soundfield.core.Ch
 import app.soundfield.core.Role
 import app.soundfield.core.SourceMode
+import app.soundfield.core.EqMagnet
+import app.soundfield.core.EqSettings
+import app.soundfield.core.EqPreset
 import org.json.JSONObject
 import java.net.InetAddress
 
@@ -54,6 +57,7 @@ data class PairRecord(
     val delayCalib: DelayCalib = DelayCalib(),
     val levelCalib: LevelCalib = LevelCalib(),
     val lastSuccessfulNetworkId: String? = null,
+    val eq: EqSettings = EqSettings(),
 ) {
     fun toJson(): String = JSONObject().apply {
         put("key", key); put("peerId", peerId); put("peerName", peerName); put("peerPlatform", peerPlatform)
@@ -68,6 +72,14 @@ data class PairRecord(
         lastSuccessfulHost?.let { put("lastSuccessfulHost", it) }
         lastSuccessfulNetworkId?.let { put("lastSuccessfulNetworkId", it) }
         put("peerAddresses", org.json.JSONArray().also { array -> peerAddresses.forEach { array.put(it.toJson()) } })
+        put("eq", JSONObject().apply {
+            put("enabled", eq.enabled)
+            put("gains", org.json.JSONArray(eq.sanitized().gainsDb))
+            put("magnet", eq.magnet.name)
+            put("preset", eq.preset)
+            put("preserveLoudness", eq.preserveLoudness)
+            put("bypass", eq.bypass)
+        })
     }.toString()
 
     companion object {
@@ -94,6 +106,17 @@ data class PairRecord(
                     it.optJSONObject("delayCalib")?.let { c -> DelayCalib(c.optString("state", "none"), c.optLong("atMs"), c.optDouble("spreadMs")) } ?: DelayCalib(),
                     it.optJSONObject("levelCalib")?.let { c -> LevelCalib(c.optString("state", "none"), c.optLong("atMs"), c.optDouble("db")) } ?: LevelCalib(),
                     it.optString("lastSuccessfulNetworkId", "").ifEmpty { null },
+                    it.optJSONObject("eq")?.let { eqObject ->
+                        val gains = eqObject.optJSONArray("gains")
+                        EqSettings(
+                            enabled = eqObject.optBoolean("enabled", false),
+                            gainsDb = List(10) { index -> gains?.optDouble(index, 0.0)?.toFloat() ?: 0f },
+                            magnet = EqMagnet.parse(eqObject.optString("magnet", "SOFT")),
+                            preset = eqObject.optString("preset", "Ровно"),
+                            preserveLoudness = eqObject.optBoolean("preserveLoudness", true),
+                            bypass = eqObject.optBoolean("bypass", false),
+                        ).sanitized()
+                    } ?: EqSettings(),
                 )
             }
         } catch (e: Exception) { null }
@@ -243,6 +266,8 @@ data class UiState(
     val myId: String = "",
     val myName: String = "",
     val phase: Phase = Phase.IDLE,
+    /** Локальный плеер без подключённой стереопары. */
+    val soloMode: Boolean = false,
     val role: Role = Role.SERVER,
     val peerName: String = "",
     val peerPlatform: String = "",
@@ -311,6 +336,14 @@ data class UiState(
     val pointAudioBufferSeconds: Double = 0.0,
     val audioPath: String = "udp",
     val clockPath: String = "udp",
+    val eq: EqSettings = EqSettings(),
+    val eqAvailable: Boolean = false,
+    val eqExpanded: Boolean = false,
+    val eqPreampDb: Float = 0f,
+    val eqRouteLabel: String = "Динамик телефона",
+    val eqSpectrumDb: List<Float> = emptyList(),
+    val customEqPresets: List<EqPreset> = emptyList(),
+    val eqCurveDb: List<Float> = List(256) { 0f },
     val freezeCount: Int = 0,
     val freezeDurationMs: Long = 0,
     val showStabilitySettings: Boolean = false,

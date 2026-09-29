@@ -132,14 +132,16 @@ class PlaybackService : Service() {
             val toggle = PendingIntent.getService(ctx, 1, Intent(ctx, PlaybackService::class.java).setAction(ACTION_TOGGLE), flags)
             val roleText = if (s.role == Role.SERVER) "Server" else "Point"
             val ch = if (s.myChannel == 0) "левый" else "правый"
-            val title = when (s.phase) {
-                Phase.RECONNECTING -> "Переподключение к «${s.peerName}»…"
+            val title = when {
+                s.soloMode -> "Соло на этом телефоне"
+                s.phase == Phase.RECONNECTING -> "Переподключение к «${s.peerName}»…"
                 else -> "Стереопара с «${s.peerName}»"
             }
+            val playbackText = if (s.soloMode) "Локальный плеер" else "$roleText · $ch канал"
             return NotificationCompat.Builder(ctx, CHANNEL)
                 .setSmallIcon(R.drawable.ic_stat_soundfield)
                 .setContentTitle(title)
-                .setContentText("$roleText · $ch канал · ${if (s.playing) "играет" else "пауза"} — ${app.soundfield.engine.trackLabel(s.title, s.artist)}")
+                .setContentText("$playbackText · ${if (s.playing) "играет" else "пауза"} — ${app.soundfield.engine.trackLabel(s.title, s.artist)}")
                 .setContentIntent(open)
                 .setOngoing(true)
                 .setOnlyAlertOnce(true)

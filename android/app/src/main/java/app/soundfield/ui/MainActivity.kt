@@ -45,7 +45,7 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-private enum class Sub { NONE, CALIBRATION, DIAGNOSTICS, STABILITY, LAN_BLOCKED }
+private enum class Sub { NONE, CALIBRATION, DIAGNOSTICS, EQUALIZER, STABILITY, LAN_BLOCKED }
 
 @Composable
 fun AppRoot(engine: Engine) {
@@ -85,7 +85,8 @@ fun AppRoot(engine: Engine) {
         if (ui.showLanBlocked) sub = Sub.LAN_BLOCKED
         else if (sub == Sub.LAN_BLOCKED) sub = Sub.NONE
     }
-    if (!ui.inPair && sub != Sub.STABILITY && sub != Sub.LAN_BLOCKED) sub = Sub.NONE
+    val showWelcome = !ui.inPair && (!ui.soloMode || ui.phase == app.soundfield.engine.Phase.INCOMING || ui.phase == app.soundfield.engine.Phase.INVITING)
+    if (showWelcome && sub != Sub.STABILITY && sub != Sub.LAN_BLOCKED) sub = Sub.NONE
     BackHandler(enabled = sub != Sub.NONE) {
         if (sub == Sub.STABILITY) engine.dismissStabilitySettings()
         if (sub == Sub.LAN_BLOCKED) engine.dismissLanBlockedHint()
@@ -100,12 +101,13 @@ fun AppRoot(engine: Engine) {
                 sub = Sub.NONE
             })
             sub == Sub.LAN_BLOCKED -> LanBlockedScreen(ui.lanBlockedPeerName, ui.lanBlockedDetails, engine)
-            !ui.inPair -> WelcomeScreen(ui, engine)
+            showWelcome -> WelcomeScreen(ui, engine)
             sub == Sub.CALIBRATION -> CalibrationScreen(ui, engine,
                 requestMic = { micLauncher.launch(Manifest.permission.RECORD_AUDIO) }, onBack = { sub = Sub.NONE })
             sub == Sub.DIAGNOSTICS -> DiagnosticsScreen(ui, engine, onBack = { sub = Sub.NONE })
+            sub == Sub.EQUALIZER -> EqualizerScreen(ui, engine, onBack = { sub = Sub.NONE })
             else -> PlayerScreen(ui, engine, openCalibration = { sub = Sub.CALIBRATION }, openDiagnostics = { sub = Sub.DIAGNOSTICS },
-                openTrackPicker = { engine.requestTrackPicker() })
+                openTrackPicker = { engine.requestTrackPicker() }, openEqualizer = { sub = Sub.EQUALIZER })
         }
     }
     if (showAudioSourceDialog) {

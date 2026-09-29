@@ -271,6 +271,7 @@ class Engine private constructor(private val app: Context) {
     // ------------------------------------------------------------------ сессия
     @Volatile private var phase = Phase.IDLE
         set(value) { if (field != value) telemetry.event("PHASE", "$field -> $value"); field = value }
+    @Volatile private var soloMode = false
     @Volatile private var role = Role.SERVER
     @Volatile private var link: ControlLink? = null
     private var pending: ControlLink? = null
@@ -283,6 +284,8 @@ class Engine private constructor(private val app: Context) {
     private var peerAddressSnapshot: List<PeerAddress> = emptyList()
     @Volatile private var sessionId = 0
     private var record: PairRecord? = PairRecord.fromJson(prefs.getString("pair", null))
+    private var eqSettings = record?.eq ?: EqSettings()
+    @Volatile private var eqConfig = EqualizerMath.config(eqSettings)
     private var reconnectTask: ScheduledFuture<*>? = null
     private var reconnectSince = 0L
     private var lastBrowseRestart = 0L
@@ -314,6 +317,9 @@ class Engine private constructor(private val app: Context) {
     private val lanBlockedLogAt = ConcurrentHashMap<String, Long>()
     private val lanBlockedLogCount = ConcurrentHashMap<String, Int>()
     private var lastTelemetry = 0L
+    private var lastLimiterWindowAtMs = 0L
+    private var limiterWindowCount = 0L
+    private var limiterWindowMaxDb = 0.0
     private val udpPackets = AtomicLong()
     private val udpInvalid = AtomicLong()
     private val udpOtherSession = AtomicLong()
@@ -329,7 +335,7 @@ class Engine private constructor(private val app: Context) {
     private val logTime = java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.US)
 
     // ------------------------------------------------------------------ Server
-    @Volatile private var serverPlay = ServerPlayState(Timeline.NONE, music, Ch.L, 0.8f)
+    @Volatile private var serverPlay = ServerPlayState(Timeline.NONE, music, Ch.L, 0.8f, eqConfig)
     private var epoch = 0
     private var preloadEpochCounter = 0
     private var mode = SourceMode.MUSIC
@@ -360,6 +366,7 @@ class Engine private constructor(private val app: Context) {
     private val pendingGainCommands = HashMap<String, () -> Unit>()
     private val scheduledGainCommands = HashMap<String, java.util.concurrent.ScheduledFuture<*>>()
     @Volatile private var pointChannel = Ch.R
+    private var activeSoloEqRouteKey = ""
     private var trimNs = 0L
     @Volatile private var pointUdp: InetSocketAddress? = null
     private val lastAudioRxAt = java.util.concurrent.atomic.AtomicLong(0)
@@ -450,7 +457,9 @@ class Engine private constructor(private val app: Context) {
         ex.scheduleAtFixedRate({ try { serverTick() } catch (t: Throwable) { Log.e(TAG, "tick", t); telemetry.limited("ENGINE_TICK_EXCEPTION", error = t) } }, 100, 100, TimeUnit.MILLISECONDS)
         ui { copy(myId = myId, myName = myName, remembered = record, durationMs = music.totalFrames * 1000 / SF.SAMPLE_RATE,
             freezeCount = processFreezeCount, freezeDurationMs = processFreezeTotalMs,
-            title = music.title, artist = music.artist, queueExpanded = prefs.getBoolean("queueExpanded", false)) }
+            title = music.title, artist = music.artist, queueExpanded = prefs.getBoolean("queueExpanded", false),
+            eq = eqSettings, eqExpanded = prefs.getBoolean("eqExpanded", false), eqPreampDb = eqConfig.preampDb.toFloat(),
+            eqRouteLabel = audio.routeLabel(), customEqPresets = readCustomEqPresets(), eqCurveDb = eqConfig.curveDb.map { it.toFloat() }) }
         watchNetwork()
         log("Запуск: TCP ${tcp.localPort}, UDP ${udp.localPort}")
         if (autoResume && record != null) post { startAutoResume() }
@@ -569,7 +578,7 @@ class Engine private constructor(private val app: Context) {
     }
 
     private fun localCapabilitiesJson() = org.json.JSONArray().also { array ->
-        listOf("addrs", "tcpClock", "tcpAudio").forEach(array::put)
+        listOf("addrs", "tcpClock", "tcpAudio", "eq").forEach(array::put)
     }
 
     private fun updatePeerAddressBook(addresses: List<PeerAddress>) {
@@ -739,7 +748,7 @@ class Engine private constructor(private val app: Context) {
     }
 
     private fun autoResumeTick() {
-        if (autoResumeUntil == 0L) return
+        if (soloMode || autoResumeUntil == 0L) return
         val now = SystemClock.elapsedRealtime()
         if (!autoResume || record == null || now > autoResumeUntil) {
             if (phase == Phase.IDLE) log("Фоновое восстановление: «${record?.peerName}» не ответил")
@@ -1302,16 +1311,91 @@ class Engine private constructor(private val app: Context) {
     fun forgetPair() = post { record = null; setAutoResume(false); stopAutoResume(); prefs.edit().remove("pair").apply(); ui { copy(remembered = null) } }
     fun disconnect() = post { setAutoResume(false); goIdle(sendBye = true, reason = "Пара разорвана") }
 
-    /**
-     * Приложение ушло с экрана. Без пары у SoundField нет foreground-сервиса, и Android вскоре замораживает
-     * процесс: TCP-соединения ещё принимаются ядром, но никто не отвечает. Второй телефон видел такой телефон
-     * в списке и ждал ответа «бесконечно». Поэтому без пары в фоне снимаем публикацию и поиск; вернёмся — включим.
-     */
+    fun startSolo() = post {
+        if (soloMode || phase != Phase.IDLE) return@post
+        startSoloPlayback()
+    }
+
+    fun stopSolo() = post {
+        if (!soloMode) return@post
+        stopSoloPlayback()
+        discovery.startBrowse()
+    }
+
+    private fun startSoloPlayback() {
+        setAutoResume(false)
+        stopAutoResume()
+        soloMode = true
+        role = Role.SERVER
+        negotiatedCapabilities = emptySet()
+        audio.preferPhoneSpeaker = false
+        mode = SourceMode.MUSIC
+        source = if (queueIndex in queue.indices) currentQueueSource ?: music else music
+        master = prefs.getFloat("soloMaster", master)
+        balance = 0.5f
+        activeSoloEqRouteKey = ""
+        val routeKey = audio.routeKey()
+        if (routeKey != "unknown") applySoloEqRoute(routeKey, savePrevious = false)
+        else {
+            eqSettings = EqSettings()
+            eqConfig = EqualizerMath.config(eqSettings)
+        }
+        audio.source = serverRenderer
+        audio.playbackActive = false
+        newEpoch(false, 0, System.nanoTime())
+        audio.start()
+        try { PlaybackService.start(app) } catch (e: Exception) {
+            Log.w(TAG, "fgs", e); telemetry.event("FOREGROUND_SERVICE_FAILED", error = e)
+        }
+        ui { copy(soloMode = true, phase = Phase.IDLE, role = Role.SERVER, playing = false,
+            title = source.title, artist = source.artist, durationMs = source.totalFrames * 1000 / SF.SAMPLE_RATE,
+            mode = SourceMode.MUSIC, eq = eqSettings, eqAvailable = true, eqRouteLabel = audio.routeLabel(),
+            eqPreampDb = eqConfig.preampDb.toFloat(), eqCurveDb = eqConfig.curveDb.map { it.toFloat() },
+            queueTracks = queue.map { QueueTrackUi(it.id, it.title, it.artist) }, queueIndex = queueIndex) }
+        telemetry.record("EQ_ROUTE_PROFILE", mapOf("route" to audio.routeLabel(), "applied" to true))
+        later(350) { if (soloMode) applySoloEqRoute(audio.routeKey(), savePrevious = true) }
+        PlaybackService.refresh(app)
+    }
+
+    private fun stopSoloPlayback() {
+        if (!soloMode) return
+        saveSoloEqProfile(activeSoloEqRouteKey)
+        soloMode = false
+        activeSoloEqRouteKey = ""
+        audio.playbackActive = false
+        audio.source = null
+        audio.stop()
+        audio.preferPhoneSpeaker = true
+        try { PlaybackService.stop(app) } catch (_: Exception) {}
+        abandonFocus()
+        serverPlay = ServerPlayState(Timeline.NONE, source, Ch.L, 0f, EqConfig.neutral())
+        ui { copy(soloMode = false, playing = false, audioBuffering = false, eqAvailable = false) }
+    }
+
+    private fun applySoloEqRoute(routeKey: String, savePrevious: Boolean) {
+        if (!soloMode || routeKey.isBlank() || routeKey == "unknown" || routeKey == activeSoloEqRouteKey) return
+        if (savePrevious) saveSoloEqProfile(activeSoloEqRouteKey)
+        activeSoloEqRouteKey = routeKey
+        val saved = prefs.getString("eqProfile:$routeKey", null)
+        eqSettings = if (saved == null) EqSettings() else parseEqSettings(runCatching { JSONObject(saved) }.getOrNull())
+        eqConfig = EqualizerMath.config(eqSettings)
+        rebuildPlayState()
+        ui { copy(eq = eqSettings, eqAvailable = true, eqRouteLabel = audio.routeLabel(),
+            eqPreampDb = eqConfig.preampDb.toFloat(), eqCurveDb = eqConfig.curveDb.map { it.toFloat() }) }
+        telemetry.record("EQ_ROUTE_PROFILE", mapOf("route" to audio.routeLabel(), "applied" to true))
+    }
+
+    private fun saveSoloEqProfile(routeKey: String) {
+        if (routeKey.isBlank() || routeKey == "unknown") return
+        prefs.edit().putString("eqProfile:$routeKey", eqSettingsJson(eqSettings).toString()).apply()
+    }
+
+    /** Без пары и активного соло в фоне снимаем публикацию/поиск, чтобы не оставлять недоступный TCP listener. */
     fun onBackground() = post {
         telemetry.event("APP_BACKGROUND", "phase=$phase")
         appVisible = false
         if (role == Role.POINT) cancelPointFileTransfer()
-        if (phase == Phase.IDLE) hideWhileBackground()
+        if (phase == Phase.IDLE && !soloMode) hideWhileBackground()
     }
 
     private fun hideWhileBackground() {
@@ -1328,7 +1412,7 @@ class Engine private constructor(private val app: Context) {
         when (phase) {
             Phase.IDLE -> {
                 if (!discovery.browsing) discovery.startBrowse()
-                if (autoResume && record != null && autoResumeUntil == 0L) startAutoResume()
+                if (!soloMode && autoResume && record != null && autoResumeUntil == 0L) startAutoResume()
             }
             Phase.RECONNECTING -> if (pending == null) { log("Возврат в приложение — переподключаемся сразу"); scheduleReconnect(0) }
             Phase.PAIRED -> {
@@ -1376,6 +1460,11 @@ class Engine private constructor(private val app: Context) {
     fun channelTest() = cmd("lrtest")
 
     private fun handleAudioRouteChanged() {
+        if (soloMode) {
+            applySoloEqRoute(audio.routeKey(), savePrevious = true)
+            ui { copy(eqRouteLabel = audio.routeLabel()) }
+            return
+        }
         if (!ui.value.inPair) return
         if (role == Role.POINT) { cmd("routeChanged"); return }
         resetCalibrationsForRoute()
@@ -1621,7 +1710,7 @@ class Engine private constructor(private val app: Context) {
     fun undoRemove() = cmd("undoRemove")
     fun savePlaylist(name: String) = post { if (role == Role.SERVER) doSavePlaylist(name) else toast("Плейлисты хранятся на телефоне Server") }
     fun openPlaylist(id: String, append: Boolean) = post {
-        if (role == Role.SERVER) doOpenPlaylist(id, append) else toast("Плейлисты хранятся на телефоне Server")
+                if (role == Role.SERVER) doOpenPlaylist(id, append) else toast("Плейлисты хранятся на телефоне Server")
     }
     fun renamePlaylist(id: String, name: String) = post { doRenamePlaylist(id, name) }
     fun deletePlaylist(id: String) = post { doDeletePlaylist(id) }
@@ -1644,7 +1733,7 @@ class Engine private constructor(private val app: Context) {
     fun addAudioFiles(uris: List<Uri>, deleteIfImportFails: List<File> = emptyList()) {
         if (uris.isEmpty()) return
         post {
-            if (calibRunning || (phase != Phase.PAIRED && phase != Phase.RECONNECTING)) {
+            if (calibRunning || (!soloMode && phase !in setOf(Phase.PAIRED, Phase.RECONNECTING))) {
                 deleteIfImportFails.forEach { it.delete() }
                 toast("Добавление музыки сейчас недоступно"); return@post
             }
@@ -1668,7 +1757,7 @@ class Engine private constructor(private val app: Context) {
                     catch (e: Exception) { Log.w(TAG, "Could not decode $name", e); null }
                 }
                 post {
-                    if (role != Role.SERVER || (phase != Phase.PAIRED && phase != Phase.RECONNECTING) || calibRunning) {
+                    if (role != Role.SERVER || (!soloMode && phase !in setOf(Phase.PAIRED, Phase.RECONNECTING)) || calibRunning) {
                         deleteIfImportFails.forEach { it.delete() }
                         ui { copy(loadingTracks = false, fileTransferText = "") }
                         return@post
@@ -2014,6 +2103,104 @@ class Engine private constructor(private val app: Context) {
         }
     }
 
+    fun setEq(settings: EqSettings, finished: Boolean = true) {
+        val clean = settings.sanitized()
+        if (!ui.value.eqAvailable) return
+        ui { copy(eq = clean) }
+        sendGainCommand("eq", finished) {
+            if (soloMode) post { applySoloEq(clean, finished) }
+            else cmd("eq", telemetry = finished) {
+                put("enabled", clean.enabled)
+                put("gains", org.json.JSONArray().also { array -> clean.gainsDb.forEach { array.put(it.toDouble()) } })
+                put("magnet", clean.magnet.name)
+                put("preset", clean.preset)
+                put("preserveLoudness", clean.preserveLoudness)
+                put("bypass", clean.bypass)
+                put("finished", finished)
+            }
+        }
+    }
+
+    private fun applySoloEq(settings: EqSettings, finished: Boolean) {
+        if (!soloMode) return
+        val previousBypass = eqSettings.bypass
+        eqSettings = settings.sanitized()
+        eqConfig = EqualizerMath.config(eqSettings)
+        rebuildPlayState()
+        if (finished) saveSoloEqProfile(activeSoloEqRouteKey)
+        ui { copy(eq = eqSettings, eqAvailable = true, eqPreampDb = eqConfig.preampDb.toFloat(),
+            eqRouteLabel = audio.routeLabel(), eqCurveDb = eqConfig.curveDb.map { it.toFloat() }) }
+        if (finished) {
+            telemetry.record("EQ_CHANGE", mapOf("preset" to eqSettings.preset, "gains" to eqSettings.gainsDb,
+                "preampDb" to eqConfig.preampDb, "magnet" to eqSettings.magnet.name.lowercase(),
+                "by" to "solo", "route" to audio.routeLabel()))
+            if (previousBypass != eqSettings.bypass) telemetry.record("EQ_BYPASS", mapOf(
+                "on" to eqSettings.bypass, "loudnessCompDb" to eqConfig.bypassCompDb))
+        }
+    }
+
+    fun setEqExpanded(expanded: Boolean) = post {
+        prefs.edit().putBoolean("eqExpanded", expanded).apply()
+        ui { copy(eqExpanded = expanded) }
+    }
+
+    fun setEqAnalyzer(enabled: Boolean) = post {
+        eqSettings = eqSettings.copy(analyzerEnabled = enabled)
+        ui { copy(eq = eqSettings) }
+    }
+
+    fun applyEqPreset(preset: EqPreset) = setEq(eqSettings.copy(
+        enabled = true, gainsDb = preset.gainsDb, preset = preset.name, bypass = false,
+    ), finished = true)
+
+    fun saveEqPreset(name: String) = post {
+        val cleanName = name.trim().take(32)
+        if (cleanName.isBlank()) return@post
+        val preset = EqPreset(cleanName, eqSettings.sanitized().gainsDb)
+        val presets = (ui.value.customEqPresets.filterNot { it.name.equals(cleanName, true) } + preset)
+        persistCustomEqPresets(presets)
+        ui { copy(customEqPresets = presets) }
+    }
+
+    fun renameEqPreset(oldName: String, newName: String) = post {
+        val cleanName = newName.trim().take(32)
+        if (cleanName.isBlank()) return@post
+        val current = ui.value.customEqPresets.firstOrNull { it.name == oldName } ?: return@post
+        val presets = (ui.value.customEqPresets.filterNot { it.name == oldName || it.name.equals(cleanName, true) } + current.copy(name = cleanName))
+        persistCustomEqPresets(presets)
+        ui { copy(customEqPresets = presets) }
+    }
+
+    fun deleteEqPreset(name: String) = post {
+        val presets = ui.value.customEqPresets.filterNot { it.name == name }
+        persistCustomEqPresets(presets)
+        ui { copy(customEqPresets = presets) }
+    }
+
+    private fun persistCustomEqPresets(presets: List<EqPreset>) {
+        val json = org.json.JSONArray().also { array -> presets.forEach { preset ->
+            array.put(JSONObject().put("name", preset.name).put("gains", org.json.JSONArray().also { gains ->
+                preset.gainsDb.forEach { gains.put(it.toDouble()) }
+            }))
+        } }
+        prefs.edit().putString("eqCustomPresets", json.toString()).apply()
+    }
+
+    private fun readCustomEqPresets(): List<EqPreset> = try {
+        val array = org.json.JSONArray(prefs.getString("eqCustomPresets", "[]"))
+        (0 until array.length()).mapNotNull { i -> array.optJSONObject(i)?.let { item ->
+            val gains = item.optJSONArray("gains")
+            EqPreset(item.optString("name").take(32), List(EqualizerMath.BAND_COUNT) { j -> gains?.optDouble(j, 0.0)?.toFloat() ?: 0f })
+        } }.filter { it.name.isNotBlank() }
+    } catch (_: Exception) { emptyList() }
+
+    fun eqSpectrumSnapshot(): List<Float> {
+        val capture = if (role == Role.POINT) pointRenderer.spectrumCapture else serverRenderer.spectrumCapture
+        val window = FloatArray(4096)
+        return if (capture.copyLatest(window)) EqSpectrumCapture().spectrumDb(window).toList()
+        else List(30) { -100f }
+    }
+
     private fun sendGainCommand(key: String, finished: Boolean, send: () -> Unit) {
         val now = System.nanoTime()
         var immediate = false
@@ -2053,7 +2240,7 @@ class Engine private constructor(private val app: Context) {
         if (detail.has("id")) detail.put("id", TelemetryIdentifiers.hash(detail.optString("id")))
         if (telemetry) this.telemetry.record("USER_COMMAND", mapOf("cmd" to a, "role" to role.name.lowercase(), "args" to detail.toString()), op = op)
         post {
-            if (!ui.value.inPair) return@post
+            if (!ui.value.inPair && !soloMode) return@post
             if (role == Role.SERVER) handleCmd(o) else link?.send(o) ?: toast("Нет связи с Server")
         }
     }
@@ -2109,6 +2296,7 @@ class Engine private constructor(private val app: Context) {
 
     private fun doInvite(p: Peer) {
         if (phase != Phase.IDLE) return
+        if (soloMode) stopSoloPlayback()
         manualLanBlockedPeerId = p.id.takeIf {
             peerPathDiagnoses[it]?.currentVerdict() == PeerPathDiagnosis.Verdict.LAN_PEER_BLOCKED
         }
@@ -2124,6 +2312,7 @@ class Engine private constructor(private val app: Context) {
 
     private fun doManualResume(auto: Boolean = false) {
         val rec = record ?: return
+        if (soloMode) stopSoloPlayback()
         manualLanBlockedPeerId = rec.peerId.takeIf { !auto &&
             peerPathDiagnoses[it]?.currentVerdict() == PeerPathDiagnosis.Verdict.LAN_PEER_BLOCKED
         }
@@ -2526,6 +2715,7 @@ class Engine private constructor(private val app: Context) {
         val l = pending ?: return
         val p = pendingPeer ?: return
         if (phase != Phase.INCOMING) return
+        if (soloMode) stopSoloPlayback()
         telemetry.event("INVITE_ACCEPT", "peer=${p.id}")
         l.send(acceptJson(pendingKey, Role.POINT))
         peerTcpPortHint = p.port
@@ -2711,6 +2901,8 @@ class Engine private constructor(private val app: Context) {
 
     // ================================================================== пара
     private fun becomePaired(l: ControlLink, r: Role, pid: String, pname: String, pplat: String, key: String, resumed: Boolean) {
+        soloMode = false
+        audio.preferPhoneSpeaker = true
         peerPathDiagnoses.getOrPut(pid) { PeerPathDiagnosis() }.onConnected()
         if (manualLanBlockedPeerId == pid) manualLanBlockedPeerId = null
         pendingTimeout?.cancel(false)
@@ -2736,7 +2928,7 @@ class Engine private constructor(private val app: Context) {
         l.tag = "paired"
         link = l
         role = r; peerId = pid; peerName = pname; peerPlatform = pplat
-        negotiatedCapabilities = peerCapabilities.intersect(setOf("addrs", "tcpClock", "tcpAudio"))
+        negotiatedCapabilities = peerCapabilities.intersect(setOf("addrs", "tcpClock", "tcpAudio", "eq"))
         phase = Phase.PAIRED
         zeroSendRenewStreak = 0
         udpNetworkRebindAttempted = false
@@ -2801,8 +2993,10 @@ class Engine private constructor(private val app: Context) {
                         if (it.state == "none" && rec.trimMs != 0.0) DelayCalib("manual", System.currentTimeMillis(), 0.0) else it
                     }
                     levelCalib = rec.levelCalib
+                    eqSettings = rec.eq.sanitized()
+                    eqConfig = EqualizerMath.config(eqSettings)
                     record = rec.copy(master = master, volTaper = 2, levelTrimServerDb = levelTrimServerDb,
-                        levelTrimPointDb = levelTrimPointDb, levelTrimVersion = 1, delayCalib = delayCalib)
+                        levelTrimPointDb = levelTrimPointDb, levelTrimVersion = 1, delayCalib = delayCalib, eq = eqSettings)
                     persistRecord()
                 }
             }
@@ -2833,7 +3027,9 @@ class Engine private constructor(private val app: Context) {
         audio.start()
         try { PlaybackService.start(app) } catch (e: Exception) { Log.w(TAG, "fgs", e); telemetry.event("FOREGROUND_SERVICE_FAILED", error = e) }
         ui { copy(phase = Phase.PAIRED, role = r, peerName = pname, peerPlatform = pplat, linkOk = true, remembered = record,
-            autoResuming = false, audioMissing = false, calib = CalibUi()) }
+            autoResuming = false, audioMissing = false, calib = CalibUi(), eqAvailable = eqAvailableInPair(),
+            eq = if (r == Role.SERVER) eqSettingsForWire() else eq, eqPreampDb = activeEqConfig().preampDb.toFloat(),
+            eqRouteLabel = audio.routeLabel(), eqCurveDb = activeEqConfig().curveDb.map { it.toFloat() }) }
         PlaybackService.refresh(app)
         toast(if (resumed) "Пара восстановлена" else "Стереопара создана")
     }
@@ -2907,12 +3103,16 @@ class Engine private constructor(private val app: Context) {
     }
 
     private fun goIdle(sendBye: Boolean, reason: String) {
+        if (soloMode) saveSoloEqProfile(activeSoloEqRouteKey)
         cancelPointFileTransfer()
         abortIncomingFileTransfer("pair disconnected")
         reconnectTask?.cancel(false); pendingTimeout?.cancel(false)
         link?.let { l -> link = null; l.tag = "dead"; if (sendBye) l.sendAndClose(JSONObject().put("t", "bye")) else l.close() }
         pending?.let { p -> pending = null; p.tag = "dead"; p.close() }
         phase = Phase.IDLE
+        soloMode = false
+        activeSoloEqRouteKey = ""
+        audio.preferPhoneSpeaker = true
         manualResumeActive = false
         log(reason)
         pendingTrackId = null
@@ -2920,7 +3120,7 @@ class Engine private constructor(private val app: Context) {
         audio.stop(); audio.source = null
         abandonFocus()
         try { PlaybackService.stop(app) } catch (_: Exception) {}
-        serverPlay = ServerPlayState(Timeline.NONE, source, Ch.L, 0f)
+        serverPlay = ServerPlayState(Timeline.NONE, source, Ch.L, 0f, EqConfig.neutral())
         pointUdp = null; serverUdp = null; sessionId = 0
         closeServerTcpAudio("pair_disconnected")
         pointTcpAudioSocket?.let { try { it.close() } catch (_: Exception) {} }
@@ -2932,7 +3132,7 @@ class Engine private constructor(private val app: Context) {
         calibRunning = false
         discovery.startBrowse()
         if (!appVisible) hideWhileBackground()   // пару разорвали, пока приложение в фоне
-        ui { copy(phase = Phase.IDLE, linkOk = false, remembered = record, playing = false, audioMissing = false, calib = CalibUi(),
+        ui { copy(phase = Phase.IDLE, soloMode = false, eqAvailable = false, linkOk = false, remembered = record, playing = false, audioMissing = false, calib = CalibUi(),
             loadingTracks = false, loadingTrackId = null, serverDiag = Diag(), pointDiag = Diag()) }
         toast(reason)
     }
@@ -2944,7 +3144,7 @@ class Engine private constructor(private val app: Context) {
     private fun saveServerParams() {
         record = record?.copy(pointChannel = pointChannel, trimMs = trimNs / 1e6, volL = volL, volR = volR,
             master = master, balance = balance, levelTrimServerDb = levelTrimServerDb, levelTrimPointDb = levelTrimPointDb,
-            volTaper = 2, levelTrimVersion = 1, delayCalib = delayCalib, levelCalib = levelCalib)
+            volTaper = 2, levelTrimVersion = 1, delayCalib = delayCalib, levelCalib = levelCalib, eq = eqSettings)
         persistRecord()
     }
 
@@ -2970,7 +3170,7 @@ class Engine private constructor(private val app: Context) {
             // --- на Point ---
             "session" -> if (role == Role.POINT) {
                 peerCapabilities = parsePeerCaps(o)
-                negotiatedCapabilities = peerCapabilities.intersect(setOf("addrs", "tcpClock", "tcpAudio"))
+                negotiatedCapabilities = peerCapabilities.intersect(setOf("addrs", "tcpClock", "tcpAudio", "eq"))
                 updatePeerAddressBook(parsePeerAddresses(o))
                 val newSession = o.getInt("session")
                 if (sessionId != newSession) {
@@ -3030,7 +3230,7 @@ class Engine private constructor(private val app: Context) {
             }
             "network-addresses" -> {
                 peerCapabilities = parsePeerCaps(o)
-                negotiatedCapabilities = peerCapabilities.intersect(setOf("addrs", "tcpClock", "tcpAudio"))
+                negotiatedCapabilities = peerCapabilities.intersect(setOf("addrs", "tcpClock", "tcpAudio", "eq"))
                 updatePeerAddressBook(parsePeerAddresses(o))
                 telemetry.record("PEER_ADDRESSES_RECEIVED", mapOf("count" to parsePeerAddresses(o).size,
                     "networkIds" to parsePeerAddresses(o).map { it.networkId }.distinct()))
@@ -3087,11 +3287,45 @@ class Engine private constructor(private val app: Context) {
     // ================================================================== Server: шкала и команды
     private fun serverChannel() = Ch.other(pointChannel)
     private fun balanceGain(channel: Int) = if (mode == SourceMode.MUSIC) BalanceLaw.gain(channel, balance) else 1f
-    private fun serverGain() = AudioGain.taper(master) * AudioGain.fromDb(levelTrimServerDb) * balanceGain(serverChannel())
+    private fun serverGain() = if (soloMode) AudioGain.taper(master)
+        else AudioGain.taper(master) * AudioGain.fromDb(levelTrimServerDb) * balanceGain(serverChannel())
     private fun pointGain() = AudioGain.taper(master) * AudioGain.fromDb(levelTrimPointDb) * balanceGain(pointChannel)
 
+    private fun eqAvailableInPair() = soloMode ||
+        (phase in setOf(Phase.PAIRED, Phase.RECONNECTING) && "eq" in negotiatedCapabilities)
+    private fun activeEqConfig() = if (phase in setOf(Phase.PAIRED, Phase.RECONNECTING) && !eqAvailableInPair()) EqConfig.neutral() else eqConfig
+
+    private fun eqSettingsJson(settings: EqSettings): JSONObject = JSONObject().apply {
+        val clean = settings.sanitized()
+        put("enabled", clean.enabled)
+        put("gains", org.json.JSONArray().also { array -> clean.gainsDb.forEach { array.put(it.toDouble()) } })
+        put("magnet", clean.magnet.name)
+        put("preset", clean.preset)
+        put("preserveLoudness", clean.preserveLoudness)
+        put("bypass", clean.bypass)
+    }
+
+    private fun parseEqSettings(json: JSONObject?): EqSettings {
+        if (json == null) return EqSettings()
+        val values = json.optJSONArray("gains")
+        return EqSettings(
+            enabled = json.optBoolean("enabled", false),
+            gainsDb = List(EqualizerMath.BAND_COUNT) { i -> values?.optDouble(i, 0.0)?.toFloat() ?: 0f },
+            magnet = EqMagnet.parse(json.optString("magnet", "SOFT")),
+            preset = json.optString("preset", "Ровно").take(40),
+            preserveLoudness = json.optBoolean("preserveLoudness", true),
+            bypass = json.optBoolean("bypass", false),
+            analyzerEnabled = eqSettings.analyzerEnabled,
+        ).sanitized()
+    }
+
+    private fun eqSettingsForWire() = if (phase in setOf(Phase.PAIRED, Phase.RECONNECTING) && !eqAvailableInPair())
+        eqSettings.copy(enabled = false, bypass = false) else eqSettings
+
+    private fun renderChannel() = if (soloMode) Ch.BOTH else serverChannel()
+
     private fun rebuildPlayState() {
-        serverPlay = ServerPlayState(serverPlay.timeline, source, serverChannel(), serverGain())
+        serverPlay = ServerPlayState(serverPlay.timeline, source, renderChannel(), serverGain(), activeEqConfig())
     }
 
     private fun sendSession(target: ControlLink? = link) {
@@ -3173,7 +3407,7 @@ class Engine private constructor(private val app: Context) {
     private fun commitEpoch(playing: Boolean, frame: Long, anchorNs: Long, newEpoch: Int) {
         epoch = newEpoch
         preloadEpochCounter = maxOf(preloadEpochCounter, newEpoch)
-        serverPlay = ServerPlayState(Timeline(epoch, playing, frame, anchorNs), source, serverChannel(), serverGain())
+        serverPlay = ServerPlayState(Timeline(epoch, playing, frame, anchorNs), source, renderChannel(), serverGain(), activeEqConfig())
         audio.playbackActive = playing
         if (role == Role.POINT) tcpAudioBuffer.activate(epoch)
         sendTimeline()
@@ -3235,6 +3469,8 @@ class Engine private constructor(private val app: Context) {
             .put("peerGainLaw", if (peerGainLawReady) 2 else 1)
             .put("levelTrimServerDb", levelTrimServerDb.toDouble()).put("levelTrimPointDb", levelTrimPointDb.toDouble())
             .put("levelMeasureText", levelMeasureText)
+            .put("eq", eqSettingsJson(eqSettingsForWire()))
+            .put("eqPreampDb", activeEqConfig().preampDb)
             .put("delayCalib", JSONObject().put("state", delayCalib.state).put("atMs", delayCalib.atMs).put("spreadMs", delayCalib.spreadMs))
             .put("levelCalib", JSONObject().put("state", levelCalib.state).put("atMs", levelCalib.atMs).put("db", levelCalib.db))
             .put("pointCh", Ch.name(pointChannel)).put("trimMs", trimNs / 1e6).put("serverName", myName)
@@ -3294,14 +3530,20 @@ class Engine private constructor(private val app: Context) {
         val b = o.optDouble("balance", 0.5).toFloat().coerceIn(0f, 1f)
         val pCh = Ch.parse(o.optString("pointCh", "R"))
         val trim = o.optDouble("trimMs", 0.0)
+        val incomingEq = parseEqSettings(o.optJSONObject("eq"))
         if (role == Role.POINT) {
+            if (incomingEq != eqSettings) {
+                eqSettings = incomingEq
+                eqConfig = EqualizerMath.config(eqSettings)
+            }
             if (o.has("pointGain") && !didAcknowledgeGainLaw) {
                 didAcknowledgeGainLaw = true
                 link?.send(JSONObject().put("t", "gainAck").put("law", 2))
             }
             val gain = if (o.has("pointGain")) o.optDouble("pointGain").toFloat().coerceIn(0f, 1f)
                 else m * (if (pCh == Ch.L) vL else vR) * LegacyBalanceLaw.gain(pCh, b)
-            pointParams = PointParams(gain, (trim * 1e6).toLong(), dur)
+            pointParams = PointParams(gain, (trim * 1e6).toLong(), dur,
+                if (eqAvailableInPair()) eqConfig else EqConfig.neutral())
         }
         val progress = if (o.isNull("decodeProgress")) null else o.optDouble("decodeProgress").toFloat().coerceIn(0f, 1f)
         ui { copy(playing = playing, durationMs = dur * 1000 / SF.SAMPLE_RATE, title = o.optString("title"),
@@ -3312,6 +3554,10 @@ class Engine private constructor(private val app: Context) {
             delayCalib = o.optJSONObject("delayCalib")?.let { DelayCalib(it.optString("state", "none"), it.optLong("atMs"), it.optDouble("spreadMs")) } ?: DelayCalib(),
             levelCalib = o.optJSONObject("levelCalib")?.let { LevelCalib(it.optString("state", "none"), it.optLong("atMs"), it.optDouble("db")) } ?: LevelCalib(),
             levelMeasureText = o.optString("levelMeasureText", ""),
+            eq = if (role == Role.SERVER) eqSettingsForWire() else incomingEq,
+            eqAvailable = eqAvailableInPair(),
+            eqPreampDb = o.optDouble("eqPreampDb", 0.0).toFloat(),
+            eqRouteLabel = audio.routeLabel(), eqCurveDb = activeEqConfig().curveDb.map { it.toFloat() },
             gainLaw = if (role == Role.POINT) if (o.has("pointGain")) 2 else 1 else o.optInt("peerGainLaw", 1)) }
         if (playing) requestFocus()
         PlaybackService.refresh(app)
@@ -3362,12 +3608,36 @@ class Engine private constructor(private val app: Context) {
                     }
                     else -> master = if (o.optInt("law", 1) >= 2) v else AudioGain.migrateMaster(v)
                 }
-                rebuildPlayState(); if (o.optBoolean("finished", true)) saveServerParams(); publishState()
+                rebuildPlayState()
+                if (o.optBoolean("finished", true)) {
+                    if (soloMode) prefs.edit().putFloat("soloMaster", master).apply() else saveServerParams()
+                }
+                publishState()
             }
             "balance" -> {
                 balance = o.optDouble("v", 0.5).toFloat().coerceIn(0f, 1f)
-                rebuildPlayState(); if (o.optBoolean("finished", true)) saveServerParams(); publishState()
+                rebuildPlayState(); if (o.optBoolean("finished", true) && !soloMode) saveServerParams(); publishState()
                 if (o.optBoolean("finished", true)) telemetry.record("balance_set", mapOf("balance" to balance.toDouble()))
+            }
+            "eq" -> {
+                if (!eqAvailableInPair()) return
+                val previousBypass = eqSettings.bypass
+                eqSettings = parseEqSettings(o)
+                eqConfig = EqualizerMath.config(eqSettings)
+                rebuildPlayState()
+                if (o.optBoolean("finished", true)) {
+                    if (soloMode) saveSoloEqProfile(activeSoloEqRouteKey) else saveServerParams()
+                    val sourceRole = if (soloMode) "solo" else o.optString("originRole", role.name.lowercase()).lowercase()
+                    telemetry.record("EQ_CHANGE", mapOf(
+                        "preset" to eqSettings.preset, "gains" to eqSettings.gainsDb,
+                        "preampDb" to eqConfig.preampDb, "magnet" to eqSettings.magnet.name.lowercase(),
+                        "by" to sourceRole, "route" to audio.routeLabel(),
+                    ))
+                    if (previousBypass != eqSettings.bypass) telemetry.record("EQ_BYPASS", mapOf(
+                        "on" to eqSettings.bypass, "loudnessCompDb" to eqConfig.bypassCompDb,
+                    ))
+                }
+                publishState()
             }
             "swap" -> {
                 if (calibRunning) return
@@ -3457,7 +3727,7 @@ class Engine private constructor(private val app: Context) {
         // замолкал сразу, а Point — только когда до него доходила команда (на 10–200 мс позже), со щелчком.
         val at = System.nanoTime() + SF.PAUSE_LEAD_NS
         val stop = maxOf(tl.anchorFrame, tl.frameAt(at).toLong()).coerceAtMost(source.totalFrames)
-        serverPlay = ServerPlayState(Timeline(tl.epoch, true, tl.anchorFrame, tl.anchorNs, stop), source, serverChannel(), serverGain())
+        serverPlay = ServerPlayState(Timeline(tl.epoch, true, tl.anchorFrame, tl.anchorNs, stop), source, renderChannel(), serverGain(), activeEqConfig())
         sendTimeline()
         publishState()
         pauseTask?.cancel(false)
@@ -3507,7 +3777,7 @@ class Engine private constructor(private val app: Context) {
     private fun navigationIndex(): Int = queue.indexOfFirst { it.id == pendingTrackId }.takeIf { it >= 0 } ?: queueIndex
 
     private fun selectTrack(index: Int, forcePaused: Boolean = false, startPlayback: Boolean = false) {
-        if (calibRunning || (phase != Phase.PAIRED && phase != Phase.RECONNECTING) || index !in queue.indices) return
+        if (calibRunning || (!soloMode && phase !in setOf(Phase.PAIRED, Phase.RECONNECTING)) || index !in queue.indices) return
         val item = queue[index]
         if (queueIndex == index && pendingTrackId == null && currentQueueSource != null) {
             if (startPlayback) cmdPlay()
@@ -3521,7 +3791,7 @@ class Engine private constructor(private val app: Context) {
         ui { copy(loadingTracks = true, loadingTrackId = item.id, decodingProgress = null) }
         queueIo.execute {
             var initialSource: AudioSource? = null
-            val cancelled = { generation != trackLoadGeneration || phase !in setOf(Phase.PAIRED, Phase.RECONNECTING) || role != Role.SERVER }
+            val cancelled = { generation != trackLoadGeneration || (!soloMode && phase !in setOf(Phase.PAIRED, Phase.RECONNECTING)) || role != Role.SERVER }
             val loaded = loadTrack(item, cancelled,
                 onReady = { ready ->
                     initialSource = ready
@@ -3784,7 +4054,7 @@ class Engine private constructor(private val app: Context) {
             }
             val missing = arr.length() - items.size
             post {
-                if (role != Role.SERVER || !ui.value.inPair || calibRunning) { ui { copy(loadingTracks = false) }; return@post }
+                if (role != Role.SERVER || (!ui.value.inPair && !soloMode) || calibRunning) { ui { copy(loadingTracks = false) }; return@post }
                 if (items.isEmpty()) {
                     ui { copy(loadingTracks = false) }
                     toast("Файлы плейлиста «$name» не найдены"); return@post
@@ -3874,7 +4144,7 @@ class Engine private constructor(private val app: Context) {
 
     /** Каждые 100 мс: конец трека / конец тестового сигнала. */
     private fun serverTick() {
-        if (role != Role.SERVER || !ui.value.inPair) return
+        if (role != Role.SERVER || (!ui.value.inPair && !soloMode)) return
         val tl = serverPlay.timeline
         val nowNs = System.nanoTime()
         val progressive = if (mode == SourceMode.MUSIC) source as? app.soundfield.core.SegmentedPcmSource else null
@@ -3926,7 +4196,7 @@ class Engine private constructor(private val app: Context) {
                 } else {
                     progressiveStopFrame = scheduled
                     serverPlay = ServerPlayState(
-                        Timeline(tl.epoch, true, tl.anchorFrame, tl.anchorNs, scheduled), source, serverChannel(), serverGain())
+                        Timeline(tl.epoch, true, tl.anchorFrame, tl.anchorNs, scheduled), source, renderChannel(), serverGain(), activeEqConfig())
                     sendTimeline(); publishState()
                 }
                 return
@@ -4070,6 +4340,14 @@ class Engine private constructor(private val app: Context) {
         val heartbeatP95 = percentile95(telemetryRateSamples.toList())
         val tickP95 = tickIntervals.takeP95Ms()
         val output = audio.takeWindow(audioFocusHeld)
+        val limiterStats = if (role == Role.POINT) pointRenderer.takeLimiterStats() else serverRenderer.takeLimiterStats()
+        limiterWindowCount += limiterStats.first
+        limiterWindowMaxDb = maxOf(limiterWindowMaxDb, limiterStats.second)
+        if (lastLimiterWindowAtMs == 0L) lastLimiterWindowAtMs = nowMs
+        else if (nowMs - lastLimiterWindowAtMs >= 10_000L) {
+            telemetry.record("LIMITER_ACTIVE", mapOf("count" to limiterWindowCount, "maxReductionDb" to limiterWindowMaxDb))
+            limiterWindowCount = 0L; limiterWindowMaxDb = 0.0; lastLimiterWindowAtMs = nowMs
+        }
         if (output.recoveryCount > 0) {
             Log.w(TAG, "Recreating audio output after ${output.recoveryCount} failures", output.recoveryError)
             telemetry.record("AUDIO_RECOVERY", mapOf("attempts" to output.recoveryCount), error = output.recoveryError)
