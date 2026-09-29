@@ -24,6 +24,8 @@ data class SpatialDspConfig(
     val reflectionTaps: List<SpatialReflectionTap> = emptyList(),
     val preserveLoudness: Boolean = true,
     val fixedLoudnessCompensationDb: Double? = null,
+    /** Side после усиления не превышает kappa·Mid в каждом бине: корреляция L/R не уходит в минус (фазовость). */
+    val phaseLimitKappa: Double = 1.0,
 )
 
 data class SpatialReflectionTap(val leftMs: Double, val rightMs: Double, val gainDb: Double)
@@ -82,7 +84,8 @@ class SpatialProcessor(
     private val highGain = 10.0.pow(config.gHighDb * config.strength / 20.0)
     private val ambientGain = 10.0.pow(config.gAmbientDb * config.strength / 20.0)
     private val depthGain = 10.0.pow(config.depthDb * config.strength / 20.0)
-    private val depthHighGain = 10.0.pow((config.depthDb - 2.0) * config.strength / 20.0)
+    // Полка D3 (−2 дБ выше 8 кГц) — часть глубины: при нулевой глубине она тоже выключена.
+    private val depthHighGain = if (config.depthDb < 0.0) 10.0.pow((config.depthDb - 2.0) * config.strength / 20.0) else 1.0
 
     init {
         require(sampleRate > 0 && fftSize >= 2 && fftSize.countOneBits() == 1 && hopSize in 1..fftSize)
@@ -216,6 +219,11 @@ class SpatialProcessor(
                 currentBinPower < peak * 1e-6) mask = 0.0
             ringMask[binBase + bin] = mask
             ringIldGate[binBase + bin] = ildGate
+            // Ограничитель фазовости работает по тем же сглаженным мощностям (80 мс, 1/6 октавы), что и когерентность:
+            // мгновенные мощности бина случайны и превращали ограничитель в шум усиления, размазанный по времени
+            // (предзвон перед атакой) и по частоте.
+            ringMidPower[binBase + bin] = max(0.0, (pL + pR + 2.0 * crossR) * 0.25)
+            ringSidePower[binBase + bin] = max(0.0, (pL + pR - 2.0 * crossR) * 0.25)
         }
     }
 
@@ -235,24 +243,9 @@ class SpatialProcessor(
         for (bin in 0 until bins) {
             val band = binBand[bin]
             val index = binBase + bin
-            var mask = ringMask[index] * releaseState[band]
             val hz = bin.toDouble() * sampleRate / fftSize
-            val baseline = widthGain(hz)
-            var gain = baseline * (1.0 + (ambientGain - 1.0) * mask)
-            gain = 1.0 + (gain - 1.0) * ringIldGate[index]
-            val mid = ringMidPower[index]
-            val side = ringSidePower[index]
-            val phaseLimit = if (side <= 1e-20) Double.POSITIVE_INFINITY else sqrt(mid / side)
-            gain = max(1.0, min(gain, phaseLimit))
-            val previous = smoothedGain[bin]
-            gain = widthSmoothing * previous + (1.0 - widthSmoothing) * gain
-            smoothedGain[bin] = gain
-
-            val specIndex = spectrumBase + bin
-            val lr = ringLReal[specIndex]; val li = ringLImag[specIndex]
-            val rr = ringRReal[specIndex]; val ri = ringRImag[specIndex]
-            val midR = (lr + rr) * 0.5; val midI = (li + ri) * 0.5
-            val sideR = (lr - rr) * 0.5 * gain; val sideI = (li - ri) * 0.5 * gain
+            // Глубина считается первой: ограничитель фазовости обязан видеть Mid уже после её ослабления,
+            // иначе Side остаётся прежним, Mid уменьшается и корреляция L/R уходит ниже нуля.
             val depthT = (ln(max(1.0, hz) / 8_000.0) / ln(2.0)).coerceIn(0.0, 1.0)
             val highBlend = smoothstepCos(depthT)
             val targetDepthGain = depthGain + (depthHighGain - depthGain) * highBlend
@@ -263,6 +256,24 @@ class SpatialProcessor(
             for (k in depthLo until depthHi) depthMask += ringMask[binBase + k] * releaseState[binBand[k]]
             depthMask /= max(1, depthHi - depthLo)
             val depth = 1.0 - (1.0 - targetDepthGain) * depthMask
+
+            val mask = ringMask[index] * releaseState[band]
+            val baseline = widthGain(hz)
+            var gain = baseline * (1.0 + (ambientGain - 1.0) * mask)
+            gain = 1.0 + (gain - 1.0) * ringIldGate[index]
+            val mid = ringMidPower[index] * depth * depth
+            val side = ringSidePower[index]
+            val phaseLimit = if (side <= 1e-20) Double.POSITIVE_INFINITY else config.phaseLimitKappa * sqrt(mid / side)
+            gain = max(1.0, min(gain, phaseLimit))
+            val previous = smoothedGain[bin]
+            gain = widthSmoothing * previous + (1.0 - widthSmoothing) * gain
+            smoothedGain[bin] = gain
+
+            val specIndex = spectrumBase + bin
+            val lr = ringLReal[specIndex]; val li = ringLImag[specIndex]
+            val rr = ringRReal[specIndex]; val ri = ringRImag[specIndex]
+            val midR = (lr + rr) * 0.5; val midI = (li + ri) * 0.5
+            val sideR = (lr - rr) * 0.5 * gain; val sideI = (li - ri) * 0.5 * gain
             val effectiveMidR = midR * depth; val effectiveMidI = midI * depth
             val lReal = effectiveMidR + sideR; val lImag = effectiveMidI + sideI
             val rReal = effectiveMidR - sideR; val rImag = effectiveMidI - sideI
