@@ -121,7 +121,7 @@ class SpatialSource(
         try {
             xtcProcessor = xtcDesign?.let { future ->
                 try {
-                    val filters = future.get(200, TimeUnit.MILLISECONDS)
+                    val filters = future.get(XTC_DESIGN_WAIT_MS, TimeUnit.MILLISECONDS)
                     xtcApplied = true
                     XtcProcessor(filters, ::processXtcFrame)
                 } catch (_: java.util.concurrent.TimeoutException) {
@@ -302,6 +302,8 @@ class SpatialSource(
         const val DEFAULT_CACHE_SECONDS = 40
         private val XTC_INPUT_AHEAD_FRAMES = (XtcFilterDesigner.DELAY_FRAMES + XtcProcessor.BLOCK_FRAMES + SF.SAMPLE_RATE / 200).toLong()
         private const val NO_RESTART = Long.MIN_VALUE
+        /** Фильтр обычно уже рассчитан заранее (Engine.prewarmXtc); ждём холодный расчёт, а не пропускаем XTC на весь трек. */
+        private const val XTC_DESIGN_WAIT_MS = 4_000L
 
         private fun nextPowerOfTwo(value: Int): Int {
             var result = 1

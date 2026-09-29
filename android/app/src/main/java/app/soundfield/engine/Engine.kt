@@ -3466,7 +3466,32 @@ class Engine private constructor(private val app: Context) {
     private fun deviceSpeakerSpacingM(): Double = deviceSpeakerRecord()?.optDouble("spacingM", 0.14)
         ?.takeIf { it > 0.0 } ?: 0.14
 
-    private fun deviceXtcVerified(): Boolean = deviceSpeakerRecord()?.optBoolean("xtcVerified") ?: false
+    /** Только для разработчика: включить XTC на этом телефоне для проверки на слух, не правя таблицу устройств. */
+    @Volatile private var xtcDeveloperOverride = prefs.getBoolean("xtcDevOverride:${Build.MODEL}", false)
+
+    fun xtcDeveloperOverrideEnabled(): Boolean = xtcDeveloperOverride
+
+    fun setXtcDeveloperOverride(on: Boolean) = post {
+        if (xtcDeveloperOverride == on) return@post
+        xtcDeveloperOverride = on
+        prefs.edit().putBoolean("xtcDevOverride:${Build.MODEL}", on).apply()
+        telemetry.record("XTC_DEV_OVERRIDE", mapOf("model" to Build.MODEL, "enabled" to on))
+        prewarmXtc()
+        if (soloMode && spatialAvailableNow() && spatialSettings.enabled)
+            applySpatialSettings(spatialSettings, finished = false, reason = "xtc_override")
+    }
+
+    private fun deviceXtcVerified(): Boolean =
+        xtcDeveloperOverride || (deviceSpeakerRecord()?.optBoolean("xtcVerified") ?: false)
+
+    /** Расчёт фильтра занимает сотни миллисекунд: делаем его заранее, до первого воспроизведения. */
+    private fun prewarmXtc() {
+        if (!soloMode || !deviceXtcVerified() || !deviceHasStereoSpeakers()) return
+        val beta = spatialProfile("solo_stereo_speaker").xtcBeta ?: return
+        listOf(SpatialLevel.SOFT, SpatialLevel.STRONG).forEach {
+            XtcFilterDesigner.request(Build.MODEL, deviceSpeakerSpacingM(), xtcBeta(it, beta))
+        }
+    }
 
     private fun xtcBeta(level: SpatialLevel, profileBeta: Double): Double = when (level) {
         SpatialLevel.SOFT -> profileBeta
@@ -3510,6 +3535,7 @@ class Engine private constructor(private val app: Context) {
     }
 
     private fun refreshSpatialAvailability() {
+        prewarmXtc()
         val available = spatialAvailableNow()
         if (ui.value.spatialAvailable != available || ui.value.spatial != spatialSettings)
             ui { copy(spatialAvailable = available, spatial = spatialSettings) }
@@ -3528,7 +3554,8 @@ class Engine private constructor(private val app: Context) {
 
     private fun spatialSignature(input: AudioSource): String {
         val profileId = if (soloMode) "solo_stereo_speaker" else spatialSettings.profile
-        return "${System.identityHashCode(input)}:$profileId:${spatialSettings.toJson()}:$spatialAbFixedCompensationDb"
+        return "${System.identityHashCode(input)}:$profileId:${spatialSettings.toJson()}:$spatialAbFixedCompensationDb:" +
+            "xtc=${soloMode && deviceXtcVerified()}"
     }
 
     private fun renderSourceFor(input: AudioSource, startAtFrame: Long = 0L): AudioSource {

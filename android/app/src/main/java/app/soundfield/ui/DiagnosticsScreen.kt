@@ -239,7 +239,7 @@ fun DiagnosticsScreen(ui: UiState, engine: Engine, onRequestSyncProbe: () -> Uni
                 DiagRow("Ограничитель / компенсация", "%.1f / %+.1f дБ".format(spatialStats.limiterDb, spatialStats.loudnessCompDb))
                 if (ui.soloMode) {
                     DiagRow("XTC в обработке", if (spatialStats.xtcApplied) "да" else "нет")
-                    if (spatialStats.xtcDesignTimedOut) DiagRow("Расчёт XTC", "превышено 200 мс", SFColors.Warn)
+                    if (spatialStats.xtcDesignTimedOut) DiagRow("Расчёт XTC", "не успел за 4 с", SFColors.Warn)
                 }
                 DiagRow("Версия", app.soundfield.dsp.DSP_VERSION)
             }
@@ -262,7 +262,13 @@ fun DiagnosticsScreen(ui: UiState, engine: Engine, onRequestSyncProbe: () -> Uni
                         DiagRow("Медиана / худшая точка", "%.1f / %.1f дБ".format(
                             xtcReport.predictedMedianDb, xtcReport.predictedWorstDb))
                     } else if (xtcReport.status != "не рассчитано") Subtitle(xtcReport.status)
-                    Subtitle("Это оценка акустической модели. Она не подтверждает модель телефона и не включает XTC без xtcVerified.")
+                    var xtcOverride by remember { mutableStateOf(engine.xtcDeveloperOverrideEnabled()) }
+                    Row(Modifier.fillMaxWidth().padding(top = 10.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Text("Включить XTC на этом телефоне (проверка на слух)", color = SFColors.Text, fontSize = 14.sp,
+                            modifier = Modifier.weight(1f))
+                        Switch(checked = xtcOverride, onCheckedChange = { xtcOverride = it; engine.setXtcDeveloperOverride(it) })
+                    }
+                    Subtitle("Оценка модельная и не подтверждает модель телефона. Переключатель только для разработчика: без него XTC включается лишь для моделей с xtcVerified=true в таблице устройств.")
                 }
             }
         }
