@@ -417,6 +417,7 @@ class Engine private constructor(private val app: Context) {
     private val cacheSeq = IntArray(1024) { -1 }
     private val cacheEpoch = IntArray(1024)
     private val cacheStart = LongArray(1024)
+    private val cacheCount = IntArray(1024)
 
     // ------------------------------------------------------------------ Point
     private val clock = ClockSync()
@@ -5352,9 +5353,11 @@ class Engine private constructor(private val app: Context) {
         pointChannelSignal.add(samples, 0, samples.size)
     }
 
-    private fun packet(st: ServerPlayState, tl: Timeline, seq: Int, start: Long, flags: Int): ByteArray {
-        val count = minOf(SF.PACKET_FRAMES.toLong(), st.source.totalFrames - start,
-            st.source.readyFrames - start).toInt().coerceAtLeast(0)
+    /** Число кадров в пакете, начинающемся с [start]: не больше PACKET_FRAMES и только из готовой части источника. */
+    private fun packetFrameCount(source: AudioSource, start: Long): Int = Packetizing.frameCount(source, start)
+
+    private fun packet(st: ServerPlayState, tl: Timeline, seq: Int, start: Long, flags: Int,
+        count: Int = packetFrameCount(st.source, start)): ByteArray {
         val pCh = Ch.other(st.channel)
         val s = ShortArray(count) { i -> (st.source.sample(start + i, pCh) * 32767f).roundToInt().coerceIn(-32768, 32767).toShort() }
         return Wire.audio(sessionId, tl.epoch, seq, start, tl.timeOf(start), System.nanoTime(), flags, s, count)
@@ -5372,13 +5375,17 @@ class Engine private constructor(private val app: Context) {
         val target = minOf(requestedTarget, st.source.readyFrames)
         var k = 0
         while (nextFrame < target && k < 40) {
+            // Пакет может оказаться короче PACKET_FRAMES, если источник (обработка, декодер) ещё не готов дальше.
+            // Курсор двигаем на фактически отправленное число кадров: иначе хвост пакета терялся бы дырой до 10 мс.
+            val count = packetFrameCount(st.source, nextFrame)
+            if (count <= 0) break
             val seq = sendSeq++
-            val b = packet(st, tl, seq, nextFrame, 0)
+            val b = packet(st, tl, seq, nextFrame, 0, count)
             val i = seq and 1023
-            cacheSeq[i] = seq; cacheEpoch[i] = tl.epoch; cacheStart[i] = nextFrame
+            cacheSeq[i] = seq; cacheEpoch[i] = tl.epoch; cacheStart[i] = nextFrame; cacheCount[i] = count
             udp.send(DatagramPacket(b, b.size, addr))
             sentAudioPackets.incrementAndGet()
-            nextFrame += SF.PACKET_FRAMES; k++
+            nextFrame += count; k++
         }
     } }
 
@@ -5390,8 +5397,8 @@ class Engine private constructor(private val app: Context) {
         for (seq in n.seqs) {
             val i = seq and 1023
             if (cacheSeq[i] != seq || cacheEpoch[i] != tl.epoch) continue
-            if (tl.timeOf(cacheStart[i] + SF.PACKET_FRAMES) < now) continue   // уже поздно
-            val b = packet(st, tl, seq, cacheStart[i], UdpMsg.FLAG_RETRANSMIT)
+            if (tl.timeOf(cacheStart[i] + cacheCount[i]) < now) continue   // уже поздно
+            val b = packet(st, tl, seq, cacheStart[i], UdpMsg.FLAG_RETRANSMIT, cacheCount[i])
             udp.send(DatagramPacket(b, b.size, addr)); resent.incrementAndGet()
         }
     } }
