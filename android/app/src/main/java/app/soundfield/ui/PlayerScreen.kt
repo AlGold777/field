@@ -24,6 +24,7 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.platform.LocalHapticFeedback
@@ -107,9 +108,10 @@ fun PlayerScreen(ui: UiState, engine: Engine, openCalibration: () -> Unit, openD
                     else {
                         val estimate = if (lrEstUs < 1_000.0) "±%.0f мкс".format(lrEstUs)
                             else "±%.2f мс".format(lrEstUs / 1_000.0)
-                        "⚡ L/R: $estimate по оценке часов • RTT %.0f мс • буфер %.0f мс".format(pd.rttMs, pd.bufferMs)
+                        "⚡ L/R: $estimate : RTT %.0f мс : буф. %.0f мс".format(pd.rttMs, pd.bufferMs)
                     },
-                    color = if (lrEstUs != null && lrEstUs < 2_000.0) SFColors.Good else SFColors.Warn, fontSize = 13.sp)
+                    color = if (lrEstUs != null && lrEstUs < 2_000.0) SFColors.Good else SFColors.Warn,
+                    fontSize = 13.sp, maxLines = 1, softWrap = false, overflow = TextOverflow.Ellipsis)
             }
             Spacer(Modifier.height(20.dp))
         }
