@@ -129,6 +129,28 @@ fun PlayerScreen(ui: UiState, engine: Engine, openCalibration: () -> Unit, openD
             }
         }
 
+        // --- уведомления над названием трека ---
+        if (ui.fileTransferText.isNotBlank()) {
+            Text(ui.fileTransferText, color = SFColors.Accent1, fontSize = 12.sp, textAlign = TextAlign.Center,
+                modifier = Modifier.fillMaxWidth())
+        } else if (ui.loadingTracks || ui.audioBuffering || ui.decodingProgress != null) {
+            Text(
+                if (ui.decodingProgress != null) "Подготовка аудиофайла… ${(ui.decodingProgress * 100).roundToInt()}%"
+                else if (ui.audioBuffering) "Буферизация аудио…" else "Подготовка аудиофайла…",
+                color = SFColors.TextDim, fontSize = 12.sp, textAlign = TextAlign.Center,
+                modifier = Modifier.fillMaxWidth(),
+            )
+        }
+        if (ui.role == Role.POINT && ui.fileTransferText.isNotBlank()) {
+            TextButton(onClick = engine::cancelFileTransfer, modifier = Modifier.align(Alignment.CenterHorizontally)) {
+                Text("Отменить передачу", color = SFColors.Warn, fontSize = 12.sp)
+            }
+        }
+        if (!ui.soloMode && ui.audioMissing) {
+            Text("Нет аудио на Point · восстанавливаем соединение", color = SFColors.Warn,
+                fontSize = 12.sp, textAlign = TextAlign.Center, modifier = Modifier.fillMaxWidth())
+        }
+
         // --- трек ---
         // «Название - Исполнитель» одной строкой; для тестовых сигналов — только название
         val trackTitle = if (ui.mode == SourceMode.MUSIC) app.soundfield.engine.trackLabel(ui.title, ui.artist) else ui.title
@@ -146,26 +168,11 @@ fun PlayerScreen(ui: UiState, engine: Engine, openCalibration: () -> Unit, openD
                 )
             }.clickable(onClick = openTrackPicker))
         Text(
-            when {
-                ui.fileTransferText.isNotBlank() -> ui.fileTransferText
-                ui.loadingTracks -> "Подготовка аудиофайла…"
-                ui.audioBuffering -> "Буферизация аудио…"
-                ui.decodingProgress != null -> "Подготовка аудиофайла… ${(ui.decodingProgress * 100).roundToInt()}%"
-                else -> ui.artist.ifBlank { "---" }
-            },
-            color = if (ui.fileTransferText.isNotBlank()) SFColors.Accent1 else SFColors.TextDim,
+            ui.artist.ifBlank { "---" },
+            color = SFColors.TextDim,
             fontSize = 12.sp, textAlign = TextAlign.Center,
             modifier = Modifier.fillMaxWidth().padding(top = 5.dp, bottom = 8.dp),
         )
-        if (ui.role == Role.POINT && ui.fileTransferText.isNotBlank()) {
-            TextButton(onClick = engine::cancelFileTransfer, modifier = Modifier.align(Alignment.CenterHorizontally)) {
-                Text("Отменить передачу", color = SFColors.Warn, fontSize = 12.sp)
-            }
-        }
-        if (!ui.soloMode && ui.audioMissing) {
-            Text("Нет аудио на Point · восстанавливаем соединение", color = SFColors.Warn,
-                fontSize = 12.sp, textAlign = TextAlign.Center, modifier = Modifier.fillMaxWidth())
-        }
         Spacer(Modifier.height(12.dp))
         val dur = ui.durationMs.coerceAtLeast(1)
         Slider(
