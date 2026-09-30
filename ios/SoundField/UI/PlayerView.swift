@@ -17,8 +17,8 @@ struct PlayerView: View {
     @State private var balanceWasInCenter = true
     @AppStorage("sf.queueExpanded") private var queueExpanded = false
     @State private var showingAudioSourceDialog = false
-    @State private var showingAudioFiles = false
-    @State private var showingAudioFolder = false
+    @State private var showingAudioImporter = false
+    @State private var importingFolder = false
     private let timer = Timer.publish(every: 0.2, on: .main, in: .common).autoconnect()
 
     var body: some View {
@@ -180,17 +180,17 @@ struct PlayerView: View {
         }
         .onChange(of: queueExpanded) { expanded in engine.setQueueExpanded(expanded) }
         .confirmationDialog("Добавить музыку", isPresented: $showingAudioSourceDialog, titleVisibility: .visible) {
-            Button("Выбрать файлы") { showingAudioFiles = true }
-            Button("Выбрать папку") { showingAudioFolder = true }
+            Button("Выбрать файлы") { importingFolder = false; showingAudioImporter = true }
+            Button("Выбрать папку") { importingFolder = true; showingAudioImporter = true }
             Button("Отмена", role: .cancel) {}
         } message: {
             Text("Файлы из папки будут добавлены в очередь по имени.")
         }
-        .fileImporter(isPresented: $showingAudioFiles, allowedContentTypes: [.audio], allowsMultipleSelection: true) { result in
+        // Один fileImporter на view: второй такой же модификатор SwiftUI игнорирует, и выбор файлов не открывался.
+        .fileImporter(isPresented: $showingAudioImporter,
+                      allowedContentTypes: importingFolder ? [.folder] : [.audio],
+                      allowsMultipleSelection: !importingFolder) { result in
             if case .success(let urls) = result { engine.addAudioFiles(urls) }
-        }
-        .fileImporter(isPresented: $showingAudioFolder, allowedContentTypes: [.folder]) { result in
-            if case .success(let url) = result { engine.addAudioFiles([url]) }
         }
         .alert("Вы хотите разорвать пару?", isPresented: $confirmDisconnect) {
             Button("Да", role: .destructive) { engine.disconnect() }
