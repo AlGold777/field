@@ -50,6 +50,7 @@ import java.util.Locale
 fun PlayerScreen(ui: UiState, engine: Engine, openCalibration: () -> Unit, openDiagnostics: () -> Unit,
     openTrackPicker: () -> Unit, openEqualizer: () -> Unit, openSpatial: () -> Unit, openPairing: () -> Unit) {
     var confirmDisconnect by remember { mutableStateOf(false) }
+    var confirmCancelFileTransfer by remember { mutableStateOf(false) }
     var pos by remember { mutableLongStateOf(0L) }
     var dragging by remember { mutableStateOf<Float?>(null) }
     val swipeThreshold = with(LocalDensity.current) { 48.dp.toPx() }
@@ -131,8 +132,16 @@ fun PlayerScreen(ui: UiState, engine: Engine, openCalibration: () -> Unit, openD
 
         // --- уведомления над названием трека ---
         if (ui.fileTransferText.isNotBlank()) {
-            Text(ui.fileTransferText, color = SFColors.Accent1, fontSize = 12.sp, textAlign = TextAlign.Center,
-                modifier = Modifier.fillMaxWidth())
+            if (ui.role == Role.POINT) {
+                val progress = ui.fileTransferText.substringAfterLast('·', "").trim()
+                    .takeIf { it.endsWith("%") }
+                TextButton(onClick = { confirmCancelFileTransfer = true }, modifier = Modifier.align(Alignment.CenterHorizontally)) {
+                    Text(progress?.let { "Send $it" } ?: "Send…", color = SFColors.Accent1, fontSize = 12.sp)
+                }
+            } else {
+                Text(ui.fileTransferText, color = SFColors.Accent1, fontSize = 12.sp, textAlign = TextAlign.Center,
+                    modifier = Modifier.fillMaxWidth())
+            }
         } else if (ui.loadingTracks || ui.audioBuffering || ui.decodingProgress != null) {
             Text(
                 if (ui.decodingProgress != null) "Подготовка аудиофайла… ${(ui.decodingProgress * 100).roundToInt()}%"
@@ -141,16 +150,6 @@ fun PlayerScreen(ui: UiState, engine: Engine, openCalibration: () -> Unit, openD
                 modifier = Modifier.fillMaxWidth(),
             )
         }
-        if (ui.role == Role.POINT && ui.fileTransferText.isNotBlank()) {
-            TextButton(onClick = engine::cancelFileTransfer, modifier = Modifier.align(Alignment.CenterHorizontally)) {
-                Text("Отменить передачу", color = SFColors.Warn, fontSize = 12.sp)
-            }
-        }
-        if (!ui.soloMode && ui.audioMissing) {
-            Text("Нет аудио на Point · восстанавливаем соединение", color = SFColors.Warn,
-                fontSize = 12.sp, textAlign = TextAlign.Center, modifier = Modifier.fillMaxWidth())
-        }
-
         // --- трек ---
         // «Название - Исполнитель» одной строкой; для тестовых сигналов — только название
         val trackTitle = if (ui.mode == SourceMode.MUSIC) app.soundfield.engine.trackLabel(ui.title, ui.artist) else ui.title
@@ -270,6 +269,22 @@ fun PlayerScreen(ui: UiState, engine: Engine, openCalibration: () -> Unit, openD
             title = { Text("Вы хотите разорвать пару?") },
             confirmButton = { TextButton(onClick = { confirmDisconnect = false; engine.disconnect() }) { Text("Да") } },
             dismissButton = { TextButton(onClick = { confirmDisconnect = false }) { Text("Нет") } },
+        )
+    }
+
+    if (confirmCancelFileTransfer) {
+        AlertDialog(
+            onDismissRequest = { confirmCancelFileTransfer = false },
+            title = { Text("Отменить передачу?") },
+            text = { Text("Отправка аудиофайлов на Server будет остановлена.") },
+            confirmButton = {
+                TextButton(onClick = { confirmCancelFileTransfer = false; engine.cancelFileTransfer() }) {
+                    Text("Отменить передачу", color = SFColors.Warn)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { confirmCancelFileTransfer = false }) { Text("Продолжить") }
+            },
         )
     }
 }
