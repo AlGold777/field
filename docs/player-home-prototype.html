@@ -1,0 +1,186 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#16213e">
+  <title>SoundField — главный экран</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      --text: #e2e8f0;
+      --muted: #94a3b8;
+      --blue: #3b82f6;
+      --red: #ef4444;
+      --accent: #667eea;
+      --line: #ffffff1a;
+    }
+    * { box-sizing: border-box; }
+    body {
+      min-height: 100vh;
+      margin: 0;
+      padding: 24px;
+      display: grid;
+      place-items: center;
+      background: #0b1020;
+      color: var(--text);
+    }
+    button { color: inherit; font: inherit; }
+    .phone {
+      width: min(100%, 390px);
+      min-height: min(844px, calc(100vh - 48px));
+      padding: 28px 20px 22px;
+      overflow: hidden;
+      border: 1px solid #ffffff20;
+      border-radius: 32px;
+      background: linear-gradient(180deg, #16213e, #0f3460);
+      box-shadow: 0 28px 90px #0009, inset 0 1px #ffffff12;
+      display: flex;
+      flex-direction: column;
+      gap: 0;
+    }
+    .topbar { display: flex; align-items: center; gap: 8px; min-height: 34px; }
+    .pair, .remembered, .role {
+      border: 1px solid #4ade8055;
+      border-radius: 999px;
+      background: #4ade8018;
+      color: #4ade80;
+      font-size: 11px;
+      line-height: 1;
+      padding: 9px 12px;
+      white-space: nowrap;
+    }
+    .remembered { border-color: #4ade8040; padding-inline: 9px; }
+    .role { margin-left: auto; border-color: #c084fc44; background: #c084fc18; color: #d8b4fe; letter-spacing: .04em; }
+    .stage {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 40px 3px 27px;
+    }
+    .speaker { width: 132px; display: grid; justify-items: center; text-align: center; }
+    .disc {
+      width: 86px; height: 86px; display: grid; place-items: center;
+      border: 3px solid var(--blue); border-radius: 50%;
+      background: #3b82f633; color: #60a5fa;
+      font-size: 27px; font-weight: 750;
+      box-shadow: 0 0 28px #3b82f22a;
+    }
+    .speaker.right .disc { border-color: var(--red); background: #ef444433; color: #f87171; box-shadow: 0 0 28px #ef44442a; }
+    .speaker-name { margin-top: 10px; font-size: 13px; font-weight: 650; }
+    .speaker-role { margin-top: 3px; color: var(--muted); font-size: 11px; }
+    .link { width: 36px; height: 2px; margin-top: -30px; border-radius: 3px; background: linear-gradient(90deg, var(--accent), #764ba2); }
+    .sync {
+      max-width: 100%; margin: 0 auto 28px; padding: 11px 13px;
+      border: 1px solid #ffffff12; border-radius: 999px;
+      background: #ffffff0d; color: #4ade80;
+      text-align: center; font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
+    .notice { text-align: center; color: #fbbf24; font-size: 12px; line-height: 1.4; }
+    .notice + .notice { margin-top: 8px; }
+    .cancel { display: block; margin: 5px auto 12px; padding: 6px 13px; border: 0; border-radius: 99px; background: #ffffff12; color: #fbbf24; font-size: 12px; }
+    .track { margin-top: 1px; text-align: center; }
+    .title { font-size: 20px; line-height: 1.3; font-weight: 750; letter-spacing: -.02em; }
+    .artist { margin-top: 5px; color: var(--muted); font-size: 12px; }
+    .timeline { margin-top: 25px; }
+    .trackbar { position: relative; height: 4px; border-radius: 8px; background: #ffffff24; }
+    .trackbar::before { content: ""; position: absolute; inset: 0 auto 0 0; width: 37%; border-radius: inherit; background: var(--accent); }
+    .trackbar::after { content: ""; position: absolute; left: calc(37% - 5px); top: 50%; width: 10px; height: 10px; transform: translateY(-50%); border-radius: 50%; background: #8b9afa; box-shadow: 0 0 0 4px #667eea2b; }
+    .times { display: flex; justify-content: space-between; margin-top: 9px; color: var(--muted); font-size: 11px; }
+    .controls { display: flex; align-items: center; justify-content: center; gap: 31px; padding: 20px 0 22px; }
+    .skip, .play { display: grid; place-items: center; border: 0; cursor: pointer; }
+    .skip { width: 50px; height: 50px; border-radius: 50%; background: #ffffff1a; font-size: 20px; }
+    .play { width: 74px; height: 74px; border-radius: 50%; background: linear-gradient(135deg, #667eea, #764ba2); box-shadow: 0 9px 26px #667eea55; font-size: 25px; }
+    .sound { padding: 15px 16px 14px; border: 1px solid #ffffff1a; border-radius: 18px; background: #ffffff0d; }
+    .sound-head { margin-bottom: 17px; color: var(--muted); font-size: 12px; font-weight: 650; letter-spacing: .11em; }
+    .setting { display: flex; justify-content: space-between; margin-bottom: 9px; font-size: 13px; }
+    .setting span:last-child { color: #d8b4fe; font-weight: 650; }
+    .range { height: 4px; border-radius: 8px; background: linear-gradient(90deg, #c084fc 0 68%, #ffffff1a 68%); }
+    .balance-title { display: flex; justify-content: space-between; align-items: center; margin: 15px 0 7px; color: var(--muted); font-size: 13px; }
+    .balance-title strong { color: var(--accent); font-size: 12px; }
+    .balance { display: flex; align-items: center; gap: 8px; font-size: 11px; font-weight: 700; }
+    .balance .range { position: relative; flex: 1; background: #ffffff1a; }
+    .balance .range::after { content: ""; position: absolute; left: 50%; top: -4px; height: 12px; width: 2px; background: #94a3b8; }
+    .actions { display: flex; gap: 8px; margin-top: 15px; }
+    .actions button { flex: 1; min-height: 43px; border: 1px solid #ffffff2a; border-radius: 13px; background: #ffffff14; font-size: 12px; font-weight: 650; }
+    .actions button:last-child { flex: 0 0 46px; font-size: 17px; }
+    @media (max-height: 760px) {
+      body { padding: 12px; }
+      .phone { min-height: 0; padding-top: 20px; }
+      .stage { padding-top: 24px; padding-bottom: 18px; }
+      .disc { width: 72px; height: 72px; }
+      .sync { margin-bottom: 18px; }
+      .timeline { margin-top: 17px; }
+      .controls { padding: 14px 0 16px; }
+    }
+  </style>
+</head>
+<body>
+  <main class="phone" aria-label="Прототип главного экрана SoundField">
+    <header class="topbar">
+      <button class="pair">● Стереопара активна</button>
+      <button class="remembered">«iPhone»</button>
+      <span class="role">SERVER</span>
+    </header>
+
+    <section class="stage" aria-label="Стереоканалы">
+      <div class="speaker left">
+        <div class="disc">L</div>
+        <div class="speaker-name">Этот телефон</div>
+        <div class="speaker-role">Server</div>
+      </div>
+      <div class="link" aria-hidden="true"></div>
+      <div class="speaker right">
+        <div class="disc">R</div>
+        <div class="speaker-name">Макбук</div>
+        <div class="speaker-role">Point</div>
+      </div>
+    </section>
+
+    <button class="sync">⚡ L/R: ±0,8 мс : RTT 12 мс : буф. 350 мс</button>
+
+    <div class="notice">Передача аудиофайла на Point · 68%</div>
+    <button class="cancel">Отменить передачу</button>
+    <div class="notice">Нет аудио на Point · восстанавливаем соединение</div>
+
+    <section class="track" aria-label="Текущий трек">
+      <div class="title">Midnight City</div>
+      <div class="artist">M83</div>
+    </section>
+
+    <section class="timeline" aria-label="Позиция воспроизведения">
+      <div class="trackbar"></div>
+      <div class="times"><span>1:24</span><span>3:59</span></div>
+    </section>
+
+    <nav class="controls" aria-label="Управление воспроизведением">
+      <button class="skip" aria-label="Назад на 10 секунд">⏪</button>
+      <button class="play" aria-label="Пауза" id="play">❚❚</button>
+      <button class="skip" aria-label="Вперёд на 10 секунд">⏩</button>
+    </nav>
+
+    <section class="sound" aria-label="Настройки звука">
+      <div class="sound-head">SOUND</div>
+      <div class="setting"><span>Громкость</span><span>72%</span></div>
+      <div class="range"></div>
+      <div class="balance-title"><span>Баланс между телефонами</span><strong>Центр</strong></div>
+      <div class="balance"><span>L</span><div class="range"></div><span>R</span></div>
+    </section>
+
+    <footer class="actions">
+      <button>Калибровка</button>
+      <button>Диагностика</button>
+      <button aria-label="Телеметрия">◉</button>
+    </footer>
+  </main>
+  <script>
+    const play = document.querySelector("#play");
+    play.addEventListener("click", () => {
+      const paused = play.textContent.trim() === "▶";
+      play.textContent = paused ? "❚❚" : "▶";
+      play.setAttribute("aria-label", paused ? "Пауза" : "Воспроизвести");
+    });
+  </script>
+</body>
+</html>
