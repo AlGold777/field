@@ -151,10 +151,7 @@ fun PlayerScreen(ui: UiState, engine: Engine, openCalibration: () -> Unit, openD
                 ui.loadingTracks -> "Подготовка аудиофайла…"
                 ui.audioBuffering -> "Буферизация аудио…"
                 ui.decodingProgress != null -> "Подготовка аудиофайла… ${(ui.decodingProgress * 100).roundToInt()}%"
-                ui.role == Role.POINT -> if (ui.peerPlatform.equals("android", true))
-                    "Нажмите на название, чтобы отправить музыку на Server"
-                else "Добавление с Point доступно, если оба телефона — Android"
-                else -> "Нажмите на название, чтобы добавить FLAC, WAV или MP3"
+                else -> ui.artist.ifBlank { "---" }
             },
             color = if (ui.fileTransferText.isNotBlank()) SFColors.Accent1 else SFColors.TextDim,
             fontSize = 12.sp, textAlign = TextAlign.Center,
