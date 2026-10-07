@@ -117,25 +117,29 @@ fun PlayerScreen(ui: UiState, engine: Engine, openCalibration: () -> Unit, openD
                     .clip(RoundedCornerShape(10.dp)).background(SFColors.Warn.copy(alpha = 0.12f)).padding(12.dp))
         }
 
-        // --- стереосцена ---
-        if (!ui.soloMode) {
-            val serverCh = Ch.other(ui.pointChannel)
-            val leftIsMe = ui.myChannel == Ch.L
-            val leftName = if (leftIsMe) "Этот телефон" else ui.peerName
-            val rightName = if (!leftIsMe) "Этот телефон" else ui.peerName
-            fun roleOf(ch: Int) = if (ch == serverCh) "Server" else "Point"
-            Row(Modifier.fillMaxWidth().padding(vertical = 28.dp), horizontalArrangement = Arrangement.SpaceEvenly,
-                verticalAlignment = Alignment.CenterVertically) {
-                SpeakerCircle("L", Ch.L, ui.playing, leftName, roleOf(Ch.L), leftIsMe) { engine.swapChannels() }
-                Box(Modifier.width(48.dp).height(44.dp).offset(y = (-20).dp)
-                    .clickable(role = androidx.compose.ui.semantics.Role.Button,
-                        onClickLabel = "Поменять каналы L и R") { engine.swapChannels() },
-                    contentAlignment = Alignment.Center) {
-                    Box(Modifier.width(40.dp).height(2.dp).background(SFColors.accent))
-                }
-                SpeakerCircle("R", Ch.R, ui.playing, rightName, roleOf(Ch.R), !leftIsMe) { engine.swapChannels() }
+        // --- стереосцена остаётся видимой и в локальном Solo ---
+        val serverCh = Ch.other(ui.pointChannel)
+        val leftIsMe = ui.myChannel == Ch.L
+        val leftName = if (ui.soloMode) "MyPhone" else if (leftIsMe) "Этот телефон" else ui.peerName
+        val rightName = if (ui.soloMode) "MyPhone" else if (!leftIsMe) "Этот телефон" else ui.peerName
+        fun roleOf(ch: Int) = if (ch == serverCh) "Server" else "Point"
+        Row(Modifier.fillMaxWidth().padding(vertical = 28.dp), horizontalArrangement = Arrangement.SpaceEvenly,
+            verticalAlignment = Alignment.CenterVertically) {
+            SpeakerCircle("L", Ch.L, ui.playing, leftName, if (ui.soloMode) "" else roleOf(Ch.L), ui.soloMode || leftIsMe) {
+                if (!ui.soloMode) engine.swapChannels()
             }
+            Box(Modifier.width(48.dp).height(44.dp).offset(y = (-20).dp)
+                .then(if (ui.soloMode) Modifier else Modifier.clickable(role = androidx.compose.ui.semantics.Role.Button,
+                    onClickLabel = "Поменять каналы L и R") { engine.swapChannels() }),
+                contentAlignment = Alignment.Center) {
+                Box(Modifier.width(40.dp).height(2.dp).background(SFColors.accent))
+            }
+            SpeakerCircle("R", Ch.R, ui.playing, rightName, if (ui.soloMode) "" else roleOf(Ch.R), ui.soloMode || !leftIsMe) {
+                if (!ui.soloMode) engine.swapChannels()
+            }
+        }
 
+        if (!ui.soloMode) {
             // --- индикатор синхронизации ---
             val pd = ui.pointDiag; val sd = ui.serverDiag
             val lrEstUs = if (pd.valid && sd.valid) abs(pd.syncErrUs - sd.syncErrUs) + pd.clockUncMs * 1_000.0 else null

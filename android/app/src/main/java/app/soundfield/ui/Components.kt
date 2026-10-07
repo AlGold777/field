@@ -216,7 +216,7 @@ fun SpeakerCircle(label: String, ch: Int, playing: Boolean, caption: String, sub
         ) { Text(label, color = SFColors.channelText(ch), fontSize = 26.sp, fontWeight = FontWeight.Bold) }
         Spacer(Modifier.height(8.dp))
         Text(caption, color = SFColors.Text, fontSize = 13.sp, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
-        Text(sub, color = SFColors.TextDim, fontSize = 11.sp, maxLines = 1)
+        if (sub.isNotBlank()) Text(sub, color = SFColors.TextDim, fontSize = 11.sp, maxLines = 1)
     }
 }
 
