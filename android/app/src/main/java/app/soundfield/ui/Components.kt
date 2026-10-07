@@ -18,7 +18,6 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.draw.scale
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
@@ -127,11 +126,11 @@ fun StatusPill(text: String, color: Color) {
 }
 
 @Composable
-fun PairStatusButton(text: String, color: Color, onClick: () -> Unit, enabled: Boolean = true) {
+fun PairStatusButton(text: String, color: Color, onClick: () -> Unit, enabled: Boolean = true, modifier: Modifier = Modifier) {
     val t = rememberInfiniteTransition(label = "pair-status-dot")
     val alpha by t.animateFloat(0.4f, 1f, infiniteRepeatable(tween(900), RepeatMode.Reverse), label = "pair-status-alpha")
     Row(
-        Modifier.clip(RoundedCornerShape(20.dp)).background(color.copy(alpha = 0.15f))
+        modifier.width(104.dp).height(36.dp).clip(RoundedCornerShape(20.dp)).background(color.copy(alpha = 0.15f))
             .border(1.dp, color.copy(alpha = 0.3f), RoundedCornerShape(20.dp))
             .clickable(enabled = enabled, role = androidx.compose.ui.semantics.Role.Button, onClick = onClick)
             .padding(horizontal = 14.dp, vertical = 7.dp),
@@ -139,18 +138,19 @@ fun PairStatusButton(text: String, color: Color, onClick: () -> Unit, enabled: B
     ) {
         Box(Modifier.size(8.dp).alpha(if (enabled) alpha else 0.6f).clip(CircleShape).background(color))
         Spacer(Modifier.width(8.dp))
-        Text(text, color = color, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+        Text(text, color = color, fontSize = 13.sp, fontWeight = FontWeight.SemiBold,
+            maxLines = 1, overflow = TextOverflow.Ellipsis)
     }
 }
 
 @Composable
 @OptIn(ExperimentalFoundationApi::class)
-fun ConnectStatusButton(onClick: () -> Unit, onOpenChooser: () -> Unit) {
+fun ConnectStatusButton(onClick: () -> Unit, onOpenChooser: () -> Unit, modifier: Modifier = Modifier) {
     val t = rememberInfiniteTransition(label = "pair-status-dot")
     val alpha by t.animateFloat(0.4f, 1f, infiniteRepeatable(tween(900), RepeatMode.Reverse), label = "pair-status-alpha")
     val swipeThreshold = with(LocalDensity.current) { 44.dp.toPx() }
     Row(
-        Modifier
+        modifier.width(104.dp).height(36.dp)
             .clip(RoundedCornerShape(20.dp))
             .background(SFColors.Accent1.copy(alpha = 0.15f))
             .border(1.dp, SFColors.Accent1.copy(alpha = 0.3f), RoundedCornerShape(20.dp))
@@ -195,28 +195,34 @@ fun PlayerActionButton(text: String, modifier: Modifier = Modifier, onClick: () 
 }
 
 @Composable
-fun Badge(text: String, color: Color) {
-    Text(text, color = color, fontSize = 11.sp, fontWeight = FontWeight.SemiBold,
-        modifier = Modifier.clip(RoundedCornerShape(20.dp)).background(color.copy(alpha = 0.18f)).padding(horizontal = 10.dp, vertical = 4.dp))
+fun Badge(text: String, color: Color, modifier: Modifier = Modifier) {
+    Box(
+        modifier.clip(RoundedCornerShape(20.dp)).background(color.copy(alpha = 0.18f)).padding(horizontal = 10.dp),
+        contentAlignment = Alignment.Center,
+    ) {
+        Text(text, color = color, fontSize = 11.sp, fontWeight = FontWeight.SemiBold,
+            maxLines = 1, overflow = TextOverflow.Ellipsis, textAlign = TextAlign.Center)
+    }
 }
 
-/** Круг канала L/R; пульсирует при воспроизведении. */
+/** Круг канала L/R; при воспроизведении меняет яркость обводки, не меняя размер и положение. */
 @Composable
 fun SpeakerCircle(label: String, ch: Int, playing: Boolean, caption: String, sub: String, highlight: Boolean, onClick: () -> Unit = {}) {
     val t = rememberInfiniteTransition(label = "pulse")
-    val s by t.animateFloat(1f, 1.06f, infiniteRepeatable(tween(520), RepeatMode.Reverse), label = "s")
+    val pulse by t.animateFloat(0.72f, 1f, infiniteRepeatable(tween(520), RepeatMode.Reverse), label = "pulse-alpha")
     val color = SFColors.channel(ch)
     Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.width(130.dp)) {
         Box(
-            Modifier.size(84.dp).scale(if (playing) s else 1f).clip(CircleShape)
+            Modifier.size(84.dp).clip(CircleShape)
                 .background(color.copy(alpha = 0.2f))
-                .border(if (highlight) 3.dp else 2.dp, color, CircleShape)
+                .border(if (highlight) 3.dp else 2.dp, color.copy(alpha = if (playing) pulse else 1f), CircleShape)
                 .clickable(onClick = onClick),
             contentAlignment = Alignment.Center,
         ) { Text(label, color = SFColors.channelText(ch), fontSize = 26.sp, fontWeight = FontWeight.Bold) }
         Spacer(Modifier.height(8.dp))
         Text(caption, color = SFColors.Text, fontSize = 13.sp, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
-        if (sub.isNotBlank()) Text(sub, color = SFColors.TextDim, fontSize = 11.sp, maxLines = 1)
+        Text(sub.ifBlank { " " }, color = if (sub.isBlank()) Color.Transparent else SFColors.TextDim,
+            fontSize = 11.sp, maxLines = 1)
     }
 }
 

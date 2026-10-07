@@ -64,16 +64,19 @@ fun PlayerScreen(ui: UiState, engine: Engine, openCalibration: () -> Unit, openD
 
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 20.dp).padding(top = 40.dp, bottom = 24.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
-            when {
-                ui.soloMode -> {
-                    ConnectStatusButton(
-                        onClick = { if (ui.remembered != null) engine.resumeRemembered() else showConnectChooser = true },
-                        onOpenChooser = { showConnectChooser = true },
-                    )
+            Box(Modifier.width(104.dp).height(36.dp), contentAlignment = Alignment.CenterStart) {
+                when {
+                    ui.soloMode -> {
+                        ConnectStatusButton(
+                            onClick = { if (ui.remembered != null) engine.resumeRemembered() else showConnectChooser = true },
+                            onOpenChooser = { showConnectChooser = true },
+                            modifier = Modifier.fillMaxSize(),
+                        )
+                    }
+                    ui.phase == Phase.RECONNECTING && ui.role == Role.POINT -> PairStatusButton("Переподключение…", SFColors.Warn, { confirmDisconnect = true }, modifier = Modifier.fillMaxSize())
+                    ui.phase == Phase.RECONNECTING -> PairStatusButton("Ждём «${ui.peerName}»", SFColors.Warn, { confirmDisconnect = true }, modifier = Modifier.fillMaxSize())
+                    else -> PairStatusButton("Active", SFColors.Good, { confirmDisconnect = true }, modifier = Modifier.fillMaxSize())
                 }
-                ui.phase == Phase.RECONNECTING && ui.role == Role.POINT -> PairStatusButton("Переподключение…", SFColors.Warn, { confirmDisconnect = true })
-                ui.phase == Phase.RECONNECTING -> PairStatusButton("Ждём «${ui.peerName}»", SFColors.Warn, { confirmDisconnect = true })
-                else -> PairStatusButton("Active", SFColors.Good, { confirmDisconnect = true })
             }
             Spacer(Modifier.weight(1f))
             val switchMode: () -> Unit = {
@@ -93,7 +96,18 @@ fun PlayerScreen(ui: UiState, engine: Engine, openCalibration: () -> Unit, openD
                 },
             ) {
                 Badge(if (ui.soloMode) "Solo" else if (ui.role == Role.SERVER) "Server" else "Point",
-                    if (ui.soloMode) SFColors.Accent1 else SFColors.Master)
+                    if (ui.soloMode) SFColors.Accent1 else SFColors.Master,
+                    modifier = Modifier.width(76.dp).height(32.dp))
+            }
+        }
+
+        // Резервируем место под предупреждение, чтобы переключение Solo не сдвигало сцену.
+        Box(Modifier.fillMaxWidth().height(24.dp), contentAlignment = Alignment.Center) {
+            if (!ui.soloMode && ui.multiWifiWarning.isNotBlank()) {
+                Text(ui.multiWifiWarning, color = SFColors.Warn, fontSize = 11.sp, maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp))
+                        .background(SFColors.Warn.copy(alpha = 0.12f)).padding(horizontal = 10.dp, vertical = 4.dp))
             }
         }
 
@@ -110,12 +124,6 @@ fun PlayerScreen(ui: UiState, engine: Engine, openCalibration: () -> Unit, openD
                     engine.invite(peer)
                 },
             )
-        }
-
-        if (!ui.soloMode && ui.multiWifiWarning.isNotBlank()) {
-            Text(ui.multiWifiWarning, color = SFColors.Warn, fontSize = 12.sp, lineHeight = 17.sp,
-                modifier = Modifier.fillMaxWidth().padding(top = 10.dp)
-                    .clip(RoundedCornerShape(10.dp)).background(SFColors.Warn.copy(alpha = 0.12f)).padding(12.dp))
         }
 
         // --- стереосцена остаётся видимой и в локальном Solo ---
@@ -140,24 +148,27 @@ fun PlayerScreen(ui: UiState, engine: Engine, openCalibration: () -> Unit, openD
             }
         }
 
-        if (!ui.soloMode) {
-            // --- индикатор синхронизации ---
-            val pd = ui.pointDiag; val sd = ui.serverDiag
-            val lrEstUs = if (pd.valid && sd.valid) abs(pd.syncErrUs - sd.syncErrUs) + pd.clockUncMs * 1_000.0 else null
-            Row(Modifier.fillMaxWidth().clip(CircleShape).background(SFColors.Card).clickable { openDiagnostics() }
-                .padding(horizontal = 16.dp, vertical = 10.dp), horizontalArrangement = Arrangement.Center) {
-                Text(
-                    if (lrEstUs == null) "⚡ Синхронизация часов…"
-                    else {
-                        val estimate = if (lrEstUs < 1_000.0) "±%.0f мкс".format(lrEstUs)
-                            else "±%.2f мс".format(lrEstUs / 1_000.0)
-                        "⚡ L/R: $estimate : RTT %.0f мс : буф. %.0f мс".format(pd.rttMs, pd.bufferMs)
-                    },
-                    color = if (lrEstUs != null && lrEstUs < 2_000.0) SFColors.Good else SFColors.Warn,
-                    fontSize = 13.sp, maxLines = 1, softWrap = false, overflow = TextOverflow.Ellipsis)
+        Box(Modifier.fillMaxWidth().height(36.dp)) {
+            if (!ui.soloMode) {
+                // --- индикатор синхронизации; слот остаётся на месте и в Solo ---
+                val pd = ui.pointDiag; val sd = ui.serverDiag
+                val lrEstUs = if (pd.valid && sd.valid) abs(pd.syncErrUs - sd.syncErrUs) + pd.clockUncMs * 1_000.0 else null
+                Row(Modifier.fillMaxSize().clip(CircleShape).background(SFColors.Card).clickable { openDiagnostics() }
+                    .padding(horizontal = 16.dp, vertical = 10.dp), horizontalArrangement = Arrangement.Center,
+                    verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        if (lrEstUs == null) "⚡ Синхронизация часов…"
+                        else {
+                            val estimate = if (lrEstUs < 1_000.0) "±%.0f мкс".format(lrEstUs)
+                                else "±%.2f мс".format(lrEstUs / 1_000.0)
+                            "⚡ L/R: $estimate : RTT %.0f мс : буф. %.0f мс".format(pd.rttMs, pd.bufferMs)
+                        },
+                        color = if (lrEstUs != null && lrEstUs < 2_000.0) SFColors.Good else SFColors.Warn,
+                        fontSize = 13.sp, maxLines = 1, softWrap = false, overflow = TextOverflow.Ellipsis)
+                }
             }
-            Spacer(Modifier.height(20.dp))
         }
+        Spacer(Modifier.height(20.dp))
 
         if (ui.mode != SourceMode.MUSIC) {
             SFCard {
@@ -173,29 +184,32 @@ fun PlayerScreen(ui: UiState, engine: Engine, openCalibration: () -> Unit, openD
         }
 
         // --- уведомления над названием трека ---
-        if (ui.fileTransferText.isNotBlank()) {
-            if (ui.role == Role.POINT) {
-                val progress = ui.fileTransferText.substringAfterLast('·', "").trim()
-                    .takeIf { it.endsWith("%") }
-                TextButton(onClick = { confirmCancelFileTransfer = true }, modifier = Modifier.align(Alignment.CenterHorizontally)) {
-                    Text(progress?.let { "Send $it" } ?: "Send…", color = SFColors.Accent1, fontSize = 12.sp)
+        Box(Modifier.fillMaxWidth().height(28.dp), contentAlignment = Alignment.Center) {
+            if (ui.fileTransferText.isNotBlank()) {
+                if (ui.role == Role.POINT) {
+                    val progress = ui.fileTransferText.substringAfterLast('·', "").trim()
+                        .takeIf { it.endsWith("%") }
+                    Text(progress?.let { "Send $it" } ?: "Send…", color = SFColors.Accent1, fontSize = 12.sp,
+                        modifier = Modifier.clip(RoundedCornerShape(12.dp)).clickable { confirmCancelFileTransfer = true }
+                            .padding(horizontal = 8.dp, vertical = 3.dp))
+                } else {
+                    Text(ui.fileTransferText, color = SFColors.Accent1, fontSize = 12.sp, textAlign = TextAlign.Center,
+                        maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.fillMaxWidth())
                 }
-            } else {
-                Text(ui.fileTransferText, color = SFColors.Accent1, fontSize = 12.sp, textAlign = TextAlign.Center,
-                    modifier = Modifier.fillMaxWidth())
+            } else if (ui.loadingTracks || ui.audioBuffering || ui.decodingProgress != null) {
+                Text(
+                    if (ui.decodingProgress != null) "Подготовка аудиофайла… ${(ui.decodingProgress * 100).roundToInt()}%"
+                    else if (ui.audioBuffering) "Буферизация аудио…" else "Подготовка аудиофайла…",
+                    color = SFColors.TextDim, fontSize = 12.sp, textAlign = TextAlign.Center,
+                    maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.fillMaxWidth(),
+                )
             }
-        } else if (ui.loadingTracks || ui.audioBuffering || ui.decodingProgress != null) {
-            Text(
-                if (ui.decodingProgress != null) "Подготовка аудиофайла… ${(ui.decodingProgress * 100).roundToInt()}%"
-                else if (ui.audioBuffering) "Буферизация аудио…" else "Подготовка аудиофайла…",
-                color = SFColors.TextDim, fontSize = 12.sp, textAlign = TextAlign.Center,
-                modifier = Modifier.fillMaxWidth(),
-            )
         }
         // --- трек ---
         // «Название - Исполнитель» одной строкой; для тестовых сигналов — только название
         val trackTitle = if (ui.mode == SourceMode.MUSIC) app.soundfield.engine.trackLabel(ui.title, ui.artist) else ui.title
         Text(trackTitle, color = SFColors.Text, fontSize = 20.sp, fontWeight = FontWeight.Bold, textAlign = TextAlign.Center,
+            maxLines = 1, overflow = TextOverflow.Ellipsis,
             modifier = Modifier.fillMaxWidth().pointerInput(engine, swipeThreshold) {
                 var distance = 0f
                 detectHorizontalDragGestures(
@@ -211,7 +225,7 @@ fun PlayerScreen(ui: UiState, engine: Engine, openCalibration: () -> Unit, openD
         Text(
             ui.artist.ifBlank { "---" },
             color = SFColors.TextDim,
-            fontSize = 12.sp, textAlign = TextAlign.Center,
+            fontSize = 12.sp, textAlign = TextAlign.Center, maxLines = 1, overflow = TextOverflow.Ellipsis,
             modifier = Modifier.fillMaxWidth().padding(top = 5.dp, bottom = 8.dp),
         )
         Spacer(Modifier.height(12.dp))
