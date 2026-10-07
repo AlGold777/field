@@ -92,7 +92,7 @@
 
   <script>
     const $=s=>document.querySelector(s), $$=s=>[...document.querySelectorAll(s)];
-    const state={paired:true,role:'POINT',soloMode:false,localPlayback:null,pairPlayback:null,peerName:'Pixel 8 Pro',rememberedPhone:'Pixel 8 Pro',rememberedPlatform:'android',swapped:false,playing:false,queueExpanded:false,selecting:false,selected:new Set(),queue:[],index:0,position:0,duration:239,volume:72,balance:50,eq:false,eqExpanded:false,spatial:'Выкл',previousQueue:null,transferTimer:null};
+    const state={paired:false,role:'POINT',soloMode:true,localPlayback:null,pairPlayback:null,peerName:'Pixel 8 Pro',rememberedPhone:'Pixel 8 Pro',rememberedPlatform:'android',swapped:false,playing:false,queueExpanded:false,selecting:false,selected:new Set(),queue:[],index:0,position:0,duration:239,volume:72,balance:50,eq:false,eqExpanded:false,spatial:'Выкл',previousQueue:null,transferTimer:null};
     const fmt=s=>`${Math.floor(s/60)}:${String(Math.floor(s%60)).padStart(2,'0')}`;
     function toast(msg){const t=$('#toast');t.textContent=msg;t.classList.add('show');setTimeout(()=>t.classList.remove('show'),1800)}
     function modal(title,body,buttons=[['Закрыть',closeModal]]){$('#modalTitle').textContent=title;$('#modalBody').innerHTML=body;$('#modalActions').replaceChildren(...buttons.map(([label,fn,cls=''])=>{const b=document.createElement('button');b.textContent=label;b.className=cls;b.onclick=fn;return b}));$('#modalWrap').style.display='grid'}
