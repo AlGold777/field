@@ -22,6 +22,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.text.font.FontWeight
@@ -342,32 +343,32 @@ private fun ConnectDeviceDialog(
 
     Dialog(onDismissRequest = onDismiss) {
         Surface(
-            modifier = Modifier.widthIn(max = 360.dp),
+            modifier = Modifier.widthIn(max = 280.dp),
             shape = RoundedCornerShape(22.dp),
             color = SFColors.Card,
             border = androidx.compose.foundation.BorderStroke(1.dp, SFColors.CardBorder),
         ) {
-            Column(Modifier.padding(horizontal = 18.dp, vertical = 16.dp)) {
-                Text("Connect", color = SFColors.Text, fontSize = 18.sp, fontWeight = FontWeight.Bold)
-                Spacer(Modifier.height(12.dp))
+            Column(Modifier.padding(horizontal = 12.dp, vertical = 11.dp)) {
+                Text("Connect", color = SFColors.Text, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                Spacer(Modifier.height(8.dp))
 
                 remembered?.let { record ->
-                    Text("Последний телефон", color = SFColors.TextDim, fontSize = 12.sp,
-                        modifier = Modifier.padding(bottom = 8.dp))
+                    Text("Последний телефон", color = SFColors.TextDim, fontSize = 9.sp,
+                        modifier = Modifier.padding(bottom = 4.dp))
                     DeviceChoiceTile(
                         name = record.peerName,
                         platform = record.peerPlatform,
                         modifier = Modifier.fillMaxWidth(),
                         onClick = onResumeRemembered,
                     )
-                    Spacer(Modifier.height(14.dp))
+                    Spacer(Modifier.height(8.dp))
                 }
 
-                Text("Доступные телефоны", color = SFColors.TextDim, fontSize = 12.sp,
-                    modifier = Modifier.padding(bottom = 8.dp))
+                Text("Доступные телефоны", color = SFColors.TextDim, fontSize = 9.sp,
+                    modifier = Modifier.padding(bottom = 4.dp))
                 if (nearby.isEmpty()) {
                     Row(
-                        Modifier.fillMaxWidth().heightIn(min = 76.dp),
+                        Modifier.fillMaxWidth().heightIn(min = 62.dp),
                         horizontalArrangement = Arrangement.Center,
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
@@ -382,7 +383,7 @@ private fun ConnectDeviceDialog(
                             DeviceChoiceTile(
                                 name = peer.name,
                                 platform = peer.platform,
-                                modifier = Modifier.width(96.dp),
+                                modifier = Modifier.width(72.dp),
                                 onClick = { onConnectNearby(peer) },
                             )
                         }
@@ -397,23 +398,31 @@ private fun ConnectDeviceDialog(
 private fun DeviceChoiceTile(name: String, platform: String, modifier: Modifier = Modifier, onClick: () -> Unit) {
     val isApple = platform.equals("ios", ignoreCase = true)
     Column(
-        modifier.clip(RoundedCornerShape(16.dp))
-            .background(SFColors.BgTop.copy(alpha = 0.45f))
-            .border(1.dp, SFColors.CardBorder, RoundedCornerShape(16.dp))
-            .clickable(onClick = onClick)
-            .padding(horizontal = 10.dp, vertical = 12.dp),
+        modifier.clickable(onClick = onClick)
+            .padding(horizontal = 4.dp, vertical = 1.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
-        Box(
-            Modifier.size(48.dp).clip(CircleShape)
-                .background((if (isApple) SFColors.Accent1 else SFColors.Master).copy(alpha = 0.15f)),
-            contentAlignment = Alignment.Center,
-        ) {
-            Text(if (isApple) "🍏" else "🤖", fontSize = 25.sp)
+        Box(Modifier.size(width = 42.dp, height = 58.dp)) {
+            Box(
+                Modifier.fillMaxSize()
+                    .clip(RoundedCornerShape(11.dp))
+                    .background(Brush.linearGradient(listOf(Color(0xFF273A68), Color(0xFF111A31))))
+                    .border(1.dp, Color(0xA6D9E2FF), RoundedCornerShape(11.dp)),
+            )
+            Box(
+                Modifier.align(Alignment.TopCenter).padding(top = 4.dp)
+                    .size(width = if (isApple) 16.dp else 4.dp, height = if (isApple) 3.dp else 4.dp)
+                    .clip(CircleShape).background(Color(0xFF080E1D)),
+            )
+            Box(
+                Modifier.align(Alignment.BottomCenter).padding(bottom = 4.dp)
+                    .size(width = 12.dp, height = 1.dp)
+                    .clip(RoundedCornerShape(1.dp)).background(Color(0x99E9EFFF)),
+            )
         }
-        Spacer(Modifier.height(7.dp))
-        Text(name, color = SFColors.Text, fontSize = 12.sp, lineHeight = 15.sp, textAlign = TextAlign.Center,
-            maxLines = 2, overflow = TextOverflow.Ellipsis, minLines = 2)
+        Spacer(Modifier.height(4.dp))
+        Text(name, color = SFColors.Text, fontSize = 10.sp, lineHeight = 12.sp, textAlign = TextAlign.Center,
+            maxLines = 2, overflow = TextOverflow.Ellipsis, minLines = 1)
     }
 }
 
