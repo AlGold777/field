@@ -170,17 +170,14 @@ fun PlayerScreen(ui: UiState, engine: Engine, openCalibration: () -> Unit, openD
         }
         Spacer(Modifier.height(20.dp))
 
-        if (ui.mode != SourceMode.MUSIC) {
-            SFCard {
-                Text(when (ui.mode) {
-                    SourceMode.METRONOME -> "🥁 Метроном для ручной подстройки"
-                    SourceMode.CHANNEL_TEST -> "🔈 Проверка каналов: сначала L, потом R"
-                    SourceMode.LEVEL_MATCH -> "Уровень: L и R звучат по очереди"
-                    SourceMode.CENTER_CHECK -> "Проверка центра"
-                    SourceMode.LEVEL_MEASURE -> "Экспериментальное измерение микрофонами"
-                    else -> "🎯 Идёт калибровка"
-                }, color = SFColors.Warn, fontWeight = FontWeight.SemiBold)
-            }
+        val operationStatus = when (ui.mode) {
+            SourceMode.MUSIC -> null
+            SourceMode.METRONOME -> "🥁 Метроном для ручной подстройки"
+            SourceMode.CHANNEL_TEST -> "🔈 Проверка каналов: сначала L, потом R"
+            SourceMode.LEVEL_MATCH -> "Уровень: L и R звучат по очереди"
+            SourceMode.CENTER_CHECK -> "Проверка центра"
+            SourceMode.LEVEL_MEASURE -> "Экспериментальное измерение микрофонами"
+            else -> "🎯 Идёт калибровка"
         }
 
         // --- уведомления над названием трека ---
@@ -196,6 +193,9 @@ fun PlayerScreen(ui: UiState, engine: Engine, openCalibration: () -> Unit, openD
                     Text(ui.fileTransferText, color = SFColors.Accent1, fontSize = 12.sp, textAlign = TextAlign.Center,
                         maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.fillMaxWidth())
                 }
+            } else if (operationStatus != null) {
+                Text(operationStatus, color = SFColors.Warn, fontSize = 12.sp, textAlign = TextAlign.Center,
+                    maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.fillMaxWidth())
             } else if (ui.loadingTracks || ui.audioBuffering || ui.decodingProgress != null) {
                 Text(
                     if (ui.decodingProgress != null) "Подготовка аудиофайла… ${(ui.decodingProgress * 100).roundToInt()}%"

@@ -26,13 +26,14 @@ struct PlayerView: View {
             VStack(alignment: .leading, spacing: 0) {
                 HStack {
                     Button { confirmDisconnect = true } label: {
-                        if ui.phase == .reconnecting && ui.role == .point { StatusPill(text: "Переподключение…", color: SFColor.warn) }
-                        else if ui.phase == .reconnecting { StatusPill(text: "Ждём «\(ui.peerName)»", color: SFColor.warn) }
-                        else { StatusPill(text: "Стереопара активна", color: SFColor.good) }
+                        if ui.phase == .reconnecting { StatusPill(text: "Reconnecting…", color: SFColor.warn) }
+                        else { StatusPill(text: "Active", color: SFColor.good) }
                     }
                     .buttonStyle(.plain)
+                    .frame(width: 104, height: 36)
                     Spacer()
-                    Badge(text: ui.role == .server ? "SERVER" : "POINT", color: SFColor.master)
+                    Badge(text: ui.role == .server ? "Server" : "Point", color: SFColor.master)
+                        .frame(width: 76, height: 32)
                 }
 
                 stage
@@ -50,8 +51,11 @@ struct PlayerView: View {
                     }
                 }
 
+                trackStatusSlot
+
                 Button { engine.requestTrackPicker() } label: {
                     Text(ui.title).font(.system(size: 20, weight: .bold)).foregroundColor(SFColor.text)
+                        .lineLimit(1).truncationMode(.tail).minimumScaleFactor(0.8)
                         .multilineTextAlignment(.center).frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.plain)
@@ -63,15 +67,10 @@ struct PlayerView: View {
                             if dx < 0 { engine.nextTrack() } else { engine.previousTrack() }
                         }
                 )
-                Subtitle(text: ui.artist, align: .center).frame(maxWidth: .infinity).padding(.top, 4).padding(.bottom, 12)
-                Text(trackStatusText)
-                    .font(.system(size: 12)).foregroundColor(SFColor.dim).multilineTextAlignment(.center)
-                    .frame(maxWidth: .infinity).padding(.bottom, 8)
-                if ui.audioMissing {
-                    Text("Нет аудио на Point · восстанавливаем соединение")
-                        .font(.system(size: 12)).foregroundColor(SFColor.warn).multilineTextAlignment(.center)
-                        .frame(maxWidth: .infinity).padding(.bottom, 8)
-                }
+                Text(ui.artist.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "---" : ui.artist)
+                    .font(.system(size: 14)).foregroundColor(SFColor.dim).lineLimit(1).truncationMode(.tail)
+                    .multilineTextAlignment(.center).frame(maxWidth: .infinity)
+                    .padding(.top, 4).padding(.bottom, 8)
 
                 let dur = Double(max(1, ui.durationMs))
                 Slider(value: Binding(get: { dragging ?? min(1, Double(pos) / dur) }, set: { dragging = $0 }),
@@ -192,9 +191,9 @@ struct PlayerView: View {
                       allowsMultipleSelection: !importingFolder) { result in
             if case .success(let urls) = result { engine.addAudioFiles(urls) }
         }
-        .alert("Вы хотите разорвать пару?", isPresented: $confirmDisconnect) {
-            Button("Да", role: .destructive) { engine.disconnect() }
-            Button("Нет", role: .cancel) {}
+        .alert("Disconnect \((ui.peerName.isEmpty ? "Phone" : String(ui.peerName.prefix(7))))?", isPresented: $confirmDisconnect) {
+            Button("No", role: .cancel) {}
+            Button("Yes", role: .destructive) { engine.disconnect() }
         }
     }
 
@@ -244,8 +243,16 @@ struct PlayerView: View {
         if ui.loadingTracks { return "Подготовка аудиофайла…" }
         if ui.audioBuffering { return "Буферизация аудио…" }
         if let progress = ui.decodingProgress { return "Подготовка аудиофайла… \(Int(progress * 100))%" }
-        if ui.role == .point { return "Добавление файлов с Point доступно только при паре Android ↔ Android" }
-        return "Нажмите на название, чтобы добавить FLAC, WAV или MP3"
+        return ""
+    }
+
+    private var trackStatusSlot: some View {
+        Text(trackStatusText)
+            .font(.system(size: 12)).foregroundColor(SFColor.dim)
+            .lineLimit(1).truncationMode(.tail)
+            .multilineTextAlignment(.center)
+            .frame(maxWidth: .infinity).frame(height: 28)
+            .accessibilityHidden(trackStatusText.isEmpty)
     }
 
     private var queueSection: some View {
@@ -328,11 +335,12 @@ struct PlayerView: View {
     private var syncIndicator: some View {
         let p = ui.pointDiag, s = ui.serverDiag
         let est: Double? = (p.valid && s.valid) ? abs(p.syncErrMs - s.syncErrMs) + p.clockUncMs : nil
-        let text = est.map { String(format: "⚡ L/R: ±%.1f мс • RTT %.0f мс • буфер %.0f мс", $0, p.rttMs, p.bufferMs) }
+        let text = est.map { String(format: "⚡ L/R: ±%.1f мс : RTT %.0f мс : буф. %.0f мс", $0, p.rttMs, p.bufferMs) }
             ?? "⚡ Синхронизация часов…"
         return Button(action: openDiagnostics) {
             Text(text).font(.system(size: 13)).foregroundColor((est ?? 99) < 2 ? SFColor.good : SFColor.warn)
-                .frame(maxWidth: .infinity).padding(.vertical, 10)
+                .lineLimit(1).truncationMode(.tail).minimumScaleFactor(0.72)
+                .frame(maxWidth: .infinity).frame(height: 36)
                 .background(Capsule().fill(SFColor.card))
         }
     }

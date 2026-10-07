@@ -139,7 +139,9 @@ struct StatusPill: View {
         HStack(spacing: 8) {
             Circle().fill(color).frame(width: 8, height: 8).opacity(on ? 1 : 0.4)
             Text(text).font(.system(size: 13, weight: .semibold)).foregroundColor(color)
+                .lineLimit(1).truncationMode(.tail).minimumScaleFactor(0.7)
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
         .padding(.horizontal, 14).padding(.vertical, 7)
         .background(Capsule().fill(color.opacity(0.15)))
         .overlay(Capsule().stroke(color.opacity(0.3), lineWidth: 1))
@@ -171,8 +173,8 @@ struct SpeakerCircle: View {
                 Text(label).font(.system(size: 26, weight: .bold)).foregroundColor(SFColor.channelText(ch))
                     .frame(width: 84, height: 84)
                     .background(Circle().fill(SFColor.channel(ch).opacity(0.2)))
-                    .overlay(Circle().stroke(SFColor.channel(ch), lineWidth: highlight ? 3 : 2))
-                    .scaleEffect(playing && pulse ? 1.06 : 1)
+                    .overlay(Circle().stroke(SFColor.channel(ch).opacity(playing && !pulse ? 0.55 : 1),
+                                             lineWidth: highlight ? 3 : 2))
             }
             .onAppear { withAnimation(.easeInOut(duration: 0.52).repeatForever()) { pulse = true } }
             Text(caption).font(.system(size: 13, weight: .semibold)).foregroundColor(SFColor.text).lineLimit(1)
