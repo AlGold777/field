@@ -110,9 +110,9 @@
     function playbackSnapshot(){return {queue:state.queue,index:state.index,position:state.position,duration:state.duration,playing:state.playing}}
     function setSolo(enabled){
       if(state.soloMode===enabled)return;
-      if(enabled){state.pairPlayback=playbackSnapshot();Object.assign(state,state.localPlayback||{queue:[{title:'Мой локальный трек',artist:'Мой исполнитель',duration:215}],index:0,position:0,duration:215,playing:false})}
-      else{state.localPlayback=playbackSnapshot();Object.assign(state,state.pairPlayback||{queue:sampleTracks(),index:0,position:0,duration:239,playing:false})}
-      state.soloMode=enabled;state.selected.clear();state.selecting=false;state.previousQueue=null;$('#undoRow').style.display='none';clearTimeout(state.transferTimer);$('#transferNotice').style.display='none';$('#play').textContent=state.playing?'❚❚':'▶';$('#play').setAttribute('aria-label',state.playing?'Пауза':'Воспроизвести');pairView();renderQueue();updatePosition();
+      if(enabled){state.pairPlayback=playbackSnapshot();if(state.role==='POINT')Object.assign(state,state.localPlayback||{queue:[{title:'Мой локальный трек',artist:'Мой исполнитель',duration:215}],index:0,position:0,duration:215,playing:false})}
+      else{state.localPlayback=playbackSnapshot();if(state.role==='POINT')Object.assign(state,state.pairPlayback||{queue:sampleTracks(),index:0,position:0,duration:239,playing:false})}
+      state.soloMode=enabled;state.paired=!enabled;state.selected.clear();state.selecting=false;state.previousQueue=null;$('#undoRow').style.display='none';clearTimeout(state.transferTimer);$('#transferNotice').style.display='none';$('#play').textContent=state.playing?'❚❚':'▶';$('#play').setAttribute('aria-label',state.playing?'Пауза':'Воспроизвести');pairView();renderQueue();updatePosition();
     }
     let soloPressTimer=0;const roleButton=$('#roleBadge');roleButton.onpointerdown=()=>{soloPressTimer=window.setTimeout(()=>{setSolo(!state.soloMode);toast(state.soloMode?'Solo · собственные файлы':state.role==='SERVER'?'Server':'Point')},550)};['pointerup','pointerleave','pointercancel'].forEach(evt=>roleButton.addEventListener(evt,()=>clearTimeout(soloPressTimer)));
     $('#swapChannels').onclick=$('#speakerL').onclick=$('#speakerR').onclick=()=>{state.swapped=!state.swapped;pairView()};

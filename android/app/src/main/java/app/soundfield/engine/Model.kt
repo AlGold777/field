@@ -306,8 +306,6 @@ data class UiState(
     val phase: Phase = Phase.IDLE,
     /** Локальный плеер без подключённой стереопары. */
     val soloMode: Boolean = false,
-    /** Server выводит локально оба канала, сохраняя передачу назначенного канала на Point. */
-    val soloOutputMode: Boolean = false,
     val role: Role = Role.SERVER,
     val peerName: String = "",
     val peerPlatform: String = "",

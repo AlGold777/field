@@ -31,6 +31,7 @@ import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.stateDescription
+import androidx.compose.ui.semantics.onLongClick
 import app.soundfield.core.AudioGain
 import app.soundfield.core.Ch
 import app.soundfield.core.Role
@@ -71,21 +72,24 @@ fun PlayerScreen(ui: UiState, engine: Engine, openCalibration: () -> Unit, openD
                 else -> PairStatusButton("Active", SFColors.Good, { confirmDisconnect = true })
             }
             Spacer(Modifier.weight(1f))
-            val soloOutput = ui.soloMode || ui.soloOutputMode
+            val switchMode: () -> Unit = {
+                if (ui.soloMode && ui.remembered == null) openPairing()
+                else engine.toggleSoloMode()
+            }
             Box(
-                Modifier.pointerInput(ui.soloMode, ui.inPair, ui.role, ui.mode) {
-                    detectTapGestures(onLongPress = {
-                        if (!ui.soloMode && ui.inPair && ui.role == Role.SERVER && ui.mode == SourceMode.MUSIC) {
-                            engine.toggleSoloOutputMode()
-                        }
-                    })
+                Modifier.pointerInput(ui.soloMode, ui.phase, ui.remembered) {
+                    detectTapGestures(onLongPress = { switchMode() })
                 }.padding(8.dp).semantics {
-                    contentDescription = "Режим вывода звука"
-                    stateDescription = if (soloOutput) "Solo" else if (ui.role == Role.SERVER) "Server" else "Point"
+                    contentDescription = "Режим проигрывателя"
+                    onLongClick(label = if (ui.soloMode) "Восстановить стереопару" else "Открыть локальный плеер Solo") {
+                        switchMode()
+                        true
+                    }
+                    stateDescription = if (ui.soloMode) "Solo" else if (ui.role == Role.SERVER) "Server" else "Point"
                 },
             ) {
-                Badge(if (soloOutput) "Solo" else if (ui.role == Role.SERVER) "Server" else "Point",
-                    if (soloOutput) SFColors.Accent1 else SFColors.Master)
+                Badge(if (ui.soloMode) "Solo" else if (ui.role == Role.SERVER) "Server" else "Point",
+                    if (ui.soloMode) SFColors.Accent1 else SFColors.Master)
             }
         }
 
