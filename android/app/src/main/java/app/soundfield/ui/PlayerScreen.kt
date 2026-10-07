@@ -60,7 +60,7 @@ fun PlayerScreen(ui: UiState, engine: Engine, openCalibration: () -> Unit, openD
         Row(verticalAlignment = Alignment.CenterVertically) {
             when {
                 ui.soloMode -> {
-                    PairStatusButton("Подключить телефон", SFColors.Accent1, openPairing)
+                    PairStatusButton("Connect", SFColors.Accent1, openPairing)
                     ui.remembered?.let { rec ->
                         Spacer(Modifier.width(8.dp))
                         PairStatusButton("«${rec.peerName}»", SFColors.Good, { engine.resumeRemembered() })
@@ -68,10 +68,25 @@ fun PlayerScreen(ui: UiState, engine: Engine, openCalibration: () -> Unit, openD
                 }
                 ui.phase == Phase.RECONNECTING && ui.role == Role.POINT -> PairStatusButton("Переподключение…", SFColors.Warn, { confirmDisconnect = true })
                 ui.phase == Phase.RECONNECTING -> PairStatusButton("Ждём «${ui.peerName}»", SFColors.Warn, { confirmDisconnect = true })
-                else -> PairStatusButton("Стереопара активна", SFColors.Good, { confirmDisconnect = true })
+                else -> PairStatusButton("Active", SFColors.Good, { confirmDisconnect = true })
             }
             Spacer(Modifier.weight(1f))
-            if (!ui.soloMode) Badge(if (ui.role == Role.SERVER) "SERVER" else "POINT", SFColors.Master)
+            val soloOutput = ui.soloMode || ui.soloOutputMode
+            Box(
+                Modifier.pointerInput(ui.soloMode, ui.inPair, ui.role, ui.mode) {
+                    detectTapGestures(onLongPress = {
+                        if (!ui.soloMode && ui.inPair && ui.role == Role.SERVER && ui.mode == SourceMode.MUSIC) {
+                            engine.toggleSoloOutputMode()
+                        }
+                    })
+                }.padding(8.dp).semantics {
+                    contentDescription = "Режим вывода звука"
+                    stateDescription = if (soloOutput) "Solo" else if (ui.role == Role.SERVER) "Server" else "Point"
+                },
+            ) {
+                Badge(if (soloOutput) "Solo" else if (ui.role == Role.SERVER) "Server" else "Point",
+                    if (soloOutput) SFColors.Accent1 else SFColors.Master)
+            }
         }
 
         if (!ui.soloMode && ui.multiWifiWarning.isNotBlank()) {
@@ -266,9 +281,9 @@ fun PlayerScreen(ui: UiState, engine: Engine, openCalibration: () -> Unit, openD
     if (confirmDisconnect && ui.inPair) {
         AlertDialog(
             onDismissRequest = { confirmDisconnect = false },
-            title = { Text("Вы хотите разорвать пару?") },
-            confirmButton = { TextButton(onClick = { confirmDisconnect = false; engine.disconnect() }) { Text("Да") } },
-            dismissButton = { TextButton(onClick = { confirmDisconnect = false }) { Text("Нет") } },
+            title = { Text("Disconnect ${(ui.peerName.ifBlank { "Phone" }).take(7)}?") },
+            confirmButton = { TextButton(onClick = { confirmDisconnect = false; engine.disconnect() }) { Text("Yes") } },
+            dismissButton = { TextButton(onClick = { confirmDisconnect = false }) { Text("No") } },
         )
     }
 

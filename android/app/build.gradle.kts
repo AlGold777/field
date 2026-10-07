@@ -12,8 +12,8 @@ android {
         applicationId = "app.soundfield"
         minSdk = 26
         targetSdk = 35
-        versionCode = 43
-        versionName = "1.10.5"
+        versionCode = 44
+        versionName = "1.10.6"
     }
 
     buildTypes {

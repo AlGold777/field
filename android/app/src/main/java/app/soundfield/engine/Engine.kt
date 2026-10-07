@@ -278,6 +278,7 @@ class Engine private constructor(private val app: Context) {
     @Volatile private var phase = Phase.IDLE
         set(value) { if (field != value) telemetry.event("PHASE", "$field -> $value"); field = value }
     @Volatile private var soloMode = false
+    @Volatile private var soloOutputMode = false
     @Volatile private var role = Role.SERVER
     @Volatile private var link: ControlLink? = null
     private var pending: ControlLink? = null
@@ -1370,6 +1371,23 @@ class Engine private constructor(private val app: Context) {
         startSoloPlayback()
     }
 
+    fun toggleSoloOutputMode() = post {
+        if (soloMode) return@post
+        if (phase != Phase.PAIRED || role != Role.SERVER || mode != SourceMode.MUSIC) {
+            return@post
+        }
+        soloOutputMode = !soloOutputMode
+        audio.stop()
+        audio.preferPhoneSpeaker = !soloOutputMode
+        rebuildPlayState()
+        audio.source = serverRenderer
+        audio.playbackActive = serverPlay.timeline.playing
+        audio.start()
+        ui { copy(soloOutputMode = this@Engine.soloOutputMode) }
+        telemetry.record("SOLO_OUTPUT_MODE", mapOf("enabled" to soloOutputMode, "paired" to true))
+        publishState()
+    }
+
     // ---- фоновый сервис соло: нужен только пока играет музыка (и 5 мин после паузы), иначе процесс замораживается зря
     private var soloServiceActive = false
     private var soloServiceStopTask: ScheduledFuture<*>? = null
@@ -1433,6 +1451,7 @@ class Engine private constructor(private val app: Context) {
 
     private fun startSoloPlayback(frame: Long = 0L, playing: Boolean = false) {
         soloMode = true
+        soloOutputMode = false
         role = Role.SERVER
         negotiatedCapabilities = emptySet()
         audio.preferPhoneSpeaker = false
@@ -1455,7 +1474,7 @@ class Engine private constructor(private val app: Context) {
         newEpoch(playing, frame.coerceIn(0L, source.totalFrames), System.nanoTime())
         audio.start()
         if (playing) { requestFocus(); ensureSoloService() }
-        ui { copy(soloMode = true, phase = Phase.IDLE, role = Role.SERVER, playing = playing,
+        ui { copy(soloMode = true, soloOutputMode = false, phase = Phase.IDLE, role = Role.SERVER, playing = playing,
             title = source.title, artist = source.artist, durationMs = source.totalFrames * 1000 / SF.SAMPLE_RATE,
             mode = SourceMode.MUSIC, eq = eqSettings, eqAvailable = true, eqRouteLabel = audio.routeLabel(),
             eqPreampDb = eqConfig.preampDb.toFloat(), eqCurveDb = eqConfig.curveDb.map { it.toFloat() },
@@ -1479,7 +1498,7 @@ class Engine private constructor(private val app: Context) {
         try { PlaybackService.stop(app) } catch (_: Exception) {}
         abandonFocus()
         serverPlay = ServerPlayState(Timeline.NONE, source, Ch.L, 0f, EqConfig.neutral())
-        ui { copy(soloMode = false, playing = false, audioBuffering = false, eqAvailable = false) }
+        ui { copy(soloMode = false, soloOutputMode = false, playing = false, audioBuffering = false, eqAvailable = false) }
     }
 
     private fun applySoloEqRoute(routeKey: String, savePrevious: Boolean) {
@@ -3124,8 +3143,10 @@ class Engine private constructor(private val app: Context) {
     // ================================================================== пара
     private fun becomePaired(l: ControlLink, r: Role, pid: String, pname: String, pplat: String, key: String, resumed: Boolean) {
         if (soloMode) leaveSoloForPair(r)
+        val retainSoloOutput = phase == Phase.RECONNECTING && role == Role.SERVER && r == Role.SERVER && soloOutputMode
         soloMode = false
-        audio.preferPhoneSpeaker = true
+        soloOutputMode = retainSoloOutput
+        audio.preferPhoneSpeaker = !soloOutputMode
         peerPathDiagnoses.getOrPut(pid) { PeerPathDiagnosis() }.onConnected()
         if (manualLanBlockedPeerId == pid) manualLanBlockedPeerId = null
         pendingTimeout?.cancel(false)
@@ -3254,7 +3275,7 @@ class Engine private constructor(private val app: Context) {
         }
         audio.start()
         try { PlaybackService.start(app) } catch (e: Exception) { Log.w(TAG, "fgs", e); telemetry.event("FOREGROUND_SERVICE_FAILED", error = e) }
-        ui { copy(phase = Phase.PAIRED, role = r, peerName = pname, peerPlatform = pplat, linkOk = true, remembered = record,
+        ui { copy(phase = Phase.PAIRED, soloOutputMode = this@Engine.soloOutputMode, role = r, peerName = pname, peerPlatform = pplat, linkOk = true, remembered = record,
             autoResuming = false, audioMissing = false, calib = CalibUi(), eqAvailable = eqAvailableInPair(),
             eq = if (r == Role.SERVER) eqSettingsForWire() else eq, eqPreampDb = activeEqConfig().preampDb.toFloat(),
             eqRouteLabel = audio.routeLabel(), eqCurveDb = activeEqConfig().curveDb.map { it.toFloat() }) }
@@ -3345,6 +3366,7 @@ class Engine private constructor(private val app: Context) {
         pending?.let { p -> pending = null; p.tag = "dead"; p.close() }
         phase = Phase.IDLE
         soloMode = false
+        soloOutputMode = false
         activeSoloEqRouteKey = ""
         audio.preferPhoneSpeaker = true
         manualResumeActive = false
@@ -3366,7 +3388,7 @@ class Engine private constructor(private val app: Context) {
         calibRunning = false
         discovery.startBrowse()
         if (!appVisible && !resumePlaying) hideWhileBackground()   // пару разорвали, пока приложение в фоне
-        ui { copy(phase = Phase.IDLE, soloMode = false, eqAvailable = false, linkOk = false, remembered = record, playing = false, audioMissing = false, calib = CalibUi(),
+        ui { copy(phase = Phase.IDLE, soloMode = false, soloOutputMode = false, eqAvailable = false, linkOk = false, remembered = record, playing = false, audioMissing = false, calib = CalibUi(),
             loadingTracks = false, loadingTrackId = null, serverDiag = Diag(), pointDiag = Diag()) }
         telemetry.record("PAIR_TO_SOLO", mapOf("fromRole" to leavingRole.name.lowercase(), "resumedPlaying" to resumePlaying,
             "positionMs" to resumeFrame * 1000 / SF.SAMPLE_RATE))
@@ -3817,7 +3839,7 @@ class Engine private constructor(private val app: Context) {
     private fun eqSettingsForWire() = if (phase in setOf(Phase.PAIRED, Phase.RECONNECTING) && !eqAvailableInPair())
         eqSettings.copy(enabled = false, bypass = false) else eqSettings
 
-    private fun renderChannel() = if (soloMode) Ch.BOTH else serverChannel()
+    private fun renderChannel() = if (soloMode || soloOutputMode) Ch.BOTH else serverChannel()
 
     private fun rebuildPlayState() {
         serverPlay = ServerPlayState(serverPlay.timeline, currentRenderedSource(), renderChannel(), serverGain(), activeEqConfig())
@@ -5464,7 +5486,7 @@ class Engine private constructor(private val app: Context) {
 
     private fun packet(st: ServerPlayState, tl: Timeline, seq: Int, start: Long, flags: Int,
         count: Int = packetFrameCount(st.source, start)): ByteArray {
-        val pCh = Ch.other(st.channel)
+        val pCh = pointChannel
         val s = ShortArray(count) { i -> (st.source.sample(start + i, pCh) * 32767f).roundToInt().coerceIn(-32768, 32767).toShort() }
         return Wire.audio(sessionId, tl.epoch, seq, start, tl.timeOf(start), System.nanoTime(), flags, s, count)
     }
