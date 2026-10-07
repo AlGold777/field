@@ -117,14 +117,30 @@
       });
     }
     function handleConnectClick(){if(state.paired){modal(`Disconnect ${state.peerName.slice(0,7)}?`,'',[['No',closeModal],['Yes',()=>{closeModal();state.rememberedPhone=state.peerName;setSolo(true);state.paired=false;pairView();toast('Disconnected')},'primary']])}else connectToPhone(state.rememberedPhone||state.peerName,state.rememberedPlatform)}
-    let connectPressTimer=0,connectStartY=0,connectGestureConsumed=false;
     const connectButton=$('#pairButton');
-    connectButton.addEventListener('pointerdown',event=>{if(state.paired)return;connectButton.setPointerCapture?.(event.pointerId);connectStartY=event.clientY;connectGestureConsumed=false;clearTimeout(connectPressTimer);connectPressTimer=setTimeout(()=>{connectGestureConsumed=true;showDeviceChooser()},520)});
-    connectButton.addEventListener('pointermove',event=>{if(state.paired||!connectPressTimer)return;if(event.clientY-connectStartY>42){clearTimeout(connectPressTimer);connectPressTimer=0;connectGestureConsumed=true;showDeviceChooser()}});
-    ['pointerup','pointercancel'].forEach(type=>connectButton.addEventListener(type,()=>{clearTimeout(connectPressTimer);connectPressTimer=0;if(connectGestureConsumed)setTimeout(()=>{connectGestureConsumed=false},160)}));
+    let connectGesture=null,ignoreConnectClick=false;
+    connectButton.title='Удерживайте или проведите вниз, когда появится Connect, чтобы выбрать телефон';
+    connectButton.addEventListener('pointerdown',event=>{
+      if(state.paired||!event.isPrimary||(event.button!==undefined&&event.button!==0))return;
+      try{connectButton.setPointerCapture(event.pointerId)}catch{}
+      connectGesture={pointerId:event.pointerId,startY:event.clientY,consumed:false,timer:0};
+      connectGesture.timer=setTimeout(()=>{if(!connectGesture)return;connectGesture.consumed=true;ignoreConnectClick=true;showDeviceChooser()},500);
+    });
+    document.addEventListener('pointermove',event=>{
+      const gesture=connectGesture;
+      if(!gesture||gesture.pointerId!==event.pointerId||state.paired||gesture.consumed)return;
+      if(event.clientY-gesture.startY>=32){clearTimeout(gesture.timer);gesture.consumed=true;ignoreConnectClick=true;showDeviceChooser()}
+    },true);
+    const finishConnectGesture=event=>{
+      const gesture=connectGesture;
+      if(!gesture||gesture.pointerId!==event.pointerId)return;
+      clearTimeout(gesture.timer);connectGesture=null;
+      if(ignoreConnectClick)setTimeout(()=>{ignoreConnectClick=false},250);
+    };
+    document.addEventListener('pointerup',finishConnectGesture,true);
+    document.addEventListener('pointercancel',finishConnectGesture,true);
     connectButton.addEventListener('contextmenu',event=>event.preventDefault());
-    document.addEventListener('pointerup',()=>{if(connectGestureConsumed)setTimeout(()=>{connectGestureConsumed=false},100)});
-    connectButton.onclick=()=>{if(connectGestureConsumed){connectGestureConsumed=false;return}handleConnectClick()};
+    connectButton.onclick=()=>{if(ignoreConnectClick){ignoreConnectClick=false;return}handleConnectClick()};
     function playbackSnapshot(){return {queue:state.queue,index:state.index,position:state.position,duration:state.duration,playing:state.playing}}
     function setSolo(enabled){
       if(state.soloMode===enabled)return;
