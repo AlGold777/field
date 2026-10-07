@@ -4,6 +4,9 @@ import androidx.compose.animation.core.*
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -11,6 +14,8 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.scale
@@ -135,6 +140,44 @@ fun PairStatusButton(text: String, color: Color, onClick: () -> Unit, enabled: B
         Box(Modifier.size(8.dp).alpha(if (enabled) alpha else 0.6f).clip(CircleShape).background(color))
         Spacer(Modifier.width(8.dp))
         Text(text, color = color, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+    }
+}
+
+@Composable
+@OptIn(ExperimentalFoundationApi::class)
+fun ConnectStatusButton(onClick: () -> Unit, onOpenChooser: () -> Unit) {
+    val t = rememberInfiniteTransition(label = "pair-status-dot")
+    val alpha by t.animateFloat(0.4f, 1f, infiniteRepeatable(tween(900), RepeatMode.Reverse), label = "pair-status-alpha")
+    val swipeThreshold = with(LocalDensity.current) { 44.dp.toPx() }
+    Row(
+        Modifier
+            .clip(RoundedCornerShape(20.dp))
+            .background(SFColors.Accent1.copy(alpha = 0.15f))
+            .border(1.dp, SFColors.Accent1.copy(alpha = 0.3f), RoundedCornerShape(20.dp))
+            .pointerInput(swipeThreshold, onOpenChooser) {
+                var drag = 0f
+                var opened = false
+                detectVerticalDragGestures(
+                    onDragStart = { drag = 0f; opened = false },
+                    onVerticalDrag = { change, amount ->
+                        drag += amount
+                        if (drag >= swipeThreshold && !opened) {
+                            opened = true
+                            onOpenChooser()
+                        }
+                        change.consume()
+                    },
+                    onDragEnd = { drag = 0f; opened = false },
+                    onDragCancel = { drag = 0f; opened = false },
+                )
+            }
+            .combinedClickable(onClick = onClick, onLongClick = onOpenChooser)
+            .padding(horizontal = 14.dp, vertical = 7.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Box(Modifier.size(8.dp).alpha(alpha).clip(CircleShape).background(SFColors.Accent1))
+        Spacer(Modifier.width(8.dp))
+        Text("Connect", color = SFColors.Accent1, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
     }
 }
 

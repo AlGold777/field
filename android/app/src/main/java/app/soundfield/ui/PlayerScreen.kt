@@ -1,6 +1,7 @@
 package app.soundfield.ui
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
@@ -13,6 +14,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -27,6 +29,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.contentDescription
@@ -52,6 +55,7 @@ fun PlayerScreen(ui: UiState, engine: Engine, openCalibration: () -> Unit, openD
     openTrackPicker: () -> Unit, openEqualizer: () -> Unit, openSpatial: () -> Unit, openPairing: () -> Unit) {
     var confirmDisconnect by remember { mutableStateOf(false) }
     var confirmCancelFileTransfer by remember { mutableStateOf(false) }
+    var showConnectChooser by remember { mutableStateOf(false) }
     var pos by remember { mutableLongStateOf(0L) }
     var dragging by remember { mutableStateOf<Float?>(null) }
     val swipeThreshold = with(LocalDensity.current) { 48.dp.toPx() }
@@ -61,11 +65,10 @@ fun PlayerScreen(ui: UiState, engine: Engine, openCalibration: () -> Unit, openD
         Row(verticalAlignment = Alignment.CenterVertically) {
             when {
                 ui.soloMode -> {
-                    PairStatusButton("Connect", SFColors.Accent1, openPairing)
-                    ui.remembered?.let { rec ->
-                        Spacer(Modifier.width(8.dp))
-                        PairStatusButton("«${rec.peerName}»", SFColors.Good, { engine.resumeRemembered() })
-                    }
+                    ConnectStatusButton(
+                        onClick = { if (ui.remembered != null) engine.resumeRemembered() else showConnectChooser = true },
+                        onOpenChooser = { showConnectChooser = true },
+                    )
                 }
                 ui.phase == Phase.RECONNECTING && ui.role == Role.POINT -> PairStatusButton("Переподключение…", SFColors.Warn, { confirmDisconnect = true })
                 ui.phase == Phase.RECONNECTING -> PairStatusButton("Ждём «${ui.peerName}»", SFColors.Warn, { confirmDisconnect = true })
@@ -91,6 +94,21 @@ fun PlayerScreen(ui: UiState, engine: Engine, openCalibration: () -> Unit, openD
                 Badge(if (ui.soloMode) "Solo" else if (ui.role == Role.SERVER) "Server" else "Point",
                     if (ui.soloMode) SFColors.Accent1 else SFColors.Master)
             }
+        }
+
+        if (showConnectChooser) {
+            ConnectDeviceDialog(
+                ui = ui,
+                onDismiss = { showConnectChooser = false },
+                onResumeRemembered = {
+                    showConnectChooser = false
+                    engine.resumeRemembered()
+                },
+                onConnectNearby = { peer ->
+                    showConnectChooser = false
+                    engine.invite(peer)
+                },
+            )
         }
 
         if (!ui.soloMode && ui.multiWifiWarning.isNotBlank()) {
@@ -305,6 +323,93 @@ fun PlayerScreen(ui: UiState, engine: Engine, openCalibration: () -> Unit, openD
                 TextButton(onClick = { confirmCancelFileTransfer = false }) { Text("Продолжить") }
             },
         )
+    }
+}
+
+@Composable
+private fun ConnectDeviceDialog(
+    ui: UiState,
+    onDismiss: () -> Unit,
+    onResumeRemembered: () -> Unit,
+    onConnectNearby: (app.soundfield.engine.Peer) -> Unit,
+) {
+    val remembered = ui.remembered
+    val nearby = ui.nearby.filterNot { it.id == remembered?.peerId }
+
+    Dialog(onDismissRequest = onDismiss) {
+        Surface(
+            modifier = Modifier.widthIn(max = 360.dp),
+            shape = RoundedCornerShape(22.dp),
+            color = SFColors.Card,
+            border = androidx.compose.foundation.BorderStroke(1.dp, SFColors.CardBorder),
+        ) {
+            Column(Modifier.padding(horizontal = 18.dp, vertical = 16.dp)) {
+                Text("Connect", color = SFColors.Text, fontSize = 18.sp, fontWeight = FontWeight.Bold)
+                Spacer(Modifier.height(12.dp))
+
+                remembered?.let { record ->
+                    Text("Последний телефон", color = SFColors.TextDim, fontSize = 12.sp,
+                        modifier = Modifier.padding(bottom = 8.dp))
+                    DeviceChoiceTile(
+                        name = record.peerName,
+                        platform = record.peerPlatform,
+                        modifier = Modifier.fillMaxWidth(),
+                        onClick = onResumeRemembered,
+                    )
+                    Spacer(Modifier.height(14.dp))
+                }
+
+                Text("Доступные телефоны", color = SFColors.TextDim, fontSize = 12.sp,
+                    modifier = Modifier.padding(bottom = 8.dp))
+                if (nearby.isEmpty()) {
+                    Row(
+                        Modifier.fillMaxWidth().heightIn(min = 76.dp),
+                        horizontalArrangement = Arrangement.Center,
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        SearchingDots()
+                        Spacer(Modifier.width(10.dp))
+                        Text("Ищем телефоны…", color = SFColors.TextDim, fontSize = 13.sp)
+                    }
+                } else {
+                    Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        nearby.forEach { peer ->
+                            DeviceChoiceTile(
+                                name = peer.name,
+                                platform = peer.platform,
+                                modifier = Modifier.width(96.dp),
+                                onClick = { onConnectNearby(peer) },
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun DeviceChoiceTile(name: String, platform: String, modifier: Modifier = Modifier, onClick: () -> Unit) {
+    val isApple = platform.equals("ios", ignoreCase = true)
+    Column(
+        modifier.clip(RoundedCornerShape(16.dp))
+            .background(SFColors.BgTop.copy(alpha = 0.45f))
+            .border(1.dp, SFColors.CardBorder, RoundedCornerShape(16.dp))
+            .clickable(onClick = onClick)
+            .padding(horizontal = 10.dp, vertical = 12.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
+        Box(
+            Modifier.size(48.dp).clip(CircleShape)
+                .background((if (isApple) SFColors.Accent1 else SFColors.Master).copy(alpha = 0.15f)),
+            contentAlignment = Alignment.Center,
+        ) {
+            Text(if (isApple) "🍏" else "🤖", fontSize = 25.sp)
+        }
+        Spacer(Modifier.height(7.dp))
+        Text(name, color = SFColors.Text, fontSize = 12.sp, lineHeight = 15.sp, textAlign = TextAlign.Center,
+            maxLines = 2, overflow = TextOverflow.Ellipsis, minLines = 2)
     }
 }
 
