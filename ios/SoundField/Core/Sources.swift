@@ -22,7 +22,7 @@ enum AudioFileDecoder {
         let metadata = AVURLAsset(url: source).commonMetadata
         let title = metadata.first { $0.commonKey == .commonKeyTitle }?.stringValue
             ?? source.deletingPathExtension().lastPathComponent
-        let artist = metadata.first { $0.commonKey == .commonKeyArtist }?.stringValue ?? "Локальная музыка"
+        let artist = metadata.first { $0.commonKey == .commonKeyArtist }?.stringValue ?? ""
         return PreparedAudioFile(id: id, url: destination, title: title, artist: artist)
     }
 

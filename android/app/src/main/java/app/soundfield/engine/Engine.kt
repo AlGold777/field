@@ -5476,7 +5476,7 @@ class Engine private constructor(private val app: Context) {
 
     private fun packet(st: ServerPlayState, tl: Timeline, seq: Int, start: Long, flags: Int,
         count: Int = packetFrameCount(st.source, start)): ByteArray {
-        val pCh = pointChannel
+        val pCh = Ch.other(st.channel)
         val s = ShortArray(count) { i -> (st.source.sample(start + i, pCh) * 32767f).roundToInt().coerceIn(-32768, 32767).toShort() }
         return Wire.audio(sessionId, tl.epoch, seq, start, tl.timeOf(start), System.nanoTime(), flags, s, count)
     }

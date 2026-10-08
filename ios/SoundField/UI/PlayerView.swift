@@ -53,7 +53,7 @@ struct PlayerView: View {
 
                 trackStatusSlot
 
-                Button { engine.requestTrackPicker() } label: {
+                Group {
                     Text(ui.title).font(.system(size: 20, weight: .bold)).foregroundColor(SFColor.text)
                         .lineLimit(1).truncationMode(.tail).minimumScaleFactor(0.8)
                         .multilineTextAlignment(.center).frame(maxWidth: .infinity)
@@ -67,7 +67,7 @@ struct PlayerView: View {
                             if dx < 0 { engine.nextTrack() } else { engine.previousTrack() }
                         }
                 )
-                Text(ui.artist.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "---" : ui.artist)
+                Text(ui.artist.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "Unknown" : ui.artist)
                     .font(.system(size: 14)).foregroundColor(SFColor.dim).lineLimit(1).truncationMode(.tail)
                     .multilineTextAlignment(.center).frame(maxWidth: .infinity)
                     .padding(.top, 4).padding(.bottom, 8)
@@ -87,7 +87,7 @@ struct PlayerView: View {
 
                 HStack {
                     Spacer()
-                    roundIcon("gobackward.10") { engine.skipMs(-10_000) }
+                    roundIcon("backward.end.fill") { engine.previousTrack() }.accessibilityLabel("Предыдущий трек")
                     Spacer()
                     Button { engine.togglePlay() } label: {
                         Image(systemName: ui.playing ? "pause.fill" : "play.fill").font(.system(size: 30)).foregroundColor(.white)
@@ -95,7 +95,7 @@ struct PlayerView: View {
                     }
                     .buttonStyle(PressStyle())
                     Spacer()
-                    roundIcon("goforward.10") { engine.skipMs(10_000) }
+                    roundIcon("forward.end.fill") { engine.nextTrack() }.accessibilityLabel("Следующий трек")
                     Spacer()
                 }
                 .padding(.vertical, 18)
@@ -257,6 +257,12 @@ struct PlayerView: View {
 
     private var queueSection: some View {
         VStack(spacing: 0) {
+            HStack {
+                Spacer()
+                Button { engine.requestTrackPicker() } label: {
+                    Image(systemName: "text.badge.plus").frame(width: 40, height: 40)
+                }.accessibilityLabel("Добавить музыку")
+            }
             Button { queueExpanded.toggle() } label: {
                 HStack {
                     Text("Очередь · \(ui.queueTracks.count) треков")

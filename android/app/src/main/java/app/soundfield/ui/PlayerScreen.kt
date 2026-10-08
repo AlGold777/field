@@ -53,7 +53,7 @@ import java.util.Locale
 
 @Composable
 fun PlayerScreen(ui: UiState, engine: Engine, openCalibration: () -> Unit, openDiagnostics: () -> Unit,
-    openTrackPicker: () -> Unit, openEqualizer: () -> Unit, openSpatial: () -> Unit, openPairing: () -> Unit) {
+    openEqualizer: () -> Unit, openSpatial: () -> Unit, openPairing: () -> Unit) {
     var confirmDisconnect by remember { mutableStateOf(false) }
     var confirmCancelFileTransfer by remember { mutableStateOf(false) }
     var showConnectChooser by remember { mutableStateOf(false) }
@@ -206,8 +206,7 @@ fun PlayerScreen(ui: UiState, engine: Engine, openCalibration: () -> Unit, openD
             }
         }
         // --- трек ---
-        // «Название - Исполнитель» одной строкой; для тестовых сигналов — только название
-        val trackTitle = if (ui.mode == SourceMode.MUSIC) app.soundfield.engine.trackLabel(ui.title, ui.artist) else ui.title
+        val trackTitle = ui.title
         Text(trackTitle, color = SFColors.Text, fontSize = 20.sp, fontWeight = FontWeight.Bold, textAlign = TextAlign.Center,
             maxLines = 1, overflow = TextOverflow.Ellipsis,
             modifier = Modifier.fillMaxWidth().pointerInput(engine, swipeThreshold) {
@@ -221,9 +220,9 @@ fun PlayerScreen(ui: UiState, engine: Engine, openCalibration: () -> Unit, openD
                     },
                     onHorizontalDrag = { change, amount -> change.consume(); distance += amount },
                 )
-            }.clickable(onClick = openTrackPicker))
+            })
         Text(
-            ui.artist.ifBlank { "---" },
+            ui.artist.ifBlank { "Unknown" },
             color = SFColors.TextDim,
             fontSize = 12.sp, textAlign = TextAlign.Center, maxLines = 1, overflow = TextOverflow.Ellipsis,
             modifier = Modifier.fillMaxWidth().padding(top = 5.dp, bottom = 8.dp),
@@ -245,12 +244,12 @@ fun PlayerScreen(ui: UiState, engine: Engine, openCalibration: () -> Unit, openD
 
         Row(Modifier.fillMaxWidth().padding(vertical = 18.dp), horizontalArrangement = Arrangement.SpaceEvenly,
             verticalAlignment = Alignment.CenterVertically) {
-            RoundIcon("⏪") { engine.skipMs(-10_000) }
+            RoundIcon("⏮", "Предыдущий трек") { engine.previousTrack() }
             Box(Modifier.size(76.dp).clip(CircleShape).background(SFColors.accent).clickable { engine.togglePlay() },
                 contentAlignment = Alignment.Center) {
                 Text(if (ui.playing || ui.audioBuffering) "❚❚" else "▶", color = Color.White, fontSize = 28.sp)
             }
-            RoundIcon("⏩") { engine.skipMs(10_000) }
+            RoundIcon("⏭", "Следующий трек") { engine.nextTrack() }
         }
 
         QueueCard(ui, engine)
@@ -441,8 +440,8 @@ private fun DeviceChoiceTile(name: String, platform: String, modifier: Modifier 
 }
 
 @Composable
-private fun RoundIcon(icon: String, onClick: () -> Unit) {
-    Box(Modifier.size(54.dp).clip(CircleShape).background(SFColors.Secondary).clickable(onClick = onClick),
+private fun RoundIcon(icon: String, label: String, onClick: () -> Unit) {
+    Box(Modifier.size(54.dp).clip(CircleShape).background(SFColors.Secondary).clickable(onClickLabel = label, onClick = onClick),
         contentAlignment = Alignment.Center) { Text(icon, color = Color.White, fontSize = 20.sp) }
 }
 
