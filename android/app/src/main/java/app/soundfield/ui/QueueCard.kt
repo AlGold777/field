@@ -13,6 +13,8 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
@@ -112,7 +114,8 @@ fun QueueCard(ui: UiState, engine: Engine) {
                         if (selecting) {
                             val checked = item.id in selected
                             TrackRow(index, item, current, ui.loadingTrackId, checked = checked,
-                                onClick = { selected = if (checked) selected - item.id else selected + item.id })
+                                onClick = { selected = if (checked) selected - item.id else selected + item.id },
+                                onRemove = { engine.removeTracks(listOf(item.id)) })
                         } else {
                             SwipeToRemove(onRemove = { engine.removeTracks(listOf(item.id)) }) {
                                 TrackRow(index, item, current, ui.loadingTrackId, checked = null,
@@ -155,7 +158,7 @@ fun QueueCard(ui: UiState, engine: Engine) {
 }
 
 @Composable
-private fun TrackRow(index: Int, item: QueueTrackUi, current: Boolean, loadingId: String?, checked: Boolean?, onClick: () -> Unit) {
+private fun TrackRow(index: Int, item: QueueTrackUi, current: Boolean, loadingId: String?, checked: Boolean?, onClick: () -> Unit, onRemove: (() -> Unit)? = null) {
     Row(
         Modifier.fillMaxWidth().clip(MaterialTheme.shapes.medium)
             .background(if (current) Color(0xFF2A2F5A) else Color(0xFF1B2446))   // непрозрачный фон — под ним полоса свайпа
@@ -172,6 +175,9 @@ private fun TrackRow(index: Int, item: QueueTrackUi, current: Boolean, loadingId
         Text(item.label, color = if (current) SFColors.Accent1 else SFColors.Text, fontSize = 14.sp,
             fontWeight = if (current) FontWeight.SemiBold else FontWeight.Normal,
             maxLines = 2, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
+        if (onRemove != null) IconButton(onClick = onRemove, modifier = Modifier.size(36.dp)) {
+            Text("×", color = SFColors.Bad, fontSize = 20.sp, modifier = Modifier.semantics { contentDescription = "Удалить ${item.title}" })
+        }
         if (current && checked == null) Text(if (item.id == loadingId) "…" else "♫", color = SFColors.Accent1, fontSize = 17.sp)
     }
 }

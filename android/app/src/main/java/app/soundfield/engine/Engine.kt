@@ -1850,7 +1850,7 @@ class Engine private constructor(private val app: Context) {
         prefs.edit().putBoolean("queueExpanded", expanded).apply()
         ui { copy(queueExpanded = expanded) }
     }
-    private fun supportsFileTransferPeer() = peerPlatform.equals("android", true) || "fileTransferV1" in peerCapabilities
+    private fun supportsFileTransferPeer() = peerPlatform.equals("android", true) || "fileTransferV1" in negotiatedCapabilities
 
     fun requestTrackPicker() {
         post {
@@ -3171,7 +3171,7 @@ class Engine private constructor(private val app: Context) {
         l.tag = "paired"
         link = l
         role = r; peerId = pid; peerName = pname; peerPlatform = pplat
-        negotiatedCapabilities = peerCapabilities.intersect(setOf("addrs", "tcpClock", "tcpAudio", "eq", "spatialV1"))
+        negotiatedCapabilities = peerCapabilities.intersect(setOf("addrs", "tcpClock", "tcpAudio", "eq", "spatialV1", "fileTransferV1"))
         phase = Phase.PAIRED
         zeroSendRenewStreak = 0
         udpNetworkRebindAttempted = false
@@ -3429,7 +3429,7 @@ class Engine private constructor(private val app: Context) {
             // --- на Point ---
             "session" -> if (role == Role.POINT) {
                 peerCapabilities = parsePeerCaps(o)
-                negotiatedCapabilities = peerCapabilities.intersect(setOf("addrs", "tcpClock", "tcpAudio", "eq", "spatialV1"))
+                negotiatedCapabilities = peerCapabilities.intersect(setOf("addrs", "tcpClock", "tcpAudio", "eq", "spatialV1", "fileTransferV1"))
                 updatePeerAddressBook(parsePeerAddresses(o))
                 val newSession = o.getInt("session")
                 if (sessionId != newSession) {
@@ -3489,7 +3489,7 @@ class Engine private constructor(private val app: Context) {
             }
             "network-addresses" -> {
                 peerCapabilities = parsePeerCaps(o)
-                negotiatedCapabilities = peerCapabilities.intersect(setOf("addrs", "tcpClock", "tcpAudio", "eq", "spatialV1"))
+                negotiatedCapabilities = peerCapabilities.intersect(setOf("addrs", "tcpClock", "tcpAudio", "eq", "spatialV1", "fileTransferV1"))
                 updatePeerAddressBook(parsePeerAddresses(o))
                 telemetry.record("PEER_ADDRESSES_RECEIVED", mapOf("count" to parsePeerAddresses(o).size,
                     "networkIds" to parsePeerAddresses(o).map { it.networkId }.distinct()))

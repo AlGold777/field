@@ -80,7 +80,7 @@ fun PlayerScreen(ui: UiState, engine: Engine, openCalibration: () -> Unit, openD
             }
             Spacer(Modifier.weight(1f))
             val switchMode: () -> Unit = {
-                if (ui.soloMode && ui.remembered == null) openPairing()
+                if (ui.soloMode && ui.remembered == null) showConnectChooser = true
                 else engine.toggleSoloMode()
             }
             Box(
@@ -154,7 +154,7 @@ fun PlayerScreen(ui: UiState, engine: Engine, openCalibration: () -> Unit, openD
                 val pd = ui.pointDiag; val sd = ui.serverDiag
                 val lrEstUs = if (pd.valid && sd.valid) abs(pd.syncErrUs - sd.syncErrUs) + pd.clockUncMs * 1_000.0 else null
                 Row(Modifier.fillMaxSize().clip(CircleShape).background(SFColors.Card).clickable { openDiagnostics() }
-                    .padding(horizontal = 16.dp, vertical = 10.dp), horizontalArrangement = Arrangement.Center,
+                    .padding(horizontal = 12.dp, vertical = 6.dp), horizontalArrangement = Arrangement.Center,
                     verticalAlignment = Alignment.CenterVertically) {
                     Text(
                         if (lrEstUs == null) "⚡ Синхронизация часов…"
@@ -164,7 +164,7 @@ fun PlayerScreen(ui: UiState, engine: Engine, openCalibration: () -> Unit, openD
                             "⚡ L/R: $estimate : RTT %.0f мс : буф. %.0f мс".format(pd.rttMs, pd.bufferMs)
                         },
                         color = if (lrEstUs != null && lrEstUs < 2_000.0) SFColors.Good else SFColors.Warn,
-                        fontSize = 13.sp, maxLines = 1, softWrap = false, overflow = TextOverflow.Ellipsis)
+                        fontSize = 12.sp, lineHeight = 16.sp, maxLines = 1, softWrap = false, overflow = TextOverflow.Ellipsis)
                 }
             }
         }
