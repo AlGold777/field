@@ -710,8 +710,9 @@ final class Engine {
     func addAudioFiles(_ urls: [URL], securityRoot: URL? = nil, deleteAfterImport: [URL] = []) {
         guard !urls.isEmpty else { return }
         q.async {
-            if self.role == .point && self.phase == .paired { self.sendAudioFiles(urls, securityRoot: securityRoot); return }
+            if self.role == .point && self.phase == .paired && deleteAfterImport.isEmpty { self.sendAudioFiles(urls, securityRoot: securityRoot); return }
             guard self.role == .server, self.soloMode || self.phase == .paired || self.phase == .reconnecting, !self.calibRunning else {
+                deleteAfterImport.forEach { try? FileManager.default.removeItem(at: $0) }
                 self.toast("Добавление музыки сейчас недоступно"); return
             }
             self.ui { $0.loadingTracks = true }
@@ -2128,8 +2129,10 @@ final class Engine {
                 let directory = incoming.url.deletingLastPathComponent().appendingPathComponent(incoming.id, isDirectory: true)
                 try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
                 let target = directory.appendingPathComponent(incoming.name)
-                try FileManager.default.moveItem(at: incoming.url, to: target); incomingAudio = nil
-                addAudioFiles([target], deleteAfterImport: [target])
+                do { try FileManager.default.moveItem(at: incoming.url, to: target) }
+                catch { try? FileManager.default.removeItem(at: directory); throw error }
+                incomingAudio = nil
+                addAudioFiles([target], deleteAfterImport: [directory])
                 ui { $0.fileTransferText = "" }
                 link?.send(["t":"file-ack", "id":id, "offset":incoming.size, "complete":true])
             case "file-cancel":

@@ -33,6 +33,7 @@ struct PlayerView: View {
     @State private var showingAudioImporter = false
     @State private var audioBrowserRoot: URL? = AudioBrowserView.restoredRoot()
     @State private var showingAudioBrowser = false
+    @State private var changingAudioRoot = false
     private let timer = Timer.publish(every: 0.2, on: .main, in: .common).autoconnect()
 
     var body: some View {
@@ -224,10 +225,12 @@ struct PlayerView: View {
         .sheet(isPresented: $showingEqualizer) { EqualizerControls(settings:ui.eq) { engine.setEq($0) } }
         .sheet(isPresented: $showingSpatial) { SpatialControls(settings:ui.spatial,solo:ui.soloMode) { engine.setSpatial($0) } }
         .sheet(isPresented: $showPlaylists) { playlistsView }
-        .sheet(isPresented: $showingAudioBrowser) {
+        .sheet(isPresented: $showingAudioBrowser, onDismiss: {
+            if changingAudioRoot { changingAudioRoot = false; showingAudioImporter = true }
+        }) {
             if let root = audioBrowserRoot {
                 AudioBrowserView(root: root, onChangeRoot: {
-                    DispatchQueue.main.async { showingAudioImporter = true }
+                    changingAudioRoot = true
                 }, onImport: { engine.addAudioFiles($0, securityRoot: root) })
             }
         }
@@ -603,11 +606,11 @@ private struct AudioBrowserView: View {
                 ToolbarItem(placement: .primaryAction) { Button("Расположение") { dismiss(); onChangeRoot() } }
             }
             .task(id: current) { await load() }
-            .onAppear { scoped = root.startAccessingSecurityScopedResource() }
             .onDisappear { if scoped { root.stopAccessingSecurityScopedResource(); scoped = false } }
         }.preferredColorScheme(.dark)
     }
     @MainActor private func load() async {
+        if !scoped { scoped = root.startAccessingSecurityScopedResource() }
         loading = true; error = nil; entries = []; selected.removeAll()
         let folder = current
         let result = await Task.detached { () -> Result<[Entry], Error> in
