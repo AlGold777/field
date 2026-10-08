@@ -66,7 +66,7 @@ private fun HeaderIcon(icon: ImageVector, label: String, active: Boolean = false
 @Composable
 fun QueueCard(ui: UiState, engine: Engine) {
     val isServer = ui.role == Role.SERVER
-    val canAddHere = isServer || (ui.inPair && ui.peerPlatform.equals("android", true))
+    val canAddHere = isServer || (ui.inPair && ui.fileTransferAvailable)
     var selecting by remember { mutableStateOf(false) }
     var selected by remember { mutableStateOf(setOf<String>()) }
     var showPlaylists by remember { mutableStateOf(false) }
@@ -102,8 +102,8 @@ fun QueueCard(ui: UiState, engine: Engine) {
         if (ui.queueExpanded) {
             if (ui.queueTracks.isEmpty()) {
                 Text(if (isServer) "Добавьте музыку значком «+» или откройте плейлист"
-                     else if (ui.peerPlatform.equals("android", true)) "Отправьте музыку на Server значком «+»"
-                     else "Добавление с Point доступно только в паре Android ↔ Android",
+                     else if (ui.fileTransferAvailable) "Отправьте музыку на Server значком «+»"
+                     else "Обновите SoundField на Server для передачи файлов",
                     color = SFColors.TextDim, fontSize = 14.sp, modifier = Modifier.padding(vertical = 6.dp))
             } else {
                 LazyColumn(Modifier.fillMaxWidth().heightIn(max = 300.dp)) {

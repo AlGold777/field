@@ -619,6 +619,7 @@ class Engine private constructor(private val app: Context) {
 
     private fun localCapabilitiesJson() = org.json.JSONArray().also { array ->
         listOf("addrs", "tcpClock", "tcpAudio", "eq", "spatialV1").forEach(array::put)
+        array.put("fileTransferV1")
     }
 
     private fun updatePeerAddressBook(addresses: List<PeerAddress>) {
@@ -1849,13 +1850,15 @@ class Engine private constructor(private val app: Context) {
         prefs.edit().putBoolean("queueExpanded", expanded).apply()
         ui { copy(queueExpanded = expanded) }
     }
+    private fun supportsFileTransferPeer() = peerPlatform.equals("android", true) || "fileTransferV1" in peerCapabilities
+
     fun requestTrackPicker() {
         post {
             if (calibRunning) { toast("Сначала завершите калибровку"); return@post }
-            if (role == Role.SERVER || (role == Role.POINT && peerPlatform.equals("android", true))) {
+            if (role == Role.SERVER || (role == Role.POINT && supportsFileTransferPeer())) {
                 ui { copy(filePickerRequest = filePickerRequest + 1) }
             } else if (role == Role.POINT) {
-                toast("Отправка файлов доступна, только если оба телефона — Android")
+                toast("Обновите SoundField на Server для передачи файлов")
             } else toast("Сначала подключите второй телефон")
         }
     }
@@ -1869,8 +1872,8 @@ class Engine private constructor(private val app: Context) {
                 toast("Добавление музыки сейчас недоступно"); return@post
             }
             if (role == Role.POINT) {
-                if (!peerPlatform.equals("android", true)) {
-                    toast("Передача файлов с Point поддерживается, если оба телефона — Android"); return@post
+                if (!supportsFileTransferPeer()) {
+                    toast("Обновите SoundField на Server для передачи файлов"); return@post
                 }
                 beginPointFileTransfer(uris)
                 return@post
@@ -2095,11 +2098,11 @@ class Engine private constructor(private val app: Context) {
         val id = o.optString("id")
         val name = File(o.optString("name")).name.take(160)
         val size = o.optLong("size", -1)
-        if (role != Role.SERVER || calibRunning || !peerPlatform.equals("android", true) || o.optString("token") != fileTransferToken) {
+        if (role != Role.SERVER || calibRunning || !supportsFileTransferPeer() || o.optString("token") != fileTransferToken) {
             sendFileError(id, "Передача не поддерживается этой парой"); return
         }
         if (incomingFileTransfer != null) { sendFileError(id, "Server уже принимает другой файл"); return }
-        if (id.isBlank() || name.substringAfterLast('.', "").lowercase() !in audioExtensions ||
+        if (runCatching { java.util.UUID.fromString(id) }.isFailure || name.substringAfterLast('.', "").lowercase() !in audioExtensions ||
             size !in 1..MAX_TRANSFER_FILE_BYTES) {
             sendFileError(id, "Неподдерживаемый или слишком большой аудиофайл"); return
         }
@@ -3272,6 +3275,7 @@ class Engine private constructor(private val app: Context) {
         audio.start()
         try { PlaybackService.start(app) } catch (e: Exception) { Log.w(TAG, "fgs", e); telemetry.event("FOREGROUND_SERVICE_FAILED", error = e) }
         ui { copy(phase = Phase.PAIRED, role = r, peerName = pname, peerPlatform = pplat, linkOk = true, remembered = record,
+            fileTransferAvailable = supportsFileTransferPeer(),
             autoResuming = false, audioMissing = false, calib = CalibUi(), eqAvailable = eqAvailableInPair(),
             eq = if (r == Role.SERVER) eqSettingsForWire() else eq, eqPreampDb = activeEqConfig().preampDb.toFloat(),
             eqRouteLabel = audio.routeLabel(), eqCurveDb = activeEqConfig().curveDb.map { it.toFloat() }) }

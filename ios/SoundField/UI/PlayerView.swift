@@ -12,6 +12,7 @@ struct PlayerView: View {
     @State private var pos: Int64 = 0
     @State private var dragging: Double? = nil
     @State private var confirmDisconnect = false
+    @State private var confirmCancelTransfer = false
     @State private var showConnectChooser = false
     @State private var selectingTracks = false
     @State private var selectedTracks = Set<String>()
@@ -200,6 +201,10 @@ struct PlayerView: View {
                 }, onImport: { engine.addAudioFiles($0, securityRoot: root) })
             }
         }
+        .alert("Отменить передачу?", isPresented: $confirmCancelTransfer) {
+            Button("Продолжить", role: .cancel) {}
+            Button("Отменить передачу", role: .destructive) { engine.cancelFileTransfer() }
+        }
         .alert("Disconnect \((ui.peerName.isEmpty ? "Phone" : String(ui.peerName.prefix(7))))?", isPresented: $confirmDisconnect) {
             Button("No", role: .cancel) {}
             Button("Yes", role: .destructive) { engine.disconnect() }
@@ -316,6 +321,7 @@ struct PlayerView: View {
     }
 
     private var trackStatusText: String {
+        if !ui.fileTransferText.isEmpty { return ui.fileTransferText }
         if ui.mode != .music {
             switch ui.mode {
             case .metronome: return "🥁 Метроном для ручной подстройки"
@@ -339,6 +345,9 @@ struct PlayerView: View {
             .multilineTextAlignment(.center)
             .frame(maxWidth: .infinity).frame(height: 28)
             .accessibilityHidden(trackStatusText.isEmpty)
+            .contentShape(Rectangle()).onTapGesture {
+                if ui.role == .point && !ui.fileTransferText.isEmpty { confirmCancelTransfer = true }
+            }
     }
 
     private var queueSection: some View {
@@ -351,7 +360,7 @@ struct PlayerView: View {
                     }.foregroundColor(SFColor.dim)
                 }.buttonStyle(.plain)
                 Spacer(minLength: 0)
-                queueIcon("text.badge.plus", "Добавить музыку") { engine.requestTrackPicker() }
+                queueIcon("text.badge.plus", "Добавить музыку", enabled: ui.role == .server || ui.fileTransferAvailable) { engine.requestTrackPicker() }
                 queueIcon("checklist", "Выбрать треки", enabled: !ui.queueTracks.isEmpty) {
                     selectingTracks.toggle(); selectedTracks.removeAll(); if selectingTracks { queueExpanded = true }
                 }

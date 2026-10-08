@@ -155,6 +155,8 @@ struct UiState: Equatable {
     var loadingTrackId: String? = nil
     var decodingProgress: Double? = nil
     var audioMissing = false
+    var fileTransferAvailable = false
+    var fileTransferText = ""
     var audioBuffering = false
     var queueExpanded = false
     var undoText = ""

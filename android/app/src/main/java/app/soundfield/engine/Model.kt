@@ -336,6 +336,7 @@ data class UiState(
     /** Процент подготовки выбранного длинного трека после того, как доступен стартовый сегмент. */
     val decodingProgress: Float? = null,
     /** Передача/приём файлов между двумя Android-телефонами. */
+    val fileTransferAvailable: Boolean = false,
     val fileTransferText: String = "",
     /** Пара подключена, но Point давно не получает аудиопакеты. */
     val audioMissing: Boolean = false,

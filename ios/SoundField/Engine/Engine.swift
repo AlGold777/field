@@ -236,7 +236,7 @@ final class Engine {
 
     private func sendSession(_ target: ControlLink? = nil) {
         let l = target ?? link
-        l?.send(["t": "session", "session": Int(sessionId), "udpPort": Int(udp?.port ?? 0), "name": myName])
+        l?.send(["t": "session", "session": Int(sessionId), "udpPort": Int(udp?.port ?? 0), "name": myName, "fileToken": fileToken, "caps": ["fileTransferV1"]])
     }
 
     /// Rebuild the UDP media session without dropping the TCP pair. Point responds with a fresh PING burst.
@@ -695,37 +695,27 @@ final class Engine {
     func requestTrackPicker() {
         q.async {
             guard !self.calibRunning else { self.toast("Сначала завершите калибровку"); return }
-            if self.role == .server { self.ui { $0.filePickerRequest += 1 } }
-            else { self.toast("Импорт файлов с Point доступен только при паре Android ↔ Android") }
+            if self.role == .server || self.state.fileTransferAvailable { self.ui { $0.filePickerRequest += 1 } }
+            else { self.toast("Обновите SoundField на Server для передачи файлов") }
         }
     }
-    func addAudioFiles(_ urls: [URL], securityRoot: URL? = nil) {
+    func addAudioFiles(_ urls: [URL], securityRoot: URL? = nil, deleteAfterImport: [URL] = []) {
         guard !urls.isEmpty else { return }
         q.async {
+            if self.role == .point && self.phase == .paired { self.sendAudioFiles(urls, securityRoot: securityRoot); return }
             guard self.role == .server, self.soloMode || self.phase == .paired || self.phase == .reconnecting, !self.calibRunning else {
                 self.toast("Добавление музыки сейчас недоступно"); return
             }
             self.ui { $0.loadingTracks = true }
             let rootAccess = securityRoot?.startAccessingSecurityScopedResource() ?? false
             self.queueIo.async {
-                defer { if rootAccess { securityRoot?.stopAccessingSecurityScopedResource() } }
+                defer { if rootAccess { securityRoot?.stopAccessingSecurityScopedResource() }; deleteAfterImport.forEach { try? FileManager.default.removeItem(at: $0) } }
                 var prepared: [PreparedAudioFile] = []
                 var failures = 0
                 for selection in urls {
                     let accessed = selection.startAccessingSecurityScopedResource()
                     defer { if accessed { selection.stopAccessingSecurityScopedResource() } }
-                    let values = try? selection.resourceValues(forKeys: [.isDirectoryKey])
-                    let candidates: [URL]
-                    if values?.isDirectory == true {
-                        let enumerator = FileManager.default.enumerator(at: selection,
-                            includingPropertiesForKeys: [.isRegularFileKey, .contentTypeKey],
-                            options: [.skipsHiddenFiles, .skipsPackageDescendants])
-                        candidates = (enumerator?.allObjects as? [URL] ?? []).filter { url in
-                            let resource = try? url.resourceValues(forKeys: [.isRegularFileKey, .contentTypeKey])
-                            return resource?.isRegularFile == true && (resource?.contentType?.conforms(to: .audio) == true ||
-                                ["aac", "aif", "aiff", "alac", "amr", "flac", "m4a", "m4b", "mp3", "oga", "ogg", "opus", "wav", "wave", "weba", "wma"].contains(url.pathExtension.lowercased()))
-                        }.sorted { $0.path.localizedStandardCompare($1.path) == .orderedAscending }
-                    } else { candidates = [selection] }
+                    let candidates = Self.audioURLs(selection)
                     for candidate in candidates {
                         do { prepared.append(try AudioFileDecoder.prepare(candidate)) }
                         catch { failures += 1; NSLog("SoundField: could not import %@: %@", candidate.lastPathComponent, error.localizedDescription) }
@@ -833,14 +823,14 @@ final class Engine {
     // ================================================================== установка пары
     private func inviteJson(_ key: String) -> [String: Any] {
         ["t": "invite", "id": myId, "name": myName, "platform": "ios", "proto": Int(SF.protocolVersion), "key": key,
-         "tcpPort": Int(discovery.listenPort)]
+         "tcpPort": Int(discovery.listenPort), "caps": ["fileTransferV1"]]
     }
     private func resumeJson(_ r: PairRecord) -> [String: Any] {
         ["t": "resume", "id": myId, "name": myName, "platform": "ios", "proto": Int(SF.protocolVersion), "key": r.key, "role": r.myRole,
-         "tcpPort": Int(discovery.listenPort)]
+         "tcpPort": Int(discovery.listenPort), "caps": ["fileTransferV1"]]
     }
     private func acceptJson(_ key: String, _ role: String) -> [String: Any] {
-        ["t": "accept", "id": myId, "name": myName, "platform": "ios", "key": key, "role": role, "tcpPort": Int(discovery.listenPort)]
+        ["t": "accept", "id": myId, "name": myName, "platform": "ios", "key": key, "role": role, "tcpPort": Int(discovery.listenPort), "caps": ["fileTransferV1"]]
     }
 
     private func doInvite(_ p: Peer) {
@@ -967,6 +957,7 @@ final class Engine {
 
     private func onFirstMessage(_ l: ControlLink, _ o: [String: Any]) {
         let pid = J.s(o, "id"), pname = J.s(o, "name", pid), pplat = J.s(o, "platform", "?")
+        peerCapabilities = Set(o["caps"] as? [String] ?? [])
         switch J.s(o, "t") {
         case "invite":
             if phase == .idle { stopAutoResume() }   // новое приглашение важнее фонового восстановления
@@ -1024,6 +1015,7 @@ final class Engine {
 
     private func onPendingMessage(_ l: ControlLink, _ o: [String: Any]) {
         let pid = J.s(o, "id"), pname = J.s(o, "name", pid), pplat = J.s(o, "platform", "?")
+        peerCapabilities = Set(o["caps"] as? [String] ?? [])
         switch J.s(o, "t") {
         case "accept":
             let hinted = Int(J.i64(o, "tcpPort"))
@@ -1087,6 +1079,8 @@ final class Engine {
 
     // ================================================================== пара
     private func becomePaired(_ l: ControlLink, _ r: Role, _ pid: String, _ pname: String, _ pplat: String, _ key: String, resumed: Bool) {
+        serverFileToken = ""
+        ui { $0.fileTransferAvailable = false }
         if soloMode {
             let frame = mode == .music ? posFrame() : 0
             if r == .point { soloResumeFrame = frame }
@@ -1149,6 +1143,7 @@ final class Engine {
                 migrated.levelTrimServerDb = Double(levelTrimServerDb); migrated.levelTrimPointDb = Double(levelTrimPointDb)
                 migrated.levelTrimVersion = 1; migrated.delayCalib = delayCalib; record = migrated; persistRecord()
             }
+            fileToken = Self.hex(24)
             sessionId = Int32.random(in: 1...Int32.max)
             pointUdpBox.value = nil; pointClockReady = false
             if !continuing {
@@ -1177,6 +1172,7 @@ final class Engine {
     }
 
     private func onLinkLost() {
+        cancelTransfers()
         link = nil
         guard phase == .paired else { return }
         phase = .reconnecting
@@ -1210,6 +1206,7 @@ final class Engine {
     }
 
     private func goIdle(sendBye: Bool, reason: String) {
+        cancelTransfers()
         let fromServer = role == .server
         let frame = fromServer && mode == .music ? posFrame() : soloResumeFrame
         let playing = fromServer && mode == .music && playBox.value.timeline.playing
@@ -1255,6 +1252,8 @@ final class Engine {
     // ================================================================== сообщения в паре
     private func onPairedMessage(_ o: [String: Any]) {
         switch J.s(o, "t") {
+        case "file-ack", "file-error": transferReplies.removeValue(forKey: J.s(o, "id"))?(o)
+        case "file-start", "file-chunk", "file-end", "file-cancel": receiveAudio(o)
         case "hb": break
         case "bye": setAutoResume(false); goIdle(sendBye: false, reason: "«\(peerName)» разорвал пару")
         case "name":
@@ -1269,6 +1268,9 @@ final class Engine {
             if role == .server { let d = Diag.from(o); pointClockReady = d.clockReady; ui { $0.pointDiag = d } }
         case "session":
             guard role == .point, let l = link else { return }
+            peerCapabilities = Set(o["caps"] as? [String] ?? [])
+            serverFileToken = peerCapabilities.contains("fileTransferV1") ? J.s(o, "fileToken") : ""
+            ui { $0.fileTransferAvailable = !serverFileToken.isEmpty }
             let newSession = Int32(truncatingIfNeeded: J.i64(o, "session"))
             if sessionId != newSession {
                 sessionId = newSession
@@ -1926,6 +1928,163 @@ final class Engine {
             guard self.savedPlaylists().contains(where: { $0.id == id }) else { return }
             do { try FileManager.default.removeItem(at: self.playlistsDirectory.appendingPathComponent(id + ".json")); self.refreshPlaylists() }
             catch { self.toast("Не удалось удалить плейлист") }
+        }
+    }
+
+    private let transferIO = DispatchQueue(label: "sf.file-transfer", qos: .utility)
+    private let transferCancelled = Locked(false)
+    private var transferActive = false
+    private var activeTransferID: String?
+    private var transferReplies: [String: ([String: Any]) -> Void] = [:]
+    private var fileToken = "", serverFileToken = ""
+    private var peerCapabilities = Set<String>()
+    private struct IncomingAudio {
+        let id: String; let name: String; let size: Int64; let url: URL; let handle: FileHandle
+        var received: Int64 = 0
+    }
+    private var incomingAudio: IncomingAudio?
+    private static let audioExtensions = Set(["aac","aif","aiff","alac","amr","flac","m4a","m4b","mp3","oga","ogg","opus","wav","wave","weba","wma"])
+    private static func audioURLs(_ selection: URL) -> [URL] {
+        guard (try? selection.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true else { return [selection] }
+        let enumerator = FileManager.default.enumerator(at: selection, includingPropertiesForKeys: [.isRegularFileKey, .contentTypeKey], options: [.skipsHiddenFiles, .skipsPackageDescendants])
+        return (enumerator?.allObjects as? [URL] ?? []).filter { url in
+            guard let value = try? url.resourceValues(forKeys: [.isRegularFileKey, .contentTypeKey]), value.isRegularFile == true else { return false }
+            return value.contentType?.conforms(to: .audio) == true || audioExtensions.contains(url.pathExtension.lowercased())
+        }.sorted { $0.path.localizedStandardCompare($1.path) == .orderedAscending }
+    }
+    func cancelFileTransfer() { q.async { self.cancelTransfers() } }
+    private func cancelTransfers() {
+        transferCancelled.value = true
+        if let id = activeTransferID { link?.send(["t":"file-cancel", "id":id]) }
+        let replies = transferReplies; transferReplies.removeAll()
+        replies.values.forEach { $0(["t":"file-error", "message":"Передача отменена"]) }
+        if let incoming = incomingAudio { try? incoming.handle.close(); try? FileManager.default.removeItem(at: incoming.url) }
+        incomingAudio = nil; ui { $0.fileTransferText = "" }
+    }
+    private func transferError(_ message: String) -> NSError {
+        NSError(domain: "SoundField.Transfer", code: 1, userInfo: [NSLocalizedDescriptionKey: message])
+    }
+    private func fileReply(_ message: [String: Any], link active: ControlLink, id: String) throws -> [String: Any] {
+        let semaphore = DispatchSemaphore(value: 0), box = Locked<[String: Any]?>(nil)
+        let sent = q.sync { () -> Bool in
+            guard !transferCancelled.value, phase == .paired, link === active, active.isOpen else { return false }
+            transferReplies[id] = { box.value = $0; semaphore.signal() }
+            active.send(message); return true
+        }
+        guard sent else { throw transferError("Передача отменена или соединение потеряно") }
+        let wait = semaphore.wait(timeout: .now() + 15)
+        q.sync { _ = transferReplies.removeValue(forKey: id) }
+        guard wait == .success, let reply = box.value else { throw transferError("Server не подтвердил передачу") }
+        guard J.s(reply, "t") == "file-ack" else { throw transferError(J.s(reply, "message", "Server отклонил файл")) }
+        return reply
+    }
+    private func sendAudioFiles(_ selections: [URL], securityRoot: URL?) {
+        guard !transferActive, phase == .paired, let active = link, !serverFileToken.isEmpty else { toast("Передача недоступна до подключения к Server"); return }
+        transferActive = true; transferCancelled.value = false
+        let token = serverFileToken, rootAccess = securityRoot?.startAccessingSecurityScopedResource() ?? false
+        ui { $0.fileTransferText = "Send…" }
+        transferIO.async {
+            var opened: [URL] = [], failure: String?
+            defer {
+                opened.forEach { $0.stopAccessingSecurityScopedResource() }
+                if rootAccess { securityRoot?.stopAccessingSecurityScopedResource() }
+                self.q.async {
+                    self.transferActive = false; self.activeTransferID = nil; self.ui { $0.fileTransferText = "" }
+                    self.toast(failure ?? "Файлы отправлены на Server")
+                }
+            }
+            do {
+                let files = selections.flatMap { selection -> [URL] in
+                    if selection.startAccessingSecurityScopedResource() { opened.append(selection) }
+                    return Self.audioURLs(selection)
+                }
+                let sizes = try files.map { url -> Int64 in
+                    guard Self.audioExtensions.contains(url.pathExtension.lowercased()),
+                          let size = try url.resourceValues(forKeys: [.fileSizeKey]).fileSize, size > 0, size <= 512 * 1024 * 1024 else {
+                        throw self.transferError("Файл пуст, не поддерживается или больше 512 МБ")
+                    }
+                    return Int64(size)
+                }
+                let total = sizes.reduce(0, +)
+                guard !files.isEmpty, total <= 1024 * 1024 * 1024 else { throw self.transferError("Нет аудиофайлов или выбранный объём больше 1 ГБ") }
+                var sent: Int64 = 0
+                for (index, url) in files.enumerated() {
+                    let id = UUID().uuidString, size = sizes[index]
+                    self.q.sync { self.activeTransferID = id }
+                    let start = try self.fileReply(["t":"file-start", "id":id, "name":url.lastPathComponent, "size":size, "token":token], link: active, id: id)
+                    guard J.i64(start, "offset", -1) == 0, let stream = InputStream(url: url) else { throw self.transferError("Не удалось открыть файл") }
+                    stream.open(); defer { stream.close() }
+                    var offset: Int64 = 0, bytes = [UInt8](repeating: 0, count: 48 * 1024)
+                    while true {
+                        guard !self.transferCancelled.value else { throw self.transferError("Передача отменена") }
+                        let count = stream.read(&bytes, maxLength: bytes.count)
+                        guard count >= 0 else { throw stream.streamError ?? self.transferError("Не удалось прочитать файл") }
+                        if count == 0 { break }
+                        let data = Data(bytes.prefix(count)).base64EncodedString()
+                        let reply = try self.fileReply(["t":"file-chunk", "id":id, "offset":offset, "data":data], link: active, id: id)
+                        offset += Int64(count); sent += Int64(count)
+                        guard J.i64(reply, "offset", -1) == offset else { throw self.transferError("Неверное подтверждение Server") }
+                        let percent = Int(sent * 100 / max(1, total))
+                        self.q.async { if !self.transferCancelled.value { self.ui { $0.fileTransferText = "Send \(percent)%" } } }
+                    }
+                    guard offset == size else { throw self.transferError("Файл изменился во время передачи") }
+                    let end = try self.fileReply(["t":"file-end", "id":id], link: active, id: id)
+                    guard J.b(end, "complete") else { throw self.transferError("Server не сохранил файл") }
+                }
+            } catch {
+                failure = error.localizedDescription
+                self.q.sync { if let id = self.activeTransferID { active.send(["t":"file-cancel", "id":id]) } }
+            }
+        }
+    }
+    private func receiveAudio(_ o: [String: Any]) {
+        let id = J.s(o, "id"), type = J.s(o, "t")
+        do {
+            switch type {
+            case "file-start":
+                let size = J.i64(o, "size"), name = URL(fileURLWithPath: J.s(o, "name")).lastPathComponent
+                guard role == .server, phase == .paired, !calibRunning, incomingAudio == nil,
+                      UUID(uuidString: id) != nil, J.s(o, "token") == fileToken, !fileToken.isEmpty,
+                      size > 0, size <= 512 * 1024 * 1024, Self.audioExtensions.contains(URL(fileURLWithPath: name).pathExtension.lowercased()) else {
+                    throw transferError("Передача не поддерживается или файл некорректен")
+                }
+                let folder = FileManager.default.temporaryDirectory.appendingPathComponent("SoundFieldReceive", isDirectory: true)
+                try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+                let url = folder.appendingPathComponent(id + ".part")
+                guard FileManager.default.createFile(atPath: url.path, contents: nil) else { throw transferError("Не удалось создать файл") }
+                incomingAudio = IncomingAudio(id: id, name: name, size: size, url: url, handle: try FileHandle(forWritingTo: url))
+                ui { $0.fileTransferText = "Получение от Point · 0%" }
+                link?.send(["t":"file-ack", "id":id, "offset":0])
+            case "file-chunk":
+                guard var incoming = incomingAudio, incoming.id == id, J.i64(o, "offset", -1) == incoming.received,
+                      let bytes = Data(base64Encoded: J.s(o, "data")), !bytes.isEmpty, bytes.count <= 48 * 1024,
+                      incoming.received + Int64(bytes.count) <= incoming.size else { throw transferError("Нарушен порядок блоков файла") }
+                try incoming.handle.write(contentsOf: bytes); incoming.received += Int64(bytes.count); incomingAudio = incoming
+                ui { $0.fileTransferText = "Получение от Point · \(incoming.received * 100 / incoming.size)%" }
+                link?.send(["t":"file-ack", "id":id, "offset":incoming.received])
+            case "file-end":
+                guard let incoming = incomingAudio, incoming.id == id, incoming.received == incoming.size else { throw transferError("Файл передан не полностью") }
+                try incoming.handle.close()
+                let directory = incoming.url.deletingLastPathComponent().appendingPathComponent(incoming.id, isDirectory: true)
+                try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+                let target = directory.appendingPathComponent(incoming.name)
+                try FileManager.default.moveItem(at: incoming.url, to: target); incomingAudio = nil
+                addAudioFiles([target], deleteAfterImport: [target])
+                ui { $0.fileTransferText = "" }
+                link?.send(["t":"file-ack", "id":id, "offset":incoming.size, "complete":true])
+            case "file-cancel":
+                if let incoming = incomingAudio, incoming.id == id {
+                    try? incoming.handle.close(); try? FileManager.default.removeItem(at: incoming.url); incomingAudio = nil
+                    ui { $0.fileTransferText = "" }
+                }
+            default: break
+            }
+        } catch {
+            if let incoming = incomingAudio, incoming.id == id {
+                try? incoming.handle.close(); try? FileManager.default.removeItem(at: incoming.url); incomingAudio = nil
+                ui { $0.fileTransferText = "" }
+            }
+            link?.send(["t":"file-error", "id":id, "message":error.localizedDescription])
         }
     }
 
