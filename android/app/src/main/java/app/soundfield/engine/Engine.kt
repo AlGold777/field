@@ -1864,7 +1864,7 @@ class Engine private constructor(private val app: Context) {
     }
 
     /** Decode picked files (or all audio files under a picked folder), then add them to the Server queue. */
-    fun addAudioFiles(uris: List<Uri>, deleteIfImportFails: List<File> = emptyList()) {
+    fun addAudioFiles(uris: List<Uri>, deleteIfImportFails: List<File> = emptyList(), displayNames: Map<Uri, String> = emptyMap()) {
         if (uris.isEmpty()) return
         post {
             if (calibRunning || (!soloMode && phase !in setOf(Phase.PAIRED, Phase.RECONNECTING))) {
@@ -1884,7 +1884,7 @@ class Engine private constructor(private val app: Context) {
                 uris.forEach { persistReadGrant(it) }   // доступ сохраняется после перезапуска — нужен для плейлистов
                 uris.forEach { uri ->
                     if (isAudioDirectory(uri)) candidates += listAudioDocuments(uri)
-                    else candidates += uri to displayName(uri)
+                    else candidates += uri to (displayNames[uri] ?: displayName(uri))
                 }
                 val prepared = candidates.mapNotNull { (uri, name) ->
                     try { AudioFileDecoder.prepare(app, uri, name) }
@@ -2166,7 +2166,8 @@ class Engine private constructor(private val app: Context) {
             transferLastProgressAtMs = 0L
             ui { copy(fileTransferText = "Подготовка аудиофайла…") }
             link?.send(JSONObject().put("t", "file-ack").put("id", id).put("offset", transfer.size).put("complete", true))
-            addAudioFiles(listOf(Uri.fromFile(target)), deleteIfImportFails = listOf(target))
+            val receivedUri = Uri.fromFile(target)
+            addAudioFiles(listOf(receivedUri), deleteIfImportFails = listOf(target), displayNames = mapOf(receivedUri to transfer.name))
         } catch (e: Exception) {
             abortIncomingFileTransfer(e.message ?: "ошибка завершения")
             sendFileError(id, e.message ?: "Не удалось завершить передачу")
