@@ -218,6 +218,7 @@ class Engine private constructor(private val app: Context) {
     private var hasImportedQueue = false
     private var pendingTrackId: String? = null
     private var pendingShouldPlay = false
+    private var pendingStartFrame = 0L
     @Volatile private var trackLoadGeneration = 0L
     private var currentQueueSource: AudioSource? = null
     @Volatile private var decodeProgress: Float? = null
@@ -1444,7 +1445,7 @@ class Engine private constructor(private val app: Context) {
         }
     }
 
-    private fun startSoloPlayback(frame: Long = 0L, playing: Boolean = false) {
+    private fun startSoloPlayback(frame: Long = 0L, playing: Boolean = false, reloadInterrupted: Boolean = false) {
         soloMode = true
         role = Role.SERVER
         negotiatedCapabilities = emptySet()
@@ -1477,6 +1478,13 @@ class Engine private constructor(private val app: Context) {
         telemetry.record("EQ_ROUTE_PROFILE", mapOf("route" to audio.routeLabel(), "applied" to true))
         later(350) { if (soloMode) applySoloEqRoute(audio.routeKey(), savePrevious = true) }
         PlaybackService.refresh(app)
+        val item = queue.getOrNull(queueIndex)
+        if (reloadInterrupted && item != null && currentQueueSource is app.soundfield.core.SegmentedPcmSource &&
+            !File(AudioFileDecoder.pcmFile(app, item.ref()), "complete").isFile) {
+            // Becoming Point cancels the local decoder and removes its incomplete PCM directory.
+            currentQueueSource = null; decodedTracks.remove(item.id)
+            selectTrack(queueIndex, forcePaused = !playing, startPlayback = playing, startFrame = frame)
+        }
     }
 
     private fun stopSoloPlayback() {
@@ -3394,7 +3402,7 @@ class Engine private constructor(private val app: Context) {
             loadingTracks = false, loadingTrackId = null, serverDiag = Diag(), pointDiag = Diag()) }
         telemetry.record("PAIR_TO_SOLO", mapOf("fromRole" to leavingRole.name.lowercase(), "resumedPlaying" to resumePlaying,
             "positionMs" to resumeFrame * 1000 / SF.SAMPLE_RATE))
-        startSoloPlayback(resumeFrame, resumePlaying)
+        startSoloPlayback(resumeFrame, resumePlaying, reloadInterrupted = leavingRole == Role.POINT)
         toast(reason)
     }
 
@@ -4332,7 +4340,7 @@ class Engine private constructor(private val app: Context) {
 
     private fun navigationIndex(): Int = queue.indexOfFirst { it.id == pendingTrackId }.takeIf { it >= 0 } ?: queueIndex
 
-    private fun selectTrack(index: Int, forcePaused: Boolean = false, startPlayback: Boolean = false) {
+    private fun selectTrack(index: Int, forcePaused: Boolean = false, startPlayback: Boolean = false, startFrame: Long = 0L) {
         if (calibRunning || (!soloMode && phase !in setOf(Phase.PAIRED, Phase.RECONNECTING)) || index !in queue.indices) return
         val item = queue[index]
         if (queueIndex == index && pendingTrackId == null && currentQueueSource != null) {
@@ -4340,6 +4348,7 @@ class Engine private constructor(private val app: Context) {
             return
         }
         pendingShouldPlay = !forcePaused && (startPlayback || serverPlay.timeline.running)
+        pendingStartFrame = startFrame.coerceAtLeast(0L)
         clearProgressiveBufferState()
         val generation = ++trackLoadGeneration
         pendingTrackId = item.id
@@ -4356,7 +4365,7 @@ class Engine private constructor(private val app: Context) {
                 onProgress = { progressSource ->
                     val value = progressSource.progress()
                     post {
-                        if (generation == trackLoadGeneration &&
+                        if (role == Role.SERVER && generation == trackLoadGeneration &&
                             (currentQueueSource === progressSource || pendingTrackId == item.id)) {
                             decodeProgress = value
                             ui { copy(decodingProgress = value) }
@@ -4365,7 +4374,7 @@ class Engine private constructor(private val app: Context) {
                     }
                 })
             post {
-                if (generation != trackLoadGeneration) return@post
+                if (role != Role.SERVER || generation != trackLoadGeneration) return@post
                 if (loaded != null) {
                     decodedTracks[item.id] = loaded
                     if (initialSource == null) activateLoadedTrack(item, generation, loaded)
@@ -4412,7 +4421,7 @@ class Engine private constructor(private val app: Context) {
         ui { copy(loadingTracks = false, loadingTrackId = null, queueIndex = queueIndex, decodingProgress = decodeProgress) }
         val now = System.nanoTime()
         cancelScheduledPause()
-        newEpoch(pendingShouldPlay, 0, if (pendingShouldPlay) now + SF.START_DELAY_NS else now)
+        newEpoch(pendingShouldPlay, pendingStartFrame.coerceAtMost(loaded.totalFrames), if (pendingShouldPlay) now + SF.START_DELAY_NS else now)
         prefetchAround(index)
     }
 
