@@ -128,6 +128,8 @@ struct QueueTrackUi: Identifiable, Equatable {
     let artist: String
 }
 
+struct PlaylistInfo: Identifiable, Equatable { let id: String; let name: String; let count: Int }
+
 struct UiState: Equatable {
     var myId = ""
     var myName = ""
@@ -155,6 +157,8 @@ struct UiState: Equatable {
     var audioMissing = false
     var audioBuffering = false
     var queueExpanded = false
+    var undoText = ""
+    var playlists: [PlaylistInfo] = []
     var filePickerRequest = 0
     var mode: SourceMode = .music
     var volL: Float = 1

@@ -13,6 +13,14 @@ struct PlayerView: View {
     @State private var dragging: Double? = nil
     @State private var confirmDisconnect = false
     @State private var showConnectChooser = false
+    @State private var selectingTracks = false
+    @State private var selectedTracks = Set<String>()
+    @State private var showPlaylists = false
+    @State private var showPlaylistName = false
+    @State private var playlistName = ""
+    @State private var editingPlaylist: PlaylistInfo?
+    @State private var playlistToOpen: PlaylistInfo?
+    @State private var playlistToDelete: PlaylistInfo?
     @State private var master = 0.8
     @State private var balance = 0.5
     @State private var balanceDragging = false
@@ -184,6 +192,7 @@ struct PlayerView: View {
                 DispatchQueue.main.async { showingAudioBrowser = true }
             }
         }
+        .sheet(isPresented: $showPlaylists) { playlistsView }
         .sheet(isPresented: $showingAudioBrowser) {
             if let root = audioBrowserRoot {
                 AudioBrowserView(root: root, onChangeRoot: {
@@ -333,65 +342,122 @@ struct PlayerView: View {
     }
 
     private var queueSection: some View {
-        VStack(spacing: 0) {
-            HStack {
-                Spacer()
-                Button { engine.requestTrackPicker() } label: {
-                    Image(systemName: "text.badge.plus").frame(width: 40, height: 40)
-                }.accessibilityLabel("Добавить музыку")
-            }
-            Button { queueExpanded.toggle() } label: {
-                HStack {
-                    Text("Очередь · \(ui.queueTracks.count) треков")
-                        .font(.system(size: 13, weight: .semibold)).tracking(1).foregroundColor(SFColor.dim)
-                    Spacer()
-                    Image(systemName: queueExpanded ? "chevron.up" : "chevron.down")
-                        .font(.system(size: 14, weight: .semibold)).foregroundColor(SFColor.text)
+        VStack(spacing: 8) {
+            HStack(spacing: 4) {
+                Button { queueExpanded.toggle() } label: {
+                    HStack(spacing: 5) {
+                        Text("ОЧЕРЕДЬ · \(ui.queueTracks.count)").font(.system(size: 12, weight: .semibold)).tracking(1)
+                        Image(systemName: queueExpanded ? "chevron.up" : "chevron.down").font(.system(size: 11))
+                    }.foregroundColor(SFColor.dim)
+                }.buttonStyle(.plain)
+                Spacer(minLength: 0)
+                queueIcon("text.badge.plus", "Добавить музыку") { engine.requestTrackPicker() }
+                queueIcon("checklist", "Выбрать треки", enabled: !ui.queueTracks.isEmpty) {
+                    selectingTracks.toggle(); selectedTracks.removeAll(); if selectingTracks { queueExpanded = true }
                 }
-                .contentShape(Rectangle()).padding(.vertical, 6)
+                queueIcon("music.note.list", "Плейлисты", enabled: ui.role == .server) { showPlaylists = true }
             }
-            .buttonStyle(.plain)
             if queueExpanded {
                 if ui.queueTracks.isEmpty {
-                    Text("Список появится после добавления музыки на Server")
-                        .font(.system(size: 14)).foregroundColor(SFColor.dim).frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(.top, 8)
+                    Text("Добавьте музыку значком в меню очереди").font(.system(size: 13)).foregroundColor(SFColor.dim)
+                        .frame(maxWidth: .infinity, alignment: .leading)
                 } else {
-                    ScrollView(.vertical) {
-                        VStack(spacing: 2) {
-                            ForEach(ui.queueTracks.indices, id: \.self) { index in
-                                let track = ui.queueTracks[index]
-                                let selected = index == ui.queueIndex || track.id == ui.loadingTrackId
-                                Button { engine.selectQueueTrack(track.id) } label: {
-                                    HStack(spacing: 10) {
-                                        Text("\(index + 1).").font(.system(size: 13)).foregroundColor(SFColor.dim).frame(width: 28, alignment: .leading)
-                                        VStack(alignment: .leading, spacing: 3) {
-                                            Text(track.title).font(.system(size: 14, weight: selected ? .semibold : .regular))
-                                                .foregroundColor(selected ? SFColor.accent1 : SFColor.text).lineLimit(1)
-                                            if !track.artist.isEmpty { Text(track.artist).font(.system(size: 12)).foregroundColor(SFColor.dim).lineLimit(1) }
-                                        }
-                                        Spacer(minLength: 4)
-                                        if selected {
-                                            if track.id == ui.loadingTrackId { ProgressView().tint(SFColor.accent1) }
-                                            else { Image(systemName: "music.note").foregroundColor(SFColor.accent1) }
-                                        }
+                    ScrollView {
+                        LazyVStack(spacing: 2) {
+                            ForEach(Array(ui.queueTracks.enumerated()), id: \.element.id) { index, track in
+                                let current = index == ui.queueIndex || track.id == ui.loadingTrackId
+                                HStack(spacing: 8) {
+                                    Button {
+                                        if selectingTracks {
+                                            if selectedTracks.contains(track.id) { selectedTracks.remove(track.id) }
+                                            else { selectedTracks.insert(track.id) }
+                                        } else { engine.selectQueueTrack(track.id) }
+                                    } label: {
+                                        HStack {
+                                            if selectingTracks {
+                                                Image(systemName: selectedTracks.contains(track.id) ? "checkmark.circle.fill" : "circle").foregroundColor(SFColor.accent1)
+                                            } else { Text("\(index + 1).").foregroundColor(SFColor.dim).frame(width: 25) }
+                                            Text(track.title).lineLimit(1)
+                                            if !track.artist.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                                                Text("· \(track.artist)").foregroundColor(SFColor.dim).lineLimit(1)
+                                            }
+                                            Spacer(minLength: 0)
+                                            if current { Image(systemName: "music.note").foregroundColor(SFColor.accent1) }
+                                        }.frame(maxWidth: .infinity, alignment: .leading)
+                                    }.buttonStyle(.plain).disabled(ui.loadingTracks && !selectingTracks)
+                                    if selectingTracks {
+                                        Button { engine.removeTracks([track.id]) } label: { Image(systemName: "xmark").foregroundColor(.red) }
+                                            .accessibilityLabel("Удалить \(track.title)")
                                     }
-                                    .padding(.horizontal, 8).padding(.vertical, 9)
-                                    .background(selected ? SFColor.accent1.opacity(0.16) : .clear)
-                                    .clipShape(RoundedRectangle(cornerRadius: 9))
-                                }
-                                .buttonStyle(.plain).disabled(ui.loadingTracks)
+                                }.font(.system(size: 12)).padding(9)
+                                    .background(current ? SFColor.accent1.opacity(0.16) : .clear, in: RoundedRectangle(cornerRadius: 9))
                             }
                         }
-                    }
-                    .frame(maxHeight: 260).padding(.top, 6)
+                    }.frame(maxHeight: 230)
+                }
+                if selectingTracks {
+                    HStack {
+                        Button("Отмена") { selectingTracks = false; selectedTracks.removeAll() }
+                        Button(selectedTracks.count == ui.queueTracks.count ? "Снять все" : "Выбрать все") {
+                            selectedTracks = selectedTracks.count == ui.queueTracks.count ? [] : Set(ui.queueTracks.map(\.id))
+                        }
+                        Spacer(minLength: 0)
+                        Button("Удалить (\(selectedTracks.count))", role: .destructive) {
+                            engine.removeTracks(selectedTracks); selectedTracks.removeAll(); selectingTracks = false
+                        }.disabled(selectedTracks.isEmpty)
+                    }.font(.system(size: 11))
                 }
             }
-        }
-        .padding(18).frame(maxWidth: .infinity, alignment: .leading)
-        .background(SFColor.card, in: RoundedRectangle(cornerRadius: 16))
-        .overlay(RoundedRectangle(cornerRadius: 16).stroke(SFColor.cardBorder, lineWidth: 1))
-        .padding(.bottom, 16)
+            if !ui.undoText.isEmpty {
+                HStack {
+                    Text(ui.undoText).font(.system(size: 11)).foregroundColor(SFColor.dim).lineLimit(1)
+                    Spacer(); Button("Вернуть") { engine.undoRemove() }.font(.system(size: 12))
+                }
+            }
+        }.padding(14).frame(maxWidth: .infinity, alignment: .leading)
+            .background(SFColor.card, in: RoundedRectangle(cornerRadius: 16))
+            .overlay(RoundedRectangle(cornerRadius: 16).stroke(SFColor.cardBorder, lineWidth: 1)).padding(.bottom, 16)
+            .onChange(of: ui.queueTracks) { tracks in selectedTracks.formIntersection(Set(tracks.map(\.id))) }
+    }
+    private func queueIcon(_ symbol: String, _ label: String, enabled: Bool = true, action: @escaping () -> Void) -> some View {
+        Button(action: action) { Image(systemName: symbol).frame(width: 35, height: 35) }
+            .buttonStyle(.plain).accessibilityLabel(label).disabled(!enabled)
+    }
+    private var playlistsView: some View {
+        NavigationStack {
+            List {
+                Button("Сохранить текущую очередь…") { playlistName = ""; editingPlaylist = nil; showPlaylistName = true }
+                    .disabled(ui.queueTracks.isEmpty)
+                ForEach(ui.playlists) { playlist in
+                    Button { playlistToOpen = playlist } label: {
+                        HStack { Text(playlist.name); Spacer(); Text("\(playlist.count)").foregroundColor(SFColor.dim) }
+                    }.contextMenu {
+                        Button("Переименовать") { editingPlaylist = playlist; playlistName = playlist.name; showPlaylistName = true }
+                        Button("Удалить", role: .destructive) { playlistToDelete = playlist }
+                    }
+                }
+            }.navigationTitle("Плейлисты").navigationBarTitleDisplayMode(.inline)
+                .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Закрыть") { showPlaylists = false } } }
+                .alert(editingPlaylist == nil ? "Новый плейлист" : "Переименовать плейлист", isPresented: $showPlaylistName) {
+                    TextField("Название", text: $playlistName)
+                    Button("Отмена", role: .cancel) {}
+                    Button("Сохранить") {
+                        if let playlist = editingPlaylist { engine.renamePlaylist(playlist.id, name: playlistName) }
+                        else { engine.savePlaylist(playlistName) }
+                    }.disabled(playlistName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                }
+                .confirmationDialog("Открыть плейлист", isPresented: Binding(get: { playlistToOpen != nil }, set: { if !$0 { playlistToOpen = nil } })) {
+                    if let playlist = playlistToOpen {
+                        Button("Добавить в конец") { engine.openPlaylist(playlist.id, append: true); showPlaylists = false }
+                        Button("Заменить очередь") { engine.openPlaylist(playlist.id, append: false); showPlaylists = false }
+                    }
+                    Button("Отмена", role: .cancel) {}
+                }
+                .alert("Удалить плейлист?", isPresented: Binding(get: { playlistToDelete != nil }, set: { if !$0 { playlistToDelete = nil } })) {
+                    Button("Отмена", role: .cancel) {}
+                    Button("Удалить", role: .destructive) { if let playlist = playlistToDelete { engine.deletePlaylist(playlist.id) } }
+                }
+        }.preferredColorScheme(.dark)
     }
 
     private var stage: some View {

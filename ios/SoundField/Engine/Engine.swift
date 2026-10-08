@@ -14,7 +14,7 @@ final class AppModel: ObservableObject {
 /// Потоки: q (serial) — всё состояние сессии; sf-udp — приём UDP; sf-tick — каждые 5 мс отправка аудио (Server)
 /// или PING/NACK (Point); аудиопоток — AudioOutput → ServerRenderer/PointRenderer.
 final class Engine {
-    private struct QueueEntry {
+    private struct QueueEntry: Codable {
         let id: String
         let fileURL: URL
         let title: String
@@ -168,13 +168,7 @@ final class Engine {
     // ================================================================== запуск
     func boot() {
         q.async { [self] in
-            if let support = try? FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask,
-                                                          appropriateFor: nil, create: true) {
-                let folder = support.appendingPathComponent("SoundField/AudioQueue", isDirectory: true)
-                if let files = try? FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil) {
-                    files.forEach { try? FileManager.default.removeItem(at: $0) }
-                }
-            }
+            refreshPlaylists()
             makeUdp()
             discovery = Discovery(queue: q, myId: myId)
             discovery.onLog = { [weak self] text in self?.log(text) }
@@ -750,7 +744,6 @@ final class Engine {
                     }
                     let firstImport = !self.hasImportedQueue
                     if firstImport {
-                        self.queue.forEach { try? FileManager.default.removeItem(at: $0.fileURL) }
                         self.queue.removeAll(); self.currentQueueSource = nil; self.queueIndex = -1; self.hasImportedQueue = true
                     }
                     self.queue.append(contentsOf: prepared.map { QueueEntry(id: $0.id, fileURL: $0.url, title: $0.title, artist: $0.artist) })
@@ -1329,7 +1322,7 @@ final class Engine {
     private func stateJson() -> [String: Any] {
         ["t": "state", "playing": playBox.value.timeline.playing, "durFrames": source.totalFrames,
          "title": source.title, "artist": source.artist, "mode": mode.rawValue,
-         "queueIndex": queueIndex, "queueCount": queue.count, "trackId": queue.indices.contains(queueIndex) ? queue[queueIndex].id : "",
+         "undo": state.undoText, "queueIndex": queueIndex, "queueCount": queue.count, "trackId": queue.indices.contains(queueIndex) ? queue[queueIndex].id : "",
          "volL": Double(volL), "volR": Double(volR), "master": Double(master), "balance": Double(balance),
          "pointGain": Double(pointGain), "gainLaw": 2, "peerGainLaw": peerGainLawReady ? 2 : 1,
          "levelTrimServerDb": Double(levelTrimServerDb), "levelTrimPointDb": Double(levelTrimPointDb),
@@ -1397,7 +1390,7 @@ final class Engine {
             s.audioBuffering = J.b(o, "audioBuffering")
             s.decodingProgress = decodingProgress
             s.title = J.s(o, "title"); s.artist = J.s(o, "artist"); s.mode = SourceMode(rawValue: J.s(o, "mode")) ?? .music
-            s.queueIndex = Int(J.i64(o, "queueIndex", -1))
+            s.queueIndex = Int(J.i64(o, "queueIndex", -1)); s.undoText = J.s(o, "undo")
             s.volL = vL; s.volR = vR; s.master = m; s.balance = b; s.pointChannel = pCh; s.trimMs = trim
             s.levelTrimServerDb = Float(J.d(o, "levelTrimServerDb")); s.levelTrimPointDb = Float(J.d(o, "levelTrimPointDb"))
             s.levelMeasureText = J.s(o, "levelMeasureText")
@@ -1427,6 +1420,8 @@ final class Engine {
         case "next": selectQueueTrack(at: navigationIndex + 1, startPlayback: true)
         case "previous": selectQueueTrack(at: navigationIndex - 1, startPlayback: true)
         case "select": selectQueueTrack(id: J.s(o, "id"))
+        case "remove": removeQueueTracks(Set(o["ids"] as? [String] ?? []))
+        case "undoRemove": undoQueueRemoval()
         case "vol":
             if mode == .levelMeasure { toast("Во время измерения общая громкость зафиксирована"); return }
             let v = Float(min(1, max(0, J.d(o, "v", 1))))
@@ -1559,7 +1554,7 @@ final class Engine {
         queueIo.async {
             let loaded = try? AudioFileDecoder.decode(PreparedAudioFile(id: item.id, url: item.fileURL, title: item.title, artist: item.artist))
             self.q.async {
-                guard self.trackLoadGeneration == generation, self.pendingTrackId == item.id, self.queue.indices.contains(index), self.queue[index].id == item.id,
+                guard self.trackLoadGeneration == generation, self.pendingTrackId == item.id, let index = self.queue.firstIndex(where: { $0.id == item.id }),
                       self.role == .server, !self.calibRunning else { return }
                 self.pendingTrackId = nil
                 guard let loaded else {
@@ -1827,4 +1822,111 @@ final class Engine {
         if role == .server { cmdPause() } else { link?.send(["t": "cmd", "a": "pause"]) }
         toast(reason)
     }
+    // Queue editing uses track IDs, including commands received from Point.
+    func removeTracks(_ ids: Set<String>) { cmd("remove", ["ids": Array(ids)]) }
+    func undoRemove() { cmd("undoRemove") }
+    private var removedTracks: [(Int, QueueEntry)] = []
+    private var undoGeneration = 0
+    private func removeQueueTracks(_ ids: Set<String>) {
+        guard !calibRunning else { return }
+        let removed = queue.enumerated().filter { ids.contains($0.element.id) }.map { ($0.offset, $0.element) }
+        guard !removed.isEmpty else { return }
+        let current = queue.indices.contains(queueIndex) ? queue[queueIndex].id : nil
+        let oldIndex = queueIndex, playing = playBox.value.timeline.playing
+        if let pendingTrackId, ids.contains(pendingTrackId) {
+            trackLoadGeneration += 1; self.pendingTrackId = nil
+            ui { $0.loadingTracks = false; $0.loadingTrackId = nil }
+        }
+        queue.removeAll { ids.contains($0.id) }; removedTracks = removed
+        if let current, !ids.contains(current) { queueIndex = queue.firstIndex { $0.id == current } ?? -1 }
+        else {
+            currentQueueSource = nil; queueIndex = -1
+            if queue.isEmpty { source = music; hasImportedQueue = false; newEpoch(false, 0, MonoClock.nowNs()) }
+            else {
+                let next = oldIndex - removed.filter { $0.0 < oldIndex }.count
+                selectQueueTrack(at: next < queue.count ? max(0, next) : 0, forcePaused: !playing || next >= queue.count, startPlayback: playing && next < queue.count)
+            }
+        }
+        undoGeneration += 1; let generation = undoGeneration
+        ui { $0.undoText = "Удалено треков: \(removed.count)" }
+        q.asyncAfter(deadline: .now() + 5) {
+            if self.undoGeneration == generation { self.removedTracks = []; self.ui { $0.undoText = "" }; self.publishState() }
+        }
+        publishQueue(); publishState()
+    }
+    private func undoQueueRemoval() {
+        guard !removedTracks.isEmpty else { return }
+        let current = queue.indices.contains(queueIndex) ? queue[queueIndex].id : nil
+        for (index, item) in removedTracks.sorted(by: { $0.0 < $1.0 }) { queue.insert(item, at: min(index, queue.count)) }
+        removedTracks = []; undoGeneration += 1; ui { $0.undoText = "" }
+        if let current { queueIndex = queue.firstIndex { $0.id == current } ?? -1 }
+        else { hasImportedQueue = true; selectQueueTrack(at: 0, forcePaused: true) }
+        publishQueue(); publishState()
+    }
+    private struct SavedPlaylist: Codable { let id: String; var name: String; var tracks: [QueueEntry] }
+    private var playlistsDirectory: URL {
+        let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        let folder = support.appendingPathComponent("SoundField/Playlists", isDirectory: true)
+        try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        return folder
+    }
+    private func savedPlaylists() -> [SavedPlaylist] {
+        let files = (try? FileManager.default.contentsOfDirectory(at: playlistsDirectory, includingPropertiesForKeys: nil)) ?? []
+        return files.filter { $0.pathExtension == "json" }.compactMap { url in
+            guard let data = try? Data(contentsOf: url) else { return nil }
+            return try? JSONDecoder().decode(SavedPlaylist.self, from: data)
+        }.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+    }
+    private func refreshPlaylists() {
+        let list = savedPlaylists().map { PlaylistInfo(id: $0.id, name: $0.name, count: $0.tracks.count) }
+        ui { $0.playlists = list }
+    }
+    func savePlaylist(_ name: String) {
+        q.async {
+            guard self.role == .server, !self.queue.isEmpty else { return }
+            let name = String(name.trimmingCharacters(in: .whitespacesAndNewlines).prefix(60))
+            guard !name.isEmpty else { return }
+            let playlist = SavedPlaylist(id: UUID().uuidString, name: name, tracks: self.queue)
+            do {
+                try JSONEncoder().encode(playlist).write(to: self.playlistsDirectory.appendingPathComponent(playlist.id + ".json"), options: .atomic)
+                self.refreshPlaylists(); self.toast("Плейлист сохранён")
+            } catch { self.toast("Не удалось сохранить плейлист") }
+        }
+    }
+    func openPlaylist(_ id: String, append: Bool) {
+        q.async {
+            guard self.role == .server, !self.calibRunning, let playlist = self.savedPlaylists().first(where: { $0.id == id }) else { return }
+            // A playlist can be appended repeatedly: queue identities remain unique.
+            let tracks = playlist.tracks.map { QueueEntry(id: UUID().uuidString, fileURL: $0.fileURL, title: $0.title, artist: $0.artist) }
+            self.trackLoadGeneration += 1; self.pendingTrackId = nil
+            self.ui { $0.loadingTracks = false; $0.loadingTrackId = nil }
+            self.removedTracks = []; self.undoGeneration += 1; self.ui { $0.undoText = "" }
+            if append { self.queue.append(contentsOf: tracks) }
+            else {
+                self.newEpoch(false, 0, MonoClock.nowNs()); self.queue = tracks
+                self.queueIndex = -1; self.currentQueueSource = nil
+            }
+            self.hasImportedQueue = !self.queue.isEmpty
+            self.publishQueue()
+            if self.queueIndex < 0 && !self.queue.isEmpty { self.selectQueueTrack(at: 0, forcePaused: true) }
+            self.publishState()
+        }
+    }
+    func renamePlaylist(_ id: String, name: String) {
+        q.async {
+            guard var playlist = self.savedPlaylists().first(where: { $0.id == id }) else { return }
+            let clean = String(name.trimmingCharacters(in: .whitespacesAndNewlines).prefix(60))
+            guard !clean.isEmpty else { return }; playlist.name = clean
+            do { try JSONEncoder().encode(playlist).write(to: self.playlistsDirectory.appendingPathComponent(id + ".json"), options: .atomic); self.refreshPlaylists() }
+            catch { self.toast("Не удалось переименовать плейлист") }
+        }
+    }
+    func deletePlaylist(_ id: String) {
+        q.async {
+            guard self.savedPlaylists().contains(where: { $0.id == id }) else { return }
+            do { try FileManager.default.removeItem(at: self.playlistsDirectory.appendingPathComponent(id + ".json")); self.refreshPlaylists() }
+            catch { self.toast("Не удалось удалить плейлист") }
+        }
+    }
+
 }
