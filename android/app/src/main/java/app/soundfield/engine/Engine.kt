@@ -1901,12 +1901,12 @@ class Engine private constructor(private val app: Context) {
                 post {
                     if (role != Role.SERVER || (!soloMode && phase !in setOf(Phase.PAIRED, Phase.RECONNECTING)) || calibRunning) {
                         deleteIfImportFails.forEach { it.delete() }
-                        ui { copy(loadingTracks = false, fileTransferText = "") }
+                        ui { copy(loadingTracks = false, fileTransferText = if (incomingFileTransfer == null && !fileTransferActive.get()) "" else fileTransferText) }
                         return@post
                     }
                     if (prepared.isEmpty()) {
                         deleteIfImportFails.forEach { it.delete() }
-                        ui { copy(loadingTracks = false, fileTransferText = "") }
+                        ui { copy(loadingTracks = false, fileTransferText = if (incomingFileTransfer == null && !fileTransferActive.get()) "" else fileTransferText) }
                         toast("Не удалось открыть аудиофайлы")
                         return@post
                     }
@@ -1919,7 +1919,8 @@ class Engine private constructor(private val app: Context) {
                         queueIndex = -1
                     }
                     queue.addAll(prepared.map { QueueItem(it.id, it.uri, it.title, it.artist) })
-                    ui { copy(fileTransferText = "") }
+                    // A later file in the same batch may already be arriving while this import finishes.
+                    ui { copy(fileTransferText = if (incomingFileTransfer == null && !fileTransferActive.get()) "" else fileTransferText) }
                     if (isFirstImport) releaseUnusedGrants()
                     val count = prepared.size
                     val failedCount = candidates.size - count
