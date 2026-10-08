@@ -1,6 +1,8 @@
 package app.soundfield.ui
 
 import android.Manifest
+import android.content.Intent
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.widget.Toast
@@ -65,13 +67,17 @@ fun AppRoot(engine: Engine) {
         if (!granted)
             Toast.makeText(ctx, "Без микрофона доступна только ручная калибровка", Toast.LENGTH_LONG).show()
     }
-    val audioFilesLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
-        if (uris.isNotEmpty()) engine.addAudioFiles(uris)
+    val browserPrefs = remember { ctx.getSharedPreferences("soundfield", android.content.Context.MODE_PRIVATE) }
+    var browserRoot by rememberSaveable { mutableStateOf(browserPrefs.getString("audioBrowserRoot", null)) }
+    var showAudioBrowser by rememberSaveable { mutableStateOf(false) }
+    val audioRootLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
+        if (uri != null) {
+            runCatching { ctx.contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION) }
+            browserPrefs.edit().putString("audioBrowserRoot", uri.toString()).apply()
+            browserRoot = uri.toString()
+            showAudioBrowser = true
+        }
     }
-    val audioFolderLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
-        if (uri != null) engine.addAudioFiles(listOf(uri))
-    }
-    var showAudioSourceDialog by rememberSaveable { mutableStateOf(false) }
     var handledPickerRequest by rememberSaveable { mutableIntStateOf(ui.filePickerRequest) }
     LaunchedEffect(Unit) {
         if (Build.VERSION.SDK_INT >= 33) notifLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
@@ -82,7 +88,10 @@ fun AppRoot(engine: Engine) {
     LaunchedEffect(ui.filePickerRequest) {
         if (ui.filePickerRequest > handledPickerRequest) {
             handledPickerRequest = ui.filePickerRequest
-            showAudioSourceDialog = true
+            val root = browserRoot?.let(Uri::parse)
+            if (root != null && ctx.contentResolver.persistedUriPermissions.any { it.uri == root && it.isReadPermission }) {
+                showAudioBrowser = true
+            } else audioRootLauncher.launch(root)
         }
     }
     LaunchedEffect(ui.showStabilitySettings) {
@@ -129,22 +138,12 @@ fun AppRoot(engine: Engine) {
         }
     }
     PairingDialogs(ui, engine)
-    if (showAudioSourceDialog) {
-        AlertDialog(
-            onDismissRequest = { showAudioSourceDialog = false },
-            title = { Text("Добавить музыку") },
-            text = { Text("Выберите отдельные аудиофайлы или папку. Файлы из папки будут добавлены в очередь по имени.") },
-            confirmButton = {
-                TextButton(onClick = { showAudioSourceDialog = false; audioFilesLauncher.launch(arrayOf("audio/*", "application/octet-stream")) }) {
-                    Text("Выбрать файлы")
-                }
-            },
-            dismissButton = {
-                Row {
-                    TextButton(onClick = { showAudioSourceDialog = false; audioFolderLauncher.launch(null) }) { Text("Выбрать папку") }
-                    TextButton(onClick = { showAudioSourceDialog = false }) { Text("Отмена") }
-                }
-            },
+    if (showAudioBrowser && browserRoot != null) {
+        AudioBrowserDialog(
+            root = Uri.parse(browserRoot),
+            onDismiss = { showAudioBrowser = false },
+            onChangeRoot = { showAudioBrowser = false; audioRootLauncher.launch(browserRoot?.let(Uri::parse)) },
+            onImport = { uris -> showAudioBrowser = false; engine.addAudioFiles(uris) },
         )
     }
 }

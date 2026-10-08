@@ -678,14 +678,16 @@ final class Engine {
             else { self.toast("Импорт файлов с Point доступен только при паре Android ↔ Android") }
         }
     }
-    func addAudioFiles(_ urls: [URL]) {
+    func addAudioFiles(_ urls: [URL], securityRoot: URL? = nil) {
         guard !urls.isEmpty else { return }
         q.async {
             guard self.role == .server, self.phase == .paired || self.phase == .reconnecting, !self.calibRunning else {
                 self.toast("Добавление музыки сейчас недоступно"); return
             }
             self.ui { $0.loadingTracks = true }
+            let rootAccess = securityRoot?.startAccessingSecurityScopedResource() ?? false
             self.queueIo.async {
+                defer { if rootAccess { securityRoot?.stopAccessingSecurityScopedResource() } }
                 var prepared: [PreparedAudioFile] = []
                 var failures = 0
                 for selection in urls {

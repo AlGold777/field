@@ -1880,7 +1880,7 @@ class Engine private constructor(private val app: Context) {
                 val candidates = mutableListOf<Pair<Uri, String>>()
                 uris.forEach { persistReadGrant(it) }   // доступ сохраняется после перезапуска — нужен для плейлистов
                 uris.forEach { uri ->
-                    if (DocumentsContract.isTreeUri(uri)) candidates += listAudioDocuments(uri)
+                    if (isAudioDirectory(uri)) candidates += listAudioDocuments(uri)
                     else candidates += uri to displayName(uri)
                 }
                 val prepared = candidates.mapNotNull { (uri, name) ->
@@ -1964,7 +1964,7 @@ class Engine private constructor(private val app: Context) {
             try {
                 val candidates = mutableListOf<Pair<Uri, String>>()
                 uris.forEach { uri ->
-                    if (DocumentsContract.isTreeUri(uri)) candidates += listAudioDocuments(uri)
+                    if (isAudioDirectory(uri)) candidates += listAudioDocuments(uri)
                     else candidates += uri to displayName(uri)
                 }
                 val files = candidates.map { (uri, name) ->
@@ -2191,10 +2191,15 @@ class Engine private constructor(private val app: Context) {
         return name?.takeIf { it.isNotBlank() } ?: uri.lastPathSegment ?: "Аудиофайл"
     }
 
+    private fun isAudioDirectory(uri: Uri): Boolean =
+        runCatching { app.contentResolver.getType(uri) == DocumentsContract.Document.MIME_TYPE_DIR }.getOrDefault(false) ||
+            (DocumentsContract.isTreeUri(uri) && !DocumentsContract.isDocumentUri(app, uri))
+
     private fun listAudioDocuments(tree: Uri): List<Pair<Uri, String>> {
         val result = mutableListOf<Pair<Uri, String>>()
         val visited = mutableSetOf<String>()
-        val root = try { DocumentsContract.getTreeDocumentId(tree) } catch (_: Exception) { return emptyList() }
+        val root = runCatching { DocumentsContract.getDocumentId(tree) }
+            .getOrElse { runCatching { DocumentsContract.getTreeDocumentId(tree) }.getOrNull() ?: return emptyList() }
         fun walk(parentId: String, depth: Int) {
             if (depth > 32 || !visited.add(parentId)) return
             val children = mutableListOf<Triple<String, String, String?>>()
@@ -4658,6 +4663,7 @@ class Engine private constructor(private val app: Context) {
      */
     private fun releaseUnusedGrants() {
         val used = HashSet<String>()
+        prefs.getString("audioBrowserRoot", null)?.let { used += it }
         queue.forEach { used += it.uri.toString() }
         removedBackup.forEach { used += it.second.uri.toString() }
         playlistDir.listFiles { f -> f.extension == "json" }.orEmpty().forEach { f ->

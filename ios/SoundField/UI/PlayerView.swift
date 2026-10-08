@@ -16,9 +16,9 @@ struct PlayerView: View {
     @State private var balanceDragging = false
     @State private var balanceWasInCenter = true
     @AppStorage("sf.queueExpanded") private var queueExpanded = false
-    @State private var showingAudioSourceDialog = false
     @State private var showingAudioImporter = false
-    @State private var importingFolder = false
+    @State private var audioBrowserRoot: URL? = AudioBrowserView.restoredRoot()
+    @State private var showingAudioBrowser = false
     private let timer = Timer.publish(every: 0.2, on: .main, in: .common).autoconnect()
 
     var body: some View {
@@ -175,21 +175,29 @@ struct PlayerView: View {
             syncVolumes()
         }
         .onChange(of: ui.filePickerRequest) { request in
-            if request > 0 { showingAudioSourceDialog = true }
+            if request > 0 {
+                if audioBrowserRoot != nil { showingAudioBrowser = true }
+                else { showingAudioImporter = true }
+            }
         }
         .onChange(of: queueExpanded) { expanded in engine.setQueueExpanded(expanded) }
-        .confirmationDialog("Добавить музыку", isPresented: $showingAudioSourceDialog, titleVisibility: .visible) {
-            Button("Выбрать файлы") { importingFolder = false; showingAudioImporter = true }
-            Button("Выбрать папку") { importingFolder = true; showingAudioImporter = true }
-            Button("Отмена", role: .cancel) {}
-        } message: {
-            Text("Файлы из папки будут добавлены в очередь по имени.")
+        .fileImporter(isPresented: $showingAudioImporter, allowedContentTypes: [.folder], allowsMultipleSelection: false) { result in
+            if case .success(let urls) = result, let root = urls.first {
+                let access = root.startAccessingSecurityScopedResource()
+                if let data = try? root.bookmarkData(options: [.minimalBookmark], includingResourceValuesForKeys: nil, relativeTo: nil) {
+                    UserDefaults.standard.set(data, forKey: "sf.audioBrowserRoot")
+                }
+                if access { root.stopAccessingSecurityScopedResource() }
+                audioBrowserRoot = root
+                DispatchQueue.main.async { showingAudioBrowser = true }
+            }
         }
-        // Один fileImporter на view: второй такой же модификатор SwiftUI игнорирует, и выбор файлов не открывался.
-        .fileImporter(isPresented: $showingAudioImporter,
-                      allowedContentTypes: importingFolder ? [.folder] : [.audio],
-                      allowsMultipleSelection: !importingFolder) { result in
-            if case .success(let urls) = result { engine.addAudioFiles(urls) }
+        .sheet(isPresented: $showingAudioBrowser) {
+            if let root = audioBrowserRoot {
+                AudioBrowserView(root: root, onChangeRoot: {
+                    DispatchQueue.main.async { showingAudioImporter = true }
+                }, onImport: { engine.addAudioFiles($0, securityRoot: root) })
+            }
         }
         .alert("Disconnect \((ui.peerName.isEmpty ? "Phone" : String(ui.peerName.prefix(7))))?", isPresented: $confirmDisconnect) {
             Button("No", role: .cancel) {}
@@ -357,5 +365,99 @@ struct PlayerView: View {
                 .frame(width: 54, height: 54).background(Circle().fill(SFColor.secondary))
         }
         .buttonStyle(PressStyle())
+    }
+}
+
+/// A single folder/file browser. No selected files means importing the folder being viewed.
+private struct AudioBrowserView: View {
+    let root: URL
+    let onChangeRoot: () -> Void
+    let onImport: ([URL]) -> Void
+    @Environment(\.dismiss) private var dismiss
+    @State private var path: [URL] = []
+    @State private var entries: [Entry] = []
+    @State private var selected = Set<URL>()
+    @State private var loading = false
+    @State private var error: String?
+    @State private var scoped = false
+    private var current: URL { path.last ?? root }
+    private struct Entry: Identifiable {
+        let url: URL
+        let directory: Bool
+        var id: URL { url }
+    }
+    var body: some View {
+        NavigationStack {
+            VStack(spacing: 0) {
+                HStack {
+                    Button("‹ Назад") { selected.removeAll(); path.removeLast() }.disabled(path.isEmpty)
+                    Spacer()
+                    Text(current.lastPathComponent).lineLimit(1)
+                }.padding()
+                if loading { ProgressView().frame(maxWidth: .infinity, maxHeight: .infinity) }
+                else if let error { Text(error).foregroundColor(SFColor.warn).padding().frame(maxHeight: .infinity) }
+                else {
+                    List(entries) { entry in
+                        Button {
+                            if entry.directory { selected.removeAll(); path.append(entry.url) }
+                            else if selected.contains(entry.url) { selected.remove(entry.url) }
+                            else { selected.insert(entry.url) }
+                        } label: {
+                            HStack {
+                                Image(systemName: entry.directory ? "folder" : selected.contains(entry.url) ? "checkmark.circle.fill" : "circle")
+                                    .foregroundColor(SFColor.accent1).frame(width: 26)
+                                Text(entry.url.lastPathComponent).foregroundColor(SFColor.text).lineLimit(2)
+                                Spacer()
+                                if entry.directory { Image(systemName: "chevron.right").foregroundColor(SFColor.dim) }
+                            }
+                        }.buttonStyle(.plain)
+                    }.listStyle(.plain)
+                    if entries.isEmpty { Text("В папке нет аудиофайлов").foregroundColor(SFColor.dim).padding() }
+                }
+                Button(selected.isEmpty ? "Добавить папку" : "Добавить (\(selected.count))") {
+                    onImport(selected.isEmpty ? [current] : entries.filter { selected.contains($0.url) }.map(\.url))
+                    dismiss()
+                }.buttonStyle(.borderedProminent).disabled(loading || error != nil).padding()
+            }
+            .navigationTitle("Добавить музыку").navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) { Button("Отмена") { dismiss() } }
+                ToolbarItem(placement: .primaryAction) { Button("Расположение") { dismiss(); onChangeRoot() } }
+            }
+            .task(id: current) { await load() }
+            .onAppear { scoped = root.startAccessingSecurityScopedResource() }
+            .onDisappear { if scoped { root.stopAccessingSecurityScopedResource(); scoped = false } }
+        }.preferredColorScheme(.dark)
+    }
+    @MainActor private func load() async {
+        loading = true; error = nil; entries = []; selected.removeAll()
+        let folder = current
+        let result = await Task.detached { () -> Result<[Entry], Error> in
+            Result {
+                let urls = try FileManager.default.contentsOfDirectory(at: folder,
+                    includingPropertiesForKeys: [.isDirectoryKey, .isRegularFileKey, .contentTypeKey], options: [.skipsHiddenFiles])
+                return urls.compactMap { url -> Entry? in
+                    guard let v = try? url.resourceValues(forKeys: [.isDirectoryKey, .isRegularFileKey, .contentTypeKey]) else { return nil }
+                    let dir = v.isDirectory == true
+                    guard dir || (v.isRegularFile == true && (v.contentType?.conforms(to: .audio) == true ||
+                        ["aac","aif","aiff","alac","amr","flac","m4a","m4b","mp3","oga","ogg","opus","wav","wave","weba","wma"].contains(url.pathExtension.lowercased()))) else { return nil }
+                    return Entry(url: url, directory: dir)
+                }.sorted { a, b in
+                    if a.directory != b.directory { return a.directory }
+                    return a.url.lastPathComponent.localizedStandardCompare(b.url.lastPathComponent) == .orderedAscending
+                }
+            }
+        }.value
+        guard !Task.isCancelled, folder == current else { return }
+        switch result {
+        case .success(let items): entries = items
+        case .failure: error = "Не удалось открыть папку. Выберите расположение заново."
+        }
+        loading = false
+    }
+    static func restoredRoot() -> URL? {
+        guard let data = UserDefaults.standard.data(forKey: "sf.audioBrowserRoot") else { return nil }
+        var stale = false
+        return try? URL(resolvingBookmarkData: data, options: [.withoutUI], relativeTo: nil, bookmarkDataIsStale: &stale)
     }
 }
