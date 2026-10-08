@@ -2990,11 +2990,10 @@ class Engine private constructor(private val app: Context) {
         val pid = o.optString("id"); val pname = o.optString("name", pid); val pplat = o.optString("platform", "?")
         when (o.optString("t")) {
             "invite" -> {
-                peerCapabilities = parsePeerCaps(o)
                 val advertised = parsePeerAddresses(o)
-                peerAddressSnapshot = advertised
                 if (phase == Phase.IDLE) stopAutoResume()   // новое приглашение важнее фонового восстановления
                 if (phase == Phase.IDLE && pending == null) {
+                    peerCapabilities = parsePeerCaps(o); peerAddressSnapshot = advertised
                     l.tag = "incoming"; pending = l
                     pendingPeer = Peer(pid, pname, pplat, l.remoteAddress, o.optInt("tcpPort", 0),
                         hosts = (listOf(l.remoteAddress) + advertised.mapNotNull { runCatching { InetAddress.getByName(it.ip) }.getOrNull() }).distinct(),
@@ -3009,6 +3008,7 @@ class Engine private constructor(private val app: Context) {
                 } else if (phase == Phase.INVITING && pendingPeer?.id == pid) {
                     // Встречные приглашения: уступает телефон с бо́льшим id (детерминированно на обеих сторонах).
                     if (CrossedConnectionPolicy.acceptInbound(myId, pid)) {
+                        peerCapabilities = parsePeerCaps(o); peerAddressSnapshot = advertised
                         pending?.let { it.tag = "dead"; it.close() }
                         l.tag = "incoming"; pending = l
                         pendingPeer = Peer(pid, pname, pplat, l.remoteAddress, o.optInt("tcpPort", 0),
@@ -3025,10 +3025,7 @@ class Engine private constructor(private val app: Context) {
                 }
             }
             "resume" -> {
-                peerCapabilities = parsePeerCaps(o)
                 val advertised = parsePeerAddresses(o)
-                peerAddressSnapshot = advertised
-                updatePeerAddressBook(advertised)
                 val rec = record
                 val ok = rec != null && rec.key == o.optString("key") && rec.peerId == pid &&
                     phase != Phase.INCOMING
@@ -3048,6 +3045,8 @@ class Engine private constructor(private val app: Context) {
                     !CrossedConnectionPolicy.acceptInbound(myId, pid)) {
                     l.tag = "dead"; l.sendAndClose(JSONObject().put("t", "reject").put("reason", "crossed")); return
                 }
+                peerCapabilities = parsePeerCaps(o); peerAddressSnapshot = advertised
+                updatePeerAddressBook(advertised)
                 // старое (возможно, «мёртвое») соединение заменяется новым
                 link?.let { old -> link = null; old.tag = "dead"; old.close() }
                 pending?.let { p -> pending = null; p.tag = "dead"; p.close() }
