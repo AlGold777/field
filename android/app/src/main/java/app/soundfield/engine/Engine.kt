@@ -3269,6 +3269,8 @@ class Engine private constructor(private val app: Context) {
         } else {
             sessionId = 0; serverUdp = null
             serverFileTransferToken = ""
+            removedBackup = emptyList(); undoText = ""; undoToken++
+            ui { copy(undoText = "") }
             if (!continuing) { clock.reset(); rx.reset(); tcpAudioBuffer.clear() }
             audio.playbackActive = rx.timeline.playing
             audio.source = pointRenderer
@@ -4034,6 +4036,7 @@ class Engine private constructor(private val app: Context) {
     }
 
     private fun publishState() {
+        if (role != Role.SERVER) return
         val s = stateJson()
         applyState(s)
         link?.send(s)

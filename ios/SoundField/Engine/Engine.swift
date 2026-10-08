@@ -1170,6 +1170,7 @@ final class Engine {
             publishQueue()
         } else {
             sessionId = 0; serverUdpBox.value = nil
+            removedTracks = []; undoGeneration += 1; ui { $0.undoText = "" }
             clock.reset(); rx.reset()
             audio.source = pointRenderer
         }
@@ -1220,6 +1221,7 @@ final class Engine {
         let fromServer = role == .server
         let frame = fromServer && mode == .music ? posFrame() : soloResumeFrame
         let playing = fromServer && mode == .music && playBox.value.timeline.playing
+        if !fromServer { removedTracks = []; undoGeneration += 1; ui { $0.undoText = "" } }
         trackLoadGeneration += 1
         reconnectTask?.cancel(); pendingTimeout?.cancel()
         if let l = link { link = nil; l.tag = "dead"; if sendBye { l.sendAndClose(["t": "bye"]) } else { l.close() } }
@@ -1408,6 +1410,7 @@ final class Engine {
     }
 
     private func publishState() {
+        guard role == .server else { return }
         let s = stateJson()
         applyState(s)
         link?.send(s)
