@@ -965,7 +965,7 @@ final class Engine {
 
     private func onFirstMessage(_ l: ControlLink, _ o: [String: Any]) {
         let pid = J.s(o, "id"), pname = J.s(o, "name", pid), pplat = J.s(o, "platform", "?")
-        peerCapabilities = Set(o["caps"] as? [String] ?? [])
+        l.peerCapabilities = Set(o["caps"] as? [String] ?? [])
         switch J.s(o, "t") {
         case "invite":
             if phase == .idle { stopAutoResume() }   // новое приглашение важнее фонового восстановления
@@ -1023,7 +1023,7 @@ final class Engine {
 
     private func onPendingMessage(_ l: ControlLink, _ o: [String: Any]) {
         let pid = J.s(o, "id"), pname = J.s(o, "name", pid), pplat = J.s(o, "platform", "?")
-        peerCapabilities = Set(o["caps"] as? [String] ?? [])
+        l.peerCapabilities = Set(o["caps"] as? [String] ?? [])
         switch J.s(o, "t") {
         case "accept":
             let hinted = Int(J.i64(o, "tcpPort"))
@@ -1087,6 +1087,7 @@ final class Engine {
 
     // ================================================================== пара
     private func becomePaired(_ l: ControlLink, _ r: Role, _ pid: String, _ pname: String, _ pplat: String, _ key: String, resumed: Bool) {
+        peerCapabilities = l.peerCapabilities
         serverFileToken = ""
         ui { $0.fileTransferAvailable = false }
         if soloMode {

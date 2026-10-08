@@ -9,6 +9,8 @@ final class ControlLink {
     var onMessage: ((ControlLink, [String: Any]) -> Void)?
     var onClosed: ((ControlLink) -> Void)?
     var tag = ""
+    // Handshake metadata belongs to this connection until Engine adopts it as the pair.
+    var peerCapabilities = Set<String>()
     private(set) var lastRx = Date()
     /// TCP-соединение установлено (для исходящих — после .ready).
     private(set) var ready = false
