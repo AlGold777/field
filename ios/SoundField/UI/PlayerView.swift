@@ -7,10 +7,12 @@ struct PlayerView: View {
     let engine: Engine
     let openCalibration: () -> Void
     let openDiagnostics: () -> Void
+    let openPairing: () -> Void
 
     @State private var pos: Int64 = 0
     @State private var dragging: Double? = nil
     @State private var confirmDisconnect = false
+    @State private var showConnectChooser = false
     @State private var master = 0.8
     @State private var balance = 0.5
     @State private var balanceDragging = false
@@ -24,32 +26,12 @@ struct PlayerView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 0) {
-                HStack {
-                    Button { confirmDisconnect = true } label: {
-                        if ui.phase == .reconnecting { StatusPill(text: "Reconnecting…", color: SFColor.warn) }
-                        else { StatusPill(text: "Active", color: SFColor.good) }
-                    }
-                    .buttonStyle(.plain)
-                    .frame(width: 104, height: 36)
-                    Spacer()
-                    Badge(text: ui.role == .server ? "Server" : "Point", color: SFColor.master)
-                        .frame(width: 76, height: 32)
-                }
+                topControls
+                Color.clear.frame(height: 24)
 
                 stage
 
-                syncIndicator.padding(.bottom, 20)
-
-                if ui.mode != .music {
-                    SFCard {
-                        Text(ui.mode == .metronome ? "🥁 Метроном для ручной подстройки"
-                             : ui.mode == .lrtest ? "🔈 Проверка каналов: сначала L, потом R"
-                             : ui.mode == .level ? "Уровень: L и R звучат по очереди"
-                             : ui.mode == .center ? "Проверка центра"
-                             : ui.mode == .levelMeasure ? "Экспериментальное измерение микрофонами" : "🎯 Идёт калибровка")
-                            .font(.system(size: 15, weight: .semibold)).foregroundColor(SFColor.warn)
-                    }
-                }
+                syncIndicator.opacity(ui.soloMode ? 0 : 1).allowsHitTesting(!ui.soloMode).padding(.bottom, 20)
 
                 trackStatusSlot
 
@@ -109,6 +91,7 @@ struct PlayerView: View {
                               enabled: ui.mode != .levelMeasure,
                               onEditingEnded: { engine.setVolume("M", Float(master), finished: true) })
                         .onChange(of: master) { if abs($0 - Double(ui.master)) > 0.004 { engine.setVolume("M", Float($0), finished: false) } }
+                    if !ui.soloMode {
                     HStack {
                         Text("Баланс между телефонами").font(.system(size: 14)).foregroundColor(SFColor.dim)
                         Spacer()
@@ -149,10 +132,11 @@ struct PlayerView: View {
                         .accessibilityValue("Баланс: \(balanceLabel(balance))")
                         Text("R").font(.system(size: 13, weight: .semibold)).foregroundColor(SFColor.rightText)
                     }
+                    }
                 }
 
                 HStack(spacing: 8) {
-                    PlayerActionButton(title: "Калибровка", action: openCalibration)
+                    if !ui.soloMode { PlayerActionButton(title: "Калибровка", action: openCalibration) }
                     PlayerActionButton(title: "Диагностика", action: openDiagnostics)
                     ShareLink(item: telemetrySnapshot) {
                         TelemetryGlyph().frame(width: 23, height: 23)
@@ -166,6 +150,14 @@ struct PlayerView: View {
                 .padding(.bottom, 12)
             }
             .padding(.horizontal, 20).padding(.vertical, 24)
+        }
+        .overlay {
+            if showConnectChooser {
+                ZStack {
+                    Color.black.opacity(0.65).ignoresSafeArea().onTapGesture { showConnectChooser = false }
+                    connectChooser
+                }
+            }
         }
         .onReceive(timer) { _ in pos = engine.positionMs() }
         .onAppear { syncVolumes(); engine.setQueueExpanded(queueExpanded) }
@@ -203,6 +195,73 @@ struct PlayerView: View {
             Button("No", role: .cancel) {}
             Button("Yes", role: .destructive) { engine.disconnect() }
         }
+    }
+
+    private func connectAction() {
+        if ui.inPair { confirmDisconnect = true }
+        else if ui.remembered != nil { engine.resumeRemembered() }
+        else { showConnectChooser = true }
+    }
+
+    private var topControls: some View {
+        HStack {
+            StatusPill(text: ui.soloMode ? "Connect" : ui.phase == .reconnecting ? "Reconnecting…" : "Active",
+                       color: ui.soloMode ? SFColor.accent1 : ui.phase == .reconnecting ? SFColor.warn : SFColor.good)
+                .frame(width: 104, height: 36).contentShape(Rectangle())
+                .onTapGesture { connectAction() }
+                .onLongPressGesture(minimumDuration: 0.5) { if ui.soloMode { showConnectChooser = true } }
+                .highPriorityGesture(DragGesture(minimumDistance: 12).onEnded { drag in
+                    if ui.soloMode && drag.translation.height >= 32 && drag.translation.height > abs(drag.translation.width) {
+                        showConnectChooser = true
+                    }
+                })
+                .accessibilityAddTraits(.isButton).accessibilityAction { connectAction() }
+            Spacer()
+            Badge(text: ui.soloMode ? "Solo" : ui.role.title, color: ui.soloMode ? SFColor.accent1 : SFColor.master)
+                .frame(width: 76, height: 32).contentShape(Rectangle())
+                .onLongPressGesture(minimumDuration: 0.5) {
+                    if ui.soloMode && ui.remembered == nil { showConnectChooser = true }
+                    else { engine.toggleSoloMode() }
+                }
+                .accessibilityAddTraits(.isButton)
+                .accessibilityAction(named: Text(ui.soloMode ? "Восстановить пару" : "Включить Solo")) {
+                    if ui.soloMode && ui.remembered == nil { showConnectChooser = true }
+                    else { engine.toggleSoloMode() }
+                }
+        }.frame(height: 48)
+    }
+
+    private var connectChooser: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Connect").font(.system(size: 16, weight: .bold))
+            if let remembered = ui.remembered {
+                Text("Последний телефон").font(.system(size: 9)).foregroundColor(SFColor.dim)
+                HStack { Spacer(); phoneTile(remembered.peerName) { showConnectChooser = false; engine.resumeRemembered() }; Spacer() }
+            }
+            Text("Доступные телефоны").font(.system(size: 9)).foregroundColor(SFColor.dim)
+            let nearby = ui.nearby.filter { $0.id != ui.remembered?.peerId }
+            if nearby.isEmpty {
+                HStack { ProgressView(); Text("Ищем телефоны…").font(.system(size: 13)) }.padding(.vertical, 12)
+            } else {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(alignment: .top, spacing: 8) {
+                        ForEach(nearby) { peer in phoneTile(peer.name) { showConnectChooser = false; engine.invite(peer) } }
+                    }
+                }
+            }
+        }.padding(12).frame(width: 280)
+            .background(Color(red: 0.098, green: 0.153, blue: 0.278), in: RoundedRectangle(cornerRadius: 20))
+            .overlay(RoundedRectangle(cornerRadius: 20).stroke(SFColor.cardBorder, lineWidth: 1))
+    }
+
+    private func phoneTile(_ name: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            VStack(spacing: 4) {
+                Image(systemName: "iphone").font(.system(size: 44, weight: .ultraLight)).foregroundStyle(SFColor.accent)
+                    .frame(width: 42, height: 58)
+                Text(name).font(.system(size: 11)).lineLimit(2).multilineTextAlignment(.center).foregroundColor(SFColor.text)
+            }.frame(width: 72)
+        }.buttonStyle(.plain)
     }
 
     private func syncVolumes() {
@@ -248,6 +307,16 @@ struct PlayerView: View {
     }
 
     private var trackStatusText: String {
+        if ui.mode != .music {
+            switch ui.mode {
+            case .metronome: return "🥁 Метроном для ручной подстройки"
+            case .lrtest: return "🔈 Проверка каналов: сначала L, потом R"
+            case .level: return "Уровень: L и R звучат по очереди"
+            case .center: return "Проверка центра"
+            case .levelMeasure: return "Измерение микрофонами"
+            default: return "🎯 Идёт калибровка"
+            }
+        }
         if ui.loadingTracks { return "Подготовка аудиофайла…" }
         if ui.audioBuffering { return "Буферизация аудио…" }
         if let progress = ui.decodingProgress { return "Подготовка аудиофайла… \(Int(progress * 100))%" }
@@ -330,9 +399,9 @@ struct PlayerView: View {
         let leftIsMe = ui.myChannel == Ch.L
         func role(_ ch: Int) -> String { ch == serverCh ? "Server" : "Point" }
         return HStack {
-            SpeakerCircle(label: "L", ch: Ch.L, playing: ui.playing, caption: leftIsMe ? "Этот телефон" : ui.peerName,
-                          sub: role(Ch.L), highlight: leftIsMe) { engine.swapChannels() }
-            Button { engine.swapChannels() } label: {
+            SpeakerCircle(label: "L", ch: Ch.L, playing: ui.playing, caption: ui.soloMode ? "MyPhone" : leftIsMe ? "Этот телефон" : ui.peerName,
+                          sub: ui.soloMode ? "" : role(Ch.L), highlight: ui.soloMode || leftIsMe) { if !ui.soloMode { engine.swapChannels() } }
+            Button { if !ui.soloMode { engine.swapChannels() } } label: {
                 Rectangle().fill(SFColor.accent).frame(width: 40, height: 2)
                     .frame(width: 48, height: 44)
                     .contentShape(Rectangle())
@@ -340,8 +409,8 @@ struct PlayerView: View {
             .buttonStyle(.plain)
             .offset(y: -20)
             .accessibilityLabel("Поменять каналы L и R")
-            SpeakerCircle(label: "R", ch: Ch.R, playing: ui.playing, caption: leftIsMe ? ui.peerName : "Этот телефон",
-                          sub: role(Ch.R), highlight: !leftIsMe) { engine.swapChannels() }
+            SpeakerCircle(label: "R", ch: Ch.R, playing: ui.playing, caption: ui.soloMode ? "MyPhone" : leftIsMe ? ui.peerName : "Этот телефон",
+                          sub: ui.soloMode ? "" : role(Ch.R), highlight: ui.soloMode || !leftIsMe) { if !ui.soloMode { engine.swapChannels() } }
         }
         .frame(maxWidth: .infinity).padding(.vertical, 28)
     }

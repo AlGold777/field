@@ -68,16 +68,5 @@ struct WelcomeView: View {
                   .padding(.top, 12).padding(.trailing, 20)
           }
         }
-        .alert("Подключение…", isPresented: .constant(ui.phase == .inviting)) {
-            Button("Отмена", role: .cancel) { engine.cancelInvite() }
-        } message: {
-            Text(ui.resuming ? "Восстанавливаем пару с «\(ui.invitingName)»…" : "Ждём ответа от «\(ui.invitingName)».")
-        }
-        .alert("Создать стереопару?", isPresented: .constant(ui.phase == .incoming)) {
-            Button("Принять") { engine.acceptIncoming() }
-            Button("Отклонить", role: .cancel) { engine.rejectIncoming() }
-        } message: {
-            Text("«\(ui.incomingName)» приглашает этот телефон в стереопару. Этот телефон станет Point и будет играть правый канал.")
-        }
     }
 }

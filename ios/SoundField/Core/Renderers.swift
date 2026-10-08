@@ -28,9 +28,24 @@ final class ServerRenderer: RenderSource {
         let src = st.source
         for i in 0..<n {
             let f = corrector.frame(i, n)
-            out[i] = f < tl.anchorFrame ? 0 : src.sample(f, st.channel)
+            out[i] = f < tl.anchorFrame ? 0 : st.channel == Ch.BOTH ? (src.sample(f, Ch.L) + src.sample(f, Ch.R)) * 0.5 : src.sample(f, st.channel)
         }
         ramp.apply(out, n, st.gain)
+    }
+    private let rightRamp = GainRamp()
+    func renderStereo(_ left: UnsafeMutablePointer<Float>, _ right: UnsafeMutablePointer<Float>, _ n: Int, _ presentLocalNs: Int64) {
+        let st = state(), tl = st.timeline
+        guard tl.playing else {
+            left.update(repeating: 0, count: n); right.update(repeating: 0, count: n)
+            corrector.reset(); ramp.apply(left, n, st.gain); rightRamp.apply(right, n, st.gain); return
+        }
+        corrector.plan(ideal: tl.frameAt(presentLocalNs), n: n)
+        for i in 0..<n {
+            let f = corrector.frame(i, n)
+            left[i] = f < tl.anchorFrame ? 0 : st.source.sample(f, st.channel == Ch.BOTH ? Ch.L : st.channel)
+            right[i] = f < tl.anchorFrame ? 0 : st.source.sample(f, st.channel == Ch.BOTH ? Ch.R : st.channel)
+        }
+        ramp.apply(left, n, st.gain); rightRamp.apply(right, n, st.gain)
     }
 }
 

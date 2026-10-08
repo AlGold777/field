@@ -1,6 +1,6 @@
 import AVFoundation
 
-/// Аудиовыход: AVAudioEngine + AVAudioSourceNode (моно, float, 48 кГц).
+/// Аудиовыход: AVAudioEngine + AVAudioSourceNode (стерео, float, 48 кГц).
 ///
 /// Момент выхода первого сэмпла блока из динамика:
 ///   present = hostTime(timestamp) + outputLatency
@@ -76,7 +76,7 @@ final class AudioOutput {
         guard !running else { return }
         Self.configurePlaybackSession()
         updateLatency()
-        let fmt = AVAudioFormat(standardFormatWithSampleRate: Double(SF.sampleRate), channels: 1)!
+        let fmt = AVAudioFormat(standardFormatWithSampleRate: Double(SF.sampleRate), channels: 2)!
         if node == nil {
             let src = sourceBox
             let lat = outLatencyNs
@@ -92,10 +92,12 @@ final class AudioOutput {
                     self?.underruns += 1
                     present = MonoClock.nowNs() + lat.value + 5_000_000
                 }
-                if let r = src.value { r.render(out, count, present) } else { out.update(repeating: 0, count: count) }
-                for k in 1..<max(1, bufs.count) {       // если формат вдруг многоканальный — копируем
-                    if let d = bufs[k].mData { memcpy(d, data, count * MemoryLayout<Float>.size) }
-                }
+                if bufs.count >= 2, let second = bufs[1].mData {
+                    let right = second.assumingMemoryBound(to: Float.self)
+                    if let r = src.value { r.renderStereo(out, right, count, present) }
+                    else { out.update(repeating: 0, count: count); right.update(repeating: 0, count: count) }
+                } else if let r = src.value { r.render(out, count, present) }
+                else { out.update(repeating: 0, count: count) }
                 return noErr
             }
             engine.attach(n)

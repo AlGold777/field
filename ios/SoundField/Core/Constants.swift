@@ -26,6 +26,7 @@ enum Role: String { case server, point
 enum Ch {
     static let L = 0
     static let R = 1
+    static let BOTH = 2
     static func name(_ c: Int) -> String { c == L ? "L" : "R" }
     static func parse(_ s: String?) -> Int { s == "L" ? L : R }
     static func other(_ c: Int) -> Int { 1 - c }

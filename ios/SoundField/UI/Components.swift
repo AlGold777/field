@@ -178,7 +178,7 @@ struct SpeakerCircle: View {
             }
             .onAppear { withAnimation(.easeInOut(duration: 0.52).repeatForever()) { pulse = true } }
             Text(caption).font(.system(size: 13, weight: .semibold)).foregroundColor(SFColor.text).lineLimit(1)
-            Text(sub).font(.system(size: 11)).foregroundColor(SFColor.dim)
+            Text(sub.isEmpty ? " " : sub).font(.system(size: 11)).foregroundColor(sub.isEmpty ? .clear : SFColor.dim).lineLimit(1)
         }
         .frame(width: 130)
     }

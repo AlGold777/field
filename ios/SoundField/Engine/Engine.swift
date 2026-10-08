@@ -41,6 +41,9 @@ final class Engine {
     private var pendingShouldPlay = false
     private var trackLoadGeneration = 0
     private var currentQueueSource: AudioSource?
+    private var soloMode = false
+    private var soloResumeFrame: Int64 = 0
+    private var soloHandoff: (frame: Int64, playing: Bool)?
     private var queueRevision = 0
     private var incomingQueueRevision = -1
     private var incomingQueueParts = 0
@@ -214,6 +217,7 @@ final class Engine {
             mon.start(queue: q)
             pathMonitor = mon
             log("Запуск: UDP \(udpBox.value?.port ?? 0)")
+            startSoloPlayback()
             if autoResume && record != nil { startAutoResume() }
         }
     }
@@ -259,7 +263,7 @@ final class Engine {
     private func onForeground() {
         discovery.ensureListening()
         ensureUdp()
-        if state.inPair { DispatchQueue.main.async { self.audio.ensureRunning() } }
+        if state.inPair || soloMode { DispatchQueue.main.async { self.audio.ensureRunning() } }
         switch phase {
         case .idle:
             if !discovery.browsing { discovery.startBrowse() }
@@ -377,6 +381,29 @@ final class Engine {
             self.ui { $0.myName = self.myName }
             self.link?.send(["t": "name", "name": self.myName])
         }
+    }
+
+    func toggleSoloMode() {
+        q.async {
+            if self.soloMode { self.doManualResume() }
+            else if self.phase == .paired || self.phase == .reconnecting {
+                self.setAutoResume(false); self.stopAutoResume()
+                self.goIdle(sendBye: true, reason: "Solo · локальный плеер")
+            }
+        }
+    }
+
+    private func startSoloPlayback(frame: Int64 = 0, playing: Bool = false) {
+        soloMode = true; role = .server; phase = .idle
+        mode = .music
+        source = queue.indices.contains(queueIndex) ? currentQueueSource ?? music : music
+        if defaults.object(forKey: "sf.soloMaster") != nil { master = defaults.float(forKey: "sf.soloMaster") }
+        balance = 0.5
+        audio.source = serverRenderer
+        ui { $0.soloMode = true; $0.role = .server; $0.phase = .idle }
+        newEpoch(playing, min(max(0, frame), source.totalFrames), MonoClock.nowNs())
+        publishQueue()
+        DispatchQueue.main.async { self.audio.start() }
     }
 
     func togglePlay() { cmd("toggle") }
@@ -681,7 +708,7 @@ final class Engine {
     func addAudioFiles(_ urls: [URL], securityRoot: URL? = nil) {
         guard !urls.isEmpty else { return }
         q.async {
-            guard self.role == .server, self.phase == .paired || self.phase == .reconnecting, !self.calibRunning else {
+            guard self.role == .server, self.soloMode || self.phase == .paired || self.phase == .reconnecting, !self.calibRunning else {
                 self.toast("Добавление музыки сейчас недоступно"); return
             }
             self.ui { $0.loadingTracks = true }
@@ -711,7 +738,7 @@ final class Engine {
                     }
                 }
                 self.q.async {
-                    guard self.role == .server, self.phase == .paired || self.phase == .reconnecting, !self.calibRunning else {
+                    guard self.role == .server, self.soloMode || self.phase == .paired || self.phase == .reconnecting, !self.calibRunning else {
                         prepared.forEach { try? FileManager.default.removeItem(at: $0.url) }
                         self.ui { $0.loadingTracks = false }
                         return
@@ -789,7 +816,7 @@ final class Engine {
         var o: [String: Any] = ["t": "cmd", "a": a]
         for (k, v) in extra { o[k] = v }
         q.async {
-            guard self.state.inPair else { return }
+            guard self.state.inPair || self.soloMode else { return }
             if self.role == .server { self.handleCmd(o) }
             else if let l = self.link { l.send(o) } else { self.toast("Нет связи с Server") }
         }
@@ -981,6 +1008,9 @@ final class Engine {
                 log("Отклонён resume от «\(pname)»: пара неизвестна")
                 l.tag = "dead"; l.sendAndClose(["t": "reject", "reason": "unknown"]); return
             }
+            if soloMode && playBox.value.timeline.playing && rec.role == .point && !manualResumeActive {
+                l.tag = "dead"; l.sendAndClose(["t": "busy"]); return
+            }
             // Встречные попытки восстановления: входящее принимает телефон с бо́льшим id (как для приглашений).
             // Отказываем, только если наше встречное соединение уже установлено (его примет второй телефон).
             // Если наше ещё «висит» (например, старый адрес), принимаем входящее — иначе попытки могли
@@ -1064,6 +1094,13 @@ final class Engine {
 
     // ================================================================== пара
     private func becomePaired(_ l: ControlLink, _ r: Role, _ pid: String, _ pname: String, _ pplat: String, _ key: String, resumed: Bool) {
+        if soloMode {
+            let frame = mode == .music ? posFrame() : 0
+            if r == .point { soloResumeFrame = frame }
+            else { soloHandoff = (frame, mode == .music && playBox.value.timeline.playing) }
+            soloMode = false
+            ui { $0.soloMode = false }
+        }
         pendingTimeout?.cancel(); reconnectTask?.cancel()
         if pending === l { pending = nil }
         if let p = pending { p.tag = "dead"; p.close(); pending = nil }
@@ -1124,7 +1161,8 @@ final class Engine {
             if !continuing {
                 mode = .music
                 source = queue.indices.contains(queueIndex) ? currentQueueSource ?? music : music
-                newEpoch(false, 0, MonoClock.nowNs())
+                let handoff = soloHandoff; soloHandoff = nil
+                newEpoch(handoff?.playing ?? false, handoff?.frame ?? 0, MonoClock.nowNs() + ((handoff?.playing ?? false) ? SF.startDelayNs : 0))
                 if queue.indices.contains(queueIndex), currentQueueSource == nil { selectQueueTrack(at: queueIndex, forcePaused: true) }
             } else { rebuildPlayState() }
             audio.source = serverRenderer
@@ -1179,6 +1217,10 @@ final class Engine {
     }
 
     private func goIdle(sendBye: Bool, reason: String) {
+        let fromServer = role == .server
+        let frame = fromServer && mode == .music ? posFrame() : soloResumeFrame
+        let playing = fromServer && mode == .music && playBox.value.timeline.playing
+        trackLoadGeneration += 1
         reconnectTask?.cancel(); pendingTimeout?.cancel()
         if let l = link { link = nil; l.tag = "dead"; if sendBye { l.sendAndClose(["t": "bye"]) } else { l.close() } }
         if let p = pending { pending = nil; p.tag = "dead"; p.close() }
@@ -1199,6 +1241,7 @@ final class Engine {
             s.serverDiag = Diag(); s.pointDiag = Diag()
             s.loadingTracks = false; s.loadingTrackId = nil; s.audioMissing = false; s.audioBuffering = false
         }
+        startSoloPlayback(frame: frame, playing: playing)
         toast(reason)
     }
 
@@ -1207,6 +1250,7 @@ final class Engine {
     }
 
     private func saveServerParams() {
+        if soloMode { defaults.set(master, forKey: "sf.soloMaster"); return }
         guard var r = record else { return }
         r.pointCh = Ch.name(pointChannel); r.trimMs = Double(trimNs) / 1e6
         r.volL = Double(volL); r.volR = Double(volR); r.master = Double(master); r.balance = Double(balance)
@@ -1261,17 +1305,17 @@ final class Engine {
     // ================================================================== Server: шкала и команды
     private var serverChannel: Int { Ch.other(pointChannel) }
     private func balanceGain(_ channel: Int) -> Float { mode == .music ? BalanceLaw.gain(channel: channel, balance: balance) : 1 }
-    private var serverGain: Float { AudioGain.taper(master) * AudioGain.fromDb(levelTrimServerDb) * balanceGain(serverChannel) }
+    private var serverGain: Float { soloMode ? AudioGain.taper(master) : AudioGain.taper(master) * AudioGain.fromDb(levelTrimServerDb) * balanceGain(serverChannel) }
     private var pointGain: Float { AudioGain.taper(master) * AudioGain.fromDb(levelTrimPointDb) * balanceGain(pointChannel) }
 
     private func rebuildPlayState() {
-        playBox.value = ServerPlayState(timeline: playBox.value.timeline, source: source, channel: serverChannel, gain: serverGain)
+        playBox.value = ServerPlayState(timeline: playBox.value.timeline, source: source, channel: soloMode ? Ch.BOTH : serverChannel, gain: serverGain)
     }
 
     private func newEpoch(_ playing: Bool, _ frame: Int64, _ anchorNs: Int64) {
         epoch += 1
         playBox.value = ServerPlayState(timeline: Timeline(epoch: epoch, playing: playing, anchorFrame: frame, anchorNs: anchorNs),
-                                        source: source, channel: serverChannel, gain: serverGain)
+                                        source: source, channel: soloMode ? Ch.BOTH : serverChannel, gain: serverGain)
         sendTimeline()
         publishState()
     }
@@ -1501,7 +1545,7 @@ final class Engine {
     private var navigationIndex: Int { queue.firstIndex { $0.id == pendingTrackId } ?? queueIndex }
 
     private func selectQueueTrack(at index: Int, forcePaused: Bool = false, startPlayback: Bool = false) {
-        guard !calibRunning, (phase == .paired || phase == .reconnecting), queue.indices.contains(index) else { return }
+        guard !calibRunning, (soloMode || phase == .paired || phase == .reconnecting), queue.indices.contains(index) else { return }
         let item = queue[index]
         if queueIndex == index, pendingTrackId == nil, currentQueueSource != nil {
             if startPlayback { cmdPlay() }
@@ -1532,7 +1576,7 @@ final class Engine {
     }
 
     private func serverTick() {
-        guard role == .server, state.inPair else { return }
+        guard role == .server, state.inPair || soloMode else { return }
         let tl = playBox.value.timeline
         guard tl.playing, pendingTrackId == nil, tl.positionFrame(MonoClock.nowNs()) >= source.totalFrames else { return }
         switch mode {

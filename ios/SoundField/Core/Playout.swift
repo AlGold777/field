@@ -71,4 +71,12 @@ final class GainRamp {
 /// Заполнить n сэмплов; первый прозвучит в presentLocalNs (локальные монотонные часы).
 protocol RenderSource: AnyObject {
     func render(_ out: UnsafeMutablePointer<Float>, _ n: Int, _ presentLocalNs: Int64)
+    func renderStereo(_ left: UnsafeMutablePointer<Float>, _ right: UnsafeMutablePointer<Float>, _ n: Int, _ presentLocalNs: Int64)
+}
+
+extension RenderSource {
+    func renderStereo(_ left: UnsafeMutablePointer<Float>, _ right: UnsafeMutablePointer<Float>, _ n: Int, _ presentLocalNs: Int64) {
+        render(left, n, presentLocalNs)
+        right.update(from: left, count: n)
+    }
 }

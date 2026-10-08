@@ -132,6 +132,7 @@ struct UiState: Equatable {
     var myId = ""
     var myName = ""
     var phase: Phase = .idle
+    var soloMode = true
     var role: Role = .server
     var peerName = ""
     var peerPlatform = ""

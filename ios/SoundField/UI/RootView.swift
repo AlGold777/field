@@ -7,14 +7,14 @@ struct RootView: View {
     @State private var toastText = ""
     @State private var toastVisible = false
 
-    enum Sub { case none, calibration, diagnostics }
+    enum Sub { case none, pairing, calibration, diagnostics }
 
     var body: some View {
         let ui = model.ui
         ZStack(alignment: .bottom) {
             SFColor.background.ignoresSafeArea()
             Group {
-                if !ui.inPair {
+                if sub == .pairing {
                     WelcomeView(ui: ui, engine: engine)
                 } else if sub == .calibration {
                     CalibrationView(ui: ui, engine: engine) { sub = .none }
@@ -22,7 +22,8 @@ struct RootView: View {
                     DiagnosticsView(ui: ui) { sub = .none }
                 } else {
                     PlayerView(ui: ui, engine: engine,
-                               openCalibration: { sub = .calibration }, openDiagnostics: { sub = .diagnostics })
+                               openCalibration: { sub = .calibration }, openDiagnostics: { sub = .diagnostics },
+                               openPairing: { sub = .pairing })
                 }
             }
             if toastVisible {
@@ -34,6 +35,15 @@ struct RootView: View {
                     .transition(.opacity.combined(with: .move(edge: .bottom)))
             }
         }
+        .alert(ui.phase == .incoming ? "Создать стереопару?" : "Подключение…",
+               isPresented: .constant(ui.phase == .incoming || ui.phase == .inviting)) {
+            if ui.phase == .incoming {
+                Button("Принять") { engine.acceptIncoming() }
+                Button("Отклонить", role: .cancel) { engine.rejectIncoming() }
+            } else { Button("Отмена", role: .cancel) { engine.cancelInvite() } }
+        } message: {
+            Text(ui.phase == .incoming ? "«\(ui.incomingName)» приглашает этот телефон в стереопару." : "Соединяемся с «\(ui.invitingName)»…")
+        }
         .preferredColorScheme(.dark)
         .onChange(of: ui.messageId) { _ in
             guard !ui.message.isEmpty else { return }
@@ -44,6 +54,6 @@ struct RootView: View {
                 if model.ui.messageId == shown { withAnimation { toastVisible = false } }
             }
         }
-        .onChange(of: ui.inPair) { inPair in if !inPair { sub = .none } }
+        .onChange(of: ui.inPair) { inPair in if (inPair && sub == .pairing) || (!inPair && sub == .calibration) { sub = .none } }
     }
 }
