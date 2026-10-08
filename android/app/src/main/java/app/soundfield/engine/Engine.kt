@@ -4110,13 +4110,7 @@ class Engine private constructor(private val app: Context) {
             "seek" -> seekFrame(o.optLong("ms") * SF.SAMPLE_RATE / 1000)
             "skip" -> seekFrame(posFrame() + o.optLong("ms") * SF.SAMPLE_RATE / 1000)
             "next" -> selectTrack(navigationIndex() + 1, startPlayback = true)
-            // Как в обычных плеерах: если трек играет дольше 3 с (или это первый трек) — «назад» возвращает
-            // в начало текущего, иначе переходит к предыдущему.
-            "previous" -> {
-                val idx = navigationIndex()
-                if (idx <= 0 || (pendingTrackId == null && mode == SourceMode.MUSIC && posFrame() > 3L * SF.SAMPLE_RATE)) seekFrame(0)
-                else selectTrack(idx - 1, startPlayback = true)
-            }
+            "previous" -> selectTrack(navigationIndex() - 1, startPlayback = true)
             "select" -> selectTrack(queue.indexOfFirst { it.id == o.optString("id") }, startPlayback = true)
             "remove" -> {
                 val arr = o.optJSONArray("ids") ?: return
