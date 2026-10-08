@@ -35,3 +35,12 @@ enum AudioGain {
         return (min(0, max(-12, s - peak)), min(0, max(-12, p - peak)))
     }
 }
+
+
+/// Compatibility with servers predating gainLaw 2: their balance uses a linear attenuation.
+enum LegacyBalanceLaw {
+    static func gain(channel: Int, balance: Float) -> Float {
+        let b = min(1,max(0,balance))
+        return channel == Ch.L ? min(1,2*(1-b)) : min(1,2*b)
+    }
+}

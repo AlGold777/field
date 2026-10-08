@@ -181,6 +181,7 @@ struct UiState: Equatable {
     var calib = CalibUi()
     var serverDiag = Diag()
     var pointDiag = Diag()
+    var levelMeasureText = ""
     var message = ""
     var messageId = 0
     var connLog: [String] = []    // журнал подключения для «Диагностики»

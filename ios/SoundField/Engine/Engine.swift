@@ -1,4 +1,5 @@
 import Foundation
+import Combine
 import Network
 import UIKit
 import AVFoundation
@@ -1870,7 +1871,7 @@ final class Engine {
     // ================================================================== прерывания
     /// Прерывание (звонок, Siri, другое приложение) на любом телефоне ставит на паузу всю пару.
     private func onInterrupted(_ reason: String) {
-        guard state.inPair else { return }
+        guard state.inPair || soloMode else { return }
         if role == .server { cmdPause() } else { link?.send(["t": "cmd", "a": "pause"]) }
         toast(reason)
     }

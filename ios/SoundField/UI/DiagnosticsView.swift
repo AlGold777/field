@@ -8,6 +8,13 @@ struct DiagnosticsView: View {
         v <= good ? SFColor.good : v <= warn ? SFColor.warn : SFColor.bad
     }
 
+    private var balanceDescription: String {
+        let p = 2 * ui.balance - 1
+        if abs(p) < 0.001 { return "Центр" }
+        if abs(p) >= 0.995 { return p < 0 ? "Только L" : "Только R" }
+        return String(format: "%@ +%.1f дБ", p < 0 ? "L" : "R", -BalanceLaw.differenceDb(balance: ui.balance))
+    }
+
     var body: some View {
         let p = ui.pointDiag, s = ui.serverDiag
         let est: Double? = (p.valid && s.valid) ? abs(p.syncErrMs - s.syncErrMs) + p.clockUncMs : nil
@@ -15,14 +22,7 @@ struct DiagnosticsView: View {
         let leftLevel = serverCh == Ch.L ? ui.levelTrimServerDb : ui.levelTrimPointDb
         let rightLevel = serverCh == Ch.R ? ui.levelTrimServerDb : ui.levelTrimPointDb
         let levelSource = ["ear": "на слух", "mic": "микрофон", "manual": "вручную"][ui.levelCalib.state] ?? "не настроено"
-        let balanceP = 2 * ui.balance - 1
-        let balanceText: String
-        if abs(balanceP) < 0.001 { balanceText = "Центр" }
-        else if abs(balanceP) >= 0.995 { balanceText = balanceP < 0 ? "Только L" : "Только R" }
-        else {
-            let db = -BalanceLaw.differenceDb(balance: Float(ui.balance))
-            balanceText = String(format: "%@ +%.1f дБ", balanceP < 0 ? "L" : "R", db)
-        }
+        let balanceText = balanceDescription
         let delayState = ui.delayCalib.state == "auto"
             ? String(format: "авто, разброс %.1f мс", ui.delayCalib.spreadMs)
             : ui.delayCalib.state == "manual" ? "вручную" : "не откалибрована"

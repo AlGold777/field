@@ -252,8 +252,12 @@ struct PlayerView: View {
             StatusPill(text: ui.soloMode ? "Connect" : ui.phase == .reconnecting ? "Reconnecting…" : "Active",
                        color: ui.soloMode ? SFColor.accent1 : ui.phase == .reconnecting ? SFColor.warn : SFColor.good)
                 .frame(width: 104, height: 36).contentShape(Rectangle())
-                .onTapGesture { connectAction() }
-                .onLongPressGesture(minimumDuration: 0.5) { if ui.soloMode { showConnectChooser = true } }
+                .gesture(LongPressGesture(minimumDuration: 0.5).exclusively(before: TapGesture()).onEnded { gesture in
+                    switch gesture {
+                    case .first: if ui.soloMode { showConnectChooser = true }
+                    case .second: connectAction()
+                    }
+                })
                 .highPriorityGesture(DragGesture(minimumDistance: 12).onEnded { drag in
                     if ui.soloMode && drag.translation.height >= 32 && drag.translation.height > abs(drag.translation.width) {
                         showConnectChooser = true
