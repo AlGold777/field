@@ -152,7 +152,8 @@ fun PlayerScreen(ui: UiState, engine: Engine, openCalibration: () -> Unit, openD
             if (!ui.soloMode) {
                 // --- индикатор синхронизации; слот остаётся на месте и в Solo ---
                 val pd = ui.pointDiag; val sd = ui.serverDiag
-                val lrEstUs = if (pd.valid && sd.valid) abs(pd.syncErrUs - sd.syncErrUs) + pd.clockUncMs * 1_000.0 else null
+                val lrEstUs = if (pd.valid && sd.valid && pd.clockReady && sd.clockReady)
+                    abs(pd.syncErrUs - sd.syncErrUs) + pd.clockUncMs * 1_000.0 else null
                 Row(Modifier.fillMaxSize().clip(CircleShape).background(SFColors.Card).clickable { openDiagnostics() }
                     .padding(horizontal = 12.dp, vertical = 6.dp), horizontalArrangement = Arrangement.Center,
                     verticalAlignment = Alignment.CenterVertically) {

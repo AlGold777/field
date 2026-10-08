@@ -529,7 +529,7 @@ struct PlayerView: View {
 
     private var syncIndicator: some View {
         let p = ui.pointDiag, s = ui.serverDiag
-        let est: Double? = (p.valid && s.valid) ? abs(p.syncErrMs - s.syncErrMs) + p.clockUncMs : nil
+        let est: Double? = (p.valid && s.valid && p.clockReady && s.clockReady) ? abs(p.syncErrMs - s.syncErrMs) + p.clockUncMs : nil
         let text = est.map { String(format: "⚡ L/R: ±%.1f мс : RTT %.0f мс : буф. %.0f мс", $0, p.rttMs, p.bufferMs) }
             ?? "⚡ Синхронизация часов…"
         return Button(action: openDiagnostics) {
