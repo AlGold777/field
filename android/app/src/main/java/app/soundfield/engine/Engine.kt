@@ -4347,13 +4347,13 @@ class Engine private constructor(private val app: Context) {
             val loaded = loadTrack(item, cancelled,
                 onReady = { ready ->
                     initialSource = ready
-                    post { activateLoadedTrack(index, item, generation, ready) }
+                    post { activateLoadedTrack(item, generation, ready) }
                 },
                 onProgress = { progressSource ->
                     val value = progressSource.progress()
                     post {
                         if (generation == trackLoadGeneration &&
-                            (queueIndex == index && currentQueueSource === progressSource || pendingTrackId == item.id)) {
+                            (currentQueueSource === progressSource || pendingTrackId == item.id)) {
                             decodeProgress = value
                             ui { copy(decodingProgress = value) }
                             publishState()
@@ -4364,7 +4364,7 @@ class Engine private constructor(private val app: Context) {
                 if (generation != trackLoadGeneration) return@post
                 if (loaded != null) {
                     decodedTracks[item.id] = loaded
-                    if (initialSource == null) activateLoadedTrack(index, item, generation, loaded)
+                    if (initialSource == null) activateLoadedTrack(item, generation, loaded)
                     if (currentQueueSource === loaded) {
                         decodeProgress = null; decodeProgressTrackId = null
                         ui { copy(decodingProgress = null, loadingTracks = false, loadingTrackId = null) }
@@ -4372,8 +4372,8 @@ class Engine private constructor(private val app: Context) {
                     }
                     Log.i(TAG, "decoded «${item.title}» fully")
                 } else if (initialSource == null) {
-                    failTrackLoad(index, item, generation)
-                } else if (currentQueueSource === initialSource && queueIndex == index) {
+                    failTrackLoad(item, generation)
+                } else if (currentQueueSource === initialSource) {
                     val progressiveSource = initialSource as? app.soundfield.core.SegmentedPcmSource
                     progressiveSource?.finish(progressiveSource.readyFrames)
                     val lastReady = (progressiveSource?.readyFrames?.minus(1)
@@ -4389,8 +4389,10 @@ class Engine private constructor(private val app: Context) {
     }
 
     /** Запускает источник, когда доступен первый полный PCM-сегмент, не дожидаясь длинного файла целиком. */
-    private fun activateLoadedTrack(index: Int, item: QueueItem, generation: Long, loaded: AudioSource) {
-        if (generation != trackLoadGeneration || pendingTrackId != item.id || queue.getOrNull(index)?.id != item.id ||
+    private fun activateLoadedTrack(item: QueueItem, generation: Long, loaded: AudioSource) {
+        // Rows can move while decoding (remove/Undo); the track identity does not.
+        val index = queue.indexOfFirst { it.id == item.id }
+        if (generation != trackLoadGeneration || pendingTrackId != item.id || index < 0 ||
             role != Role.SERVER || calibRunning) return
         pendingTrackId = null
         clearProgressiveBufferState()
@@ -4410,7 +4412,7 @@ class Engine private constructor(private val app: Context) {
         prefetchAround(index)
     }
 
-    private fun failTrackLoad(index: Int, item: QueueItem, generation: Long) {
+    private fun failTrackLoad(item: QueueItem, generation: Long) {
         if (generation != trackLoadGeneration || pendingTrackId != item.id) return
         pendingTrackId = null
         decodeProgress = null; decodeProgressTrackId = null
@@ -4517,7 +4519,8 @@ class Engine private constructor(private val app: Context) {
         queue.removeAll { it.id in ids }
         removedBackup = removed
 
-        if (pendingTrackId in ids) {                       // удалили трек, который сейчас загружается
+        if (pendingTrackId in ids || (current != null && current.id in ids)) {
+            // Also cancel an already activated progressive decoder before deleting its PCM cache.
             pendingTrackId = null; trackLoadGeneration++
             ui { copy(loadingTracks = false, loadingTrackId = null) }
         }
