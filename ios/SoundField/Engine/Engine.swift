@@ -1330,7 +1330,10 @@ final class Engine {
         if soloMode { spatialSettings.profile = "solo_stereo_speaker" }
     }
     private func playbackSource() -> AudioSource {
-        guard mode == .music && spatialSettings.enabled else { return source }
+        guard mode == .music && spatialSettings.enabled && (soloMode || peerCapabilities.contains("spatialV1")) else {
+            processedSource = nil; processedInner = nil; processedSpatial = nil
+            return source
+        }
         if processedInner !== source || processedSpatial != spatialSettings {
             processedInner = source; processedSpatial = spatialSettings
             processedSource = StereoSpatialSource(source,settings:spatialSettings)
@@ -1357,9 +1360,11 @@ final class Engine {
     }
 
     private func stateJson() -> [String: Any] {
-        ["t": "state", "playing": playBox.value.timeline.playing, "durFrames": source.totalFrames,
+        let eq = soloMode || peerCapabilities.contains("eq") ? eqSettings : EqSettings()
+        let spatial = soloMode || peerCapabilities.contains("spatialV1") ? spatialSettings : SpatialSettings()
+        return ["t": "state", "playing": playBox.value.timeline.playing, "durFrames": source.totalFrames,
          "title": source.title, "artist": source.artist, "mode": mode.rawValue,
-         "eq": eqSettings.json, "spatial": spatialSettings.json,
+         "eq": eq.json, "spatial": spatial.json,
          "undo": state.undoText, "queueIndex": queueIndex, "queueCount": queue.count, "trackId": queue.indices.contains(queueIndex) ? queue[queueIndex].id : "",
          "volL": Double(volL), "volR": Double(volR), "master": Double(master), "balance": Double(balance),
          "pointGain": Double(pointGain), "gainLaw": 2, "peerGainLaw": peerGainLawReady ? 2 : 1,
