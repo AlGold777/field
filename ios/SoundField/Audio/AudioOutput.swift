@@ -9,6 +9,7 @@ import AVFoundation
 final class AudioOutput {
     private let engine = AVAudioEngine()
     private var node: AVAudioSourceNode?
+    private let equalizer = AVAudioUnitEQ(numberOfBands: 10)
     private let sourceBox = Locked<RenderSource?>(nil)
     private let outLatencyNs = Locked<Int64>(0)
     private(set) var running = false
@@ -101,12 +102,29 @@ final class AudioOutput {
                 return noErr
             }
             engine.attach(n)
-            engine.connect(n, to: engine.mainMixerNode, format: fmt)
+            if equalizer.engine == nil { engine.attach(equalizer) }
+            engine.connect(n, to: equalizer, format: fmt)
+            engine.connect(equalizer, to: engine.mainMixerNode, format: fmt)
             node = n
         }
         engine.mainMixerNode.outputVolume = 1
         engine.prepare()
         do { try engine.start(); running = true } catch { NSLog("SoundField engine: \(error)") }
+    }
+
+    /// Main-thread graph parameters; the unit owns its render state.
+    func setEqualizer(_ settings: EqSettings, music: Bool) {
+        let active = music && settings.enabled && !settings.bypass
+        for i in 0..<10 {
+            let band = equalizer.bands[i]
+            band.filterType = .parametric; band.frequency = EqSettings.frequencies[i]
+            band.bandwidth = 1; band.gain = settings.gains[i]; band.bypass = !active
+        }
+        // Conservative headroom for a cascade of boosts; no hard clipping introduced by EQ.
+        let positive = settings.gains.reduce(Float(0)) { $0 + max(0,$1) }
+        let mean = settings.gains.reduce(0,+) / 10
+        let restore: Float = settings.preserveLoudness && positive == 0 ? min(-mean, -(settings.gains.max() ?? 0)) : 0
+        equalizer.globalGain = active ? max(-96, -positive + restore) : 0
     }
 
     func stop() {

@@ -294,3 +294,43 @@ enum Wav {
         return out
     }
 }
+
+
+/// iOS M/S spatial processor. Stateless frame access gives identical results to UDP resend and local render.
+/// It does not replace Android's STFT/XTC implementation; both use the same control protocol.
+final class StereoSpatialSource: AudioSource {
+    private let inner: AudioSource
+    private let width: Float, air: Float, ambient: Float, depth: Float, reflection: Float, scale: Float
+    private let taps: [(Int64, Int64)]
+    var mode: SourceMode { inner.mode }
+    var title: String { inner.title }
+    var artist: String { inner.artist }
+    var totalFrames: Int64 { inner.totalFrames }
+    init(_ inner: AudioSource, settings: SpatialSettings) {
+        self.inner = inner
+        let strength = settings.level == "strong" ? 1.4 : 0.6
+        width = Float(pow(10,settings.width * strength/20))
+        air = Float(pow(10,settings.air * strength/20))
+        ambient = Float(pow(10,settings.ambient * strength/20)-1)
+        depth = Float(pow(10,settings.depth * strength/20))
+        reflection = Float(pow(10,settings.reflection/20)*strength)
+        let near = settings.profile == "pair_near"
+        taps = near ? [(240,360),(432,576),(672,552)] : [(346,504),(643,869),(1008,754)]
+        let bound = max(1,Float(pow(10,settings.width * strength/20)) + 2 * (air-1) + ambient + 3 * reflection)
+        // Headroom is maintained for every parameter combination; optional loudness mode reduces attenuation.
+        scale = settings.preserveLoudness ? 1 / bound : 0.7 / bound
+    }
+    private func mid(_ f: Int64) -> Float { (inner.sample(f,Ch.L)+inner.sample(f,Ch.R))*0.5 }
+    private func side(_ f: Int64) -> Float { (inner.sample(f,Ch.L)-inner.sample(f,Ch.R))*0.5 }
+    func sample(_ frame: Int64, _ ch: Int) -> Float {
+        guard frame >= 0 && frame < totalFrames else { return 0 }
+        let sign: Float = ch == Ch.L ? 1 : -1
+        let currentSide = side(frame)
+        // Short symmetric low pass splits side information into body and air without phase offset.
+        let body = (side(frame-6) + 2*currentSide + side(frame+6))*0.25
+        let widened = currentSide*width + (currentSide-body)*(air-1) + side(frame-528)*ambient
+        var value = mid(frame)*depth + sign*widened
+        for tap in taps { value += mid(frame - (ch == Ch.L ? tap.0 : tap.1))*reflection }
+        return min(1,max(-1,value*scale))
+    }
+}

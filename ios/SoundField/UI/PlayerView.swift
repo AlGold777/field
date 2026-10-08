@@ -9,6 +9,9 @@ struct PlayerView: View {
     let openDiagnostics: () -> Void
     let openPairing: () -> Void
 
+    @State private var showingEqualizer = false
+    @State private var showingSpatial = false
+    @AppStorage("sf.soundExpanded") private var soundExpanded = true
     @State private var pos: Int64 = 0
     @State private var dragging: Double? = nil
     @State private var confirmDisconnect = false
@@ -94,8 +97,11 @@ struct PlayerView: View {
                 queueSection
 
                 SFCard {
-                    Text("Sound").font(.system(size: 13, weight: .semibold)).kerning(1)
-                        .foregroundColor(SFColor.dim).padding(.bottom, 8)
+                    Button { soundExpanded.toggle() } label: {
+                        HStack { Text("Sound").font(.system(size:13,weight:.semibold)).kerning(1); Spacer()
+                            Image(systemName:soundExpanded ? "chevron.up" : "chevron.down") }.foregroundColor(SFColor.dim)
+                    }.buttonStyle(.plain).padding(.bottom,8)
+                    if soundExpanded {
                     SliderRow(label: "Громкость", valueText: "\(Int(master * 100))%", value: $master, color: SFColor.master,
                               enabled: ui.mode != .levelMeasure,
                               onEditingEnded: { engine.setVolume("M", Float(master), finished: true) })
@@ -140,6 +146,28 @@ struct PlayerView: View {
                         .accessibilityLabel("Баланс между телефонами")
                         .accessibilityValue("Баланс: \(balanceLabel(balance))")
                         Text("R").font(.system(size: 13, weight: .semibold)).foregroundColor(SFColor.rightText)
+                    }
+                    }
+                    HStack {
+                        Button { showingEqualizer = true } label: {
+                            Label(ui.eq.enabled ? "EQ · \(ui.eq.bypass ? "Bypass" : ui.eq.preset)" : "EQ · Off",systemImage:"slider.vertical.3")
+                        }.disabled(!ui.eqAvailable)
+                        Spacer()
+                        Button { showingSpatial = true } label: { Image(systemName:"slider.horizontal.3") }.accessibilityLabel("Настройки пространства")
+                            .disabled(!ui.spatialAvailable)
+                    }.font(.system(size:13)).foregroundColor(SFColor.accent1)
+                    HStack {
+                        Text("Пространство").font(.system(size:13)).foregroundColor(SFColor.dim)
+                        Spacer()
+                        ForEach(["off","soft","strong"],id: \.self) { level in
+                            Button(level.capitalized) {
+                                var settings = ui.spatial; settings.level = level; settings.enabled = level != "off"
+                                engine.setSpatial(settings)
+                            }.font(.system(size:12,weight:.semibold)).padding(.horizontal,9).padding(.vertical,7)
+                                .background(Capsule().fill(ui.spatial.level == level ? SFColor.accent1.opacity(0.3) : SFColor.secondary))
+                                .disabled(!ui.spatialAvailable)
+                                .onLongPressGesture(minimumDuration:0.5) { showingSpatial = true }
+                        }
                     }
                     }
                 }
@@ -193,6 +221,8 @@ struct PlayerView: View {
                 DispatchQueue.main.async { showingAudioBrowser = true }
             }
         }
+        .sheet(isPresented: $showingEqualizer) { EqualizerControls(settings:ui.eq) { engine.setEq($0) } }
+        .sheet(isPresented: $showingSpatial) { SpatialControls(settings:ui.spatial,solo:ui.soloMode) { engine.setSpatial($0) } }
         .sheet(isPresented: $showPlaylists) { playlistsView }
         .sheet(isPresented: $showingAudioBrowser) {
             if let root = audioBrowserRoot {
@@ -603,5 +633,89 @@ private struct AudioBrowserView: View {
         guard let data = UserDefaults.standard.data(forKey: "sf.audioBrowserRoot") else { return nil }
         var stale = false
         return try? URL(resolvingBookmarkData: data, options: [.withoutUI], relativeTo: nil, bookmarkDataIsStale: &stale)
+    }
+}
+
+
+private struct EqualizerControls: View {
+    @State var settings: EqSettings
+    let onChange: (EqSettings) -> Void
+    @Environment(\.dismiss) private var dismiss
+    var body: some View {
+        NavigationStack {
+            Form {
+                Toggle("Эквалайзер",isOn:$settings.enabled).onChange(of:settings.enabled) { _ in onChange(settings) }
+                Toggle("Bypass",isOn:$settings.bypass).onChange(of:settings.bypass) { _ in onChange(settings) }
+                Picker("Пресет",selection:$settings.preset) {
+                    ForEach(EqSettings.presets.map { $0.0 },id: \.self) { Text($0).tag($0) }
+                    Text("Свой").tag("Свой")
+                }.onChange(of:settings.preset) { name in
+                    if let preset = EqSettings.presets.first(where: { $0.0 == name }) { settings.gains = preset.1; onChange(settings) }
+                }
+                // The line visualizes the selected band gains, not a fabricated live analyzer.
+                Canvas { context,size in
+                    var path = Path()
+                    for i in 0..<10 {
+                        let point = CGPoint(x:size.width*Double(i)/9,y:size.height*(0.5-Double(settings.gains[i])/30))
+                        if i == 0 { path.move(to:point) } else { path.addLine(to:point) }
+                    }
+                    context.stroke(path,with:.color(SFColor.accent1),lineWidth:2)
+                }.frame(height:90)
+                ForEach(0..<10,id: \.self) { i in
+                    HStack {
+                        Text(bandName(i)).frame(width:42,alignment:.leading).font(.system(size:12))
+                        Slider(value:Binding(get:{Double(settings.gains[i])},set:{ settings.moveBand(i,to:Float($0)) }),in:-12...12,step:0.5,
+                               onEditingChanged:{ editing in if !editing { onChange(settings) } })
+                        Text(String(format:"%+.1f",settings.gains[i])).font(.system(size:12)).monospacedDigit().frame(width:40)
+                    }
+                }
+                Picker("Магнит",selection:$settings.magnet) {
+                    Text("Off").tag("OFF"); Text("Soft").tag("SOFT"); Text("Strong").tag("STRONG")
+                }.onChange(of:settings.magnet) { _ in onChange(settings) }
+                Toggle("Сохранять громкость",isOn:$settings.preserveLoudness).onChange(of:settings.preserveLoudness) { _ in onChange(settings) }
+                Button("Сбросить полосы") { settings.gains = Array(repeating:0,count:10); settings.preset = "Ровно"; onChange(settings) }
+            }.navigationTitle("Эквалайзер").navigationBarTitleDisplayMode(.inline)
+                .toolbar { ToolbarItem(placement:.confirmationAction) { Button("Готово") { onChange(settings); dismiss() } } }
+        }.preferredColorScheme(.dark)
+    }
+    private func bandName(_ i: Int) -> String { let f = EqSettings.frequencies[i]; return f >= 1000 ? "\(Int(f/1000))k" : "\(Int(f))" }
+}
+
+private struct SpatialControls: View {
+    @State var settings: SpatialSettings
+    let solo: Bool
+    let onChange: (SpatialSettings) -> Void
+    @Environment(\.dismiss) private var dismiss
+    var body: some View {
+        NavigationStack {
+            Form {
+                Picker("Интенсивность",selection:$settings.level) {
+                    Text("Off").tag("off"); Text("Soft").tag("soft"); Text("Strong").tag("strong")
+                }.pickerStyle(.segmented).onChange(of:settings.level) { level in settings.enabled = level != "off"; onChange(settings) }
+                if !solo {
+                    Toggle("Телефоны близко",isOn:Binding(get:{settings.profile == "pair_near"},set:{ near in
+                        settings.profile = near ? "pair_near" : "pair_wide"; onChange(settings)
+                    }))
+                }
+                parameter("Ширина",value:$settings.width,range:0...8)
+                parameter("Воздух",value:$settings.air,range:0...8)
+                parameter("Окружение",value:$settings.ambient,range:0...6)
+                parameter("Глубина",value:$settings.depth,range:-6...0)
+                parameter("Ранние отражения",value:$settings.reflection,range:-30 ... -10)
+                Toggle("Сохранять громкость",isOn:$settings.preserveLoudness).onChange(of:settings.preserveLoudness) { _ in onChange(settings) }
+                Button("Сбросить настройки") {
+                    let level = settings.level
+                    settings = SpatialSettings(); settings.profile = solo ? "solo_stereo_speaker" : "pair_wide"
+                    settings.level = level; settings.enabled = level != "off"; onChange(settings)
+                }
+            }.navigationTitle("Пространство").navigationBarTitleDisplayMode(.inline)
+                .toolbar { ToolbarItem(placement:.confirmationAction) { Button("Готово") { onChange(settings); dismiss() } } }
+        }.preferredColorScheme(.dark)
+    }
+    private func parameter(_ label: String,value:Binding<Double>,range:ClosedRange<Double>) -> some View {
+        VStack {
+            HStack { Text(label); Spacer(); Text(String(format:"%+.1f дБ",value.wrappedValue)).monospacedDigit() }.font(.system(size:14))
+            Slider(value:value,in:range,step:0.5,onEditingChanged:{ editing in if !editing { onChange(settings) } })
+        }
     }
 }

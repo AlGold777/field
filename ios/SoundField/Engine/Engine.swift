@@ -100,6 +100,11 @@ final class Engine {
     private var epoch: Int32 = 0
     private var mode: SourceMode = .music
     private var source: AudioSource
+    private var eqSettings = EqSettings()
+    private var spatialSettings = SpatialSettings()
+    private var processedSource: AudioSource?
+    private var processedInner: AudioSource?
+    private var processedSpatial: SpatialSettings?
     private var savedFrame: Int64 = 0
     private var savedPlaying = false
     private var volL: Float = 1, volR: Float = 1, master: Float = 0.96
@@ -236,7 +241,7 @@ final class Engine {
 
     private func sendSession(_ target: ControlLink? = nil) {
         let l = target ?? link
-        l?.send(["t": "session", "session": Int(sessionId), "udpPort": Int(udp?.port ?? 0), "name": myName, "fileToken": fileToken, "caps": ["fileTransferV1"]])
+        l?.send(["t": "session", "session": Int(sessionId), "udpPort": Int(udp?.port ?? 0), "name": myName, "fileToken": fileToken, "caps": ["fileTransferV1", "eq", "spatialV1"]])
     }
 
     /// Rebuild the UDP media session without dropping the TCP pair. Point responds with a fresh PING burst.
@@ -393,6 +398,7 @@ final class Engine {
         source = queue.indices.contains(queueIndex) ? currentQueueSource ?? music : music
         if defaults.object(forKey: "sf.soloMaster") != nil { master = defaults.float(forKey: "sf.soloMaster") }
         balance = 0.5
+        loadSoundProfile()
         audio.source = serverRenderer
         ui { $0.soloMode = true; $0.role = .server; $0.phase = .idle }
         newEpoch(playing, min(max(0, frame), source.totalFrames), MonoClock.nowNs())
@@ -427,6 +433,7 @@ final class Engine {
     func channelTest() { cmd("lrtest") }
 
     private func handleAudioRouteChanged() {
+        if soloMode { loadSoundProfile(); rebuildPlayState(); publishState(); return }
         guard state.inPair else { return }
         if role == .point { cmd("routeChanged"); return }
         resetCalibrationsForRoute()
@@ -823,14 +830,14 @@ final class Engine {
     // ================================================================== установка пары
     private func inviteJson(_ key: String) -> [String: Any] {
         ["t": "invite", "id": myId, "name": myName, "platform": "ios", "proto": Int(SF.protocolVersion), "key": key,
-         "tcpPort": Int(discovery.listenPort), "caps": ["fileTransferV1"]]
+         "tcpPort": Int(discovery.listenPort), "caps": ["fileTransferV1", "eq", "spatialV1"]]
     }
     private func resumeJson(_ r: PairRecord) -> [String: Any] {
         ["t": "resume", "id": myId, "name": myName, "platform": "ios", "proto": Int(SF.protocolVersion), "key": r.key, "role": r.myRole,
-         "tcpPort": Int(discovery.listenPort), "caps": ["fileTransferV1"]]
+         "tcpPort": Int(discovery.listenPort), "caps": ["fileTransferV1", "eq", "spatialV1"]]
     }
     private func acceptJson(_ key: String, _ role: String) -> [String: Any] {
-        ["t": "accept", "id": myId, "name": myName, "platform": "ios", "key": key, "role": role, "tcpPort": Int(discovery.listenPort), "caps": ["fileTransferV1"]]
+        ["t": "accept", "id": myId, "name": myName, "platform": "ios", "key": key, "role": role, "tcpPort": Int(discovery.listenPort), "caps": ["fileTransferV1", "eq", "spatialV1"]]
     }
 
     private func doInvite(_ p: Peer) {
@@ -1143,6 +1150,7 @@ final class Engine {
                 migrated.levelTrimServerDb = Double(levelTrimServerDb); migrated.levelTrimPointDb = Double(levelTrimPointDb)
                 migrated.levelTrimVersion = 1; migrated.delayCalib = delayCalib; record = migrated; persistRecord()
             }
+            loadSoundProfile()
             fileToken = Self.hex(24)
             sessionId = Int32.random(in: 1...Int32.max)
             pointUdpBox.value = nil; pointClockReady = false
@@ -1303,14 +1311,40 @@ final class Engine {
     private var serverGain: Float { soloMode ? AudioGain.taper(master) : AudioGain.taper(master) * AudioGain.fromDb(levelTrimServerDb) * balanceGain(serverChannel) }
     private var pointGain: Float { AudioGain.taper(master) * AudioGain.fromDb(levelTrimPointDb) * balanceGain(pointChannel) }
 
+    func setEq(_ settings: EqSettings, finished: Bool = true) { var o = settings.json; o["finished"] = finished; cmd("eq",o) }
+    func setSpatial(_ settings: SpatialSettings, finished: Bool = true) { var o = settings.json; o["finished"] = finished; cmd("spatial",o) }
+    private var soundProfileKey: String {
+        if !soloMode { return "sf.sound.pair." + (record?.peerId ?? peerName) }
+        let route = AVAudioSession.sharedInstance().currentRoute.outputs.map { $0.uid }.sorted().joined(separator: ",")
+        return "sf.sound.solo." + route
+    }
+    private func saveSoundProfile() {
+        let value: [String:Any] = ["eq":eqSettings.json,"spatial":spatialSettings.json]
+        if let data = try? JSONSerialization.data(withJSONObject:value) { defaults.set(data,forKey:soundProfileKey) }
+    }
+    private func loadSoundProfile() {
+        let value = defaults.data(forKey:soundProfileKey).flatMap { try? JSONSerialization.jsonObject(with:$0) as? [String:Any] } ?? [:]
+        eqSettings = EqSettings.read(value["eq"] as? [String:Any] ?? [:])
+        spatialSettings = SpatialSettings.read(value["spatial"] as? [String:Any] ?? [:])
+        if soloMode { spatialSettings.profile = "solo_stereo_speaker" }
+    }
+    private func playbackSource() -> AudioSource {
+        guard mode == .music && spatialSettings.enabled else { return source }
+        if processedInner !== source || processedSpatial != spatialSettings {
+            processedInner = source; processedSpatial = spatialSettings
+            processedSource = StereoSpatialSource(source,settings:spatialSettings)
+        }
+        return processedSource ?? source
+    }
+
     private func rebuildPlayState() {
-        playBox.value = ServerPlayState(timeline: playBox.value.timeline, source: source, channel: soloMode ? Ch.BOTH : serverChannel, gain: serverGain)
+        playBox.value = ServerPlayState(timeline: playBox.value.timeline, source: playbackSource(), channel: soloMode ? Ch.BOTH : serverChannel, gain: serverGain)
     }
 
     private func newEpoch(_ playing: Bool, _ frame: Int64, _ anchorNs: Int64) {
         epoch += 1
         playBox.value = ServerPlayState(timeline: Timeline(epoch: epoch, playing: playing, anchorFrame: frame, anchorNs: anchorNs),
-                                        source: source, channel: soloMode ? Ch.BOTH : serverChannel, gain: serverGain)
+                                        source: playbackSource(), channel: soloMode ? Ch.BOTH : serverChannel, gain: serverGain)
         sendTimeline()
         publishState()
     }
@@ -1324,6 +1358,7 @@ final class Engine {
     private func stateJson() -> [String: Any] {
         ["t": "state", "playing": playBox.value.timeline.playing, "durFrames": source.totalFrames,
          "title": source.title, "artist": source.artist, "mode": mode.rawValue,
+         "eq": eqSettings.json, "spatial": spatialSettings.json,
          "undo": state.undoText, "queueIndex": queueIndex, "queueCount": queue.count, "trackId": queue.indices.contains(queueIndex) ? queue[queueIndex].id : "",
          "volL": Double(volL), "volR": Double(volR), "master": Double(master), "balance": Double(balance),
          "pointGain": Double(pointGain), "gainLaw": 2, "peerGainLaw": peerGainLawReady ? 2 : 1,
@@ -1387,7 +1422,14 @@ final class Engine {
                 : min(1, max(0, Float(J.d(o, "pointGain"))))
             paramsBox.value = PointParams(gain: gain, trimNs: Int64(trim * 1e6), totalFrames: dur)
         }
+        let eq = EqSettings.read(o["eq"] as? [String: Any] ?? [:])
+        let spatial = SpatialSettings.read(o["spatial"] as? [String: Any] ?? [:])
+        let musicMode = J.s(o,"mode") == SourceMode.music.rawValue
+        DispatchQueue.main.async { self.audio.setEqualizer(eq, music: musicMode) }
         ui { s in
+            s.eq = eq; s.spatial = spatial
+            s.eqAvailable = self.soloMode || self.peerCapabilities.contains("eq")
+            s.spatialAvailable = musicMode && (self.soloMode || self.peerCapabilities.contains("spatialV1"))
             s.playing = playing; s.durationMs = dur * 1000 / Int64(SF.sampleRate)
             s.audioBuffering = J.b(o, "audioBuffering")
             s.decodingProgress = decodingProgress
@@ -1424,6 +1466,14 @@ final class Engine {
         case "select": selectQueueTrack(id: J.s(o, "id"))
         case "remove": removeQueueTracks(Set(o["ids"] as? [String] ?? []))
         case "undoRemove": undoQueueRemoval()
+        case "eq":
+            guard soloMode || peerCapabilities.contains("eq") else { return }
+            eqSettings = EqSettings.read(o); if J.b(o,"finished",true) { saveSoundProfile() }; publishState()
+        case "spatial":
+            guard mode == .music, soloMode || peerCapabilities.contains("spatialV1") else { return }
+            spatialSettings = SpatialSettings.read(o); if J.b(o,"finished",true) { saveSoundProfile() }
+            let playing = playBox.value.timeline.playing
+            newEpoch(playing,posFrame(), now + (playing ? SF.startDelayNs : 0))
         case "vol":
             if mode == .levelMeasure { toast("Во время измерения общая громкость зафиксирована"); return }
             let v = Float(min(1, max(0, J.d(o, "v", 1))))

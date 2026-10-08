@@ -163,6 +163,10 @@ struct UiState: Equatable {
     var playlists: [PlaylistInfo] = []
     var filePickerRequest = 0
     var mode: SourceMode = .music
+    var eq = EqSettings()
+    var spatial = SpatialSettings()
+    var eqAvailable = true
+    var spatialAvailable = true
     var volL: Float = 1
     var volR: Float = 1
     var master: Float = 0.96
@@ -195,4 +199,71 @@ enum J {
     }
     static func b(_ o: [String: Any], _ k: String, _ def: Bool = false) -> Bool { (o[k] as? NSNumber)?.boolValue ?? def }
     static func s(_ o: [String: Any], _ k: String, _ def: String = "") -> String { o[k] as? String ?? def }
+}
+
+
+struct EqSettings: Codable, Equatable {
+    static let frequencies: [Float] = [31.5, 63, 125, 250, 500, 1000, 2000, 4000, 8000, 16000]
+    static let presets: [(String, [Float])] = [
+        ("Ровно", Array(repeating: 0, count: 10)),
+        ("Больше баса", [4,3.5,2.5,1.5,0,0,0,0.5,1,1]),
+        ("Вокал", [-2,-1.5,0,1,2.5,3,2,0.5,0,-0.5]),
+        ("Яркость", [-1.5,-1,0,0.5,0,0.5,2,3,3.5,2.5]),
+        ("Мягко", [1,1,0.5,0,-0.5,-1,-1,-0.5,0.5,1]),
+        ("Динамик телефона", [-12,-9,-5,-2,0,1.5,2,1.5,0.5,0])]
+    var enabled = false
+    var gains: [Float] = Array(repeating: 0, count: 10)
+    var preset = "Ровно"
+    var magnet = "SOFT"
+    var preserveLoudness = true
+    var bypass = false
+    var json: [String: Any] { ["enabled":enabled, "gains":gains.map(Double.init), "preset":preset,
+        "magnet":magnet, "preserveLoudness":preserveLoudness, "bypass":bypass] }
+    static func read(_ o: [String: Any]) -> EqSettings {
+        var v = EqSettings(); v.enabled = J.b(o,"enabled"); v.bypass = J.b(o,"bypass")
+        v.preserveLoudness = J.b(o,"preserveLoudness",true); v.preset = J.s(o,"preset","Ровно")
+        v.magnet = J.s(o,"magnet","SOFT").uppercased()
+        let values = o["gains"] as? [NSNumber] ?? []
+        v.gains = (0..<10).map { i in i < values.count ? (min(12,max(-12,values[i].floatValue))*2).rounded()/2 : 0 }
+        return v
+    }
+    mutating func moveBand(_ index: Int, to value: Float) {
+        let delta = value - gains[index], sigma: Float = magnet == "STRONG" ? 1.4 : 0.8
+        let start = gains
+        for j in gains.indices {
+            let distance = abs(log2(EqSettings.frequencies[j] / EqSettings.frequencies[index]))
+            let weight: Float = j == index ? 1 : magnet == "OFF" ? 0 : exp(-log(2) * pow(distance/sigma,2))
+            gains[j] = min(12,max(-12,start[j] + delta * weight))
+        }
+        gains[index] = min(12,max(-12,value)); preset = "Свой"
+    }
+}
+
+struct SpatialSettings: Codable, Equatable {
+    var enabled = false
+    var level = "off"
+    var profile = "pair_wide"
+    var preserveLoudness = true
+    var width = 3.0
+    var air = 2.0
+    var ambient = 2.0
+    var depth = -2.0
+    var reflection = -17.0
+    var json: [String: Any] { ["enabled":enabled, "level":level, "profile":profile,
+        "preserveLoudness":preserveLoudness, "custom":["gMidDb":width,"gHighDb":air,
+        "gAmbientDb":ambient,"depthDb":depth,"reflectionDb":reflection]] }
+    static func read(_ o: [String: Any]) -> SpatialSettings {
+        var s = SpatialSettings(); s.level = J.s(o,"level","off")
+        if !["off","soft","strong"].contains(s.level) { s.level = "off" }
+        s.enabled = J.b(o,"enabled") && s.level != "off"; if !s.enabled { s.level = "off" }
+        s.profile = J.s(o,"profile","pair_wide"); s.preserveLoudness = J.b(o,"preserveLoudness",true)
+        if s.profile == "pair_near" { s.width = 5; s.air = 3; s.ambient = 3; s.depth = -1.5 }
+        if s.profile == "solo_stereo_speaker" { s.width = 2; s.depth = -1 }
+        if let c = o["custom"] as? [String: Any] {
+            s.width = min(8,max(0,J.d(c,"gMidDb",s.width))); s.air = min(8,max(0,J.d(c,"gHighDb",s.air)))
+            s.ambient = min(6,max(0,J.d(c,"gAmbientDb",s.ambient))); s.depth = min(0,max(-6,J.d(c,"depthDb",s.depth)))
+            s.reflection = min(-10,max(-30,J.d(c,"reflectionDb",s.reflection)))
+        }
+        return s
+    }
 }
