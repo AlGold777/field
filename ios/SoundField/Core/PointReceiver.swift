@@ -85,14 +85,31 @@ final class PointReceiver {
             if !seqInit { expectedSeq = p.seq; seqInit = true }
             // разность по модулю 2^32: >= 0 — пакет впереди ожидаемого
             let diff = p.seq &- expectedSeq
+            var duplicate = false
             if diff >= 0 {
-                var s = expectedSeq
-                while s != p.seq && pending.count < 512 { pending[s] = Pending(firstSeen: arrivalLocalNs); s &+= 1 }
+                let gap = Int64(diff)
+                if gap > 256 {
+                    // Огромный провал в приёме (> 2.5 с звука) — не забиваем очередь безнадёжными NACK
+                    lostFinal += gap
+                } else {
+                    var s = expectedSeq
+                    while s != p.seq {
+                        // очередь полна: вытесняем самый старый, потерю учитываем (как в Kotlin)
+                        if pending.count >= 512, let oldest = pending.min(by: { $0.value.firstSeen < $1.value.firstSeen }) {
+                            pending.removeValue(forKey: oldest.key)
+                            lostFinal += 1
+                        }
+                        pending[s] = Pending(firstSeen: arrivalLocalNs)
+                        s &+= 1
+                    }
+                }
                 expectedSeq = p.seq &+ 1
             } else if pending.removeValue(forKey: p.seq) != nil {
                 recovered += 1
+            } else {
+                duplicate = true // уже обработанный seq
             }
-            received += 1
+            if !duplicate { received += 1 }
             if clock.ready {
                 let transit = clock.toServer(arrivalLocalNs) - p.sendNs
                 if lastTransit != .min {

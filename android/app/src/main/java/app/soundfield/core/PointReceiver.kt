@@ -79,6 +79,7 @@ class PointReceiver(private val clock: ClockSync, capacityPow2: Int = 17) {
             if (!seqInit) { expectedSeq = p.seq; seqInit = true }
             // разность по модулю 2^32: >= 0 — пакет впереди ожидаемого
             val diff = p.seq - expectedSeq
+            var duplicate = false
             if (diff >= 0) {
                 val gap = diff
                 if (gap > 256) {
@@ -102,8 +103,10 @@ class PointReceiver(private val clock: ClockSync, capacityPow2: Int = 17) {
                 expectedSeq = p.seq + 1
             } else if (pending.remove(p.seq) != null) {
                 recovered++ // переупорядочивание
+            } else {
+                duplicate = true // уже обработанный seq
             }
-            received++
+            if (!duplicate) received++
             // jitter RFC 3550 по времени прохождения (в часах Server)
             if (clock.ready) {
                 val transit = clock.toServer(arrivalLocalNs) - p.sendNs
