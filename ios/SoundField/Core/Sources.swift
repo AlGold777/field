@@ -265,7 +265,16 @@ enum Wav {
         while pos + 8 <= b.count {
             let id = String(bytes: b[pos..<pos + 4], encoding: .ascii) ?? ""
             let len = u32(pos + 4); let body = pos + 8
-            if id == "fmt " { fmt = u16(body); channels = u16(body + 2); rate = u32(body + 4); bits = u16(body + 14) }
+            if id == "fmt " {
+                // Обрезанный fmt-чанк — невалидный файл, а не выход за границы массива.
+                guard len >= 16, body + 16 <= b.count else { throw WavError.format }
+                fmt = u16(body); channels = u16(body + 2); rate = u32(body + 4); bits = u16(body + 14)
+                // WAVE_FORMAT_EXTENSIBLE: реальный формат — первые 2 байта под-GUID (смещение 24 в fmt).
+                if fmt == 0xFFFE {
+                    guard len >= 40, body + 26 <= b.count else { throw WavError.format }
+                    fmt = u16(body + 24)
+                }
+            }
             if id == "data" { dataOff = body; dataLen = min(len, b.count - body) }
             if dataOff >= 0 && channels > 0 { break }
             pos = body + len + (len & 1)
