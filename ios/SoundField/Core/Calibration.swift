@@ -15,8 +15,7 @@ enum CalibrationAnalyzer {
 
     static func analyze(rec: [Float], recSr: Int, recStartServerNs: Int64, anchorNs: Int64, trimNs: Int64) -> Result {
         guard rec.count >= recSr else { return Result(ok: false, lateMs: 0, spreadMs: 0, pairs: 0, snrDb: 0, message: "Запись слишком короткая") }
-        let corrUp = xcorrAbs(rec, Chirp.make(up: true, sampleRate: recSr))
-        let corrDown = xcorrAbs(rec, Chirp.make(up: false, sampleRate: recSr))
+        let (corrUp, corrDown) = xcorrAbsBoth(rec, Chirp.make(up: true, sampleRate: recSr), Chirp.make(up: false, sampleRate: recSr))
         func expected(_ serverNs: Int64) -> Double { Double(serverNs - recStartServerNs) * Double(recSr) / 1e9 }
 
         var lates: [Double] = []
@@ -47,11 +46,14 @@ enum CalibrationAnalyzer {
         let from = max(1, Int(expected - 0.30 * Double(sr)))
         let to = min(c.count - 2, Int(expected + 0.45 * Double(sr)))
         guard to - from >= sr / 20 else { return nil }
-        var best = from; var bestV: Float = 0
-        for i in from...to where c[i] > bestV { bestV = c[i]; best = i }
+        var argmax = from; var maxV: Float = 0
+        for i in from...to where c[i] > maxV { maxV = c[i]; argmax = i }
+        // первый локальный максимум, превышающий 50% глобального максимума окна (а не самый сильный путь)
+        var best = argmax
+        for i in from...to where c[i] >= 0.5 * maxV && c[i] >= c[i - 1] && c[i] > c[i + 1] { best = i; break }
         var window = Array(c[from...to]); window.sort()
         let noise = max(Double(window[window.count / 2]), 1e-9)
-        let ratio = Double(bestV) / noise
+        let ratio = Double(c[best]) / noise
         guard ratio >= 8 else { return nil }
         let y0 = Double(c[best - 1]), y1 = Double(c[best]), y2 = Double(c[best + 1])
         let den = y0 - 2 * y1 + y2
@@ -64,15 +66,21 @@ enum CalibrationAnalyzer {
         return s.count % 2 == 1 ? s[m] : (s[m - 1] + s[m]) / 2
     }
 
-    /// |взаимная корреляция| через БПФ.
-    static func xcorrAbs(_ x: [Float], _ tpl: [Float]) -> [Float] {
+    /// |взаимная корреляция| с двумя шаблонами. БПФ записи считается один раз.
+    static func xcorrAbsBoth(_ x: [Float], _ tplA: [Float], _ tplB: [Float]) -> (up: [Float], down: [Float]) {
         var n = 1
-        while n < x.count + tpl.count { n <<= 1 }
-        var xr = [Double](repeating: 0, count: n), xi = [Double](repeating: 0, count: n)
+        while n < x.count + max(tplA.count, tplB.count) { n <<= 1 }
+        var xr0 = [Double](repeating: 0, count: n), xi0 = [Double](repeating: 0, count: n)
+        for i in 0..<x.count { xr0[i] = Double(x[i]) }
+        Fft.transform(&xr0, &xi0, inverse: false)
+        return (corrWith(xr0, xi0, tplA, x.count), corrWith(xr0, xi0, tplB, x.count))
+    }
+
+    private static func corrWith(_ xr0: [Double], _ xi0: [Double], _ tpl: [Float], _ len: Int) -> [Float] {
+        let n = xr0.count
+        var xr = xr0, xi = xi0
         var tr = [Double](repeating: 0, count: n), ti = [Double](repeating: 0, count: n)
-        for i in 0..<x.count { xr[i] = Double(x[i]) }
         for i in 0..<tpl.count { tr[i] = Double(tpl[i]) }
-        Fft.transform(&xr, &xi, inverse: false)
         Fft.transform(&tr, &ti, inverse: false)
         for i in 0..<n {
             let re = xr[i] * tr[i] + xi[i] * ti[i]
@@ -80,7 +88,7 @@ enum CalibrationAnalyzer {
             xr[i] = re; xi[i] = im
         }
         Fft.transform(&xr, &xi, inverse: true)
-        return (0..<x.count).map { Float(abs(xr[$0])) }
+        return (0..<len).map { Float(abs(xr[$0])) }
     }
 }
 
