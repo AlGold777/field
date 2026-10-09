@@ -137,6 +137,7 @@ struct StatusPill: View {
     let text: String
     let color: Color
     @State private var on = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     var body: some View {
         HStack(spacing: 8) {
             Circle().fill(color).frame(width: 8, height: 8).opacity(on ? 1 : 0.4)
@@ -147,7 +148,7 @@ struct StatusPill: View {
         .padding(.horizontal, 14).padding(.vertical, 7)
         .background(Capsule().fill(color.opacity(0.15)))
         .overlay(Capsule().stroke(color.opacity(0.3), lineWidth: 1))
-        .onAppear { withAnimation(.easeInOut(duration: 0.9).repeatForever()) { on = true } }
+        .onAppear { withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.9).repeatForever()) { on = true } }
     }
 }
 
@@ -169,6 +170,7 @@ struct SpeakerCircle: View {
     let highlight: Bool
     let action: () -> Void
     @State private var pulse = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     var body: some View {
         VStack(spacing: 6) {
             Text(label).font(.system(size: 26, weight: .bold)).foregroundColor(SFColor.channelText(ch))
@@ -180,11 +182,21 @@ struct SpeakerCircle: View {
                 .onLongPressGesture(minimumDuration: 0.5) { action() }
                 .accessibilityAddTraits(.isButton)
                 .accessibilityAction(named: Text("Поменять каналы")) { action() }
-                .onAppear { withAnimation(.easeInOut(duration: 0.52).repeatForever()) { pulse = true } }
+                .onAppear { updatePulse() }
+                .onChange(of: playing) { _ in updatePulse() }
             Text(caption).font(.system(size: 13, weight: .semibold)).foregroundColor(SFColor.text).lineLimit(1)
             Text(sub.isEmpty ? " " : sub).font(.system(size: 11)).foregroundColor(sub.isEmpty ? .clear : SFColor.dim).lineLimit(1)
         }
         .frame(width: 130)
+    }
+
+    /// Пульсация только во время воспроизведения и без «Уменьшения движения».
+    private func updatePulse() {
+        guard playing && !reduceMotion else {
+            withAnimation(.easeOut(duration: 0.2)) { pulse = false }
+            return
+        }
+        withAnimation(.easeInOut(duration: 0.52).repeatForever()) { pulse = true }
     }
 }
 
@@ -261,11 +273,12 @@ struct DiagRow: View {
 
 struct SearchingDots: View {
     @State private var on = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     var body: some View {
         HStack(spacing: 10) {
             ForEach(0..<3, id: \.self) { i in
                 Circle().fill(SFColor.accent1).frame(width: 10, height: 10).opacity(on ? 1 : 0.2)
-                    .animation(.easeInOut(duration: 0.6).repeatForever().delay(Double(i) * 0.2), value: on)
+                    .animation(reduceMotion ? nil : .easeInOut(duration: 0.6).repeatForever().delay(Double(i) * 0.2), value: on)
             }
         }
         .frame(maxWidth: .infinity).padding(.vertical, 14)
