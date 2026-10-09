@@ -37,6 +37,7 @@ struct PlayerView: View {
     @State private var audioBrowserRoot: URL? = AudioBrowserView.restoredRoot()
     @State private var showingAudioBrowser = false
     @State private var changingAudioRoot = false
+    @Environment(\.scenePhase) private var scenePhase
     private let timer = Timer.publish(every: 0.2, on: .main, in: .common).autoconnect()
 
     var body: some View {
@@ -212,6 +213,8 @@ struct PlayerView: View {
             }
         }
         .onReceive(timer) { _ in
+            // Опрос позиции не нужен, пока приложение не на переднем плане
+            guard scenePhase == .active else { return }
             pos = engine.positionMs()
             if let h = seekHoldFraction, abs(Double(pos) - h * Double(max(1, ui.durationMs))) < 1000 { seekHoldFraction = nil }
         }
