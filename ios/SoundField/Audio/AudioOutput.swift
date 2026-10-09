@@ -151,7 +151,27 @@ final class AudioOutput {
         engine.stop()
         updateLatency()
         engine.prepare()
-        try? engine.start()
+        startAfterRestart(retry: true)
+    }
+
+    /// Движок не запустился после restart(), даже после повтора.
+    private(set) var restartFailed = false
+
+    private func startAfterRestart(retry: Bool) {
+        do {
+            try engine.start()
+            restartFailed = false
+        } catch {
+            NSLog("SoundField engine restart: \(error)")
+            if retry {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+                    guard let self, self.running else { return }
+                    self.startAfterRestart(retry: false)
+                }
+            } else {
+                restartFailed = true
+            }
+        }
     }
 
     private func handleInterruption(_ n: Notification) {
