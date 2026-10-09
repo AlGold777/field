@@ -19,12 +19,23 @@ final class AudioOutput {
     private var routeSignature: String?
 
     private(set) var latencyMs = 0.0
-    private(set) var underruns: Int64 = 0      // на iOS система не отдаёт счётчик — считаем отсутствие hostTime
+    // Счётчик пишет только реалтайм-callback (без блокировок и без self); читается на главном потоке.
+    private let underrunCounter: UnsafeMutablePointer<Int64> = {
+        let p = UnsafeMutablePointer<Int64>.allocate(capacity: 1)
+        p.initialize(to: 0)
+        return p
+    }()
+    private(set) var underruns: Int64 {       // на iOS система не отдаёт счётчик — считаем отсутствие hostTime
+        get { underrunCounter.pointee }
+        set { underrunCounter.pointee = newValue }
+    }
 
     var source: RenderSource? {
         get { sourceBox.value }
         set { sourceBox.value = newValue }
     }
+
+    deinit { underrunCounter.deallocate() }
 
     init() {
         let nc = NotificationCenter.default
@@ -83,7 +94,8 @@ final class AudioOutput {
         if node == nil {
             let src = sourceBox
             let lat = outLatencyNs
-            let n = AVAudioSourceNode(format: fmt) { [weak self] _, ts, frameCount, abl -> OSStatus in
+            let underrunCount = underrunCounter
+            let n = AVAudioSourceNode(format: fmt) { _, ts, frameCount, abl -> OSStatus in
                 let bufs = UnsafeMutableAudioBufferListPointer(abl)
                 guard let first = bufs.first, let data = first.mData else { return noErr }
                 let out = data.assumingMemoryBound(to: Float.self)
@@ -92,7 +104,7 @@ final class AudioOutput {
                 if ts.pointee.mFlags.contains(.hostTimeValid) {
                     present = MonoClock.ns(fromHost: ts.pointee.mHostTime) + lat.value
                 } else {
-                    self?.underruns += 1
+                    underrunCount.pointee += 1
                     present = MonoClock.nowNs() + lat.value + 5_000_000
                 }
                 if bufs.count >= 2, let second = bufs[1].mData {
