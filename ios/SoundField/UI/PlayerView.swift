@@ -101,6 +101,7 @@ struct PlayerView: View {
                             .frame(width: 76, height: 76).background(Circle().fill(SFColor.accent))
                     }
                     .buttonStyle(PressStyle())
+                    .accessibilityLabel(ui.playing ? "Пауза" : "Играть")
                     Spacer()
                     roundIcon("forward.end.fill") { engine.nextTrack() }.accessibilityLabel("Следующий трек")
                     Spacer()

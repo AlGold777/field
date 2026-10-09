@@ -16,8 +16,9 @@ struct H3: View {
 struct Subtitle: View {
     let text: String
     var align: TextAlignment = .leading
+    @ScaledMetric(relativeTo: .subheadline) var textSize: CGFloat = 14
     var body: some View {
-        Text(text).font(.system(size: 14)).foregroundColor(SFColor.dim).multilineTextAlignment(align)
+        Text(text).font(.system(size: textSize)).foregroundColor(SFColor.dim).multilineTextAlignment(align)
             .lineSpacing(3).fixedSize(horizontal: false, vertical: true)
     }
 }
@@ -66,9 +67,10 @@ struct SecondaryButton: View {
 struct PlayerActionButton: View {
     let title: String
     let action: () -> Void
+    @ScaledMetric(relativeTo: .footnote) var labelSize: CGFloat = 13
     var body: some View {
         Button(action: action) {
-            Text(title).font(.system(size: 13, weight: .semibold)).foregroundColor(SFColor.text)
+            Text(title).font(.system(size: labelSize, weight: .semibold)).foregroundColor(SFColor.text)
                 .lineLimit(1).minimumScaleFactor(0.8)
                 .frame(maxWidth: .infinity).frame(height: 48)
                 .background(RoundedRectangle(cornerRadius: 14).fill(SFColor.secondary))
@@ -280,6 +282,7 @@ struct BackBar: View {
                 Text("←").font(.system(size: 20)).foregroundColor(.white).frame(width: 40, height: 40)
                     .background(RoundedRectangle(cornerRadius: 12).fill(SFColor.secondary))
             }
+            .accessibilityLabel("Назад")
             H2(text: title)
             Spacer()
         }
