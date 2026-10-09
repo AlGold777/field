@@ -100,7 +100,7 @@ final class ClockSync {
             }
             let den = sw * sxx - sx * sx
             b = abs(den) > 1e-12 ? (sw * sxy - sx * sy) / den : 0
-            if abs(b) > Self.maxDrift { b = 0 }
+            b = min(max(b, -Self.maxDrift), Self.maxDrift)
             a = base + (sy - b * sx) / sw
             var r2 = 0.0
             for k in ok { let e = k.offset - (a + b * Double(k.mid - ref)); r2 += e * e }

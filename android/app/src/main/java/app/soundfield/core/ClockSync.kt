@@ -163,7 +163,7 @@ class ClockSync {
             }
             val den = sw * sxx - sx * sx
             b = if (abs(den) > 1e-12) (sw * sxy - sx * sy) / den else 0.0
-            if (abs(b) > MAX_DRIFT) b = 0.0
+            b = b.coerceIn(-MAX_DRIFT, MAX_DRIFT)
             a = base + (sy - b * sx) / sw
             // разброс остатков как оценка погрешности
             var r2 = 0.0
