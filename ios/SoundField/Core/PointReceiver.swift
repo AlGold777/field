@@ -26,6 +26,7 @@ final class PointReceiver {
     private(set) var nacksSent: Int64 = 0
 
     private var expectedSeq: Int32 = -1
+    private var seqInit = false   // expectedSeq уже задан (seq может быть отрицательным после переполнения Int32)
     private struct Pending { var firstSeen: Int64; var lastNack: Int64 = 0; var tries = 0 }
     private var pending: [Int32: Pending] = [:]
     private var lastTransit: Int64 = .min
@@ -50,7 +51,7 @@ final class PointReceiver {
     func reset() {
         lock.lock(); defer { lock.unlock() }
         tlBox.value = .none
-        clearBuffer(); expectedSeq = -1; pending.removeAll(); lastTransit = .min
+        clearBuffer(); expectedSeq = -1; seqInit = false; pending.removeAll(); lastTransit = .min
     }
 
     private func clearBuffer() {
@@ -63,7 +64,7 @@ final class PointReceiver {
         lock.lock(); defer { lock.unlock() }
         let cur = tlBox.value
         if tl.epoch < cur.epoch { return }
-        if tl.epoch > cur.epoch { clearBuffer(); expectedSeq = -1; pending.removeAll(); lastTransit = .min }
+        if tl.epoch > cur.epoch { clearBuffer(); expectedSeq = -1; seqInit = false; pending.removeAll(); lastTransit = .min }
         tlBox.value = tl
     }
 
@@ -72,7 +73,7 @@ final class PointReceiver {
         let cur = tlBox.value
         if p.epoch < cur.epoch { stale += 1; return }
         if p.epoch > cur.epoch {
-            clearBuffer(); expectedSeq = -1; pending.removeAll(); lastTransit = .min
+            clearBuffer(); expectedSeq = -1; seqInit = false; pending.removeAll(); lastTransit = .min
             tlBox.value = Timeline(epoch: p.epoch, playing: true, anchorFrame: p.startFrame, anchorNs: p.playoutNs)
         } else if !cur.playing { stale += 1; return }
 
@@ -81,10 +82,12 @@ final class PointReceiver {
         if p.isRetransmit {
             if pending.removeValue(forKey: p.seq) != nil { recovered += 1 }
         } else {
-            if expectedSeq < 0 { expectedSeq = p.seq }
-            if p.seq >= expectedSeq {
+            if !seqInit { expectedSeq = p.seq; seqInit = true }
+            // разность по модулю 2^32: >= 0 — пакет впереди ожидаемого
+            let diff = p.seq &- expectedSeq
+            if diff >= 0 {
                 var s = expectedSeq
-                while s < p.seq && pending.count < 512 { pending[s] = Pending(firstSeen: arrivalLocalNs); s += 1 }
+                while s != p.seq && pending.count < 512 { pending[s] = Pending(firstSeen: arrivalLocalNs); s &+= 1 }
                 expectedSeq = p.seq &+ 1
             } else if pending.removeValue(forKey: p.seq) != nil {
                 recovered += 1

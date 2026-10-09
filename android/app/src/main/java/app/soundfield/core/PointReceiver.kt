@@ -30,6 +30,7 @@ class PointReceiver(private val clock: ClockSync, capacityPow2: Int = 17) {
 
     private val lock = Any()
     private var expectedSeq = -1
+    private var seqInit = false   // expectedSeq уже задан (seq может быть отрицательным после переполнения Int)
     private class Pending(val firstSeen: Long) { var lastNack = 0L; var tries = 0 }
     private val pending = LinkedHashMap<Int, Pending>()
     private var lastTransit = Long.MIN_VALUE
@@ -44,7 +45,7 @@ class PointReceiver(private val clock: ClockSync, capacityPow2: Int = 17) {
     fun reset() = synchronized(lock) {
         timeline = Timeline.NONE
         clearBuffer()
-        expectedSeq = -1; pending.clear(); lastTransit = Long.MIN_VALUE
+        expectedSeq = -1; seqInit = false; pending.clear(); lastTransit = Long.MIN_VALUE
     }
 
     private fun clearBuffer() {
@@ -57,7 +58,7 @@ class PointReceiver(private val clock: ClockSync, capacityPow2: Int = 17) {
     fun onTimeline(tl: Timeline) = synchronized(lock) {
         val cur = timeline
         if (tl.epoch < cur.epoch) return
-        if (tl.epoch > cur.epoch) { clearBuffer(); expectedSeq = -1; pending.clear(); lastTransit = Long.MIN_VALUE }
+        if (tl.epoch > cur.epoch) { clearBuffer(); expectedSeq = -1; seqInit = false; pending.clear(); lastTransit = Long.MIN_VALUE }
         timeline = tl
     }
 
@@ -65,7 +66,7 @@ class PointReceiver(private val clock: ClockSync, capacityPow2: Int = 17) {
         val cur = timeline
         if (p.epoch < cur.epoch) { stale++; return }
         if (p.epoch > cur.epoch) {
-            clearBuffer(); expectedSeq = -1; pending.clear(); lastTransit = Long.MIN_VALUE
+            clearBuffer(); expectedSeq = -1; seqInit = false; pending.clear(); lastTransit = Long.MIN_VALUE
             timeline = Timeline(p.epoch, true, p.startFrame, p.playoutNs)
         } else if (!cur.playing) { stale++; return }
 
@@ -75,15 +76,17 @@ class PointReceiver(private val clock: ClockSync, capacityPow2: Int = 17) {
         if (p.isRetransmit) {
             if (pending.remove(p.seq) != null) recovered++
         } else {
-            if (expectedSeq < 0) expectedSeq = p.seq
-            if (p.seq >= expectedSeq) {
-                val gap = p.seq - expectedSeq
+            if (!seqInit) { expectedSeq = p.seq; seqInit = true }
+            // разность по модулю 2^32: >= 0 — пакет впереди ожидаемого
+            val diff = p.seq - expectedSeq
+            if (diff >= 0) {
+                val gap = diff
                 if (gap > 256) {
                     // Огромный провал в приёме (> 2.5 с звука) — не забиваем очередь безнадёжными NACK
                     lostFinal += gap
                 } else {
                     var s = expectedSeq
-                    while (s < p.seq) {
+                    while (s != p.seq) {
                         if (pending.size >= 512) {
                             val it = pending.keys.iterator()
                             if (it.hasNext()) {
