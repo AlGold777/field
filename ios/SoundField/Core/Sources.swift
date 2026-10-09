@@ -158,9 +158,12 @@ final class ChannelTestSource: AudioSource {
     let title = "Проверка каналов"
     let artist = "Сначала левый, затем правый"
     let totalFrames = Int64(Double(SF.sampleRate) * 3.8)
+    // Вынесено из sample(): литерал массива создавался бы на каждый сэмпл.
+    private static let leftStarts = [0.3, 0.8, 1.3]
+    private static let rightStarts = [2.1, 2.6, 3.1]
     func sample(_ frame: Int64, _ ch: Int) -> Float {
         let t = Double(frame) / Double(SF.sampleRate)
-        let starts = ch == Ch.L ? [0.3, 0.8, 1.3] : [2.1, 2.6, 3.1]
+        let starts = ch == Ch.L ? Self.leftStarts : Self.rightStarts
         let f = ch == Ch.L ? 880.0 : 1_320.0
         for s in starts {
             let dt = t - s
