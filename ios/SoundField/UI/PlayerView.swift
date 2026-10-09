@@ -14,6 +14,8 @@ struct PlayerView: View {
     @AppStorage("sf.soundExpanded") private var soundExpanded = true
     @State private var pos: Int64 = 0
     @State private var dragging: Double? = nil
+    @State private var seekHoldFraction: Double? = nil
+    @State private var seekHoldUntil = Date.distantPast
     @State private var confirmDisconnect = false
     @State private var confirmCancelTransfer = false
     @State private var showConnectChooser = false
@@ -69,13 +71,19 @@ struct PlayerView: View {
                     .padding(.top, 4).padding(.bottom, 8)
 
                 let dur = Double(max(1, ui.durationMs))
-                Slider(value: Binding(get: { dragging ?? min(1, Double(pos) / dur) }, set: { dragging = $0 }),
+                // После отпускания держим позицию перемотки, пока движок не догонит её (или 300 мс)
+                let held = Date() < seekHoldUntil ? seekHoldFraction : nil
+                Slider(value: Binding(get: { dragging ?? held ?? min(1, Double(pos) / dur) }, set: { dragging = $0 }),
                        in: 0...1, onEditingChanged: { editing in
-                           if !editing, let d = dragging { engine.seekMs(Int64(d * dur)); dragging = nil }
+                           if !editing, let d = dragging {
+                               engine.seekMs(Int64(d * dur))
+                               seekHoldFraction = d; seekHoldUntil = Date().addingTimeInterval(0.3)
+                               dragging = nil
+                           }
                        })
                     .tint(SFColor.accent1)
                 HStack {
-                    Text(fmtTime(dragging.map { Int64($0 * dur) } ?? pos))
+                    Text(fmtTime(dragging.map { Int64($0 * dur) } ?? held.map { Int64($0 * dur) } ?? pos))
                     Spacer()
                     Text(fmtTime(ui.durationMs))
                 }
@@ -199,7 +207,10 @@ struct PlayerView: View {
                 }
             }
         }
-        .onReceive(timer) { _ in pos = engine.positionMs() }
+        .onReceive(timer) { _ in
+            pos = engine.positionMs()
+            if let h = seekHoldFraction, abs(Double(pos) - h * Double(max(1, ui.durationMs))) < 1000 { seekHoldFraction = nil }
+        }
         .onAppear { syncVolumes(); engine.setQueueExpanded(queueExpanded) }
         .onChange(of: ui.master) { _ in syncVolumes() }
         .onChange(of: ui.balance) { value in
