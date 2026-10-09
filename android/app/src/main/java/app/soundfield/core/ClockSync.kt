@@ -177,6 +177,8 @@ class ClockSync {
             a = best.offset
             uncertaintyMs = (best.quality - qMin) / 2e6 + (qMin / 1e6) * 0.1
         }
+        // верхняя граница вклада асимметрии задержек: половина минимального RTT
+        uncertaintyMs = maxOf(uncertaintyMs, qMin / 1e6 * 0.5)
         driftPpm = b * 1e6
         val next = Model(ref, a, b, true)
         val now = System.nanoTime()

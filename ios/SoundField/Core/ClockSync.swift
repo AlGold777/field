@@ -113,6 +113,8 @@ final class ClockSync {
             a = best.offset
             uncertaintyMs = (best.quality - qMin) / 2e6 + (qMin / 1e6) * 0.1
         }
+        // верхняя граница вклада асимметрии задержек: половина минимального RTT
+        uncertaintyMs = max(uncertaintyMs, qMin / 1e6 * 0.5)
         driftPpm = b * 1e6
         modelBox.value = Model(ref: ref, a: a, b: b, ready: true)
     }
