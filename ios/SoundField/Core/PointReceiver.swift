@@ -17,6 +17,8 @@ final class PointReceiver {
     var lastRenderedFrame: Int64 = .min
     private(set) var maxFrame: Int64 = -1
 
+    // Статистика пишется под lock (сетевой поток), а UI читает её без блокировки. Аналог @Volatile в Kotlin:
+    // чтение допустимо, так как Int64/Double выровнены и на arm64 читаются целым словом. Возможна лишь устаревшая копия.
     private(set) var received: Int64 = 0
     private(set) var lostFinal: Int64 = 0
     private(set) var recovered: Int64 = 0
