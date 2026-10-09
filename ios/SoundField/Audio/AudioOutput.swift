@@ -36,6 +36,8 @@ final class AudioOutput {
         }
         nc.addObserver(forName: AVAudioSession.mediaServicesWereResetNotification, object: nil, queue: .main) { [weak self] _ in
             guard let self, self.running else { return }
+            // Старый source node остаётся в графе движка: отсоединяем, иначе рендер идёт дважды.
+            if let old = self.node { self.engine.detach(old) }
             self.running = false; self.node = nil; self.start()
         }
         nc.addObserver(forName: .AVAudioEngineConfigurationChange, object: engine, queue: .main) { [weak self] _ in
