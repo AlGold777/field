@@ -26,6 +26,7 @@ struct PlayerView: View {
     @State private var playlistToOpen: PlaylistInfo?
     @State private var playlistToDelete: PlaylistInfo?
     @State private var master = 0.8
+    @State private var masterDragging = false
     @State private var balance = 0.5
     @State private var balanceDragging = false
     @State private var balanceWasInCenter = true
@@ -105,6 +106,7 @@ struct PlayerView: View {
                     if soundExpanded {
                     SliderRow(label: "Громкость", valueText: "\(Int(master * 100))%", value: $master, color: SFColor.master,
                               enabled: ui.mode != .levelMeasure,
+                              onEditingChanged: { masterDragging = $0 },
                               onEditingEnded: { engine.setVolume("M", Float(master), finished: true) })
                         .onChange(of: master) { if abs($0 - Double(ui.master)) > 0.004 { engine.setVolume("M", Float($0), finished: false) } }
                     if !ui.soloMode {
@@ -316,7 +318,7 @@ struct PlayerView: View {
     }
 
     private func syncVolumes() {
-        if abs(master - Double(ui.master)) > 0.005 { master = Double(ui.master) }
+        if !masterDragging && abs(master - Double(ui.master)) > 0.005 { master = Double(ui.master) }
         if !balanceDragging && abs(balance - Double(ui.balance)) > 0.005 {
             balance = Double(ui.balance); balanceWasInCenter = abs(balance - 0.5) < 0.015
         }
