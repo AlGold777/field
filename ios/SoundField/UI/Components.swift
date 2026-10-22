@@ -16,8 +16,9 @@ struct H3: View {
 struct Subtitle: View {
     let text: String
     var align: TextAlignment = .leading
+    @ScaledMetric(relativeTo: .subheadline) var textSize: CGFloat = 14
     var body: some View {
-        Text(text).font(.system(size: 14)).foregroundColor(SFColor.dim).multilineTextAlignment(align)
+        Text(text).font(.system(size: textSize)).foregroundColor(SFColor.dim).multilineTextAlignment(align)
             .lineSpacing(3).fixedSize(horizontal: false, vertical: true)
     }
 }
@@ -66,9 +67,10 @@ struct SecondaryButton: View {
 struct PlayerActionButton: View {
     let title: String
     let action: () -> Void
+    @ScaledMetric(relativeTo: .footnote) var labelSize: CGFloat = 13
     var body: some View {
         Button(action: action) {
-            Text(title).font(.system(size: 13, weight: .semibold)).foregroundColor(SFColor.text)
+            Text(title).font(.system(size: labelSize, weight: .semibold)).foregroundColor(SFColor.text)
                 .lineLimit(1).minimumScaleFactor(0.8)
                 .frame(maxWidth: .infinity).frame(height: 48)
                 .background(RoundedRectangle(cornerRadius: 14).fill(SFColor.secondary))
@@ -135,6 +137,7 @@ struct StatusPill: View {
     let text: String
     let color: Color
     @State private var on = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     var body: some View {
         HStack(spacing: 8) {
             Circle().fill(color).frame(width: 8, height: 8).opacity(on ? 1 : 0.4)
@@ -145,7 +148,7 @@ struct StatusPill: View {
         .padding(.horizontal, 14).padding(.vertical, 7)
         .background(Capsule().fill(color.opacity(0.15)))
         .overlay(Capsule().stroke(color.opacity(0.3), lineWidth: 1))
-        .onAppear { withAnimation(.easeInOut(duration: 0.9).repeatForever()) { on = true } }
+        .onAppear { withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.9).repeatForever()) { on = true } }
     }
 }
 
@@ -167,20 +170,33 @@ struct SpeakerCircle: View {
     let highlight: Bool
     let action: () -> Void
     @State private var pulse = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     var body: some View {
         VStack(spacing: 6) {
-            Button(action: action) {
-                Text(label).font(.system(size: 26, weight: .bold)).foregroundColor(SFColor.channelText(ch))
-                    .frame(width: 84, height: 84)
-                    .background(Circle().fill(SFColor.channel(ch).opacity(0.2)))
-                    .overlay(Circle().stroke(SFColor.channel(ch).opacity(playing && !pulse ? 0.55 : 1),
-                                             lineWidth: highlight ? 3 : 2))
-            }
-            .onAppear { withAnimation(.easeInOut(duration: 0.52).repeatForever()) { pulse = true } }
+            Text(label).font(.system(size: 26, weight: .bold)).foregroundColor(SFColor.channelText(ch))
+                .frame(width: 84, height: 84)
+                .background(Circle().fill(SFColor.channel(ch).opacity(0.2)))
+                .overlay(Circle().stroke(SFColor.channel(ch).opacity(playing && !pulse ? 0.55 : 1),
+                                         lineWidth: highlight ? 3 : 2))
+                .contentShape(Circle())
+                .onLongPressGesture(minimumDuration: 0.5) { action() }
+                .accessibilityAddTraits(.isButton)
+                .accessibilityAction(named: Text("Поменять каналы")) { action() }
+                .onAppear { updatePulse() }
+                .onChange(of: playing) { _ in updatePulse() }
             Text(caption).font(.system(size: 13, weight: .semibold)).foregroundColor(SFColor.text).lineLimit(1)
             Text(sub.isEmpty ? " " : sub).font(.system(size: 11)).foregroundColor(sub.isEmpty ? .clear : SFColor.dim).lineLimit(1)
         }
         .frame(width: 130)
+    }
+
+    /// Пульсация только во время воспроизведения и без «Уменьшения движения».
+    private func updatePulse() {
+        guard playing && !reduceMotion else {
+            withAnimation(.easeOut(duration: 0.2)) { pulse = false }
+            return
+        }
+        withAnimation(.easeInOut(duration: 0.52).repeatForever()) { pulse = true }
     }
 }
 
@@ -257,11 +273,12 @@ struct DiagRow: View {
 
 struct SearchingDots: View {
     @State private var on = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     var body: some View {
         HStack(spacing: 10) {
             ForEach(0..<3, id: \.self) { i in
                 Circle().fill(SFColor.accent1).frame(width: 10, height: 10).opacity(on ? 1 : 0.2)
-                    .animation(.easeInOut(duration: 0.6).repeatForever().delay(Double(i) * 0.2), value: on)
+                    .animation(reduceMotion ? nil : .easeInOut(duration: 0.6).repeatForever().delay(Double(i) * 0.2), value: on)
             }
         }
         .frame(maxWidth: .infinity).padding(.vertical, 14)
@@ -278,6 +295,7 @@ struct BackBar: View {
                 Text("←").font(.system(size: 20)).foregroundColor(.white).frame(width: 40, height: 40)
                     .background(RoundedRectangle(cornerRadius: 12).fill(SFColor.secondary))
             }
+            .accessibilityLabel("Назад")
             H2(text: title)
             Spacer()
         }

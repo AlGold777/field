@@ -29,7 +29,7 @@ struct DiagnosticsView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 0) {
                 BackBar(title: "Диагностика", back: back)
-                Subtitle(text: "Обновляется каждую секунду. Этот телефон — \(ui.role.title).").padding(.bottom, 16)
+                Subtitle(text: "Обновляется раз в секунду, пока телефоны в паре. Этот телефон — \(ui.role.title).").padding(.bottom, 16)
 
                 SFCard {
                     H3(text: "Рассогласование L/R")

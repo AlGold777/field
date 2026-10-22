@@ -14,6 +14,8 @@ struct PlayerView: View {
     @AppStorage("sf.soundExpanded") private var soundExpanded = true
     @State private var pos: Int64 = 0
     @State private var dragging: Double? = nil
+    @State private var seekHoldFraction: Double? = nil
+    @State private var seekHoldUntil = Date.distantPast
     @State private var confirmDisconnect = false
     @State private var confirmCancelTransfer = false
     @State private var showConnectChooser = false
@@ -26,6 +28,7 @@ struct PlayerView: View {
     @State private var playlistToOpen: PlaylistInfo?
     @State private var playlistToDelete: PlaylistInfo?
     @State private var master = 0.8
+    @State private var masterDragging = false
     @State private var balance = 0.5
     @State private var balanceDragging = false
     @State private var balanceWasInCenter = true
@@ -34,6 +37,7 @@ struct PlayerView: View {
     @State private var audioBrowserRoot: URL? = AudioBrowserView.restoredRoot()
     @State private var showingAudioBrowser = false
     @State private var changingAudioRoot = false
+    @Environment(\.scenePhase) private var scenePhase
     private let timer = Timer.publish(every: 0.2, on: .main, in: .common).autoconnect()
 
     var body: some View {
@@ -43,6 +47,9 @@ struct PlayerView: View {
                 Color.clear.frame(height: 24)
 
                 stage
+                Text("Чтобы поменять L и R, удерживайте кружок")
+                    .font(.system(size: 12)).foregroundColor(SFColor.dim)
+                    .frame(maxWidth: .infinity).opacity(ui.soloMode ? 0 : 1).padding(.bottom, 12)
 
                 syncIndicator.opacity(ui.soloMode ? 0 : 1).allowsHitTesting(!ui.soloMode).padding(.bottom, 20)
 
@@ -68,13 +75,19 @@ struct PlayerView: View {
                     .padding(.top, 4).padding(.bottom, 8)
 
                 let dur = Double(max(1, ui.durationMs))
-                Slider(value: Binding(get: { dragging ?? min(1, Double(pos) / dur) }, set: { dragging = $0 }),
+                // После отпускания держим позицию перемотки, пока движок не догонит её (или 300 мс)
+                let held = Date() < seekHoldUntil ? seekHoldFraction : nil
+                Slider(value: Binding(get: { dragging ?? held ?? min(1, Double(pos) / dur) }, set: { dragging = $0 }),
                        in: 0...1, onEditingChanged: { editing in
-                           if !editing, let d = dragging { engine.seekMs(Int64(d * dur)); dragging = nil }
+                           if !editing, let d = dragging {
+                               engine.seekMs(Int64(d * dur))
+                               seekHoldFraction = d; seekHoldUntil = Date().addingTimeInterval(0.3)
+                               dragging = nil
+                           }
                        })
                     .tint(SFColor.accent1)
                 HStack {
-                    Text(fmtTime(dragging.map { Int64($0 * dur) } ?? pos))
+                    Text(fmtTime(dragging.map { Int64($0 * dur) } ?? held.map { Int64($0 * dur) } ?? pos))
                     Spacer()
                     Text(fmtTime(ui.durationMs))
                 }
@@ -89,6 +102,7 @@ struct PlayerView: View {
                             .frame(width: 76, height: 76).background(Circle().fill(SFColor.accent))
                     }
                     .buttonStyle(PressStyle())
+                    .accessibilityLabel(ui.playing ? "Пауза" : "Играть")
                     Spacer()
                     roundIcon("forward.end.fill") { engine.nextTrack() }.accessibilityLabel("Следующий трек")
                     Spacer()
@@ -105,6 +119,7 @@ struct PlayerView: View {
                     if soundExpanded {
                     SliderRow(label: "Громкость", valueText: "\(Int(master * 100))%", value: $master, color: SFColor.master,
                               enabled: ui.mode != .levelMeasure,
+                              onEditingChanged: { masterDragging = $0 },
                               onEditingEnded: { engine.setVolume("M", Float(master), finished: true) })
                         .onChange(of: master) { if abs($0 - Double(ui.master)) > 0.004 { engine.setVolume("M", Float($0), finished: false) } }
                     if !ui.soloMode {
@@ -197,7 +212,12 @@ struct PlayerView: View {
                 }
             }
         }
-        .onReceive(timer) { _ in pos = engine.positionMs() }
+        .onReceive(timer) { _ in
+            // Опрос позиции не нужен, пока приложение не на переднем плане
+            guard scenePhase == .active else { return }
+            pos = engine.positionMs()
+            if let h = seekHoldFraction, abs(Double(pos) - h * Double(max(1, ui.durationMs))) < 1000 { seekHoldFraction = nil }
+        }
         .onAppear { syncVolumes(); engine.setQueueExpanded(queueExpanded) }
         .onChange(of: ui.master) { _ in syncVolumes() }
         .onChange(of: ui.balance) { value in
@@ -316,7 +336,7 @@ struct PlayerView: View {
     }
 
     private func syncVolumes() {
-        if abs(master - Double(ui.master)) > 0.005 { master = Double(ui.master) }
+        if !masterDragging && abs(master - Double(ui.master)) > 0.005 { master = Double(ui.master) }
         if !balanceDragging && abs(balance - Double(ui.balance)) > 0.005 {
             balance = Double(ui.balance); balanceWasInCenter = abs(balance - 0.5) < 0.015
         }
@@ -513,14 +533,14 @@ struct PlayerView: View {
         return HStack {
             SpeakerCircle(label: "L", ch: Ch.L, playing: ui.playing, caption: ui.soloMode ? "MyPhone" : leftIsMe ? "Этот телефон" : ui.peerName,
                           sub: ui.soloMode ? "" : role(Ch.L), highlight: ui.soloMode || leftIsMe) { if !ui.soloMode { engine.swapChannels() } }
-            Button { if !ui.soloMode { engine.swapChannels() } } label: {
-                Rectangle().fill(SFColor.accent).frame(width: 40, height: 2)
-                    .frame(width: 48, height: 44)
-                    .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .offset(y: -20)
-            .accessibilityLabel("Поменять каналы L и R")
+            Rectangle().fill(SFColor.accent).frame(width: 40, height: 2)
+                .frame(width: 48, height: 44)
+                .contentShape(Rectangle())
+                .onLongPressGesture(minimumDuration: 0.5) { if !ui.soloMode { engine.swapChannels() } }
+                .offset(y: -20)
+                .accessibilityLabel("Поменять каналы L и R")
+                .accessibilityAddTraits(.isButton)
+                .accessibilityAction { if !ui.soloMode { engine.swapChannels() } }
             SpeakerCircle(label: "R", ch: Ch.R, playing: ui.playing, caption: ui.soloMode ? "MyPhone" : leftIsMe ? ui.peerName : "Этот телефон",
                           sub: ui.soloMode ? "" : role(Ch.R), highlight: ui.soloMode || !leftIsMe) { if !ui.soloMode { engine.swapChannels() } }
         }
