@@ -173,17 +173,15 @@ struct SpeakerCircle: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     var body: some View {
         VStack(spacing: 6) {
-            Text(label).font(.system(size: 26, weight: .bold)).foregroundColor(SFColor.channelText(ch))
-                .frame(width: 84, height: 84)
-                .background(Circle().fill(SFColor.channel(ch).opacity(0.2)))
-                .overlay(Circle().stroke(SFColor.channel(ch).opacity(playing && !pulse ? 0.55 : 1),
-                                         lineWidth: highlight ? 3 : 2))
-                .contentShape(Circle())
-                .onLongPressGesture(minimumDuration: 0.5) { action() }
-                .accessibilityAddTraits(.isButton)
-                .accessibilityAction(named: Text("Поменять каналы")) { action() }
-                .onAppear { updatePulse() }
-                .onChange(of: playing) { _ in updatePulse() }
+            Button(action: action) {
+                Text(label).font(.system(size: 26, weight: .bold)).foregroundColor(SFColor.channelText(ch))
+                    .frame(width: 84, height: 84)
+                    .background(Circle().fill(SFColor.channel(ch).opacity(0.2)))
+                    .overlay(Circle().stroke(SFColor.channel(ch).opacity(playing && !pulse ? 0.55 : 1),
+                                             lineWidth: highlight ? 3 : 2))
+            }
+            .onAppear { updatePulse() }
+            .onChange(of: playing) { _ in updatePulse() }
             Text(caption).font(.system(size: 13, weight: .semibold)).foregroundColor(SFColor.text).lineLimit(1)
             Text(sub.isEmpty ? " " : sub).font(.system(size: 11)).foregroundColor(sub.isEmpty ? .clear : SFColor.dim).lineLimit(1)
         }

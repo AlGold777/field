@@ -47,9 +47,6 @@ struct PlayerView: View {
                 Color.clear.frame(height: 24)
 
                 stage
-                Text("Чтобы поменять L и R, удерживайте кружок")
-                    .font(.system(size: 12)).foregroundColor(SFColor.dim)
-                    .frame(maxWidth: .infinity).opacity(ui.soloMode ? 0 : 1).padding(.bottom, 12)
 
                 syncIndicator.opacity(ui.soloMode ? 0 : 1).allowsHitTesting(!ui.soloMode).padding(.bottom, 20)
 
@@ -533,14 +530,14 @@ struct PlayerView: View {
         return HStack {
             SpeakerCircle(label: "L", ch: Ch.L, playing: ui.playing, caption: ui.soloMode ? "MyPhone" : leftIsMe ? "Этот телефон" : ui.peerName,
                           sub: ui.soloMode ? "" : role(Ch.L), highlight: ui.soloMode || leftIsMe) { if !ui.soloMode { engine.swapChannels() } }
-            Rectangle().fill(SFColor.accent).frame(width: 40, height: 2)
-                .frame(width: 48, height: 44)
-                .contentShape(Rectangle())
-                .onLongPressGesture(minimumDuration: 0.5) { if !ui.soloMode { engine.swapChannels() } }
-                .offset(y: -20)
-                .accessibilityLabel("Поменять каналы L и R")
-                .accessibilityAddTraits(.isButton)
-                .accessibilityAction { if !ui.soloMode { engine.swapChannels() } }
+            Button { if !ui.soloMode { engine.swapChannels() } } label: {
+                Rectangle().fill(SFColor.accent).frame(width: 40, height: 2)
+                    .frame(width: 48, height: 44)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .offset(y: -20)
+            .accessibilityLabel("Поменять каналы L и R")
             SpeakerCircle(label: "R", ch: Ch.R, playing: ui.playing, caption: ui.soloMode ? "MyPhone" : leftIsMe ? ui.peerName : "Этот телефон",
                           sub: ui.soloMode ? "" : role(Ch.R), highlight: ui.soloMode || !leftIsMe) { if !ui.soloMode { engine.swapChannels() } }
         }
