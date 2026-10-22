@@ -17,6 +17,7 @@ import app.soundfield.core.SourceMode
 import app.soundfield.engine.Engine
 import app.soundfield.engine.UiState
 import kotlin.math.abs
+import kotlin.math.roundToInt
 
 @Composable
 fun CalibrationScreen(ui: UiState, engine: Engine, requestMic: () -> Unit, onBack: () -> Unit, micDeniedForever: Boolean = false) {
@@ -68,7 +69,7 @@ fun CalibrationScreen(ui: UiState, engine: Engine, requestMic: () -> Unit, onBac
             var trim by remember(ui.trimMs) { mutableFloatStateOf(ui.trimMs.toFloat()) }
             val limit = SF.MAX_TRIM_MS.toFloat()
             SliderRow("Ручной сдвиг Point", "%+.1f мс".format(trim), trim, SFColors.Accent1, -limit..limit,
-                onChange = { trim = (it * 2).toInt() / 2f }, onDone = { engine.setTrimMs(trim.toDouble()) })
+                onChange = { trim = (it * 2).roundToInt() / 2f }, onDone = { engine.setTrimMs(trim.toDouble()) })
             Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                 listOf(-5f, -1f, -0.5f, 0.5f, 1f, 5f).forEach { d ->
                     OutlinedButton(onClick = { trim = (trim + d).coerceIn(-limit, limit); engine.setTrimMs(trim.toDouble()) },
@@ -107,7 +108,7 @@ fun CalibrationScreen(ui: UiState, engine: Engine, requestMic: () -> Unit, onBac
                         else ui.levelTrimPointDb - ui.levelTrimServerDb
                 }
                 SliderRow("L громче  ·  R громче", "%+.1f дБ".format(offset), offset, SFColors.Accent1, -12f..12f,
-                    onChange = { offset = (it * 2).toInt() / 2f; levelDragging = true; engine.setLevelOffsetDb(offset, false) },
+                    onChange = { offset = (it * 2).roundToInt() / 2f; levelDragging = true; engine.setLevelOffsetDb(offset, false) },
                     onDone = { levelDragging = false; engine.setLevelOffsetDb(offset, true) })
                 Text("Сядьте на одинаковом расстоянии от телефонов (±10 см). Двигайте ползунок, пока обе стороны не станут одинаково громкими.",
                     color = SFColors.TextDim, fontSize = 13.sp, lineHeight = 18.sp)
