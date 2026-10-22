@@ -255,6 +255,7 @@ private extension RawTable {
         guard let genericProfile = generic else { throw SpecViolation() }
 
         var keys = Set<String>()
+        var matches = Set<String>()
         var profiles: [Profile] = []
         for model in self.models {
             try require(isValidKey(model.key))
@@ -263,6 +264,7 @@ private extension RawTable {
             try require(!model.match.isEmpty)
             for pattern in model.match {
                 try require(!pattern.isEmpty)
+                try require(matches.insert(pattern.lowercased()).inserted)
             }
             profiles.append(try makeProfile(key: model.key, match: model.match, body: model.body))
         }

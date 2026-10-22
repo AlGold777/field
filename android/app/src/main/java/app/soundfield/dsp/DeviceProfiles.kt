@@ -87,6 +87,8 @@ object DeviceProfiles {
             parseProfile(key, o, match)
         }
         check(models.map { it.key }.toSet().size == models.size) { "дубликаты key" }
+        val ids = models.flatMap { m -> m.match.map { it.lowercase() } }
+        check(ids.toSet().size == ids.size) { "дубликаты match" }
         return ProfileTable(version, schema.toInt(), generic, models)
     }
 
