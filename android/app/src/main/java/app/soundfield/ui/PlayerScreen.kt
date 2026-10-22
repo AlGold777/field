@@ -34,6 +34,7 @@ import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.role
 import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.semantics.onLongClick
 import app.soundfield.core.AudioGain
@@ -230,15 +231,19 @@ fun PlayerScreen(ui: UiState, engine: Engine, openCalibration: () -> Unit, openD
         )
         Spacer(Modifier.height(12.dp))
         val dur = ui.durationMs.coerceAtLeast(1)
+        // после отпускания держим позицию перемотки до прихода свежей позиции (или 300 мс), чтобы не было отката к старому pos
+        var seekHold by remember { mutableStateOf<Float?>(null) }
+        LaunchedEffect(seekHold) { if (seekHold != null) { delay(300); seekHold = null } }
+        LaunchedEffect(pos) { seekHold?.let { if (abs(pos - it * dur) < 500) seekHold = null } }
         Slider(
-            value = dragging ?: (pos.toFloat() / dur).coerceIn(0f, 1f),
+            value = dragging ?: seekHold ?: (pos.toFloat() / dur).coerceIn(0f, 1f),
             onValueChange = { dragging = it },
-            onValueChangeFinished = { dragging?.let { engine.seekMs((it * dur).toLong()) }; dragging = null },
+            onValueChangeFinished = { dragging?.let { engine.seekMs((it * dur).toLong()); seekHold = it }; dragging = null },
             colors = SliderDefaults.colors(thumbColor = SFColors.Accent1, activeTrackColor = SFColors.Accent1,
                 inactiveTrackColor = Color(0x1AFFFFFF)),
         )
         Row(Modifier.fillMaxWidth()) {
-            Text(fmtTime(dragging?.let { (it * dur).toLong() } ?: pos), color = SFColors.TextDim, fontSize = 12.sp)
+            Text(fmtTime((dragging ?: seekHold)?.let { (it * dur).toLong() } ?: pos), color = SFColors.TextDim, fontSize = 12.sp)
             Spacer(Modifier.weight(1f))
             Text(fmtTime(ui.durationMs), color = SFColors.TextDim, fontSize = 12.sp)
         }
@@ -246,7 +251,9 @@ fun PlayerScreen(ui: UiState, engine: Engine, openCalibration: () -> Unit, openD
         Row(Modifier.fillMaxWidth().padding(vertical = 18.dp), horizontalArrangement = Arrangement.SpaceEvenly,
             verticalAlignment = Alignment.CenterVertically) {
             RoundIcon("⏮", "Предыдущий трек") { engine.previousTrack() }
-            Box(Modifier.size(76.dp).clip(CircleShape).background(SFColors.accent).clickable { engine.togglePlay() },
+            Box(Modifier.size(76.dp).clip(CircleShape).background(SFColors.accent)
+                .semantics { contentDescription = if (ui.playing || ui.audioBuffering) "Пауза" else "Воспроизведение"; role = androidx.compose.ui.semantics.Role.Button }
+                .clickable { engine.togglePlay() },
                 contentAlignment = Alignment.Center) {
                 Text(if (ui.playing || ui.audioBuffering) "❚❚" else "▶", color = Color.White, fontSize = 28.sp)
             }
@@ -442,7 +449,9 @@ private fun DeviceChoiceTile(name: String, platform: String, modifier: Modifier 
 
 @Composable
 private fun RoundIcon(icon: String, label: String, onClick: () -> Unit) {
-    Box(Modifier.size(54.dp).clip(CircleShape).background(SFColors.Secondary).clickable(onClickLabel = label, onClick = onClick),
+    Box(Modifier.size(54.dp).clip(CircleShape).background(SFColors.Secondary)
+        .semantics { contentDescription = label; role = androidx.compose.ui.semantics.Role.Button }
+        .clickable(onClickLabel = label, onClick = onClick),
         contentAlignment = Alignment.Center) { Text(icon, color = Color.White, fontSize = 20.sp) }
 }
 

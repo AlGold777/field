@@ -1,5 +1,6 @@
 package app.soundfield.ui
 
+import android.provider.Settings
 import androidx.compose.animation.core.*
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -15,11 +16,15 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.role
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
@@ -110,10 +115,17 @@ fun DangerButton(text: String, modifier: Modifier = Modifier, onClick: () -> Uni
     ) { Text(text, color = SFColors.Bad, fontSize = 15.sp, fontWeight = FontWeight.SemiBold) }
 }
 
+/** false, если пользователь отключил анимации в системе (масштаб анимаций = 0): бесконечные анимации не запускаем. */
+@Composable
+fun motionEnabled(): Boolean {
+    val ctx = LocalContext.current
+    return remember(ctx) { Settings.Global.getFloat(ctx.contentResolver, Settings.Global.ANIMATOR_DURATION_SCALE, 1f) != 0f }
+}
+
 @Composable
 fun StatusPill(text: String, color: Color) {
     val t = rememberInfiniteTransition(label = "dot")
-    val a by t.animateFloat(0.4f, 1f, infiniteRepeatable(tween(900), RepeatMode.Reverse), label = "a")
+    val a = if (motionEnabled()) t.animateFloat(0.4f, 1f, infiniteRepeatable(tween(900), RepeatMode.Reverse), label = "a").value else 1f
     Row(
         Modifier.clip(RoundedCornerShape(20.dp)).background(color.copy(alpha = 0.15f))
             .border(1.dp, color.copy(alpha = 0.3f), RoundedCornerShape(20.dp)).padding(horizontal = 14.dp, vertical = 7.dp),
@@ -128,7 +140,7 @@ fun StatusPill(text: String, color: Color) {
 @Composable
 fun PairStatusButton(text: String, color: Color, onClick: () -> Unit, enabled: Boolean = true, modifier: Modifier = Modifier) {
     val t = rememberInfiniteTransition(label = "pair-status-dot")
-    val alpha by t.animateFloat(0.4f, 1f, infiniteRepeatable(tween(900), RepeatMode.Reverse), label = "pair-status-alpha")
+    val alpha = if (motionEnabled()) t.animateFloat(0.4f, 1f, infiniteRepeatable(tween(900), RepeatMode.Reverse), label = "pair-status-alpha").value else 1f
     Row(
         modifier.width(104.dp).height(36.dp).clip(RoundedCornerShape(20.dp)).background(color.copy(alpha = 0.15f))
             .border(1.dp, color.copy(alpha = 0.3f), RoundedCornerShape(20.dp))
@@ -147,7 +159,7 @@ fun PairStatusButton(text: String, color: Color, onClick: () -> Unit, enabled: B
 @OptIn(ExperimentalFoundationApi::class)
 fun ConnectStatusButton(onClick: () -> Unit, onOpenChooser: () -> Unit, modifier: Modifier = Modifier) {
     val t = rememberInfiniteTransition(label = "pair-status-dot")
-    val alpha by t.animateFloat(0.4f, 1f, infiniteRepeatable(tween(900), RepeatMode.Reverse), label = "pair-status-alpha")
+    val alpha = if (motionEnabled()) t.animateFloat(0.4f, 1f, infiniteRepeatable(tween(900), RepeatMode.Reverse), label = "pair-status-alpha").value else 1f
     val swipeThreshold = with(LocalDensity.current) { 44.dp.toPx() }
     Row(
         modifier.width(104.dp).height(36.dp)
@@ -209,7 +221,8 @@ fun Badge(text: String, color: Color, modifier: Modifier = Modifier) {
 @Composable
 fun SpeakerCircle(label: String, ch: Int, playing: Boolean, caption: String, sub: String, highlight: Boolean, onClick: () -> Unit = {}) {
     val t = rememberInfiniteTransition(label = "pulse")
-    val pulse by t.animateFloat(0.72f, 1f, infiniteRepeatable(tween(520), RepeatMode.Reverse), label = "pulse-alpha")
+    // пульсация только при воспроизведении и если анимации не отключены в системе
+    val pulse = if (playing && motionEnabled()) t.animateFloat(0.72f, 1f, infiniteRepeatable(tween(520), RepeatMode.Reverse), label = "pulse-alpha").value else 1f
     val color = SFColors.channel(ch)
     Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.width(130.dp)) {
         Box(
@@ -272,9 +285,10 @@ fun DiagRow(label: String, value: String, color: Color = SFColors.Text) {
 @Composable
 fun SearchingDots() {
     val t = rememberInfiniteTransition(label = "dots")
+    val motion = motionEnabled()
     Row(Modifier.fillMaxWidth().padding(vertical = 14.dp), horizontalArrangement = Arrangement.Center) {
         repeat(3) { i ->
-            val a by t.animateFloat(0.2f, 1f, infiniteRepeatable(tween(600, delayMillis = i * 200), RepeatMode.Reverse), label = "d$i")
+            val a = if (motion) t.animateFloat(0.2f, 1f, infiniteRepeatable(tween(600, delayMillis = i * 200), RepeatMode.Reverse), label = "d$i").value else 1f
             Box(Modifier.padding(horizontal = 5.dp).size(10.dp).alpha(a).clip(CircleShape).background(SFColors.Accent1))
         }
     }
@@ -283,7 +297,9 @@ fun SearchingDots() {
 @Composable
 fun BackBar(title: String, onBack: () -> Unit) {
     Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(bottom = 12.dp)) {
-        Box(Modifier.size(40.dp).clip(RoundedCornerShape(12.dp)).background(SFColors.Secondary).clickable(onClick = onBack),
+        Box(Modifier.size(40.dp).clip(RoundedCornerShape(12.dp)).background(SFColors.Secondary)
+            .semantics { contentDescription = "Назад"; role = androidx.compose.ui.semantics.Role.Button }
+            .clickable(onClick = onBack),
             contentAlignment = Alignment.Center) { Text("←", color = Color.White, fontSize = 20.sp) }
         Spacer(Modifier.width(14.dp))
         H2(title)

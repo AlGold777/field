@@ -124,7 +124,7 @@ fun RenameDialog(current: String, onDismiss: () -> Unit, onSave: (String) -> Uni
         title = { Text("Имя телефона") },
         text = { OutlinedTextField(value = text, onValueChange = { text = it.take(40) }, singleLine = true,
             label = { Text("Видно второму телефону") }) },
-        confirmButton = { TextButton(onClick = { onSave(text) }) { Text("Сохранить") } },
+        confirmButton = { TextButton(enabled = text.trim().isNotEmpty(), onClick = { onSave(text.trim()) }) { Text("Сохранить") } },
         dismissButton = { TextButton(onClick = onDismiss) { Text("Отмена") } },
     )
 }

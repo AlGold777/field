@@ -1,10 +1,13 @@
 package app.soundfield.ui
 
 import android.Manifest
+import android.app.Activity
+import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.provider.Settings
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
@@ -25,6 +28,7 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Modifier
 import androidx.core.content.ContextCompat
 import androidx.compose.ui.platform.LocalContext
+import androidx.core.app.ActivityCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import app.soundfield.engine.Engine
 
@@ -58,14 +62,22 @@ fun AppRoot(engine: Engine) {
     var syncProbeAfterPermission by remember { mutableStateOf(false) }
 
     val notifLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) {}
+    // отказ без показа объяснения системой = постоянный отказ («больше не спрашивать»): дальше ведём в настройки приложения
+    var micDeniedForever by rememberSaveable { mutableStateOf(false) }
     val micLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
         if (granted) {
+            micDeniedForever = false
             engine.micPermissionGranted()
             if (syncProbeAfterPermission) engine.startSyncProbe()
         }
         syncProbeAfterPermission = false
-        if (!granted)
-            Toast.makeText(ctx, "Без микрофона доступна только ручная калибровка", Toast.LENGTH_LONG).show()
+        if (!granted) {
+            val act = ctx as? Activity
+            micDeniedForever = act != null && !ActivityCompat.shouldShowRequestPermissionRationale(act, Manifest.permission.RECORD_AUDIO)
+            val text = if (micDeniedForever) "Микрофон запрещён. Разрешите его в настройках приложения, иначе доступна только ручная калибровка"
+                else "Без микрофона доступна только ручная калибровка"
+            Toast.makeText(ctx, text, Toast.LENGTH_LONG).show()
+        }
     }
     val browserPrefs = remember { ctx.getSharedPreferences("soundfield", android.content.Context.MODE_PRIVATE) }
     var browserRoot by rememberSaveable { mutableStateOf(browserPrefs.getString("audioBrowserRoot", null)) }
@@ -82,8 +94,13 @@ fun AppRoot(engine: Engine) {
     LaunchedEffect(Unit) {
         if (Build.VERSION.SDK_INT >= 33) notifLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
     }
+    // id последнего показанного сообщения переживает пересоздание активности, чтобы тост не повторялся
+    var shownMsgId by rememberSaveable { mutableStateOf(0) }
     LaunchedEffect(ui.messageId) {
-        if (ui.messageId > 0 && ui.message.isNotEmpty()) Toast.makeText(ctx, ui.message, Toast.LENGTH_SHORT).show()
+        if (ui.messageId > 0 && ui.messageId != shownMsgId && ui.message.isNotEmpty()) {
+            shownMsgId = ui.messageId
+            Toast.makeText(ctx, ui.message, Toast.LENGTH_SHORT).show()
+        }
     }
     LaunchedEffect(ui.filePickerRequest) {
         if (ui.filePickerRequest > handledPickerRequest) {
@@ -103,7 +120,7 @@ fun AppRoot(engine: Engine) {
     }
     // Главная страница — плеер. Экран подключения закрывается сам, когда пара создана; калибровка бывает только в паре.
     LaunchedEffect(ui.inPair) { if (ui.inPair && sub == Sub.PAIRING) sub = Sub.NONE }
-    if (!ui.inPair && sub == Sub.CALIBRATION) sub = Sub.NONE
+    LaunchedEffect(ui.inPair) { if (!ui.inPair && sub == Sub.CALIBRATION) sub = Sub.NONE }
     BackHandler(enabled = sub != Sub.NONE) {
         if (sub == Sub.STABILITY) engine.dismissStabilitySettings()
         if (sub == Sub.LAN_BLOCKED) engine.dismissLanBlockedHint()
@@ -120,7 +137,8 @@ fun AppRoot(engine: Engine) {
             sub == Sub.LAN_BLOCKED -> LanBlockedScreen(ui.lanBlockedPeerName, ui.lanBlockedDetails, engine)
             sub == Sub.PAIRING -> WelcomeScreen(ui, engine, onBack = { sub = Sub.NONE })
             sub == Sub.CALIBRATION -> CalibrationScreen(ui, engine,
-                requestMic = { micLauncher.launch(Manifest.permission.RECORD_AUDIO) }, onBack = { sub = Sub.NONE })
+                requestMic = { if (micDeniedForever) openAppSettings(ctx) else micLauncher.launch(Manifest.permission.RECORD_AUDIO) },
+                onBack = { sub = Sub.NONE }, micDeniedForever = micDeniedForever)
             sub == Sub.DIAGNOSTICS -> DiagnosticsScreen(ui, engine,
                 onRequestSyncProbe = {
                     if (ContextCompat.checkSelfPermission(ctx, Manifest.permission.RECORD_AUDIO) == android.content.pm.PackageManager.PERMISSION_GRANTED)
@@ -146,4 +164,10 @@ fun AppRoot(engine: Engine) {
             onImport = { uris -> showAudioBrowser = false; engine.addAudioFiles(uris) },
         )
     }
+}
+
+/** Открывает экран настроек приложения (разрешения), когда системный запрос уже недоступен. */
+private fun openAppSettings(ctx: Context) {
+    ctx.startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.fromParts("package", ctx.packageName, null))
+        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
 }

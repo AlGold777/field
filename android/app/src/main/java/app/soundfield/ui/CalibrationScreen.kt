@@ -17,9 +17,10 @@ import app.soundfield.core.SourceMode
 import app.soundfield.engine.Engine
 import app.soundfield.engine.UiState
 import kotlin.math.abs
+import kotlin.math.roundToInt
 
 @Composable
-fun CalibrationScreen(ui: UiState, engine: Engine, requestMic: () -> Unit, onBack: () -> Unit) {
+fun CalibrationScreen(ui: UiState, engine: Engine, requestMic: () -> Unit, onBack: () -> Unit, micDeniedForever: Boolean = false) {
     val c = ui.calib
     val pointCh = ui.pointChannel
     val serverCh = Ch.other(pointCh)
@@ -53,7 +54,14 @@ fun CalibrationScreen(ui: UiState, engine: Engine, requestMic: () -> Unit, onBac
                 PrimaryButton("🎯  Запустить автокалибровку") { engine.calibrate() }
                 SecondaryButton("📏  Только измерить рассогласование") { engine.measure() }
             }
-            if (c.needsMicPermission && ui.role == Role.SERVER) SecondaryButton("🎤  Разрешить доступ к микрофону") { requestMic() }
+            if (c.needsMicPermission && ui.role == Role.SERVER) {
+                if (micDeniedForever) {
+                    Text("Доступ к микрофону запрещён. Откройте настройки приложения и включите «Микрофон».",
+                        color = SFColors.Warn, fontSize = 13.sp, lineHeight = 19.sp)
+                    Spacer(Modifier.height(8.dp))
+                }
+                SecondaryButton(if (micDeniedForever) "⚙  Открыть настройки приложения" else "🎤  Разрешить доступ к микрофону") { requestMic() }
+            }
             if (c.resultText.isNotEmpty() && !c.running) {
                 Text(c.resultText, color = if (c.resultOk) SFColors.Good else SFColors.Warn, fontSize = 14.sp, lineHeight = 20.sp)
             }
@@ -61,7 +69,7 @@ fun CalibrationScreen(ui: UiState, engine: Engine, requestMic: () -> Unit, onBac
             var trim by remember(ui.trimMs) { mutableFloatStateOf(ui.trimMs.toFloat()) }
             val limit = SF.MAX_TRIM_MS.toFloat()
             SliderRow("Ручной сдвиг Point", "%+.1f мс".format(trim), trim, SFColors.Accent1, -limit..limit,
-                onChange = { trim = (it * 2).toInt() / 2f }, onDone = { engine.setTrimMs(trim.toDouble()) })
+                onChange = { trim = (it * 2).roundToInt() / 2f }, onDone = { engine.setTrimMs(trim.toDouble()) })
             Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                 listOf(-5f, -1f, -0.5f, 0.5f, 1f, 5f).forEach { d ->
                     OutlinedButton(onClick = { trim = (trim + d).coerceIn(-limit, limit); engine.setTrimMs(trim.toDouble()) },
@@ -100,7 +108,7 @@ fun CalibrationScreen(ui: UiState, engine: Engine, requestMic: () -> Unit, onBac
                         else ui.levelTrimPointDb - ui.levelTrimServerDb
                 }
                 SliderRow("L громче  ·  R громче", "%+.1f дБ".format(offset), offset, SFColors.Accent1, -12f..12f,
-                    onChange = { offset = (it * 2).toInt() / 2f; levelDragging = true; engine.setLevelOffsetDb(offset, false) },
+                    onChange = { offset = (it * 2).roundToInt() / 2f; levelDragging = true; engine.setLevelOffsetDb(offset, false) },
                     onDone = { levelDragging = false; engine.setLevelOffsetDb(offset, true) })
                 Text("Сядьте на одинаковом расстоянии от телефонов (±10 см). Двигайте ползунок, пока обе стороны не станут одинаково громкими.",
                     color = SFColors.TextDim, fontSize = 13.sp, lineHeight = 18.sp)
