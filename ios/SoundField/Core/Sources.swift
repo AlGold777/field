@@ -46,6 +46,7 @@ enum AudioFileDecoder {
         }
         let encoder = Pcm24StereoEncoder(seed: 0x5F24)
         var pcm24: [UInt8] = []
+        let meter = SfTrackMeter()
         let channelCount = Int(format.channelCount)
         while true {
             try file.read(into: buffer, frameCount: 32_768)
@@ -62,16 +63,25 @@ enum AudioFileDecoder {
                 block[f * 2 + 1] = right[f]
             }
             if let c = converter {
-                pcm24 += encoder.encode(c.process(block))
+                let out = c.process(block)
+                meter.process(out)
+                pcm24 += encoder.encode(out)
             } else {
+                meter.process(block)
                 pcm24 += encoder.encode(block)
             }
         }
-        if let c = converter { pcm24 += encoder.encode(c.finish()) }
+        if let c = converter {
+            let tail = c.finish()
+            meter.process(tail)
+            pcm24 += encoder.encode(tail)
+        }
         guard !pcm24.isEmpty else {
             throw NSError(domain: "SoundField.Audio", code: 5, userInfo: [NSLocalizedDescriptionKey: "Кодек не вернул аудиоданные"])
         }
-        return PcmSource(pcm24: pcm24, title: item.title, artist: item.artist)
+        let tp = meter.truePeakDbtp
+        return PcmSource(pcm24: pcm24, title: item.title, artist: item.artist,
+                         staticGain: SfTrackMeter.staticGain(truePeakDbtp: tp), truePeakDbtp: tp)
     }
 }
 
@@ -90,16 +100,25 @@ final class PcmSource: AudioSource {
     let title: String
     let artist: String
     let totalFrames: Int64
+    /// Статическое усиление по true-peak (линейное); кэш остаётся без усиления.
+    let staticGain: Float
+    /// Измеренный true-peak трека, dBTP (для диагностики; −200 — не измерялся).
+    let truePeakDbtp: Double
     private let pcm: [UInt8]
-    init(pcm24: [UInt8], title: String, artist: String) {
+    init(pcm24: [UInt8], title: String, artist: String, staticGain: Float = 1, truePeakDbtp: Double = -200) {
         self.pcm = pcm24; self.title = title; self.artist = artist; totalFrames = Int64(pcm24.count / 6)
+        self.staticGain = staticGain; self.truePeakDbtp = truePeakDbtp
     }
     convenience init(interleavedFloat: [Float], title: String, artist: String) {
-        self.init(pcm24: Pcm24StereoEncoder(seed: 0x5F24).encode(interleavedFloat), title: title, artist: artist)
+        let meter = SfTrackMeter()
+        meter.process(interleavedFloat)
+        let tp = meter.truePeakDbtp
+        self.init(pcm24: Pcm24StereoEncoder(seed: 0x5F24).encode(interleavedFloat), title: title, artist: artist,
+                  staticGain: SfTrackMeter.staticGain(truePeakDbtp: tp), truePeakDbtp: tp)
     }
     func sample(_ frame: Int64, _ ch: Int) -> Float {
         guard frame >= 0 && frame < totalFrames else { return 0 }
-        return pcm.withUnsafeBufferPointer { Pcm24.sampleLe($0, Int(frame) * 2 + ch) }
+        return pcm.withUnsafeBufferPointer { Pcm24.sampleLe($0, Int(frame) * 2 + ch) } * staticGain
     }
 }
 
