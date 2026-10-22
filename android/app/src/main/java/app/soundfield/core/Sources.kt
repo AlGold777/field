@@ -111,9 +111,12 @@ class ChannelTestSource : AudioSource {
     override val title = "Проверка каналов"
     override val artist = "Сначала левый, затем правый"
     override val totalFrames = (SF.SAMPLE_RATE * 3.8).toLong()
+    // предвычислено: sample() вызывается на аудиопотоке для каждого кадра
+    private val startsL = doubleArrayOf(0.3, 0.8, 1.3)
+    private val startsR = doubleArrayOf(2.1, 2.6, 3.1)
     override fun sample(frame: Long, ch: Int): Float {
         val t = frame.toDouble() / SF.SAMPLE_RATE
-        val starts = if (ch == Ch.L) doubleArrayOf(0.3, 0.8, 1.3) else doubleArrayOf(2.1, 2.6, 3.1)
+        val starts = if (ch == Ch.L) startsL else startsR
         val f = if (ch == Ch.L) 880.0 else 1_320.0
         for (s in starts) {
             val dt = t - s
