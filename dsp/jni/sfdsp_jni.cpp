@@ -127,4 +127,13 @@ JNIEXPORT void JNICALL JFN(nativeLimiterTakeStats)(JNIEnv* env, jclass, jlong h,
     env->SetDoubleArrayRegion(stats, 0, 3, v);
 }
 
+JNIEXPORT jlong JNICALL JFN(nativeMeterCreate)(JNIEnv*, jclass, jint channels) { return (jlong)(intptr_t)sf_meter_create(channels); }
+JNIEXPORT void JNICALL JFN(nativeMeterDestroy)(JNIEnv*, jclass, jlong h) { sf_meter_destroy((sf_meter*)(intptr_t)h); }
+JNIEXPORT void JNICALL JFN(nativeMeterProcess)(JNIEnv* env, jclass, jlong h, jfloatArray in, jint offFrames, jint frames) {
+    Critical a(env, in);
+    if (!a.p) return;
+    sf_meter_process((sf_meter*)(intptr_t)h, (const float*)a.p + (int64_t)offFrames * 2, frames);   // стерео интерлив
+}
+JNIEXPORT jdouble JNICALL JFN(nativeMeterTruePeak)(JNIEnv*, jclass, jlong h) { return sf_meter_true_peak_dbtp((const sf_meter*)(intptr_t)h); }
+
 }

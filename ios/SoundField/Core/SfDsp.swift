@@ -126,3 +126,25 @@ enum Pcm24 {
         return Float(v) / scale
     }
 }
+
+/// Одноходовой анализатор трека при импорте (true-peak 4×; громкость BS.1770 добавится в A3.1 в тот же проход).
+final class SfTrackMeter {
+    private let handle: OpaquePointer?
+    init() { handle = sf_meter_create(2) }
+    deinit { if let h = handle { sf_meter_destroy(h) } }
+
+    /// Стерео интерлив float (после ресемплера, до квантования).
+    func process(_ interleaved: [Float]) {
+        guard let h = handle, interleaved.count >= 2 else { return }
+        interleaved.withUnsafeBufferPointer { sf_meter_process(h, $0.baseAddress, Int64($0.count / 2)) }
+    }
+
+    /// Максимальный true-peak с начала потока, dBTP (−200 — тишина).
+    var truePeakDbtp: Double { handle.map { sf_meter_true_peak_dbtp($0) } ?? -200 }
+
+    /// Статическое усиление трека, линейное: min(0, −1,55 − tp) dB (запас 0,05 dB под потолок предлимитера −1,5 dBTP).
+    static func staticGain(truePeakDbtp tp: Double) -> Float {
+        let db = min(0.0, -1.55 - tp)
+        return Float(pow(10.0, db / 20.0))
+    }
+}

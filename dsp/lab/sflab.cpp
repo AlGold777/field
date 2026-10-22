@@ -103,6 +103,7 @@ int cmdRun(int argc, char** argv) {
         runChainSuite("cache24_tpdf", fn, sink, ChainTraits{true, true});
         for (const auto& f : wavs) runCorpus("cache24_tpdf", fn, stem(f), readWav(corpus + "/" + f), sink, true);
     }
+    runBitperfect(sink);
     // A1.2: SRC
     runSrcSuite(sink);
     for (const auto& f : wavs) runSrcCorpus(stem(f), readWav(corpus + "/" + f), sink);
@@ -111,6 +112,8 @@ int cmdRun(int argc, char** argv) {
     // A1.4: лимитеры
     runLimiterSynth(sink);
     for (const auto& f : wavs) runLimiterCorpus(stem(f), readWav(corpus + "/" + f), sink);
+    runStaticGainSynth(sink);
+    for (const auto& f : wavs) runStaticGainCorpus(stem(f), readWav(corpus + "/" + f), sink);
     const SyncScenario scs[] = {
         {"drift100_jit20", 100, 20, 0, 0, 0},
         {"drift100_jit100", 100, 100, 0, 0, 0},

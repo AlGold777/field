@@ -110,6 +110,16 @@ SFDSP_API void sf_limiter_process(sf_limiter* l, float* io, int frames);
 /* Забирает и обнуляет: число вызовов process, из них с ослаблением > 0,5 dB, максимальное ослабление (dB). */
 SFDSP_API void sf_limiter_take_stats(sf_limiter* l, int64_t* blocks, int64_t* active_blocks, double* max_reduction_db);
 
+/* ---- Анализатор трека при импорте: true-peak (4×) за один проход; громкость BS.1770 добавится в A3.1 ---- */
+
+typedef struct sf_meter sf_meter;
+SFDSP_API sf_meter* sf_meter_create(int channels);
+SFDSP_API void sf_meter_destroy(sf_meter* m);
+/* Интерлив. Можно вызывать блоками любой длины. */
+SFDSP_API void sf_meter_process(sf_meter* m, const float* interleaved, int64_t frames);
+/* Максимальный true-peak с начала потока, dBTP (−200 для тишины); можно вызывать в любой момент (хвост детектора учитывается). */
+SFDSP_API double sf_meter_true_peak_dbtp(const sf_meter* m);
+
 #ifdef __cplusplus
 }
 #endif

@@ -17,39 +17,16 @@
 
 #include "dspmath.hpp"
 #include "rt.hpp"
+#include "truepeak.hpp"
 #include "sfdsp.h"
 
 namespace {
 
-constexpr int kOversample = 4;
-constexpr int kTpTaps = 128;
-constexpr int kTpPerPhase = kTpTaps / kOversample;  // 32
-constexpr int kTpHalf = kTpPerPhase / 2;            // 16: задержка детектора
+using sf::kOversample; using sf::kTpTaps; using sf::kTpPerPhase; using sf::kTpHalf; using sf::tpTable;
 constexpr double kFastReleaseS = 0.050, kSlowReleaseS = 0.400, kDensityS = 1.000;
 constexpr double kDensityThreshold = 0.98855;       // −0,1 dB: ослабление «держится»
 constexpr double kDensityDeadZone = 0.20, kDensitySpan = 0.50;  // c = clamp((доля времени с ослаблением − 0,2) / 0,5)
 constexpr double kGuardDb = 0.005;                   // запас потолка на изменение усиления внутри окна детектора
-
-// Коэффициенты фаз 1..3: tp[ph][j], j = 0..31, применяются к x[k + 16 − j].
-struct TpTable {
-    double h[kOversample][kTpPerPhase];
-    TpTable() {
-        std::vector<double> t(kTpTaps);
-        const double beta = 8.0, inv = 1.0 / sf::bessel0(beta);
-        const double c = kTpTaps / 2.0;
-        for (int i = 0; i < kTpTaps; i++) {
-            const double x = (i - c) / kOversample;
-            const double s = std::fabs(x) < 1e-12 ? 1.0 : std::sin(sf::kPi * x) / (sf::kPi * x);
-            t[(size_t)i] = s * sf::kaiserWindow((i - c) / (kTpTaps / 2.0 + 0.5), beta, inv);
-        }
-        for (int ph = 0; ph < kOversample; ph++) {
-            double sum = 0;
-            for (int i = ph; i < kTpTaps; i += kOversample) sum += t[(size_t)i];
-            for (int j = 0; j < kTpPerPhase; j++) h[ph][j] = t[(size_t)(ph + j * kOversample)] / sum;
-        }
-    }
-};
-const TpTable& tpTable() { static const TpTable t; return t; }
 
 }  // namespace
 

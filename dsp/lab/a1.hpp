@@ -170,6 +170,68 @@ inline void runLimiterCorpus(const std::string& id, const Wav& w, Sink& sink) {
     sink.add("active_blocks_pct", d2.activePct, "info", 0);
 }
 
+// ---- A1.1+: бит-в-бит хранение значений на сетке 24 бит (16/24-бит источники) ----
+inline void runBitperfect(Sink& sink) {
+    sink.prefix = "cache24.";
+    Rng r(41);
+    auto grid = [&](int bits, size_t n) {
+        std::vector<float> x(n);
+        for (auto& v : x) { const int64_t m = (int64_t)(r.next() >> 11) % (1ll << bits) - (1ll << (bits - 1)); v = (float)m / (float)(1ll << (bits - 1)); }
+        return x;
+    };
+    auto maxDiffLsb = [](const std::vector<float>& a, const std::vector<float>& b) {
+        double m = 0; for (size_t i = 0; i < a.size(); i++) m = std::max(m, std::fabs((double)a[i] - b[i]) * 8388608.0); return m;
+    };
+    auto p16 = grid(16, 96000), p24 = grid(24, 96000);
+    std::vector<float> zero(48000, 0.0f);
+    sink.add("bitperfect_pcm16.max_diff_lsb24", maxDiffLsb(p16, cache24Roundtrip(p16, 5)), "equal", 0);
+    sink.add("bitperfect_pcm24.max_diff_lsb24", maxDiffLsb(p24, cache24Roundtrip(p24, 5)), "equal", 0);
+    sink.add("bitperfect_silence.max_diff_lsb24", maxDiffLsb(zero, cache24Roundtrip(zero, 5)), "equal", 0);
+    // вне сетки (результат SRC/усиления): дизер действует, ошибка ≤ 1,5 LSB
+    auto off = sine(1000, -20, 1.0);
+    sink.add("offgrid_sine.max_diff_lsb24", maxDiffLsb(off, cache24Roundtrip(off, 5)), "lower", 0.1);
+}
+
+// ---- A1.4+: статическое усиление по true-peak трека перед предлимитером ----
+inline double staticGainDb(double tpDbtp) { return std::min(0.0, -1.55 - tpDbtp); }
+
+inline double trackTruePeak(const std::vector<std::vector<float>>& ch) {
+    const int C = (int)ch.size();
+    sf_meter* m = sf_meter_create(C);
+    std::vector<float> io(ch[0].size() * (size_t)C);
+    for (size_t i = 0; i < ch[0].size(); i++) for (int c = 0; c < C; c++) io[i * (size_t)C + (size_t)c] = ch[(size_t)c][i];
+    sf_meter_process(m, io.data(), (int64_t)ch[0].size());
+    const double tp = sf_meter_true_peak_dbtp(m);
+    sf_meter_destroy(m);
+    return tp;
+}
+
+inline void runStaticGainCorpus(const std::string& id, const Wav& w, Sink& sink) {
+    std::vector<std::vector<float>> in = w.ch;
+    if (in.size() == 1) in.push_back(in[0]);
+    const double tp = trackTruePeak(in), g = staticGainDb(tp), lin = std::pow(10.0, g / 20.0);
+    auto scaled = in;
+    for (auto& c : scaled) for (auto& v : c) v = (float)((double)v * lin);
+    auto lim = limiterRun(scaled, -1.5);
+    sink.prefix = "limiter.static_m1p5.corpus." + id + ".";
+    sink.add("track_true_peak_dbtp", tp, "info", 0);
+    sink.add("static_gain_db", g, "equal", 0.05);
+    sink.add("active_blocks_pct", lim.activePct, "lower", 0.5);
+    sink.add("max_reduction_db", lim.maxRedDb, "info", 0);
+    sink.add("true_peak_out_dbtp", maxTruePeak(lim.out), "lower", 0.02);
+    sink.add("lufs_delta_lu", lufsIntegrated(lim.out, kSr) - lufsIntegrated(in, kSr), "equal", 0.05);
+}
+
+inline void runStaticGainSynth(Sink& sink) {
+    sink.prefix = "limiter.static_m1p5.";
+    auto low = sine(100, 0.0, 2.0);
+    const double g = staticGainDb(trackTruePeak({low}));
+    for (auto& v : low) v = (float)((double)v * std::pow(10.0, g / 20.0));
+    auto lr = limiterRun({low}, -1.5);
+    sink.add("sine_100_0dbfs.thdn_db", analyzeTone(lr.out[0], kSr, std::pow(10.0, (-1.55) / 20.0), 32768, 65536).thdnDb, "lower", 3.0);
+    sink.add("sine_100_0dbfs.active_blocks_pct", lr.activePct, "lower", 0.5);
+}
+
 // ---- A1.5: закон громкости (только измерение) ----
 // Цифровое ослабление тона −20 dBFS на 30 dB с последующим выводом в float / 24 бит / 16 бит (TPDF). Показывает, что уровень шума
 // определяется разрядностью ТРАКТА ПОСЛЕ ослабления: пока ОС микширует во float, ослабление в приложении и системной громкостью

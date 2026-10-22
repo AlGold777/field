@@ -35,9 +35,13 @@ void sf_dither_destroy(sf_dither* d) { delete d; }
 void sf_pcm24_encode(sf_dither* d, const float* in, int in_stride, int n, uint8_t* out, int out_stride, int big_endian) {
     for (int i = 0; i < n; i++) {
         double v = (double)in[(int64_t)i * in_stride] * 8388608.0;
-        if (d) v += (d->uniform() - 0.5) + (d->uniform() - 0.5);  // TPDF: сумма двух равномерных ±0,5 LSB
         double q = 0.0;
-        if (!std::isnan(v)) q = std::min(8388607.0, std::max(-8388608.0, std::floor(v + 0.5)));
+        if (!std::isnan(v)) {
+            // Значение уже точно на сетке 24 бит (целое число LSB) — хранится как есть, без дизера: 16/24-бит источники бит-в-бит.
+            const bool exact = v == std::floor(v);
+            if (d && !exact) v += (d->uniform() - 0.5) + (d->uniform() - 0.5);  // TPDF: сумма двух равномерных ±0,5 LSB
+            q = std::min(8388607.0, std::max(-8388608.0, std::floor(v + 0.5)));
+        }
         const int32_t s = (int32_t)q;
         uint8_t* o = out + (int64_t)i * out_stride;
         if (big_endian) { o[0] = (uint8_t)(s >> 16); o[1] = (uint8_t)(s >> 8); o[2] = (uint8_t)s; }

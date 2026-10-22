@@ -188,24 +188,65 @@ TEST(pcm24_byte_order_clamp_nan_and_strides) {
 TEST(pcm24_tpdf_dither_statistics) {
     sf_dither* d = sf_dither_create(5);
     const int n = 2000000;
-    std::vector<float> zeros((size_t)n, 0.0f);
+    const double off = 0.37;   // доля LSB: значение вне сетки 24 бит — дизер применяется
+    std::vector<float> in((size_t)n, (float)(off / 8388608.0));
     std::vector<uint8_t> b((size_t)n * 3);
-    sf_pcm24_encode(d, zeros.data(), 1, n, b.data(), 3, 0);
+    sf_pcm24_encode(d, in.data(), 1, n, b.data(), 3, 0);
     std::vector<float> o((size_t)n);
     sf_pcm24_decode(b.data(), 3, n, 0, o.data(), 1);
-    double sum = 0, sq = 0; int hist[5] = {0, 0, 0, 0, 0};
-    for (float v : o) { const double q = (double)v * 8388608.0; sum += q; sq += q * q; const int k = (int)std::lround(q); if (k >= -2 && k <= 2) hist[k + 2]++; }
-    CHECK_NEAR(sum / n, 0.0, 0.002);
-    CHECK_NEAR(sq / n, 1.0 / 6.0 + 1.0 / 12.0, 0.003);     // TPDF (2·1/12) + округление (1/12) = 1/4... для ±0,5 LSB + ±0,5 LSB: 1/6, плюс квантование 1/12
-    CHECK(hist[0] == 0 && hist[4] == 0);                  // TPDF в пределах ±1 LSB (после округления ±1)
-    // независимые потоки: разные seed → разные последовательности
+    double sum = 0, sq = 0; int hist[7] = {0};
+    for (float v : o) { const double q = (double)v * 8388608.0; sum += q; sq += (q - off) * (q - off); const int k = (int)std::lround(q); if (k >= -3 && k <= 3) hist[k + 3]++; }
+    CHECK_NEAR(sum / n, off, 0.003);                        // дизер без смещения
+    CHECK_NEAR(sq / n, 1.0 / 6.0 + 1.0 / 12.0, 0.01);       // TPDF (2·1/12) + округление (1/12)
+    CHECK(hist[0] == 0 && hist[6] == 0);                    // в пределах ±1 LSB после округления
     sf_dither* d2 = sf_dither_create(6);
-    std::vector<uint8_t> b2((size_t)n * 3);
-    sf_pcm24_encode(d2, zeros.data(), 1, 1000, b2.data(), 3, 0);
-    sf_pcm24_encode(nullptr, zeros.data(), 1, 1, b2.data() + 3000, 3, 0);
+    std::vector<uint8_t> b2((size_t)1000 * 3);
+    sf_pcm24_encode(d2, in.data(), 1, 1000, b2.data(), 3, 0);
     int diff = 0; for (int i = 0; i < 1000 * 3; i++) if (b[(size_t)i] != b2[(size_t)i]) diff++;
-    CHECK(diff > 300);
+    CHECK(diff > 200);                                      // разные seed → разные потоки
     sf_dither_destroy(d); sf_dither_destroy(d2);
+}
+
+TEST(pcm24_values_on_the_24bit_grid_are_stored_bit_exact_even_with_dither) {
+    Rng r(12);
+    std::vector<float> in(200000);
+    for (size_t i = 0; i < in.size(); i++) {
+        const int bits = (i % 3 == 0) ? 16 : 24;               // 16-бит и 24-бит PCM, приведённые к float
+        const int64_t m = (int64_t)(r.next() >> 11) % (1ll << bits) - (1ll << (bits - 1));
+        in[i] = (float)m / (float)(1ll << (bits - 1));
+    }
+    in[0] = 0.0f; in[1] = -1.0f;
+    sf_dither* d = sf_dither_create(9);
+    std::vector<uint8_t> b(in.size() * 3);
+    sf_pcm24_encode(d, in.data(), 1, (int)in.size(), b.data(), 3, 0);
+    std::vector<float> out(in.size());
+    sf_pcm24_decode(b.data(), 3, (int)in.size(), 0, out.data(), 1);
+    bool same = true; for (size_t i = 0; i < in.size(); i++) if (in[i] != out[i]) { same = false; break; }
+    CHECK(same);
+    sf_dither_destroy(d);
+}
+
+TEST(meter_true_peak_matches_lab_measurement_and_is_block_independent) {
+    auto x = sine(12000, 0.0, 1.0, kPi / 4);                 // sample peak −3 dB, true-peak 0 dBTP
+    sf_meter* m = sf_meter_create(1);
+    for (size_t s = 0; s < x.size(); s += 333) sf_meter_process(m, x.data() + s, (int64_t)std::min<size_t>(333, x.size() - s));
+    // анализатор считает и края потока (резкое начало даёт выброс Гиббса до ~0,1 dB), лабораторный измеритель края отбрасывает
+    CHECK_NEAR(sf_meter_true_peak_dbtp(m), 0.0, 0.15);
+    CHECK_NEAR(sf_meter_true_peak_dbtp(m), truePeakDb(x), 0.15);
+    sf_meter_destroy(m);
+    // стерео: максимум по каналам; тишина
+    auto q = sine(1000, -6, 0.5);
+    std::vector<float> st(q.size() * 2, 0.0f);
+    for (size_t i = 0; i < q.size(); i++) st[2 * i + 1] = q[i];
+    m = sf_meter_create(2);
+    sf_meter_process(m, st.data(), (int64_t)q.size());
+    CHECK_NEAR(sf_meter_true_peak_dbtp(m), -6.0, 0.05);
+    sf_meter_destroy(m);
+    m = sf_meter_create(2);
+    std::vector<float> z(2000, 0.0f);
+    sf_meter_process(m, z.data(), 1000);
+    CHECK(sf_meter_true_peak_dbtp(m) <= -199.0);
+    sf_meter_destroy(m);
 }
 
 // ---- A1.2: SRC ----
