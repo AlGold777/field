@@ -86,6 +86,7 @@ final class PointRenderer: RenderSource {
     private(set) var underrunFrames: Int64 = 0
     private(set) var underrunEvents: Int64 = 0
     private var inUnderrun = false
+    private var fade = PauseFade()
 
     init(rx: PointReceiver, clock: ClockSync, params: @escaping () -> PointParams) {
         self.rx = rx; self.clock = clock; self.params = params
@@ -95,7 +96,7 @@ final class PointRenderer: RenderSource {
         let tl = rx.timeline
         let p = params()
         guard tl.playing, clock.ready else {
-            out.update(repeating: 0, count: n); corrector.reset(); ramp.apply(out, n, p.gain); return
+            out.update(repeating: 0, count: n); fade.apply(out, n); corrector.reset(); ramp.apply(out, n, p.gain); return
         }
         let serverNs = clock.toServer(presentLocalNs) - p.trimNs
         corrector.plan(ideal: tl.frameAt(serverNs), n: n)
@@ -112,6 +113,7 @@ final class PointRenderer: RenderSource {
             if !inUnderrun { underrunEvents += 1; inUnderrun = true }
         } else { inUnderrun = false }
         rx.lastRenderedFrame = corrector.frame(n - 1, n)
+        fade.remember(out, n)
         ramp.apply(out, n, p.gain)
     }
 }
