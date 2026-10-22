@@ -191,7 +191,10 @@ struct SpeakerCircle: View {
     /// Пульсация только во время воспроизведения и без «Уменьшения движения».
     private func updatePulse() {
         guard playing && !reduceMotion else {
-            withAnimation(.easeOut(duration: 0.2)) { pulse = false }
+            // Остановка repeatForever только без анимации: обычная withAnimation её не снимает
+            var transaction = Transaction()
+            transaction.disablesAnimations = true
+            withTransaction(transaction) { pulse = false }
             return
         }
         withAnimation(.easeInOut(duration: 0.52).repeatForever()) { pulse = true }
