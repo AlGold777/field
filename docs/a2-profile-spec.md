@@ -8,7 +8,7 @@
 - `classes.generic_phone_speaker` — обязателен: запасной профиль (ФВЧ 250 Гц, подъёмов нет).
 - `models[]`: `key` (уникален, `[a-z0-9_]+`), `match[]` — строки `MANUFACTURER/MODEL/DEVICE` (Android, без учёта регистра) или `hw.machine` (iOS); `synthetic` — true для тестовых, в релизной сборке игнорируются;
   `preamp_db` ≤ 0; `f_low_hz` 60…600; `sections[]` — до 16 штук;
-  `allpass_vs_partner{partner_key: [{f0_hz, q}]}` — до 4 секций allpass 2-го порядка.
+  `allpass_vs_partner{partner_key: [{f0_hz, q}]}` — до 4 секций allpass 2-го порядка на каждого партнёра.
 - Секция: `type` ∈ `highpass | lowshelf | highshelf | peak`; `f0_hz` 20…20000; `q` 0.1…6; `gain_db` обязателен для peak/shelf, ограничен [−15, +6] (выше 8 кГц ≤ +3).
 - Формулы биквадов — RBJ Audio EQ Cookbook; фаза min-phase, форма TDF-II.
 

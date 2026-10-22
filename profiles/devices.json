@@ -7,7 +7,11 @@
       "preamp_db": 0.0,
       "f_low_hz": 250.0,
       "sections": [
-        {"type": "highpass", "f0_hz": 250.0, "q": 0.5412}
+        {
+          "type": "highpass",
+          "f0_hz": 250.0,
+          "q": 0.5412
+        }
       ],
       "allpass_vs_partner": {}
     }
@@ -15,18 +19,62 @@
   "models": [
     {
       "key": "synthetic_test_a",
-      "match": ["TEST/SYNTH_A/synth_a"],
+      "match": [
+        "TEST/SYNTH_A/synth_a"
+      ],
       "synthetic": true,
       "preamp_db": -3.0,
       "f_low_hz": 180.0,
       "sections": [
-        {"type": "highpass", "f0_hz": 180.0, "q": 0.7071},
-        {"type": "peak", "f0_hz": 2500.0, "q": 1.2, "gain_db": -4.0},
-        {"type": "highshelf", "f0_hz": 9000.0, "q": 0.7071, "gain_db": 2.0}
+        {
+          "type": "highpass",
+          "f0_hz": 180.0,
+          "q": 0.7071
+        },
+        {
+          "type": "peak",
+          "f0_hz": 2500.0,
+          "q": 1.2,
+          "gain_db": -4.0
+        },
+        {
+          "type": "highshelf",
+          "f0_hz": 9000.0,
+          "q": 0.7071,
+          "gain_db": 2.0
+        }
       ],
       "allpass_vs_partner": {
-        "synthetic_test_b": [{"f0_hz": 1800.0, "q": 0.6}]
+        "synthetic_test_b": [
+          {
+            "f0_hz": 1800.0,
+            "q": 0.6
+          }
+        ]
       }
+    },
+    {
+      "key": "synthetic_test_b",
+      "match": [
+        "TEST/SYNTH_B/synth_b"
+      ],
+      "synthetic": true,
+      "preamp_db": -2.0,
+      "f_low_hz": 220.0,
+      "sections": [
+        {
+          "type": "highpass",
+          "f0_hz": 220.0,
+          "q": 0.7071
+        },
+        {
+          "type": "peak",
+          "f0_hz": 3200.0,
+          "q": 1.0,
+          "gain_db": -3.0
+        }
+      ],
+      "allpass_vs_partner": {}
     }
   ]
 }

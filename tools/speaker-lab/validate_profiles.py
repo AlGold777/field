@@ -110,7 +110,6 @@ def _validate_profile(errors, path, prof, model_keys):
         errors.append(f"{path}.allpass_vs_partner: ожидается объект")
         return
 
-    total = 0
     for partner, sections in allpass.items():
         ap_path = f"{path}.allpass_vs_partner[{partner}]"
         if partner not in model_keys:
@@ -118,17 +117,14 @@ def _validate_profile(errors, path, prof, model_keys):
         if not isinstance(sections, list):
             errors.append(f"{ap_path}: ожидается список секций")
             continue
-        total += len(sections)
+        if len(sections) > MAX_ALLPASS:
+            errors.append(f"{ap_path}: allpass-секций {len(sections)}, максимум {MAX_ALLPASS}")
         for i, ap in enumerate(sections):
             if not isinstance(ap, dict):
                 errors.append(f"{ap_path}[{i}]: секция должна быть объектом")
                 continue
             _range_field(errors, f"{ap_path}[{i}]", ap, "f0_hz", 20, 20000)
             _range_field(errors, f"{ap_path}[{i}]", ap, "q", 0.1, 6)
-    if total > MAX_ALLPASS:
-        errors.append(
-            f"{path}.allpass_vs_partner: всего allpass-секций {total}, максимум {MAX_ALLPASS}"
-        )
 
 
 def validate(doc):

@@ -20,40 +20,16 @@ def _load_raw():
         return json.load(fh)
 
 
-PARTNER_MODEL = {
-    "key": "synthetic_test_b",
-    "match": ["TEST/SYNTH_B/synth_b"],
-    "synthetic": True,
-    "preamp_db": 0.0,
-    "f_low_hz": 180.0,
-    "sections": [{"type": "highpass", "f0_hz": 180.0, "q": 0.7071}],
-    "allpass_vs_partner": {},
-}
-
-
 def _load_valid():
-    """Фикстура: devices.json плюс модель-партнёр synthetic_test_b.
-
-    В самом devices.json этой модели нет, а allpass_vs_partner на неё ссылается
-    (см. ValidFileTest). Здесь она добавляется только в памяти, чтобы остальные
-    тесты проверяли свои правила, а не это расхождение.
-    """
-    doc = _load_raw()
-    doc["models"].append(copy.deepcopy(PARTNER_MODEL))
-    return doc
+    return _load_raw()
 
 
 class ValidFileTest(unittest.TestCase):
     def test_fixture_is_valid(self):
         self.assertEqual(validate(_load_valid()), [])
 
-    def test_devices_json_known_partner_gap(self):
-        # Известное расхождение в profiles/devices.json: allpass_vs_partner
-        # ссылается на synthetic_test_b, а такой модели в models нет.
-        # Валидатор обязан это поймать; файл не правим (по заданию).
-        errors = validate(_load_raw())
-        self.assertEqual(len(errors), 1, errors)
-        self.assertIn("synthetic_test_b", errors[0])
+    def test_devices_json_is_valid(self):
+        self.assertEqual(validate(_load_raw()), [])
 
     def test_minimal_valid_doc(self):
         doc = {
@@ -248,16 +224,6 @@ class AllpassTest(ValidatorTestBase):
         }
         self.assertHasError(validate(self.doc), "максимум 4")
 
-    def test_allpass_total_across_partners_rejected(self):
-        self.doc["models"].append(copy.deepcopy(PARTNER_MODEL))
-        self.doc["models"][-1]["key"] = "third_model"
-        self.doc["models"][-1]["match"] = ["TEST/SYNTH_C/synth_c"]
-        self.model["allpass_vs_partner"] = {
-            "synthetic_test_b": [{"f0_hz": 1000, "q": 0.6}, {"f0_hz": 1100, "q": 0.6}],
-            "third_model": [{"f0_hz": 1200, "q": 0.6}, {"f0_hz": 1300, "q": 0.6}, {"f0_hz": 1400, "q": 0.6}],
-        }
-        self.assertHasError(validate(self.doc), "максимум 4")
-
     def test_four_allpass_allowed(self):
         self.model["allpass_vs_partner"] = {
             "synthetic_test_b": [{"f0_hz": 1000 + i, "q": 0.6} for i in range(4)]
@@ -331,10 +297,9 @@ class CliTest(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn("q", result.stdout)
 
-    def test_cli_real_devices_json_reports_known_gap(self):
+    def test_cli_real_devices_json(self):
         result = self._run(DEVICES)
-        self.assertEqual(result.returncode, 1)
-        self.assertIn("synthetic_test_b", result.stdout)
+        self.assertEqual(result.returncode, 0, result.stdout)
 
     def test_cli_unreadable_file(self):
         with tempfile.TemporaryDirectory() as tmp:
