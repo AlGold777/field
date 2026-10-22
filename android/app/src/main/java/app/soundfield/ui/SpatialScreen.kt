@@ -156,9 +156,9 @@ private fun SpatialSettingSlider(label: String, value: Float, onValueChange: (Fl
 @Composable
 private fun SceneWidthView(sideMidDb: Double, correlation: Double, modifier: Modifier = Modifier) {
     val infinite = rememberInfiniteTransition(label = "scene")
-    val breathing by infinite.animateFloat(
+    val breathing = if (motionEnabled()) infinite.animateFloat(
         initialValue = 0.95f, targetValue = 1.05f,
-        animationSpec = infiniteRepeatable(tween(1800, easing = FastOutSlowInEasing), RepeatMode.Reverse), label = "breath")
+        animationSpec = infiniteRepeatable(tween(1800, easing = FastOutSlowInEasing), RepeatMode.Reverse), label = "breath").value else 1f
     val width = (0.54f + (sideMidDb.toFloat().coerceIn(-12f, 12f) / 30f)).coerceIn(0.30f, 0.90f) * breathing
     val center = (0.5f + (correlation.toFloat().coerceIn(-1f, 1f) * 0.025f))
     Canvas(modifier.clip(RoundedCornerShape(18.dp))) {
