@@ -159,7 +159,7 @@ final class PointReceiver {
             for i in 0..<count {
                 let f = p.startFrame + Int64(i)
                 let idx = Int(f & mask)
-                samples[idx] = Float(src[i]) / 32768
+                samples[idx] = Float(src[i]) / Pcm24.scale
                 tags[idx] = f
             }
         }

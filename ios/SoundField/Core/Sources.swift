@@ -28,40 +28,50 @@ enum AudioFileDecoder {
 
     static func decode(_ item: PreparedAudioFile) throws -> PcmSource {
         let file = try AVAudioFile(forReading: item.url)
-        let inputFormat = file.processingFormat
-        guard inputFormat.sampleRate > 0, file.length > 0,
-              let input = AVAudioPCMBuffer(pcmFormat: inputFormat, frameCapacity: AVAudioFrameCount(file.length)) else {
+        let format = file.processingFormat
+        guard format.sampleRate > 0, file.length > 0 else {
             throw NSError(domain: "SoundField.Audio", code: 1, userInfo: [NSLocalizedDescriptionKey: "В файле нет аудиоданных"])
         }
-        try file.read(into: input)
-        guard let outputFormat = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: Double(SF.sampleRate),
-                                               channels: 2, interleaved: false),
-              let converter = AVAudioConverter(from: inputFormat, to: outputFormat) else {
-            throw NSError(domain: "SoundField.Audio", code: 2, userInfo: [NSLocalizedDescriptionKey: "Формат аудио не поддерживается"])
+        // Частота источника → 48 кГц ядром (SfSampleRateConverter); при совпадении частот конвертер не нужен.
+        let inputRate = Int(format.sampleRate.rounded())
+        var converter: SfSampleRateConverter?
+        if inputRate != SF.sampleRate {
+            guard let c = SfSampleRateConverter(channels: 2, from: inputRate, to: SF.sampleRate) else {
+                throw NSError(domain: "SoundField.Audio", code: 2, userInfo: [NSLocalizedDescriptionKey: "Формат аудио не поддерживается"])
+            }
+            converter = c
         }
-        let ratio = Double(SF.sampleRate) / inputFormat.sampleRate
-        let capacity = AVAudioFrameCount(ceil(Double(input.frameLength) * ratio) + 2048)
-        guard let output = AVAudioPCMBuffer(pcmFormat: outputFormat, frameCapacity: max(1, capacity)) else {
+        guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 32_768) else {
             throw NSError(domain: "SoundField.Audio", code: 3, userInfo: [NSLocalizedDescriptionKey: "Не удалось подготовить аудио"])
         }
-        var suppliedInput = false
-        var conversionError: NSError?
-        let status = converter.convert(to: output, error: &conversionError) { _, inputStatus in
-            guard !suppliedInput else { inputStatus.pointee = .endOfStream; return nil }
-            suppliedInput = true
-            inputStatus.pointee = .haveData
-            return input
+        let encoder = Pcm24StereoEncoder(seed: 0x5F24)
+        var pcm24: [UInt8] = []
+        let channelCount = Int(format.channelCount)
+        while true {
+            try file.read(into: buffer, frameCount: 32_768)
+            let n = Int(buffer.frameLength)
+            if n == 0 { break }
+            guard let ch = buffer.floatChannelData else {
+                throw NSError(domain: "SoundField.Audio", code: 5, userInfo: [NSLocalizedDescriptionKey: "Кодек не вернул аудиоданные"])
+            }
+            // Интерлив стерео: моно дублируется в L и R; при >2 каналах берём первые два.
+            let left = ch[0], right = channelCount > 1 ? ch[1] : ch[0]
+            var block = [Float](repeating: 0, count: n * 2)
+            for f in 0..<n {
+                block[f * 2] = left[f]
+                block[f * 2 + 1] = right[f]
+            }
+            if let c = converter {
+                pcm24 += encoder.encode(c.process(block))
+            } else {
+                pcm24 += encoder.encode(block)
+            }
         }
-        if status == .error { throw conversionError ?? NSError(domain: "SoundField.Audio", code: 4) }
-        guard let channels = output.int16ChannelData, output.frameLength > 0 else {
+        if let c = converter { pcm24 += encoder.encode(c.finish()) }
+        guard !pcm24.isEmpty else {
             throw NSError(domain: "SoundField.Audio", code: 5, userInfo: [NSLocalizedDescriptionKey: "Кодек не вернул аудиоданные"])
         }
-        var pcm = [Int16](repeating: 0, count: Int(output.frameLength) * 2)
-        for frame in 0..<Int(output.frameLength) {
-            pcm[frame * 2] = channels[0][frame]
-            pcm[frame * 2 + 1] = channels[1][frame]
-        }
-        return PcmSource(pcm: pcm, title: item.title, artist: item.artist)
+        return PcmSource(pcm24: pcm24, title: item.title, artist: item.artist)
     }
 }
 
@@ -74,18 +84,22 @@ protocol AudioSource: AnyObject {
     func sample(_ frame: Int64, _ ch: Int) -> Float
 }
 
+/// Музыкальный источник: 24-битный кэш little-endian, интерлив L/R, 6 байт на кадр.
 final class PcmSource: AudioSource {
     let mode = SourceMode.music
     let title: String
     let artist: String
     let totalFrames: Int64
-    private let pcm: [Int16]
-    init(pcm: [Int16], title: String, artist: String) {
-        self.pcm = pcm; self.title = title; self.artist = artist; totalFrames = Int64(pcm.count / 2)
+    private let pcm: [UInt8]
+    init(pcm24: [UInt8], title: String, artist: String) {
+        self.pcm = pcm24; self.title = title; self.artist = artist; totalFrames = Int64(pcm24.count / 6)
+    }
+    convenience init(interleavedFloat: [Float], title: String, artist: String) {
+        self.init(pcm24: Pcm24StereoEncoder(seed: 0x5F24).encode(interleavedFloat), title: title, artist: artist)
     }
     func sample(_ frame: Int64, _ ch: Int) -> Float {
         guard frame >= 0 && frame < totalFrames else { return 0 }
-        return Float(pcm[Int(frame * 2) + ch]) / 32768
+        return pcm.withUnsafeBufferPointer { Pcm24.sampleLe($0, Int(frame) * 2 + ch) }
     }
 }
 
@@ -249,11 +263,11 @@ final class LevelMatchSource: AudioSource {
     }
 }
 
-/// Минимальный WAV-парсер (PCM 16 бит, моно/стерео) → 48 кГц стерео int16.
+/// Минимальный WAV-парсер (PCM 8/16/24/32 бит или float32, моно/стерео) → 48 кГц стерео интерлив [Float].
 enum Wav {
     enum WavError: Error { case format }
 
-    static func decode(_ data: Data) throws -> [Int16] {
+    static func decode(_ data: Data) throws -> [Float] {
         let b = [UInt8](data)
         func u32(_ o: Int) -> Int { Int(b[o]) | Int(b[o + 1]) << 8 | Int(b[o + 2]) << 16 | Int(b[o + 3]) << 24 }
         func u16(_ o: Int) -> Int { Int(b[o]) | Int(b[o + 1]) << 8 }
@@ -279,31 +293,33 @@ enum Wav {
             if dataOff >= 0 && channels > 0 { break }
             pos = body + len + (len & 1)
         }
-        guard fmt == 1, bits == 16, (1...2).contains(channels), dataOff >= 0 else { throw WavError.format }
-        let frames = dataLen / (2 * channels)
-        var st = [Int16](repeating: 0, count: frames * 2)
-        for f in 0..<frames {
-            let l = i16(dataOff + f * channels * 2)
-            let r = channels == 2 ? i16(dataOff + (f * channels + 1) * 2) : l
-            st[f * 2] = l; st[f * 2 + 1] = r
-        }
-        if rate != SF.sampleRate { st = resample(st, from: rate, to: SF.sampleRate) }
-        return st
-    }
-
-    private static func resample(_ src: [Int16], from: Int, to: Int) -> [Int16] {
-        let inFrames = src.count / 2
-        let outFrames = inFrames * to / from
-        var out = [Int16](repeating: 0, count: outFrames * 2)
-        for i in 0..<outFrames {
-            let x = Double(i) * Double(from) / Double(to)
-            let i0 = min(Int(x), inFrames - 1), i1 = min(i0 + 1, inFrames - 1)
-            let fr = x - Double(i0)
-            for c in 0..<2 {
-                out[i * 2 + c] = Int16(Double(src[i0 * 2 + c]) * (1 - fr) + Double(src[i1 * 2 + c]) * fr)
+        let isPcm = fmt == 1 && [8, 16, 24, 32].contains(bits)
+        let isFloat = fmt == 3 && bits == 32
+        guard isPcm || isFloat, (1...2).contains(channels), dataOff >= 0 else { throw WavError.format }
+        let bytesPerSample = bits / 8
+        let frames = dataLen / (bytesPerSample * channels)
+        // Масштаб к [-1, 1): 8 бит — беззнаковый, 16/24/32 — знаковые, float32 — как есть.
+        func sampleAt(_ o: Int) -> Float {
+            switch (fmt, bits) {
+            case (3, _): return Float(bitPattern: UInt32(truncatingIfNeeded: u32(o)))
+            case (_, 8): return (Float(b[o]) - 128) / 128
+            case (_, 16): return Float(i16(o)) / 32768
+            case (_, 24):
+                var v = Int32(b[o]) | Int32(b[o + 1]) << 8 | Int32(b[o + 2]) << 16
+                if v & 0x800000 != 0 { v -= 0x1000000 }
+                return Float(v) / 8_388_608
+            default: return Float(Int32(truncatingIfNeeded: u32(o))) / 2_147_483_648
             }
         }
-        return out
+        var st = [Float](repeating: 0, count: frames * 2)
+        for f in 0..<frames {
+            let base = dataOff + f * channels * bytesPerSample
+            let l = sampleAt(base)
+            let r = channels == 2 ? sampleAt(base + bytesPerSample) : l
+            st[f * 2] = l; st[f * 2 + 1] = r
+        }
+        if rate != SF.sampleRate { st = SfDsp.resample(st, channels: 2, from: rate, to: SF.sampleRate) }
+        return st
     }
 }
 

@@ -177,7 +177,7 @@ final class Engine {
         let url = Bundle.main.url(forResource: "test_track", withExtension: "wav")
         if url == nil { NSLog("SoundField: test_track.wav не найден в приложении") }
         let pcm = url.flatMap { try? Wav.decode(Data(contentsOf: $0)) } ?? []
-        music = PcmSource(pcm: pcm, title: "Тестовый трек SoundField", artist: "Стерео-демо · L: аккорды и бас · R: мелодия")
+        music = PcmSource(interleavedFloat: pcm, title: "Тестовый трек SoundField", artist: "Стерео-демо · L: аккорды и бас · R: мелодия")
         source = music
         playBox = Locked(ServerPlayState(timeline: .none, source: music, channel: Ch.L, gain: 0.8))
         rx = PointReceiver(clock: clock)
@@ -1976,11 +1976,13 @@ final class Engine {
     private func packet(_ st: ServerPlayState, _ tl: Timeline, seq: Int32, start: Int64, flags: UInt8) -> [UInt8] {
         let count = Int(max(0, min(Int64(SF.packetFrames), st.source.totalFrames - start)))
         let pCh = Ch.other(st.channel)
-        var s = [Int16](repeating: 0, count: count)
+        var f = [Float](repeating: 0, count: count)
         for i in 0..<count {
-            let v = (st.source.sample(start + Int64(i), pCh) * 32767).rounded()
-            s[i] = Int16(max(-32768, min(32767, v)))
+            let v = st.source.sample(start + Int64(i), pCh)
+            f[i] = v.isNaN ? 0 : v
         }
+        // Сетевое 24-битное квантование с TPDF; seed от позиции и канала — перепосылка даёт тот же пакет.
+        let s = Pcm24.quantize(f, seed: UInt64(bitPattern: start &* 2 &+ Int64(pCh) &+ 1))
         return Wire.audio(session: sessionId, epoch: tl.epoch, seq: seq, startFrame: start, playoutNs: tl.timeOf(start),
                           sendNs: MonoClock.nowNs(), flags: flags, samples: s, key: udpKeyBox.value ?? [])
     }
