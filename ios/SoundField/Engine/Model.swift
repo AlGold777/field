@@ -1,5 +1,6 @@
 import Foundation
 import Network
+import Security
 
 /// Телефон, найденный в сети (Bonjour).
 struct Peer: Identifiable, Equatable {
@@ -84,6 +85,35 @@ struct LevelCalib: Codable, Equatable {
     var state = "none"
     var atMs: Int64 = 0
     var db = 0.0
+}
+
+/// Хранение записи пары в Keychain: в ней ключ пары (секрет), в UserDefaults его не держим.
+enum PairKeychain {
+    private static let base: [String: Any] = [
+        kSecClass as String: kSecClassGenericPassword,
+        kSecAttrService as String: "app.soundfield.pair",
+        kSecAttrAccount as String: "pair"
+    ]
+
+    static func load() -> Data? {
+        var q = base
+        q[kSecReturnData as String] = true
+        q[kSecMatchLimit as String] = kSecMatchLimitOne
+        var out: AnyObject?
+        guard SecItemCopyMatching(q as CFDictionary, &out) == errSecSuccess else { return nil }
+        return out as? Data
+    }
+
+    @discardableResult
+    static func save(_ data: Data) -> Bool {
+        SecItemDelete(base as CFDictionary)
+        var q = base
+        q[kSecValueData as String] = data
+        q[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+        return SecItemAdd(q as CFDictionary, nil) == errSecSuccess
+    }
+
+    static func delete() { SecItemDelete(base as CFDictionary) }
 }
 
 struct Diag: Equatable {

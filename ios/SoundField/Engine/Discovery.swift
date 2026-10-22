@@ -132,10 +132,11 @@ final class Discovery {
         var list: [Peer] = []
         for r in results {
             guard case .service(let name, _, _, _) = r.endpoint, name.hasPrefix(SF.servicePrefix) else { continue }
-            var id = String(name.dropFirst(SF.servicePrefix.count))
+            // id берём только из имени сервиса; TXT id — лишь для сверки (чужой TXT не подменяет id)
+            let id = String(name.dropFirst(SF.servicePrefix.count))
             var display = id, platform = "?"
             if case .bonjour(let txt) = r.metadata {
-                if let v = txt["id"] { id = v }
+                if let v = txt["id"], v != id { NSLog("SoundField: TXT id не совпадает с именем сервиса, пир пропущен"); continue }
                 if let v = txt["n"] { display = v }
                 if let v = txt["p"] { platform = v }
             }

@@ -13,6 +13,7 @@ final class UdpSocket {
     var broken: Bool { brokenBox.value }
     private let closedBox = Locked(false)
     var onPacket: ((UnsafeRawBufferPointer, Addr, Int64) -> Void)?
+    /// Цикл приёма стартует отдельно (после назначения onPacket).
 
     init?() {
         let socketFD = socket(AF_INET6, SOCK_DGRAM, IPPROTO_UDP)
@@ -36,16 +37,29 @@ final class UdpSocket {
             $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { getsockname(socketFD, $0, &len) }
         }
         port = UInt16(bigEndian: bound.sin6_port)
+    }
+
+    /// Запуск приёма. Вызывать после назначения onPacket, иначе первые датаграммы уйдут в пустоту.
+    func start() {
         let t = Thread { [weak self] in self?.loop() }
         t.name = "sf-udp"
         t.qualityOfService = .userInteractive
         t.start()
     }
 
+    /// Остановка приёма: цикл завершится в пределах 200 мс, сокет закрывается при освобождении объекта.
+    /// Закрытие fd только в deinit — после выхода цикла, иначе номер fd может уйти другому сокету.
+    deinit { Darwin.close(fd) }
+
     private func loop() {
         var buf = [UInt8](repeating: 0, count: 4096)
         var errors = 0
         while !closedBox.value {
+            // poll с таймаутом, чтобы цикл регулярно проверял флаг остановки
+            var pfd = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
+            let ready = poll(&pfd, 1, 200)
+            if ready == 0 { continue }
+            if ready < 0 { usleep(10_000); continue }
             var storage = sockaddr_storage()
             var len = socklen_t(MemoryLayout<sockaddr_storage>.size)
             let n = buf.withUnsafeMutableBytes { b -> Int in
@@ -66,7 +80,9 @@ final class UdpSocket {
                 usleep(10_000); continue
             }
             errors = 0
-            if n == 0 { continue }
+            if n == 0 { continue }   // пустая датаграмма
+            // буфер 4096 байт: датаграмма, не поместившаяся целиком, отбрасывается (усечённые данные не декодируем)
+            if n >= buf.count { NSLog("SoundField udp: датаграмма \(n) байт не помещается в буфер, отброшена"); continue }
             let from = Addr(storage: storage, len: len)
             buf.withUnsafeBytes { b in onPacket?(UnsafeRawBufferPointer(rebasing: b[0..<n]), from, now) }
         }
@@ -76,8 +92,6 @@ final class UdpSocket {
         guard !closedBox.value else { return }
         closedBox.value = true
         brokenBox.value = true
-        Darwin.shutdown(fd, SHUT_RDWR)
-        Darwin.close(fd)
     }
 
     func send(_ bytes: [UInt8], to a: Addr) {

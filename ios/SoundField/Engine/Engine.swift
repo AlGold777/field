@@ -55,7 +55,7 @@ final class Engine {
     // сеть
     private var discovery: Discovery!
     private let udpBox = Locked<UdpSocket?>(nil)
-    private var udp: UdpSocket! { udpBox.value }
+    private var udp: UdpSocket? { udpBox.value }
     private var pathMonitor: NWPathMonitor?
     private var lastPathSignature: String?
 
@@ -79,6 +79,8 @@ final class Engine {
     private var lastAudioSessionResetNs: Int64 = 0
     private var record: PairRecord?
     private var reconnectTask: DispatchWorkItem?
+    private var unknownRejects = 0
+    private var newLinks: [ControlLink] = []   // входящие соединения до invite/resume
     private var lastBrowseRestart = Date.distantPast
     private var manualResumeDeadline = Date.distantPast
     /// Идёт восстановление сохранённой пары (вручную или автоматически при запуске/возврате в приложение).
@@ -134,6 +136,7 @@ final class Engine {
     private let pointUdpBox = Locked<UdpSocket.Addr?>(nil)
     private var serverRenderer: ServerRenderer!
     private var calibRunning = false
+    private var calibAborted = false     // калибровка прервана (звонок и т.п.): результат не применять
     private var pointClockReady = false
     private var resent: Int64 = 0
     private let sendLock = NSLock()
@@ -151,7 +154,9 @@ final class Engine {
     private var pointRenderer: PointRenderer!
     private let serverUdpBox = Locked<UdpSocket.Addr?>(nil)
     private var pingSeq: Int32 = 0
-    private var pingBurst = 0
+    // пишется с q (сессия) и уменьшается на sf-tick (pointNet): доступ через Locked
+    private let pingBurstBox = Locked(0)
+    private var pingBurst: Int { get { pingBurstBox.value } set { pingBurstBox.value = newValue } }
     private var lastPing: Int64 = 0
     private var lastRecv: Int64 = 0, lastLost: Int64 = 0
 
@@ -160,9 +165,10 @@ final class Engine {
             myId = String(format: "%08x", UInt32.random(in: 0...UInt32.max)); defaults.set(myId, forKey: "sf.id")
         }
         myName = defaults.string(forKey: "sf.name") ?? UIDevice.current.name
-        if let d = defaults.data(forKey: "sf.pair") { record = try? JSONDecoder().decode(PairRecord.self, from: d) }
-        let url = Bundle.main.url(forResource: "test_track", withExtension: "wav")!
-        let pcm = (try? Wav.decode(Data(contentsOf: url))) ?? []
+        record = Engine.loadPair(defaults)
+        let url = Bundle.main.url(forResource: "test_track", withExtension: "wav")
+        if url == nil { NSLog("SoundField: test_track.wav не найден в приложении") }
+        let pcm = url.flatMap { try? Wav.decode(Data(contentsOf: $0)) } ?? []
         music = PcmSource(pcm: pcm, title: "Тестовый трек SoundField", artist: "Стерео-демо · L: аккорды и бас · R: мелодия")
         source = music
         playBox = Locked(ServerPlayState(timeline: .none, source: music, channel: Ch.L, gain: 0.8))
@@ -217,6 +223,8 @@ final class Engine {
             mon.start(queue: q)
             pathMonitor = mon
             log("Запуск: UDP \(udpBox.value?.port ?? 0)")
+            if udpBox.value == nil { toast(Self.noUdpText) }
+            if music.totalFrames == 0 { toast("Тестовый трек не загружен — воспроизведение недоступно") }
             startSoloPlayback()
             if autoResume && record != nil { startAutoResume() }
         }
@@ -226,6 +234,7 @@ final class Engine {
         udpBox.value?.close()
         guard let s = UdpSocket() else { log("Не удалось открыть UDP-сокет"); udpBox.value = nil; return }
         s.onPacket = { [weak self] p, from, now in self?.onUdp(p, from, now) }
+        s.start()   // после назначения onPacket, иначе первые датаграммы уйдут в пустоту
         udpBox.value = s
     }
 
@@ -370,7 +379,7 @@ final class Engine {
     func acceptIncoming() { q.async { self.doAccept() } }
     func rejectIncoming() { q.async { self.doReject() } }
     func resumeRemembered() { q.async { self.doManualResume() } }
-    func forgetPair() { q.async { self.record = nil; self.setAutoResume(false); self.stopAutoResume(); self.defaults.removeObject(forKey: "sf.pair"); self.ui { $0.remembered = nil } } }
+    func forgetPair() { q.async { self.record = nil; self.setAutoResume(false); self.stopAutoResume(); PairKeychain.delete(); self.defaults.removeObject(forKey: "sf.pair"); self.ui { $0.remembered = nil } } }
     func disconnect() { q.async { self.setAutoResume(false); self.goIdle(sendBye: true, reason: "Пара разорвана") } }
     func rename(_ name: String) {
         q.async {
@@ -842,8 +851,11 @@ final class Engine {
         ["t": "accept", "id": myId, "name": myName, "platform": "ios", "key": key, "role": role, "tcpPort": Int(discovery.listenPort), "caps": ["fileTransferV1", "eq", "spatialV1"]]
     }
 
+    private static let noUdpText = "Не удалось открыть сетевой сокет — перезапустите приложение"
+
     private func doInvite(_ p: Peer) {
         guard phase == .idle else { return }
+        guard udp != nil else { toast(Self.noUdpText); return }
         stopAutoResume()
         pendingKey = Self.hex(16)
         phase = .inviting
@@ -854,6 +866,7 @@ final class Engine {
     private func doManualResume(auto: Bool = false) {
         if phase == .idle { stopAutoResume() }
         guard let rec = record, phase == .idle, pending == nil else { return }
+        guard udp != nil else { toast(Self.noUdpText); return }
         phase = .inviting
         manualResumeActive = true; manualResumeAuto = auto; resumeAttempt = 0
         ui { $0.phase = .inviting; $0.invitingName = rec.peerName; $0.resuming = true }
@@ -927,8 +940,12 @@ final class Engine {
     }
 
     private func onIncoming(_ c: NWConnection) {
+        // не более 8 неавторизованных соединений одновременно (авторизация = invite/resume, тег меняется)
+        newLinks = newLinks.filter { $0.isOpen && $0.tag == "new" }
+        guard newLinks.count < 8 else { NSLog("SoundField: лимит неавторизованных соединений, лишнее закрыто"); c.cancel(); return }
         let l = newLink(c)
         l.tag = "new"
+        newLinks.append(l)
         l.start()
         later(5) { if l.tag == "new" { l.close() } }
     }
@@ -967,7 +984,13 @@ final class Engine {
     private func onFirstMessage(_ l: ControlLink, _ o: [String: Any]) {
         let pid = J.s(o, "id"), pname = J.s(o, "name", pid), pplat = J.s(o, "platform", "?")
         l.peerCapabilities = Set(o["caps"] as? [String] ?? [])
-        switch J.s(o, "t") {
+        guard udp != nil else { l.tag = "dead"; l.close(); return }   // без UDP пара невозможна
+        let t = J.s(o, "t")
+        // версия протокола: поле необязательно, но если есть и не совпадает — отказ
+        if (t == "invite" || t == "resume") && o["proto"] != nil && J.i64(o, "proto") != Int64(SF.protocolVersion) {
+            l.tag = "dead"; l.sendAndClose(["t": "reject", "reason": "proto"]); return
+        }
+        switch t {
         case "invite":
             if phase == .idle { stopAutoResume() }   // новое приглашение важнее фонового восстановления
             if phase == .idle && pending == nil {
@@ -1055,7 +1078,14 @@ final class Engine {
                 phase = .idle; ui { $0.phase = .idle }
                 toast(t == "busy" ? "Телефон уже в другой паре"
                       : reason == "unknown" ? "Второй телефон не помнит эту пару — создайте её заново" : "Подключение отклонено")
-            } else if phase == .reconnecting { scheduleReconnect(reason == "crossed" ? 1.5 : 2) }
+            } else if phase == .reconnecting {
+                // пара забыта на стороне второго телефона: не повторять отказы бесконечно
+                unknownRejects = (reason == "unknown" || reason == "proto") ? unknownRejects + 1 : 0
+                if unknownRejects >= 5 {
+                    unknownRejects = 0
+                    goIdle(sendBye: false, reason: "«\(peerName)» не подтверждает пару — переподключение остановлено")
+                } else { scheduleReconnect(reason == "crossed" ? 1.5 : 2) }
+            }
         case "cancel":
             if l.tag == "incoming" {
                 pending = nil; l.tag = "dead"; l.close()
@@ -1098,7 +1128,7 @@ final class Engine {
             soloMode = false
             ui { $0.soloMode = false }
         }
-        pendingTimeout?.cancel(); reconnectTask?.cancel()
+        pendingTimeout?.cancel(); reconnectTask?.cancel(); unknownRejects = 0
         if pending === l { pending = nil }
         if let p = pending { p.tag = "dead"; p.close(); pending = nil }
         manualResumeActive = false
@@ -1249,7 +1279,21 @@ final class Engine {
     }
 
     private func persistRecord() {
-        if let r = record, let d = try? JSONEncoder().encode(r) { defaults.set(d, forKey: "sf.pair") }
+        if let r = record, let d = try? JSONEncoder().encode(r) { PairKeychain.save(d) }
+    }
+
+    /// Пара из Keychain; запись прежнего формата из UserDefaults переносится в Keychain.
+    private static func loadPair(_ defaults: UserDefaults) -> PairRecord? {
+        var data = PairKeychain.load()
+        if data == nil, let legacy = defaults.data(forKey: "sf.pair") {
+            data = legacy
+            if PairKeychain.save(legacy) { defaults.removeObject(forKey: "sf.pair") }
+        }
+        guard let d = data else { return nil }
+        do { return try JSONDecoder().decode(PairRecord.self, from: d) } catch {
+            NSLog("SoundField: запись пары повреждена, пара не загружена: \(error)")
+            return nil
+        }
     }
 
     private func saveServerParams() {
@@ -1291,12 +1335,7 @@ final class Engine {
                 clock.reset(); rx.reset()
             }
             let port = UInt16(truncatingIfNeeded: J.i64(o, "udpPort"))
-            if let host = l.remoteHost, let addr = UdpSocket.resolve(host: host, port: port) {
-                serverUdpBox.value = addr
-                pingBurst = 20
-            } else {
-                NSLog("SoundField: не удалось определить адрес Server")
-            }
+            resolveServerUdp(l, port: port, attempt: 0)
         case "state": if role == .point { applyState(o) }
         case "queue": if role == .point { applyQueue(o) }
         case "timeline":
@@ -1307,6 +1346,21 @@ final class Engine {
         case "sdiag": if role == .point { let d = Diag.from(o); ui { $0.serverDiag = d } }
         case "calib": if role == .point { applyCalib(o) }
         default: break
+        }
+    }
+
+    /// Адрес UDP Server по адресу TCP-соединения; при неудаче — повтор через 2 с (до 5 раз), затем сообщение.
+    private func resolveServerUdp(_ l: ControlLink, port: UInt16, attempt: Int) {
+        if let host = l.remoteHost, let addr = UdpSocket.resolve(host: host, port: port) {
+            serverUdpBox.value = addr
+            pingBurst = 20
+            return
+        }
+        NSLog("SoundField: не удалось определить адрес Server (попытка \(attempt + 1))")
+        guard attempt < 5 else { toast("Не удалось определить адрес Server — звук не получен"); return }
+        later(2) { [weak self, weak l] in
+            guard let self, let l, self.link === l else { return }
+            self.resolveServerUdp(l, port: port, attempt: attempt + 1)
         }
     }
 
@@ -1470,8 +1524,9 @@ final class Engine {
         case "play": cmdPlay()
         case "pause": cmdPause()
         case "toggle": if playBox.value.timeline.playing && mode != .calib { cmdPause() } else { cmdPlay() }
-        case "seek": seekFrame(J.i64(o, "ms") * sr / 1000)
-        case "skip": seekFrame(posFrame() + J.i64(o, "ms") * sr / 1000)
+        // ограничение до умножения: иначе переполнение Int64 на некорректном вводе (трап = падение приложения)
+        case "seek": seekFrame(min(max(0, J.i64(o, "ms")), 86_400_000) * sr / 1000)
+        case "skip": seekFrame(posFrame() + min(max(-3_600_000, J.i64(o, "ms")), 3_600_000) * sr / 1000)
         case "next": selectQueueTrack(at: navigationIndex + 1, startPlayback: true)
         case "previous": selectQueueTrack(at: navigationIndex - 1, startPlayback: true)
         case "select": selectQueueTrack(id: J.s(o, "id"))
@@ -1508,6 +1563,7 @@ final class Engine {
             if tl.playing { newEpoch(true, posFrame(), now + SF.startDelayNs) } else { newEpoch(false, tl.anchorFrame, now) }
             toast("Каналы поменяны: этот телефон — \(Ch.name(serverChannel))")
         case "trim":
+            guard !calibRunning else { return }
             let ms = min(SF.maxTrimMs, max(-SF.maxTrimMs, J.d(o, "ms")))
             trimNs = Int64(ms * 1e6)
             delayCalib = J.b(o, "reset") ? DelayCalib() : DelayCalib(state: "manual", atMs: Int64(Date().timeIntervalSince1970 * 1000))
@@ -1662,6 +1718,7 @@ final class Engine {
             return
         }
         calibRunning = true
+        calibAborted = false
         if mode == .music { savedFrame = posFrame(); savedPlaying = playBox.value.timeline.playing }
         mode = .calib; source = CalibrationSource(pointCh: pointChannel)
         newEpoch(false, 0, MonoClock.nowNs())
@@ -1673,11 +1730,15 @@ final class Engine {
                 try AudioOutput.configureMeasurementSession()
                 self.audio.restart()
             } catch {
+                // восстанавливаем сессию воспроизведения, иначе после ошибки звук остаётся в режиме записи
+                AudioOutput.configurePlaybackSession()
+                self.audio.restart()
                 self.q.async { self.calibFailed("Не удалось включить микрофон: \(error.localizedDescription)") }
                 return
             }
             self.mic.record(durationSec: 8.6, onStarted: {
                 self.q.async {
+                    guard !self.calibAborted else { return }
                     let a = MonoClock.nowNs() + 700_000_000
                     anchor.value = a
                     self.newEpoch(true, 0, a)
@@ -1703,6 +1764,7 @@ final class Engine {
 
     private func calibFailed(_ text: String) {
         calibRunning = false
+        calibAborted = false
         restoreMusic(savedPlaying)
         broadcastCalib(false, "", text, false, nil)
     }
@@ -1710,6 +1772,10 @@ final class Engine {
     private func finishCalibration(_ res: CalibrationAnalyzer.Result, apply: Bool, trimUsed: Int64) {
         calibRunning = false
         restoreMusic(savedPlaying)
+        if calibAborted {
+            calibAborted = false
+            broadcastCalib(false, "", "Калибровка прервана — результат не применён", false, nil); return
+        }
         guard res.ok else { broadcastCalib(false, "", res.message, false, nil); return }
         let who = res.lateMs >= 0 ? "опаздывал" : "спешил"
         if apply {
@@ -1882,7 +1948,11 @@ final class Engine {
     /// Прерывание (звонок, Siri, другое приложение) на любом телефоне ставит на паузу всю пару.
     private func onInterrupted(_ reason: String) {
         guard state.inPair || soloMode else { return }
-        if role == .server { cmdPause() } else { link?.send(["t": "cmd", "a": "pause"]) }
+        if role == .server && calibRunning {
+            // калибровка отменяется: сигналы останавливаем сразу, результат запишется как прерванный
+            calibAborted = true
+            newEpoch(false, 0, MonoClock.nowNs())
+        } else if role == .server { cmdPause() } else { link?.send(["t": "cmd", "a": "pause"]) }
         toast(reason)
     }
     // Queue editing uses track IDs, including commands received from Point.
