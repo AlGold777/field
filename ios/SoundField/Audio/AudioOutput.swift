@@ -18,9 +18,11 @@ private final class UnderrunBox {
 }
 
 final class AudioOutput {
-    private let engine = AVAudioEngine()
+    private var engine = AVAudioEngine()
     private var node: AVAudioSourceNode?
-    private let equalizer = AVAudioUnitEQ(numberOfBands: 10)
+    private var equalizer = AVAudioUnitEQ(numberOfBands: 10)
+    private var configObserver: NSObjectProtocol?
+    private var eqState: (EqSettings, Bool)?     // последние параметры EQ: переприменяются после пересборки движка
     private let sourceBox = Locked<RenderSource?>(nil)
     private let outLatencyNs = Locked<Int64>(0)
     private(set) var running = false
@@ -52,16 +54,34 @@ final class AudioOutput {
             self?.handleRouteChange(n)
         }
         nc.addObserver(forName: AVAudioSession.mediaServicesWereResetNotification, object: nil, queue: .main) { [weak self] _ in
-            guard let self, self.running else { return }
-            // Старый source node остаётся в графе движка: отсоединяем, иначе рендер идёт дважды.
-            if let old = self.node { self.engine.detach(old) }
-            self.running = false; self.node = nil; self.start()
+            guard let self else { return }
+            // После сброса медиасервисов все аудиообъекты недействительны (документация Apple):
+            // движок, узлы и EQ пересоздаются, граф строится тем же кодом, что при первом start().
+            let wasRunning = self.running
+            self.rebuildEngine()
+            if wasRunning { self.start() }
+            if let eq = self.eqState { self.setEqualizer(eq.0, music: eq.1) }
         }
-        nc.addObserver(forName: .AVAudioEngineConfigurationChange, object: engine, queue: .main) { [weak self] _ in
+        observeEngineConfiguration()
+    }
+
+    private func observeEngineConfiguration() {
+        configObserver = NotificationCenter.default.addObserver(forName: .AVAudioEngineConfigurationChange, object: engine, queue: .main) { [weak self] _ in
             guard let self, self.running else { return }
             self.updateLatency()
             if !self.engine.isRunning { try? self.engine.start() }
         }
+    }
+
+    /// Новый движок и EQ вместо недействительных после сброса медиасервисов; source node создаётся заново в start().
+    private func rebuildEngine() {
+        engine.stop()
+        if let token = configObserver { NotificationCenter.default.removeObserver(token) }
+        engine = AVAudioEngine()
+        equalizer = AVAudioUnitEQ(numberOfBands: 10)
+        node = nil
+        running = false
+        observeEngineConfiguration()
     }
 
     /// Обычный режим — воспроизведение. Категория .playback: звук не глушится переключателем «бесшумно»
@@ -134,6 +154,7 @@ final class AudioOutput {
 
     /// Main-thread graph parameters; the unit owns its render state.
     func setEqualizer(_ settings: EqSettings, music: Bool) {
+        eqState = (settings, music)
         let active = music && settings.enabled && !settings.bypass
         for i in 0..<10 {
             let band = equalizer.bands[i]
