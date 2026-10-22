@@ -5155,6 +5155,7 @@ class Engine private constructor(private val app: Context) {
                 "activeShare" to if (limiterWindowBlocks > 0) limiterWindowActive.toDouble() / limiterWindowBlocks else 0.0,
                 "preActiveShare" to if (preLimiterWindowBlocks > 0) preLimiterWindowActive.toDouble() / preLimiterWindowBlocks else 0.0,
                 "preMaxReductionDb" to preLimiterWindowMaxDb,
+                "staticGainDb" to (currentPreLimited?.staticGainDb ?: 0.0),
             ))
             limiterWindowBlocks = 0L; limiterWindowActive = 0L; limiterWindowMaxDb = 0.0
             preLimiterWindowBlocks = 0L; preLimiterWindowActive = 0L; preLimiterWindowMaxDb = 0.0

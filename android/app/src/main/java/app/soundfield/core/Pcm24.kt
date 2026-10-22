@@ -3,7 +3,7 @@ package app.soundfield.core
 import app.soundfield.dsp.SfDsp
 
 /**
- * PCM 24 бит со знаком (A1.1). Квантование float → 24 бит — всегда с TPDF-дизерингом ядра (xorshift128+, два равномерных
+ * PCM 24 бит со знаком (A1.1). Квантование float → 24 бит — с TPDF-дизерингом ядра для значений вне сетки 24 бит (значения на сетке хранятся точно) (xorshift128+, два равномерных
  * значения по ±0,5 LSB, независимый генератор на канал). Без библиотеки ядра — та же формула на Kotlin.
  */
 object Pcm24 {
@@ -50,8 +50,10 @@ object Pcm24 {
         }
         private fun uniform(): Double = (next() ushr 11).toDouble() * (1.0 / 9007199254740992.0)
         fun quantize(x: Float): Int {
-            val v = x.toDouble() * 8388608.0 + ((uniform() - 0.5) + (uniform() - 0.5))   // порядок как в ядре (C++)
+            var v = x.toDouble() * 8388608.0
             if (v.isNaN()) return 0
+            // значение уже на сетке 24 бит (16/24-бит источник) — хранится бит-в-бит, без дизера; порядок сложения как в ядре (C++)
+            if (v != Math.floor(v)) v += (uniform() - 0.5) + (uniform() - 0.5)
             return Math.floor(v + 0.5).coerceIn(MIN.toDouble(), MAX.toDouble()).toInt()
         }
     }

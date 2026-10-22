@@ -72,11 +72,12 @@ object AudioFileDecoder {
         val completeFile = File(directory, "complete")
         if (completeFile.exists()) {
             // Метка формата «v3 <кадры>»: кэш PCM16 прежних версий (сегменты *.pcm48, метка без префикса) перекодируется заново.
-            val totalFrames = parseComplete(completeFile)
-            if (totalFrames != null) {
-                val source = SegmentedPcmSource(directory, track.title, track.artist, totalFrames)
+            val info = parseComplete(completeFile)
+            if (info != null) {
+                val source = SegmentedPcmSource(directory, track.title, track.artist, info.frames)
                 loadSegments(source, directory)
-                source.finish(totalFrames)
+                source.truePeakDbtp = info.truePeakDbtp
+                source.finish(info.frames)
                 return source
             }
         }
@@ -87,7 +88,7 @@ object AudioFileDecoder {
             val source = decodeToFile(context, track, directory, cancelled, onProgress) { readySource ->
                 if (!notified) { notified = true; onReady(readySource) }
             }
-            File(directory, "complete.tmp").writeText("$CACHE_FORMAT ${source.totalFrames}")
+            File(directory, "complete.tmp").writeText("$CACHE_FORMAT ${source.totalFrames} tp=${source.truePeakDbtp}")
             check(File(directory, "complete.tmp").renameTo(completeFile)) { "Не удалось завершить декодирование" }
             onProgress(source)
             return source
@@ -97,11 +98,16 @@ object AudioFileDecoder {
         }
     }
 
-    /** Число кадров из метки завершённого кэша или null, если это кэш другого формата (PCM16 до A1) — его нужно перекодировать. */
-    internal fun parseComplete(file: File): Long? {
+    /** Метаданные завершённого кэша; [truePeakDbtp] — NaN, если в метке его нет. Здесь же в A3.1 появится громкость (`lufs=`). */
+    internal class CacheInfo(val frames: Long, val truePeakDbtp: Double)
+
+    /** Метка кэша или null, если это кэш другого формата (PCM16 до A1) — его нужно перекодировать. Формат: `v3 <кадры> [tp=<dBTP>]`. */
+    internal fun parseComplete(file: File): CacheInfo? {
         val parts = runCatching { file.readText().trim().split(' ') }.getOrNull() ?: return null
-        if (parts.size != 2 || parts[0] != CACHE_FORMAT) return null
-        return parts[1].toLongOrNull()?.takeIf { it > 0 }
+        if (parts.size !in 2..3 || parts[0] != CACHE_FORMAT) return null
+        val frames = parts[1].toLongOrNull()?.takeIf { it > 0 } ?: return null
+        val tp = parts.drop(2).firstOrNull { it.startsWith("tp=") }?.substring(3)?.toDoubleOrNull() ?: Double.NaN
+        return CacheInfo(frames, tp)
     }
 
     private fun loadSegments(source: SegmentedPcmSource, directory: File) {
@@ -237,6 +243,7 @@ object AudioFileDecoder {
                 flushInput(final = true)
                 converter?.close(); converter = null
                 sink.finish()
+                sink.publishPeak()
                 require(sink.framesOut > 0) { "В файле нет аудиоданных" }
                 source.finish(sink.framesOut)
                 return source
@@ -276,6 +283,7 @@ object AudioFileDecoder {
     ) {
         private val readyThreshold = minOf(source.totalFrames, SegmentedPcmSource.SEGMENT_FRAMES.toLong())
         private val encoder = Pcm24StereoEncoder(seed = 0x5F24)
+        private val meter = app.soundfield.dsp.TruePeakMeter()
         private var bytes = ByteArray(0)
         private var index = 0L
         private var segmentFrames = 0
@@ -290,8 +298,9 @@ object AudioFileDecoder {
             while (done < frames) {
                 val n = minOf(frames - done, SegmentedPcmSource.SEGMENT_FRAMES - segmentFrames)
                 if (bytes.size < n * 6) bytes = ByteArray(n * 6)
-                if (done == 0 && n == frames) encoder.encode(block, n, bytes)
-                else encoder.encode(block.copyOfRange(done * 2, (done + n) * 2), n, bytes)
+                val part = if (done == 0 && n == frames) block else block.copyOfRange(done * 2, (done + n) * 2)
+                meter.process(part, n)
+                encoder.encode(part, n, bytes)
                 if (output == null) output = BufferedOutputStream(FileOutputStream(File(directory, "$index.tmp")), 1 shl 16)
                 output!!.write(bytes, 0, n * 6)
                 segmentFrames += n; framesOut += n; done += n
@@ -301,7 +310,10 @@ object AudioFileDecoder {
 
         fun finish() { if (segmentFrames > 0) publishSegment() }
 
-        fun close() { try { output?.close() } finally { output = null; encoder.close() } }
+        /** Итоговый true-peak трека (последний сегмент мог быть пуст). */
+        fun publishPeak() { source.truePeakDbtp = meter.truePeakDbtp }
+
+        fun close() { try { output?.close() } finally { output = null; encoder.close(); meter.close() } }
 
         private fun publishSegment() {
             val stream = output ?: return
@@ -309,6 +321,7 @@ object AudioFileDecoder {
             val tmp = File(directory, "$index.tmp")
             val segment = File(directory, "$index.pcm24")
             check(tmp.renameTo(segment)) { "Не удалось сохранить сегмент аудио" }
+            source.truePeakDbtp = meter.truePeakDbtp
             source.publish(index, segment, segmentFrames)
             segmentFrames = 0
             index++

@@ -2,6 +2,7 @@ package app.soundfield.core
 
 import app.soundfield.dsp.LimiterStats
 import app.soundfield.dsp.PeakLimiter
+import app.soundfield.dsp.TruePeakMeter
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 
@@ -19,7 +20,8 @@ class PreLimitedSource(
     private val startAtFrame: Long = 0L,
     cacheSeconds: Int = DEFAULT_CACHE_SECONDS,
     ceilingDbtp: Double = PRE_LIMITER_CEILING_DBTP,
-) : AudioSource, PrefetchableAudioSource, AutoCloseable {
+) : AudioSource, PrefetchableAudioSource, AutoCloseable, TrackMeters {
+    override val truePeakDbtp: Double get() = (inner as? TrackMeters)?.truePeakDbtp ?: Double.NaN
     override val mode get() = inner.mode
     override val title get() = inner.title
     override val artist get() = inner.artist
@@ -39,6 +41,10 @@ class PreLimitedSource(
     @Volatile private var processedHead = maxOf(0L, startAtFrame - WARMUP_FRAMES)
     private var nextInput = processedHead
     private val buffer = FloatArray(CHUNK_FRAMES * 2)
+    /** Текущее статическое усиление, линейное. Цель = min(0, −1,55 − tp) dB по измеренному true-peak трека; меняется плавно в пределах блока. */
+    private var currentGain = Math.pow(10.0, TruePeakMeter.staticGainDb((inner as? TrackMeters)?.truePeakDbtp ?: Double.NaN) / 20.0)
+    @Volatile var staticGainDb = 0.0
+        private set
     private val statBlocks = AtomicLong()
     private val statActive = AtomicLong()
     private val statMaxMilliDb = AtomicLong()
@@ -110,6 +116,7 @@ class PreLimitedSource(
                             buffer[i * 2] = if (l.isNaN()) 0f else l; buffer[i * 2 + 1] = if (r.isNaN()) 0f else r
                         } else { buffer[i * 2] = 0f; buffer[i * 2 + 1] = 0f }
                     }
+                    applyStaticGain(n)
                     limiter.process(buffer, 0, n)
                     var written = processedHead
                     for (i in 0 until n) {
@@ -136,6 +143,24 @@ class PreLimitedSource(
         }
     }
 
+    /**
+     * Статическое усиление по true-peak трека (метаданные импорта) — до предлимитера: громкий мастеринг делается тише целиком,
+     * а не ослабляется лимитером в каждом пике. Пока трек декодируется, tp — максимум по уже готовой части (усиление только
+     * уменьшается); смена цели сглаживается линейно на блок (21 мс). Предлимитер остаётся страховкой (Spatial/EQ могут поднять пики).
+     */
+    private fun applyStaticGain(n: Int) {
+        val db = TruePeakMeter.staticGainDb(truePeakDbtp)
+        staticGainDb = db
+        val target = Math.pow(10.0, db / 20.0)
+        if (target == 1.0 && currentGain == 1.0) return
+        val from = currentGain
+        for (i in 0 until n) {
+            val g = if (target == from) target else from + (target - from) * (i + 1) / n
+            buffer[i * 2] = (buffer[i * 2] * g).toFloat(); buffer[i * 2 + 1] = (buffer[i * 2 + 1] * g).toFloat()
+        }
+        currentGain = target
+    }
+
     private fun collectStats() {
         val s = limiter.takeStats()
         statBlocks.addAndGet(s.blocks); statActive.addAndGet(s.activeBlocks)
@@ -149,6 +174,7 @@ class PreLimitedSource(
         if (target == NO_RESTART) return
         val from = maxOf(0L, target - WARMUP_FRAMES)
         limiter.reset()
+        currentGain = Math.pow(10.0, TruePeakMeter.staticGainDb(truePeakDbtp) / 20.0)   // после перемотки без «подъезда»
         nextInput = from
         processedHead = from
         requestedHead.set(minOf(inner.totalFrames, maxOf(requestedHead.get(), target + 1)))

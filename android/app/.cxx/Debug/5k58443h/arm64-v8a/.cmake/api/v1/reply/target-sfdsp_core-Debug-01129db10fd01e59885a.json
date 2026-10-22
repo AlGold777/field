@@ -98,7 +98,8 @@
 				1,
 				2,
 				3,
-				4
+				4,
+				5
 			],
 			"sysroot" : 
 			{
@@ -124,7 +125,8 @@
 				1,
 				2,
 				3,
-				4
+				4,
+				5
 			]
 		}
 	],
@@ -158,6 +160,12 @@
 			"backtrace" : 1,
 			"compileGroupIndex" : 0,
 			"path" : "src/limiter.cpp",
+			"sourceGroupIndex" : 0
+		},
+		{
+			"backtrace" : 1,
+			"compileGroupIndex" : 0,
+			"path" : "src/meter.cpp",
 			"sourceGroupIndex" : 0
 		}
 	],

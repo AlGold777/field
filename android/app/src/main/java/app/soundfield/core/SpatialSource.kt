@@ -21,7 +21,8 @@ class SpatialSource(
     cacheSeconds: Int = DEFAULT_CACHE_SECONDS,
     spatialConfig: SpatialDspConfig = SpatialDspConfig(),
     private val xtcDesign: CompletableFuture<XtcFilterSet>? = null,
-) : AudioSource, AutoCloseable, PrefetchableAudioSource {
+) : AudioSource, AutoCloseable, PrefetchableAudioSource, TrackMeters {
+    override val truePeakDbtp: Double get() = (inner as? TrackMeters)?.truePeakDbtp ?: Double.NaN
     private val bypass = !spatialConfig.enabled &&
         !(spatialConfig.reflectionsEnabled && spatialConfig.reflectionTaps.isNotEmpty())
     override val mode get() = inner.mode

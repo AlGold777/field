@@ -19,6 +19,11 @@ interface AudioSource {
     fun sample(frame: Long, ch: Int): Float
 }
 
+/** Источник знает true-peak трека (анализ при импорте); NaN — неизвестно или анализ ещё идёт (значение — максимум по уже декодированному). */
+interface TrackMeters {
+    val truePeakDbtp: Double
+}
+
 /** Sources with a forward worker can precompute frames before a consumer reads them. */
 interface PrefetchableAudioSource {
     fun requestThrough(frameExclusive: Long)
@@ -27,9 +32,13 @@ interface PrefetchableAudioSource {
 /** Декодированный стереофайл в памяти (float32, интерлив L/R, 48 кГц): встроенный тестовый трек и лаборатория. */
 class PcmSource(
     private val pcm: FloatArray, override val title: String, override val artist: String,
-) : AudioSource {
+) : AudioSource, TrackMeters {
     override val mode = SourceMode.MUSIC
     override val totalFrames = (pcm.size / 2).toLong()
+    /** true-peak считается лениво одним проходом ядра (встроенный трек, лаборатория). */
+    override val truePeakDbtp: Double by lazy {
+        app.soundfield.dsp.TruePeakMeter().use { it.process(pcm, pcm.size / 2); it.truePeakDbtp }
+    }
     override fun sample(frame: Long, ch: Int): Float {
         if (frame < 0 || frame >= totalFrames) return 0f
         return pcm[(frame * 2 + ch).toInt()]

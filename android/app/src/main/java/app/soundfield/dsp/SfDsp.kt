@@ -81,6 +81,10 @@ object SfDsp {
     @JvmStatic external fun nativeLimiterLatency(handle: Long): Int
     @JvmStatic external fun nativeLimiterProcess(handle: Long, io: FloatArray, offFloats: Int, frames: Int)
     @JvmStatic external fun nativeLimiterTakeStats(handle: Long, stats: DoubleArray)
+    @JvmStatic external fun nativeMeterCreate(channels: Int): Long
+    @JvmStatic external fun nativeMeterDestroy(handle: Long)
+    @JvmStatic external fun nativeMeterProcess(handle: Long, interleavedStereo: FloatArray, offFrames: Int, frames: Int)
+    @JvmStatic external fun nativeMeterTruePeak(handle: Long): Double
 }
 
 /** Дробный корректор воспроизведения в ядре (порт PlayoutCorrector). Не потокобезопасен; [close] обязателен. */

@@ -58,7 +58,7 @@ class A1PathTest {
             assertTrue(abs(v - x[i * 2 + c]) <= 1.5f / Pcm24.SCALE)
         }
         // независимые генераторы каналов: одинаковый вход слева и справа даёт разные отсчёты
-        val same = FloatArray(2_000) { 0.25f }
+        val same = FloatArray(2_000) { 1f / 3f }
         val sb = ByteArray(1_000 * 6)
         Pcm24StereoEncoder(seed = 2).use { it.encode(same, 1_000, sb) }
         val sbuf = ByteBuffer.wrap(sb).order(ByteOrder.LITTLE_ENDIAN)
@@ -72,6 +72,18 @@ class A1PathTest {
         assertEquals(8388607f / Pcm24.SCALE, Pcm24.readLe(b, 0), 0f)
         val n = ByteBuffer.wrap(byteArrayOf(0, 0, 0x80.toByte())).order(ByteOrder.LITTLE_ENDIAN)
         assertEquals(-1f, Pcm24.readLe(n, 0), 0f)
+    }
+
+    @Test fun valuesOnThe24BitGridAreStoredBitExact() {
+        val r = Random(21)
+        val frames = 10_000
+        val x = FloatArray(frames * 2) { i -> val bits = if (i % 3 == 0) 16 else 24; (r.nextInt(1 shl bits) - (1 shl (bits - 1))).toFloat() / (1 shl (bits - 1)).toFloat() }
+        val bytes = ByteArray(frames * 6)
+        Pcm24StereoEncoder(seed = 8).use { it.encode(x, frames, bytes) }
+        val buf = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN)
+        for (i in 0 until frames) for (c in 0..1) assertEquals(x[i * 2 + c], Pcm24.readLe(buf, i * 6 + c * 3), 0f)
+        val q = IntArray(x.size); Pcm24.quantize(x, x.size, 3L, q)
+        for (i in x.indices) assertEquals(x[i], q[i] / Pcm24.SCALE, 0f)
     }
 
     @Test fun segmentedSourceReadsThe24BitCache() {
@@ -96,7 +108,10 @@ class A1PathTest {
             val old = File(dir, "complete").also { it.writeText("48000") }          // метка PCM16-кэша: только число кадров
             assertNull(AudioFileDecoder.parseComplete(old))
             val current = File(dir, "complete2").also { it.writeText("v3 48000") }
-            assertEquals(48_000L, AudioFileDecoder.parseComplete(current))
+            assertEquals(48_000L, AudioFileDecoder.parseComplete(current)!!.frames)
+            assertTrue(AudioFileDecoder.parseComplete(current)!!.truePeakDbtp.isNaN())
+            val withTp = File(dir, "complete4").also { it.writeText("v3 48000 tp=1.25") }
+            assertEquals(1.25, AudioFileDecoder.parseComplete(withTp)!!.truePeakDbtp, 0.0)
             val broken = File(dir, "complete3").also { it.writeText("v3 x") }
             assertNull(AudioFileDecoder.parseComplete(broken))
         } finally { dir.deleteRecursively() }
@@ -173,6 +188,31 @@ class A1PathTest {
         while (!s.complete && s.processingError == null && System.nanoTime() < deadline) Thread.sleep(2)
         assertNull(s.processingError)
         assertTrue("timeout", s.complete)
+    }
+
+    private class Metered(l: FloatArray, r: FloatArray, override val truePeakDbtp: Double) : AudioSource, TrackMeters {
+        val inner = Stereo(l, r)
+        override val mode = SourceMode.MUSIC
+        override val title = "t"; override val artist = "a"
+        override val totalFrames = inner.totalFrames
+        override fun sample(frame: Long, ch: Int) = inner.sample(frame, ch)
+    }
+
+    @Test fun staticGainBringsAHotTrackBelowTheCeilingWithoutTheLimiterWorking() {
+        native()
+        val n = SF.SAMPLE_RATE * 2
+        val l = FloatArray(n) { (1.0 * sin(2 * PI * 440.0 * it / 48_000.0)).toFloat() }   // 0 dBFS
+        val src = Metered(l, l.copyOf(), 0.0)
+        PreLimitedSource(src).use { s ->
+            drain(s)
+            assertEquals(-1.55, s.staticGainDb, 1e-9)
+            var peak = 0.0
+            for (i in 2_000 until n) peak = maxOf(peak, abs(s.sample(i.toLong(), 0).toDouble()))
+            assertEquals(10.0.pow(-1.55 / 20), peak, 1e-4)
+            assertEquals(0L, s.takeStats().activeBlocks)
+        }
+        assertEquals(0.0, app.soundfield.dsp.TruePeakMeter.staticGainDb(-3.0), 0.0)
+        assertEquals(0.0, app.soundfield.dsp.TruePeakMeter.staticGainDb(Double.NaN), 0.0)
     }
 
     @Test fun preLimiterKeepsFrameNumbersAndIsTransparentWhenQuiet() {
