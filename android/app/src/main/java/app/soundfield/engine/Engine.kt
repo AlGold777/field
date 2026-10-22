@@ -437,6 +437,8 @@ class Engine private constructor(private val app: Context) {
     private val pointRenderer = PointRenderer(rx, clock, tcpAudioBuffer, { currentAudioPath }) { pointParams }
     @Volatile private var serverUdp: InetSocketAddress? = null
     private var pingSeq = 0
+    private val pingGate = PingReplayGate()
+    private val pongWindow = PongWindow()
     @Volatile private var pingBurst = 0
     private var lastPing = 0L
     private var lastRecv = 0L
@@ -2983,7 +2985,7 @@ class Engine private constructor(private val app: Context) {
             phase = Phase.IDLE; ui { copy(phase = Phase.IDLE) }; return
         }
         l.send(acceptJson(Role.POINT).put("epk", PairCrypto.hex(acceptorPub)).put("proof", PairCrypto.hex(
-            PairCrypto.proof(pairKey, "sf-accept", p.id.toByteArray(), myId.toByteArray(), inviterPub, acceptorPub))))
+            HandshakeAuth.acceptProof(pairKey, p.id, myId, inviterPub, acceptorPub))))
         peerTcpPortHint = p.port
         becomePaired(l, Role.POINT, p.id, p.name, p.platform, pendingKey, resumed = false)
     }
@@ -3080,7 +3082,7 @@ class Engine private constructor(private val app: Context) {
                 incomingLinks.add(l)
                 later(5_000) { if (l.tag == "resume-challenge") { incomingLinks.remove(l); l.tag = "dead"; l.close("auth timeout 5000ms") } }
                 l.send(JSONObject().put("t", "challenge").put("sn", PairCrypto.hex(sn)).put("proof", PairCrypto.hex(
-                    PairCrypto.proof(key, "sf-resume-s", cn, sn, pid.toByteArray(), myId.toByteArray()))))
+                    HandshakeAuth.resumeServerProof(key, cn, sn, pid, myId))))
             }
             else -> telemetry.record("TCP_UNKNOWN_MESSAGE_IGNORED", mapOf("type" to o.optString("t", ""),
                 "linkId" to l.id, "phase" to phase.name))
@@ -3094,10 +3096,9 @@ class Engine private constructor(private val app: Context) {
         incomingLinks.remove(l)
         val first = l.hsFirst; val cn = l.hsCn; val sn = l.hsSn; val rec = record
         val pid = first?.optString("id").orEmpty()
-        val proof = PairCrypto.unhex(o.optString("proof"))
         val valid = o.optString("t") == "auth" && first != null && cn != null && sn != null && rec != null &&
-            rec.peerId == pid && proof != null && PairCrypto.equal(proof,
-                PairCrypto.proof(keyBytes(rec.key), "sf-resume-c", cn, sn, pid.toByteArray(), myId.toByteArray()))
+            rec.peerId == pid && HandshakeAuth.matches(o.optString("proof"),
+                HandshakeAuth.resumeClientProof(keyBytes(rec.key), cn, sn, pid, myId))
         if (!valid || phase == Phase.INCOMING) {
             log("Отклонён resume: неверное подтверждение ключа")
             telemetry.record("AUTH_FAILED", mapOf("stage" to "resume", "peer" to pid))
@@ -3137,9 +3138,8 @@ class Engine private constructor(private val app: Context) {
                     val eph = inviteEph
                     val theirPub = PairCrypto.unhex(o.optString("epk"))?.takeIf { it.size == 32 }
                     val derived = if (eph != null && theirPub != null) PairCrypto.pairKey(eph.priv, theirPub, eph.pub, theirPub) else null
-                    val proof = PairCrypto.unhex(o.optString("proof"))
-                    if (derived == null || proof == null || !PairCrypto.equal(proof, PairCrypto.proof(derived, "sf-accept",
-                            myId.toByteArray(), pid.toByteArray(), eph!!.pub, theirPub!!))) {
+                    if (derived == null || !HandshakeAuth.matches(o.optString("proof"),
+                            HandshakeAuth.acceptProof(derived, myId, pid, eph!!.pub, theirPub!!))) {
                         telemetry.record("AUTH_FAILED", mapOf("stage" to "invite", "peer" to pid))
                         onPendingMessage(l, JSONObject().put("t", "reject").put("reason", "auth")); return
                     }
@@ -3165,10 +3165,9 @@ class Engine private constructor(private val app: Context) {
             "challenge" -> if (l.tag == "resume-out" || l.tag == "resume-auto") {
                 val rec = record; val cn = l.hsCn
                 val sn = PairCrypto.unhex(o.optString("sn"))?.takeIf { it.size == 16 }
-                val proof = PairCrypto.unhex(o.optString("proof"))
                 val peer = rec?.peerId.orEmpty()
-                if (rec == null || cn == null || sn == null || proof == null || !PairCrypto.equal(proof,
-                        PairCrypto.proof(keyBytes(rec.key), "sf-resume-s", cn, sn, myId.toByteArray(), peer.toByteArray()))) {
+                if (rec == null || cn == null || sn == null || !HandshakeAuth.matches(o.optString("proof"),
+                        HandshakeAuth.resumeServerProof(keyBytes(rec.key), cn, sn, myId, peer))) {
                     telemetry.record("AUTH_FAILED", mapOf("stage" to "challenge", "peer" to peer))
                     onPendingMessage(l, JSONObject().put("t", "reject").put("reason", "auth")); return
                 }
@@ -3176,7 +3175,7 @@ class Engine private constructor(private val app: Context) {
                 l.hsSn = sn
                 l.udpKey = PairCrypto.udpKey(key, cn, sn)
                 l.send(JSONObject().put("t", "auth").put("proof", PairCrypto.hex(
-                    PairCrypto.proof(key, "sf-resume-c", cn, sn, myId.toByteArray(), peer.toByteArray()))))
+                    HandshakeAuth.resumeClientProof(key, cn, sn, myId, peer))))
             }
             "reject", "busy" -> {
                 val reason = o.optString("reason")
@@ -3287,6 +3286,7 @@ class Engine private constructor(private val app: Context) {
         l.tag = "paired"
         link = l
         udpKey = l.udpKey
+        pingGate.reset(); pongWindow.reset()
         role = r; peerId = pid; peerName = pname; peerPlatform = pplat
         negotiatedCapabilities = peerCapabilities.intersect(setOf("addrs", "tcpClock", "tcpAudio", "eq", "spatialV1", "fileTransferV1"))
         phase = Phase.PAIRED
@@ -5565,12 +5565,20 @@ class Engine private constructor(private val app: Context) {
                 }
                 when (m) {
                     is UdpMsg.Ping -> if (role == Role.SERVER && phase == Phase.PAIRED && !debugStopUdpTraffic) {
+                        if (!pingGate.accept(m.pingSeq)) {
+                            telemetry.limited("UDP_REPLAY_DROPPED", "type=ping seq=${m.pingSeq} from=${pkt.socketAddress}")
+                            continue
+                        }
                         pointUdp = pkt.socketAddress as InetSocketAddress
                         val b = Wire.pong(sessionId, m.t1, now, System.nanoTime(), m.pingSeq, key)
                         udp.send(DatagramPacket(b, b.size, pkt.socketAddress))
                     }
                     is UdpMsg.Nack -> if (role == Role.SERVER) resend(m)
                     is UdpMsg.Pong -> if (role == Role.POINT) {
+                        if (!pongWindow.accept(m.pingSeq)) {
+                            telemetry.limited("UDP_REPLAY_DROPPED", "type=pong seq=${m.pingSeq} from=${pkt.socketAddress}")
+                            continue
+                        }
                         lastUdpPongAtMs.set(SystemClock.elapsedRealtime())
                         clock.addPong(m.t1, m.t2, m.t3, now)
                         setClockPath("udp", "udp_pong_received")
@@ -5685,7 +5693,8 @@ class Engine private constructor(private val app: Context) {
             if (addr != null && now - lastPing >= interval) {
                 lastPing = now
                 if (pingBurst > 0) pingBurst--
-                val b = Wire.ping(sessionId, now, pingSeq++, udpKey ?: return)
+                val b = Wire.ping(sessionId, now, pingSeq, udpKey ?: return)
+                pongWindow.sent(pingSeq++)
                 try {
                     udp.send(DatagramPacket(b, b.size, addr))
                     pointPingPacketsSent.incrementAndGet()

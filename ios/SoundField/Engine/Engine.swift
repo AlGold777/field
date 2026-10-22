@@ -160,6 +160,8 @@ final class Engine {
     private var pointRenderer: PointRenderer!
     private let serverUdpBox = Locked<UdpSocket.Addr?>(nil)
     private var pingSeq: Int32 = 0
+    private let pingGate = PingReplayGate()
+    private let pongWindow = PongWindow()
     // пишется с q (сессия) и уменьшается на sf-tick (pointNet): доступ через Locked
     private let pingBurstBox = Locked(0)
     private var pingBurst: Int { get { pingBurstBox.value } set { pingBurstBox.value = newValue } }
@@ -1198,6 +1200,7 @@ final class Engine {
     private func becomePaired(_ l: ControlLink, _ r: Role, _ pid: String, _ pname: String, _ pplat: String, _ key: String, resumed: Bool) {
         peerCapabilities = l.peerCapabilities
         udpKeyBox.value = l.udpKey
+        pingGate.reset(); pongWindow.reset()
         serverFileToken = ""
         ui { $0.fileTransferAvailable = false }
         if soloMode {
@@ -1937,12 +1940,22 @@ final class Engine {
         switch m {
         case .ping(_, let t1, let seq):
             guard role == .server, phase == .paired else { return }
+            guard pingGate.accept(seq) else {
+                NSLog("SoundField UDP_REPLAY_DROPPED ping seq=\(seq)")
+                return
+            }
             pointUdpBox.value = from
             udp?.send(Wire.pong(session: sid, t1: t1, t2: now, t3: MonoClock.nowNs(), pingSeq: seq, key: key), to: from)
         case .nack(_, let ep, let seqs):
             if role == .server { resend(epoch: ep, seqs: seqs) }
-        case .pong(_, let t1, let t2, let t3, _):
-            if role == .point { clock.addPong(t1: t1, t2: t2, t3: t3, t4: now) }
+        case .pong(_, let t1, let t2, let t3, let pSeq):
+            if role == .point {
+                guard pongWindow.accept(pSeq) else {
+                    NSLog("SoundField UDP_REPLAY_DROPPED pong seq=\(pSeq)")
+                    return
+                }
+                clock.addPong(t1: t1, t2: t2, t3: t3, t4: now)
+            }
         case .audio(let a):
             if role == .point && phase == .paired {
                 lastAudioRxAtNs.value = now
@@ -2016,6 +2029,7 @@ final class Engine {
         if now - lastPing >= interval {
             lastPing = now
             if pingBurst > 0 { pingBurst -= 1 }
+            pongWindow.sent(pingSeq)
             udp?.send(Wire.ping(session: sid, t1: now, pingSeq: pingSeq, key: udpKey), to: addr)
             pingSeq &+= 1
         }
