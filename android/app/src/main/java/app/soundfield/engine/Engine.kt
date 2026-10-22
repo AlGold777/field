@@ -1397,6 +1397,7 @@ class Engine private constructor(private val app: Context) {
         soloServiceActive = true
         try { PlaybackService.start(app) } catch (e: Exception) {
             Log.w(TAG, "fgs", e); telemetry.event("FOREGROUND_SERVICE_FAILED", error = e)
+            toast("Фоновый режим не запущен: при блокировке экрана звук может прерваться")
         }
     }
 
@@ -3284,14 +3285,16 @@ class Engine private constructor(private val app: Context) {
             audio.source = pointRenderer
         }
         audio.start()
-        try { PlaybackService.start(app) } catch (e: Exception) { Log.w(TAG, "fgs", e); telemetry.event("FOREGROUND_SERVICE_FAILED", error = e) }
+        var fgsFailed = false
+        try { PlaybackService.start(app) } catch (e: Exception) { Log.w(TAG, "fgs", e); telemetry.event("FOREGROUND_SERVICE_FAILED", error = e); fgsFailed = true }
         ui { copy(phase = Phase.PAIRED, role = r, peerName = pname, peerPlatform = pplat, linkOk = true, remembered = record,
             fileTransferAvailable = supportsFileTransferPeer(),
             autoResuming = false, audioMissing = false, calib = CalibUi(), eqAvailable = eqAvailableInPair(),
             eq = if (r == Role.SERVER) eqSettingsForWire() else eq, eqPreampDb = activeEqConfig().preampDb.toFloat(),
             eqRouteLabel = audio.routeLabel(), eqCurveDb = activeEqConfig().curveDb.map { it.toFloat() }) }
         PlaybackService.refresh(app)
-        toast(if (resumed) "Пара восстановлена" else "Стереопара создана")
+        val text = if (resumed) "Пара восстановлена" else "Стереопара создана"
+        toast(if (fgsFailed) "$text. Фоновый режим не запущен: при блокировке экрана звук может прерваться" else text)
     }
 
     /** Экспоненциальный backoff: 1с → 2с → 4с → 8с → 15с (потолок). */
