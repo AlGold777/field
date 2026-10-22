@@ -541,6 +541,78 @@ TEST(lab_json_roundtrip) {
     CHECK(std::isnan(parsed["x.nan"].v));
 }
 
+
+// ---- коррекция динамика (A2.4) ----
+std::vector<float> speakerRun(const std::vector<sf_speaker_section>& secs, double pre, const std::vector<float>& in, int block, int ch = 1) {
+    sf_speaker* sp = sf_speaker_create(48000, ch);
+    sf_speaker_set_chain(sp, secs.data(), (int)secs.size(), pre);
+    std::vector<float> out = in;
+    const size_t frames = in.size() / (size_t)ch;
+    for (size_t s0 = 0; s0 < frames; s0 += (size_t)block)
+        sf_speaker_process(sp, out.data() + s0 * (size_t)ch, (int)std::min<size_t>((size_t)block, frames - s0));
+    sf_speaker_destroy(sp);
+    return out;
+}
+
+double speakerGainDb(const sf_speaker_section& sec, double f) {
+    std::vector<float> x(48000 * 2);
+    for (size_t i = 0; i < x.size(); i++) x[i] = (float)(0.5 * std::sin(2 * 3.14159265358979323846 * f * (double)i / 48000.0));
+    auto y = speakerRun({sec}, 0.0, x, 480);
+    double a = 0, b = 0;
+    for (size_t i = 48000; i < x.size(); i++) { a += (double)x[i] * x[i]; b += (double)y[i] * y[i]; }
+    return 10 * std::log10(b / a);
+}
+
+TEST(speaker_empty_chain_is_bit_exact) {
+    std::vector<float> x(1000);
+    for (size_t i = 0; i < x.size(); i++) x[i] = (float)std::sin(0.01 * (double)i);
+    auto y = speakerRun({}, 0.0, x, 37);
+    CHECK(std::memcmp(x.data(), y.data(), x.size() * sizeof(float)) == 0);
+}
+
+TEST(speaker_section_magnitudes_match_design) {
+    CHECK_NEAR(speakerGainDb({SF_SECTION_PEAK, 1000, 1.0, 6.0}, 1000), 6.0, 0.02);
+    CHECK_NEAR(speakerGainDb({SF_SECTION_PEAK, 1000, 1.0, -6.0}, 1000), -6.0, 0.02);
+    CHECK_NEAR(speakerGainDb({SF_SECTION_HIGHPASS, 250, 0.7071, 0}, 250), -3.01, 0.05);
+    CHECK(speakerGainDb({SF_SECTION_HIGHPASS, 250, 0.7071, 0}, 25) < -38);
+    CHECK_NEAR(speakerGainDb({SF_SECTION_HIGHPASS, 250, 0.7071, 0}, 5000), 0.0, 0.01);
+    CHECK_NEAR(speakerGainDb({SF_SECTION_LOWSHELF, 200, 0.7071, 4.0}, 30), 4.0, 0.1);
+    CHECK_NEAR(speakerGainDb({SF_SECTION_HIGHSHELF, 8000, 0.7071, 3.0}, 20000), 3.0, 0.25);
+    CHECK_NEAR(speakerGainDb({SF_SECTION_ALLPASS, 1800, 0.6, 0}, 300), 0.0, 1e-4);
+    CHECK_NEAR(speakerGainDb({SF_SECTION_ALLPASS, 1800, 0.6, 0}, 9000), 0.0, 1e-4);
+}
+
+TEST(speaker_block_size_independent_and_stereo) {
+    std::vector<sf_speaker_section> c = {{SF_SECTION_HIGHPASS, 180, 0.7071, 0}, {SF_SECTION_PEAK, 2500, 1.2, -4}, {SF_SECTION_HIGHSHELF, 9000, 0.7071, 2}};
+    std::vector<float> x(2 * 9600);
+    for (size_t i = 0; i < x.size() / 2; i++) { x[2 * i] = (float)std::sin(0.03 * (double)i); x[2 * i + 1] = (float)(0.5 * std::sin(0.11 * (double)i)); }
+    auto ref = speakerRun(c, -3.0, x, 4096, 2);
+    for (int blk : {1, 37, 240}) {
+        auto y = speakerRun(c, -3.0, x, blk, 2);
+        CHECK(std::memcmp(ref.data(), y.data(), ref.size() * sizeof(float)) == 0);
+    }
+}
+
+TEST(speaker_chain_change_crossfades_and_rejects_invalid) {
+    sf_speaker* sp = sf_speaker_create(48000, 1);
+    sf_speaker_section hp = {SF_SECTION_HIGHPASS, 250, 0.7071, 0};
+    CHECK(sf_speaker_set_chain(sp, &hp, 1, 1.0) == -1);                       // preamp > 0
+    sf_speaker_section bad = {SF_SECTION_PEAK, 30000, 1.0, 3.0};
+    CHECK(sf_speaker_set_chain(sp, &bad, 1, 0.0) == -1);                      // f0 ≥ fs/2
+    CHECK(sf_speaker_set_chain(sp, &hp, SF_SPEAKER_MAX_SECTIONS + 1, 0.0) == -1);
+    std::vector<float> x(48000, 0.5f);                                        // постоянная составляющая: ФВЧ гасит её
+    sf_speaker_process(sp, x.data(), 100);                                    // пустая цепочка — без изменений
+    CHECK(x[99] == 0.5f);
+    CHECK(sf_speaker_set_chain(sp, &hp, 1, 0.0) == 0);
+    std::vector<float> y(48000, 0.5f);
+    for (size_t s0 = 0; s0 < y.size(); s0 += 64) sf_speaker_process(sp, y.data() + s0, 64);
+    double maxStep = 0;
+    for (size_t i = 1; i < y.size(); i++) maxStep = std::max(maxStep, (double)std::fabs(y[i] - y[i - 1]));
+    CHECK(maxStep < 0.01);                                                    // без щелчка при включении
+    CHECK(std::fabs(y.back()) < 0.01f);                                       // после кроссфейда ФВЧ в силе
+    sf_speaker_destroy(sp);
+}
+
 }  // namespace
 
 int main() {

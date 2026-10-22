@@ -120,6 +120,38 @@ SFDSP_API void sf_meter_process(sf_meter* m, const float* interleaved, int64_t f
 /* Максимальный true-peak с начала потока, dBTP (−200 для тишины); можно вызывать в любой момент (хвост детектора учитывается). */
 SFDSP_API double sf_meter_true_peak_dbtp(const sf_meter* m);
 
+/* ---- Коррекция динамика (A2.4): каскад биквадов RBJ (TDF-II, double), смена профиля кроссфейдом 50 мс ---- */
+
+#define SF_SPEAKER_MAX_SECTIONS 20
+#define SF_SPEAKER_XFADE_S 0.05
+
+#define SF_SECTION_HIGHPASS 0
+#define SF_SECTION_LOWSHELF 1
+#define SF_SECTION_HIGHSHELF 2
+#define SF_SECTION_PEAK 3
+#define SF_SECTION_ALLPASS 4
+
+typedef struct sf_speaker_section {
+    int32_t type;      /* SF_SECTION_* */
+    double f0_hz;
+    double q;
+    double gain_db;    /* shelf/peak; для остальных игнорируется */
+} sf_speaker_section;
+
+typedef struct sf_speaker sf_speaker;
+/* channels 1..2. Пустая цепочка (после create) — тождественная, бит-в-бит. */
+SFDSP_API sf_speaker* sf_speaker_create(int sample_rate, int channels);
+SFDSP_API void sf_speaker_destroy(sf_speaker* s);
+SFDSP_API void sf_speaker_reset(sf_speaker* s);
+/*
+ * Публикует новую цепочку из любого одного потока (управляющего); аудиопоток подхватит её на границе блока.
+ * Секции — как в профиле: n ≤ SF_SPEAKER_MAX_SECTIONS, preamp_db ≤ 0. Возвращает 0, при неверных параметрах — -1 (цепочка не меняется).
+ */
+SFDSP_API int sf_speaker_set_chain(sf_speaker* s, const sf_speaker_section* sections, int n, double preamp_db);
+SFDSP_API int sf_speaker_latency_frames(const sf_speaker* s);
+/* На месте, интерлив. Без аллокаций и блокировок. */
+SFDSP_API void sf_speaker_process(sf_speaker* s, float* io, int frames);
+
 #ifdef __cplusplus
 }
 #endif

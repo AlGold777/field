@@ -7,7 +7,7 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 # Одинаковая арифметика на всех платформах: без слияния в FMA и без fast-math.
 add_compile_options(-ffp-contract=off -fno-fast-math -Wall -Wextra -Wno-unused-parameter)
 
-add_library(sfdsp_core STATIC src/sinc.cpp src/playout.cpp src/pcm24.cpp src/src.cpp src/limiter.cpp src/meter.cpp)
+add_library(sfdsp_core STATIC src/sinc.cpp src/playout.cpp src/pcm24.cpp src/src.cpp src/limiter.cpp src/meter.cpp src/speaker.cpp)
 target_include_directories(sfdsp_core PUBLIC include)
 
 if(ANDROID)

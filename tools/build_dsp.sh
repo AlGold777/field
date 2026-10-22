@@ -7,7 +7,7 @@ OUT=${1:-dsp/build/host}
 mkdir -p "$OUT"
 CXX=${CXX:-clang++}
 FLAGS="-std=c++20 -O2 -ffp-contract=off -fno-fast-math -Wall -Wextra -Wno-unused-parameter -Idsp/include"
-SRC="dsp/src/sinc.cpp dsp/src/playout.cpp dsp/src/pcm24.cpp dsp/src/src.cpp dsp/src/limiter.cpp dsp/src/meter.cpp"
+SRC="dsp/src/sinc.cpp dsp/src/playout.cpp dsp/src/pcm24.cpp dsp/src/src.cpp dsp/src/limiter.cpp dsp/src/meter.cpp dsp/src/speaker.cpp"
 JH=${JAVA_HOME:-/opt/homebrew/opt/openjdk@17}
 "$CXX" $FLAGS -fvisibility=hidden -shared -fPIC $SRC dsp/jni/sfdsp_jni.cpp -I"$JH/include" -I"$JH/include/darwin" -o "$OUT/libsfdsp.dylib" 2>"$OUT/jni.log" ||
     { echo "JNI-библиотека не собрана (нужен JDK): см. $OUT/jni.log" >&2; }
