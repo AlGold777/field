@@ -193,10 +193,7 @@ final class AudioOutput {
         case .began:
             onInterruption?(true)
         case .ended:
-            // Возобновляется только запуск сессии и движка; воспроизведение решает приложение.
-            let rawOptions = info[AVAudioSessionInterruptionOptionKey] as? UInt ?? 0
-            let shouldResume = AVAudioSession.InterruptionOptions(rawValue: rawOptions).contains(.shouldResume)
-            if running && shouldResume { try? AVAudioSession.sharedInstance().setActive(true); try? engine.start() }
+            if running { try? AVAudioSession.sharedInstance().setActive(true); try? engine.start() }
             onInterruption?(false)
         @unknown default: break
         }
