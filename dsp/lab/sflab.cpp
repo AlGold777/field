@@ -106,6 +106,8 @@ int cmdRun(int argc, char** argv) {
     // A1.2: SRC
     runSrcSuite(sink);
     for (const auto& f : wavs) runSrcCorpus(stem(f), readWav(corpus + "/" + f), sink);
+    // A1.5: закон громкости (измерение)
+    runVolumeLaw(sink);
     // A1.4: лимитеры
     runLimiterSynth(sink);
     for (const auto& f : wavs) runLimiterCorpus(stem(f), readWav(corpus + "/" + f), sink);

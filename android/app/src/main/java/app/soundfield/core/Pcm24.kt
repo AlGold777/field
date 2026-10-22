@@ -50,7 +50,7 @@ object Pcm24 {
         }
         private fun uniform(): Double = (next() ushr 11).toDouble() * (1.0 / 9007199254740992.0)
         fun quantize(x: Float): Int {
-            val v = x.toDouble() * 8388608.0 + (uniform() - 0.5) + (uniform() - 0.5)
+            val v = x.toDouble() * 8388608.0 + ((uniform() - 0.5) + (uniform() - 0.5))   // порядок как в ядре (C++)
             if (v.isNaN()) return 0
             return Math.floor(v + 0.5).coerceIn(MIN.toDouble(), MAX.toDouble()).toInt()
         }

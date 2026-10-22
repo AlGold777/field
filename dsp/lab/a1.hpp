@@ -170,4 +170,37 @@ inline void runLimiterCorpus(const std::string& id, const Wav& w, Sink& sink) {
     sink.add("active_blocks_pct", d2.activePct, "info", 0);
 }
 
+// ---- A1.5: закон громкости (только измерение) ----
+// Цифровое ослабление тона −20 dBFS на 30 dB с последующим выводом в float / 24 бит / 16 бит (TPDF). Показывает, что уровень шума
+// определяется разрядностью ТРАКТА ПОСЛЕ ослабления: пока ОС микширует во float, ослабление в приложении и системной громкостью
+// эквивалентны в цифровом домене. Различие на выходе ЦАП/усилителя телефона цифровой лабораторией не измеряется (нужен микрофон, A2).
+inline std::vector<float> quantizeBits(const std::vector<float>& x, int bits, uint64_t seed) {
+    Rng r(seed);
+    const double q = std::pow(2.0, bits - 1);
+    std::vector<float> y(x.size());
+    for (size_t i = 0; i < x.size(); i++) {
+        const double d = (r.uniform() - 0.5) + (r.uniform() - 0.5);
+        y[i] = (float)(std::floor((double)x[i] * q + d + 0.5) / q);
+    }
+    return y;
+}
+
+inline void runVolumeLaw(Sink& sink) {
+    const double tone = -20.0;
+    for (double att : {-30.0, -50.0}) {
+        sink.prefix = std::string("volume_law.sine_1k_m20_att") + (att == -30.0 ? "_m30" : "_m50") + ".";
+        const double level = tone + att;
+        const double lin = std::pow(10.0, att / 20.0);
+        auto x = sine(1000, tone, 3.0);
+        for (auto& v : x) v = (float)((double)v * lin);
+        struct V { const char* name; std::vector<float> y; } vs[] = {
+            {"float32", x}, {"pcm24", quantizeBits(x, 24, 31)}, {"pcm16", quantizeBits(x, 16, 32)}};
+        for (auto& v : vs) {
+            auto t = analyzeTone(v.y, kSr, std::pow(10.0, level / 20.0));
+            sink.add(std::string(v.name) + ".thdn_db", t.thdnDb, "info", 0);
+            sink.add(std::string(v.name) + ".residual_dbfs", t.thdnDb + level, "info", 0);
+        }
+    }
+}
+
 }  // namespace sflab
