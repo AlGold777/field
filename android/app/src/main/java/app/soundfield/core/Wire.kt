@@ -12,6 +12,9 @@ import java.nio.ByteOrder
  *  PONG  (3): t1 i64 | t2 i64 | t3 i64 | pingSeq i32
  *  NACK  (4): epoch i32 | n u16 | n × seq i32
  *
+ * Версия 2: в конце каждого пакета — усечённый HMAC-SHA256 (TAG_BYTES = 8) от всех предыдущих байт, ключ — udpKey
+ * соединения (PairCrypto.udpKey). Пакет с неверным тегом отбрасывается.
+ *
  * playoutNs — момент (по монотонным часам Server), когда кадр startFrame должен прозвучать.
  * sendNs — момент отправки (часы Server), нужен Point для оценки jitter.
  */
@@ -31,6 +34,7 @@ sealed class UdpMsg {
         const val FLAG_RETRANSMIT = 1
         const val T_AUDIO = 1; const val T_PING = 2; const val T_PONG = 3; const val T_NACK = 4
         const val HEADER = 8
+        const val TAG = PairCrypto.TAG_BYTES
         const val AUDIO_HEADER = HEADER + 36
         const val MAX_NACK = 64
     }
@@ -42,39 +46,53 @@ object Wire {
         b.put(type.toByte()); b.putInt(session)
     }
 
+    /** Дописывает тег в последние TAG байт буфера (буфер уже выделен с запасом). */
+    private fun seal(b: ByteBuffer, key: ByteArray): ByteArray {
+        val a = b.array()
+        val body = a.size - UdpMsg.TAG
+        System.arraycopy(PairCrypto.hmac(key, a, 0, body), 0, a, body, UdpMsg.TAG)
+        return a
+    }
+
     fun audio(session: Int, epoch: Int, seq: Int, startFrame: Long, playoutNs: Long, sendNs: Long,
-              flags: Int, samples: ShortArray, count: Int): ByteArray {
-        val b = ByteBuffer.allocate(UdpMsg.AUDIO_HEADER + count * 2).order(ByteOrder.BIG_ENDIAN)
+              flags: Int, samples: ShortArray, count: Int, key: ByteArray): ByteArray {
+        val b = ByteBuffer.allocate(UdpMsg.AUDIO_HEADER + count * 2 + UdpMsg.TAG).order(ByteOrder.BIG_ENDIAN)
         header(b, UdpMsg.T_AUDIO, session)
         b.putInt(epoch); b.putInt(seq); b.putLong(startFrame); b.putLong(playoutNs); b.putLong(sendNs)
         b.putShort(count.toShort()); b.put(flags.toByte()); b.put(0)
         for (i in 0 until count) b.putShort(samples[i])
-        return b.array()
+        return seal(b, key)
     }
 
-    fun ping(session: Int, t1: Long, pingSeq: Int): ByteArray {
-        val b = ByteBuffer.allocate(UdpMsg.HEADER + 12)
+    fun ping(session: Int, t1: Long, pingSeq: Int, key: ByteArray): ByteArray {
+        val b = ByteBuffer.allocate(UdpMsg.HEADER + 12 + UdpMsg.TAG)
         header(b, UdpMsg.T_PING, session); b.putLong(t1); b.putInt(pingSeq)
-        return b.array()
+        return seal(b, key)
     }
 
-    fun pong(session: Int, t1: Long, t2: Long, t3: Long, pingSeq: Int): ByteArray {
-        val b = ByteBuffer.allocate(UdpMsg.HEADER + 28)
+    fun pong(session: Int, t1: Long, t2: Long, t3: Long, pingSeq: Int, key: ByteArray): ByteArray {
+        val b = ByteBuffer.allocate(UdpMsg.HEADER + 28 + UdpMsg.TAG)
         header(b, UdpMsg.T_PONG, session); b.putLong(t1); b.putLong(t2); b.putLong(t3); b.putInt(pingSeq)
-        return b.array()
+        return seal(b, key)
     }
 
-    fun nack(session: Int, epoch: Int, seqs: IntArray): ByteArray {
+    fun nack(session: Int, epoch: Int, seqs: IntArray, key: ByteArray): ByteArray {
         val n = minOf(seqs.size, UdpMsg.MAX_NACK)
-        val b = ByteBuffer.allocate(UdpMsg.HEADER + 6 + n * 4)
+        val b = ByteBuffer.allocate(UdpMsg.HEADER + 6 + n * 4 + UdpMsg.TAG)
         header(b, UdpMsg.T_NACK, session); b.putInt(epoch); b.putShort(n.toShort())
         for (i in 0 until n) b.putInt(seqs[i])
-        return b.array()
+        return seal(b, key)
     }
 
-    /** Возвращает null для чужих/битых пакетов. */
-    fun decode(data: ByteArray, length: Int): UdpMsg? {
-        if (length < UdpMsg.HEADER) return null
+    /** Возвращает null для чужих/битых пакетов и пакетов с неверным тегом. */
+    fun decode(data: ByteArray, fullLength: Int, key: ByteArray): UdpMsg? {
+        if (fullLength < UdpMsg.HEADER + UdpMsg.TAG) return null
+        if (data[0] != 'S'.code.toByte() || data[1] != 'F'.code.toByte() || data[2].toInt() != SF.PROTOCOL_VERSION) return null
+        val length = fullLength - UdpMsg.TAG
+        val expect = PairCrypto.hmac(key, data, 0, length)
+        var diff = 0
+        for (i in 0 until UdpMsg.TAG) diff = diff or (expect[i].toInt() xor data[length + i].toInt())
+        if (diff != 0) return null
         val b = ByteBuffer.wrap(data, 0, length).order(ByteOrder.BIG_ENDIAN)
         if (b.get() != 'S'.code.toByte() || b.get() != 'F'.code.toByte()) return null
         if (b.get().toInt() != SF.PROTOCOL_VERSION) return null

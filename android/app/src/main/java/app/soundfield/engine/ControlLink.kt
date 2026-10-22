@@ -38,6 +38,12 @@ class ControlLink(
     private val out = DataOutputStream(BufferedOutputStream(socket.getOutputStream()))
     private val writer = Executors.newSingleThreadExecutor { Thread(it, "sf-tcp-write") }
 
+    /** Рукопожатие v2: ключ UDP-контура этого соединения и временные значения challenge–response. */
+    @Volatile var udpKey: ByteArray? = null
+    var hsCn: ByteArray? = null
+    var hsSn: ByteArray? = null
+    var hsFirst: JSONObject? = null
+
     /** Произвольная метка, которую Engine использует для сопоставления (invite/resume/paired). */
     @Volatile var tag: String = initialTag
 

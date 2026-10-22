@@ -285,6 +285,12 @@ class Engine private constructor(private val app: Context) {
     private var pending: ControlLink? = null
     private var pendingPeer: Peer? = null
     private var pendingKey = ""
+    /** Эфемерный ключ исходящего приглашения и открытые ключи входящего (X25519, протокол v2). */
+    private var inviteEph: PairCrypto.Ephemeral? = null
+    private var pendingInviterPub: ByteArray? = null
+    private var pendingAcceptorPub: ByteArray? = null
+    /** Ключ UDP-контура текущей пары (выводится при рукопожатии, см. PairCrypto.udpKey). */
+    @Volatile private var udpKey: ByteArray? = null
     private var pendingTimeout: ScheduledFuture<*>? = null
     private var peerId = ""
     private var peerName = ""
@@ -2544,8 +2550,8 @@ class Engine private constructor(private val app: Context) {
     }
 
     // ================================================================== установка пары
-    private fun inviteJson(key: String) = JSONObject().put("t", "invite").put("id", myId).put("name", myName)
-        .put("platform", "android").put("proto", SF.PROTOCOL_VERSION).put("key", key).put("tcpPort", tcp.localPort)
+    private fun inviteJson(epk: ByteArray) = JSONObject().put("t", "invite").put("id", myId).put("name", myName)
+        .put("platform", "android").put("proto", SF.PROTOCOL_VERSION).put("epk", PairCrypto.hex(epk)).put("tcpPort", tcp.localPort)
         .put("caps", localCapabilitiesJson()).put("addrs", addressesJson())
 
     private fun doInvite(p: Peer) {
@@ -2554,13 +2560,14 @@ class Engine private constructor(private val app: Context) {
             peerPathDiagnoses[it]?.currentVerdict() == PeerPathDiagnosis.Verdict.LAN_PEER_BLOCKED
         }
         stopAutoResume()
-        pendingKey = hex(16)
+        inviteEph = PairCrypto.ephemeral()
+        pendingKey = ""
         phase = Phase.INVITING
         inviteRinging = false
         ui { copy(phase = Phase.INVITING, invitingName = p.name, resuming = false, inviteRinging = false) }
         log("Приглашение → «${p.name}» ${p.host?.hostAddress}:${p.port}")
         // Старые Android и iOS не объявляют ringing: отсутствие ответа не означает, что они спят.
-        connectOutgoing(p, "invite-out", inviteJson(pendingKey), if (p.supportsRinging) 8_000 else 65_000)
+        connectOutgoing(p, "invite-out", inviteJson(inviteEph!!.pub), if (p.supportsRinging) 8_000 else 65_000)
     }
 
     private fun doManualResume(auto: Boolean = false) {
@@ -2623,11 +2630,11 @@ class Engine private constructor(private val app: Context) {
     }
 
     private fun resumeJson(rec: PairRecord) = JSONObject().put("t", "resume").put("id", myId).put("name", myName)
-        .put("platform", "android").put("proto", SF.PROTOCOL_VERSION).put("key", rec.key).put("role", rec.myRole.wire)
+        .put("platform", "android").put("proto", SF.PROTOCOL_VERSION).put("cn", PairCrypto.hex(PairCrypto.random(16))).put("role", rec.myRole.wire)
         .put("tcpPort", tcp.localPort).put("caps", localCapabilitiesJson()).put("addrs", addressesJson())
 
-    private fun acceptJson(key: String, r: Role) = JSONObject().put("t", "accept").put("id", myId).put("name", myName)
-        .put("platform", "android").put("key", key).put("role", r.wire).put("tcpPort", tcp.localPort)
+    private fun acceptJson(r: Role) = JSONObject().put("t", "accept").put("id", myId).put("name", myName)
+        .put("platform", "android").put("role", r.wire).put("tcpPort", tcp.localPort)
         .put("caps", localCapabilitiesJson()).put("addrs", addressesJson())
 
     private fun connectOutgoing(p: Peer, tag: String, first: JSONObject, timeoutMs: Long) {
@@ -2693,6 +2700,7 @@ class Engine private constructor(private val app: Context) {
                     if (!stillWanted || pending != null) { telemetry.event("TCP_CONNECT_DISCARDED", "tag=$tag phase=$phase"); try { connectedSocket.close() } catch (_: Exception) {}; return@post }
                     val l = newLink(connectedSocket, tag)
                     pending = l
+                    l.hsCn = first.optString("cn").takeIf { it.isNotEmpty() }?.let { PairCrypto.unhex(it) }
                     l.send(first)
                     pendingTimeout?.cancel(false)
                     pendingTimeout = later(timeoutMs) { if (pending === l) l.close("response timeout ${timeoutMs}ms") }
@@ -2968,7 +2976,14 @@ class Engine private constructor(private val app: Context) {
         val p = pendingPeer ?: return
         if (phase != Phase.INCOMING) return
         telemetry.event("INVITE_ACCEPT", "peer=${p.id}")
-        l.send(acceptJson(pendingKey, Role.POINT))
+        val inviterPub = pendingInviterPub; val acceptorPub = pendingAcceptorPub
+        val pairKey = PairCrypto.unhex(pendingKey)
+        if (inviterPub == null || acceptorPub == null || pairKey == null) {
+            pending = null; l.tag = "dead"; l.sendAndClose(JSONObject().put("t", "reject").put("reason", "proto"))
+            phase = Phase.IDLE; ui { copy(phase = Phase.IDLE) }; return
+        }
+        l.send(acceptJson(Role.POINT).put("epk", PairCrypto.hex(acceptorPub)).put("proof", PairCrypto.hex(
+            PairCrypto.proof(pairKey, "sf-accept", p.id.toByteArray(), myId.toByteArray(), inviterPub, acceptorPub))))
         peerTcpPortHint = p.port
         becomePaired(l, Role.POINT, p.id, p.name, p.platform, pendingKey, resumed = false)
     }
@@ -2987,6 +3002,7 @@ class Engine private constructor(private val app: Context) {
             l === link -> onPairedMessage(o)
             l === pending -> onPendingMessage(l, o)
             l.tag == "new" -> onFirstMessage(l, o)
+            l.tag == "resume-challenge" -> onResumeAuth(l, o)
         }
     }
 
@@ -2995,13 +3011,25 @@ class Engine private constructor(private val app: Context) {
         val pid = o.optString("id"); val pname = o.optString("name", pid); val pplat = o.optString("platform", "?")
         // несовпадение версии протокола: поле proto есть, но значение другое (отсутствие поля не ошибка)
         val t = o.optString("t")
-        if ((t == "invite" || t == "resume") && o.has("proto") && o.optInt("proto") != SF.PROTOCOL_VERSION) {
+        if ((t == "invite" || t == "resume") && o.optInt("proto", 1) != SF.PROTOCOL_VERSION) {
             l.tag = "dead"; l.sendAndClose(JSONObject().put("t", "reject").put("reason", "proto"))
             return
         }
         when (t) {
             "invite" -> {
+                // X25519: ключ пары выводится из общего секрета, по сети ключ не передаётся
+                val theirPub = PairCrypto.unhex(o.optString("epk"))?.takeIf { it.size == 32 }
+                val myEph = PairCrypto.ephemeral()
+                val derived = theirPub?.let { PairCrypto.pairKey(myEph.priv, it, it, myEph.pub) }
+                if (theirPub == null || derived == null) {
+                    l.tag = "dead"; l.sendAndClose(JSONObject().put("t", "reject").put("reason", "proto")); return
+                }
                 val advertised = parsePeerAddresses(o)
+                val acceptKey = PairCrypto.hex(derived)
+                fun adopt() {
+                    pendingKey = acceptKey; pendingInviterPub = theirPub; pendingAcceptorPub = myEph.pub
+                    l.udpKey = PairCrypto.udpKey(derived, theirPub, myEph.pub)
+                }
                 if (phase == Phase.IDLE) stopAutoResume()   // новое приглашение важнее фонового восстановления
                 if (phase == Phase.IDLE && pending == null) {
                     peerCapabilities = parsePeerCaps(o); peerAddressSnapshot = advertised
@@ -3009,7 +3037,7 @@ class Engine private constructor(private val app: Context) {
                     pendingPeer = Peer(pid, pname, pplat, l.remoteAddress, o.optInt("tcpPort", 0),
                         hosts = (listOf(l.remoteAddress) + advertised.mapNotNull { runCatching { InetAddress.getByName(it.ip) }.getOrNull() }).distinct(),
                         addresses = advertised)
-                    pendingKey = o.optString("key")
+                    adopt()
                     phase = Phase.INCOMING
                     l.send(JSONObject().put("t", "ringing"))
                     log("Приглашение от «$pname»")
@@ -3025,7 +3053,7 @@ class Engine private constructor(private val app: Context) {
                         pendingPeer = Peer(pid, pname, pplat, l.remoteAddress, o.optInt("tcpPort", 0),
                             hosts = (listOf(l.remoteAddress) + advertised.mapNotNull { runCatching { InetAddress.getByName(it.ip) }.getOrNull() }).distinct(),
                             addresses = advertised)
-                        pendingKey = o.optString("key")
+                        adopt()
                         phase = Phase.INCOMING
                         doAccept()
                     } else {
@@ -3036,39 +3064,69 @@ class Engine private constructor(private val app: Context) {
                 }
             }
             "resume" -> {
-                val advertised = parsePeerAddresses(o)
                 val rec = record
-                val ok = rec != null && rec.key == o.optString("key") && rec.peerId == pid &&
-                    phase != Phase.INCOMING
+                val cn = PairCrypto.unhex(o.optString("cn"))?.takeIf { it.size == 16 }
+                val ok = rec != null && cn != null && rec.peerId == pid && phase != Phase.INCOMING
                 if (!ok) {
                     log("Отклонён resume от «$pname»: пара неизвестна")
                     l.tag = "dead"; l.sendAndClose(JSONObject().put("t", "reject").put("reason", "unknown")); return
                 }
-                if (soloMode && serverPlay.timeline.playing && rec!!.myRole == Role.POINT && !manualResumeActive) {
-                    log("Resume от «$pname» отклонён: на этом телефоне играет музыка")
-                    telemetry.record("AUTO_RESUME_DEFERRED", mapOf("reason" to "solo_playing_as_point", "inbound" to true))
-                    l.tag = "dead"; l.sendAndClose(JSONObject().put("t", "busy")); return
-                }
-                // Оба телефона стучатся друг к другу одновременно — оставляем одно соединение детерминированно:
-                // входящее принимает телефон с бо́льшим id (как и для встречных приглашений).
-                val mine = pending
-                if (mine != null && (mine.tag == "resume-out" || mine.tag == "resume-auto") &&
-                    !CrossedConnectionPolicy.acceptInbound(myId, pid)) {
-                    l.tag = "dead"; l.sendAndClose(JSONObject().put("t", "reject").put("reason", "crossed")); return
-                }
-                peerCapabilities = parsePeerCaps(o); peerAddressSnapshot = advertised
-                updatePeerAddressBook(advertised)
-                // старое (возможно, «мёртвое») соединение заменяется новым
-                link?.let { old -> link = null; old.tag = "dead"; old.close() }
-                pending?.let { p -> pending = null; p.tag = "dead"; p.close() }
-                l.send(acceptJson(rec!!.key, rec.myRole))
-                peerTcpPortHint = o.optInt("tcpPort", 0)
-                log("Входящее восстановление от «$pname» (${l.remoteAddress.hostAddress})")
-                becomePaired(l, rec.myRole, pid, pname, pplat, rec.key, resumed = true)
+                // Challenge–response: сначала доказываем знание ключа мы, затем Point; ключ по сети не передаётся
+                val key = keyBytes(rec!!.key)
+                val sn = PairCrypto.random(16)
+                l.hsCn = cn; l.hsSn = sn; l.hsFirst = o
+                l.udpKey = PairCrypto.udpKey(key, cn!!, sn)
+                l.tag = "resume-challenge"
+                incomingLinks.add(l)
+                later(5_000) { if (l.tag == "resume-challenge") { incomingLinks.remove(l); l.tag = "dead"; l.close("auth timeout 5000ms") } }
+                l.send(JSONObject().put("t", "challenge").put("sn", PairCrypto.hex(sn)).put("proof", PairCrypto.hex(
+                    PairCrypto.proof(key, "sf-resume-s", cn, sn, pid.toByteArray(), myId.toByteArray()))))
             }
             else -> telemetry.record("TCP_UNKNOWN_MESSAGE_IGNORED", mapOf("type" to o.optString("t", ""),
                 "linkId" to l.id, "phase" to phase.name))
         }
+    }
+
+    private fun keyBytes(key: String): ByteArray = PairCrypto.unhex(key) ?: key.toByteArray(Charsets.UTF_8)
+
+    /** Второй шаг входящего resume: Point доказал знание ключа пары — завершаем восстановление. */
+    private fun onResumeAuth(l: ControlLink, o: JSONObject) {
+        incomingLinks.remove(l)
+        val first = l.hsFirst; val cn = l.hsCn; val sn = l.hsSn; val rec = record
+        val pid = first?.optString("id").orEmpty()
+        val proof = PairCrypto.unhex(o.optString("proof"))
+        val valid = o.optString("t") == "auth" && first != null && cn != null && sn != null && rec != null &&
+            rec.peerId == pid && proof != null && PairCrypto.equal(proof,
+                PairCrypto.proof(keyBytes(rec.key), "sf-resume-c", cn, sn, pid.toByteArray(), myId.toByteArray()))
+        if (!valid || phase == Phase.INCOMING) {
+            log("Отклонён resume: неверное подтверждение ключа")
+            telemetry.record("AUTH_FAILED", mapOf("stage" to "resume", "peer" to pid))
+            l.tag = "dead"; l.sendAndClose(JSONObject().put("t", "reject").put("reason", "unknown")); return
+        }
+        val o1 = first!!
+        val pname = o1.optString("name", pid); val pplat = o1.optString("platform", "?")
+        val advertised = parsePeerAddresses(o1)
+        if (soloMode && serverPlay.timeline.playing && rec!!.myRole == Role.POINT && !manualResumeActive) {
+            log("Resume от «$pname» отклонён: на этом телефоне играет музыка")
+            telemetry.record("AUTO_RESUME_DEFERRED", mapOf("reason" to "solo_playing_as_point", "inbound" to true))
+            l.tag = "dead"; l.sendAndClose(JSONObject().put("t", "busy")); return
+        }
+        // Оба телефона стучатся друг к другу одновременно — оставляем одно соединение детерминированно:
+        // входящее принимает телефон с бо́льшим id (как и для встречных приглашений).
+        val mine = pending
+        if (mine != null && (mine.tag == "resume-out" || mine.tag == "resume-auto") &&
+            !CrossedConnectionPolicy.acceptInbound(myId, pid)) {
+            l.tag = "dead"; l.sendAndClose(JSONObject().put("t", "reject").put("reason", "crossed")); return
+        }
+        peerCapabilities = parsePeerCaps(o1); peerAddressSnapshot = advertised
+        updatePeerAddressBook(advertised)
+        // старое (возможно, «мёртвое») соединение заменяется новым
+        link?.let { old -> link = null; old.tag = "dead"; old.close() }
+        pending?.let { p -> pending = null; p.tag = "dead"; p.close() }
+        l.send(acceptJson(rec!!.myRole))
+        peerTcpPortHint = o1.optInt("tcpPort", 0)
+        log("Входящее восстановление от «$pname» (${l.remoteAddress.hostAddress})")
+        becomePaired(l, rec.myRole, pid, pname, pplat, rec.key, resumed = true)
     }
 
     private fun onPendingMessage(l: ControlLink, o: JSONObject) {
@@ -3076,6 +3134,18 @@ class Engine private constructor(private val app: Context) {
         when (o.optString("t")) {
             "accept" -> when (l.tag) {
                 "invite-out" -> {
+                    val eph = inviteEph
+                    val theirPub = PairCrypto.unhex(o.optString("epk"))?.takeIf { it.size == 32 }
+                    val derived = if (eph != null && theirPub != null) PairCrypto.pairKey(eph.priv, theirPub, eph.pub, theirPub) else null
+                    val proof = PairCrypto.unhex(o.optString("proof"))
+                    if (derived == null || proof == null || !PairCrypto.equal(proof, PairCrypto.proof(derived, "sf-accept",
+                            myId.toByteArray(), pid.toByteArray(), eph!!.pub, theirPub!!))) {
+                        telemetry.record("AUTH_FAILED", mapOf("stage" to "invite", "peer" to pid))
+                        onPendingMessage(l, JSONObject().put("t", "reject").put("reason", "auth")); return
+                    }
+                    pendingKey = PairCrypto.hex(derived)
+                    l.udpKey = PairCrypto.udpKey(derived, eph.pub, theirPub)
+                    inviteEph = null
                     peerCapabilities = parsePeerCaps(o)
                     peerAddressSnapshot = parsePeerAddresses(o)
                     peerTcpPortHint = o.optInt("tcpPort", 0).takeIf { it > 0 } ?: (pendingPeer?.port ?: 0)
@@ -3087,8 +3157,26 @@ class Engine private constructor(private val app: Context) {
                     peerTcpPortHint = o.optInt("tcpPort", 0).takeIf { it > 0 } ?: (pendingPeer?.port ?: 0)
                     val their = Role.fromWire(o.optString("role"))
                     val mine = if (their == Role.SERVER) Role.POINT else Role.SERVER
-                    becomePaired(l, mine, pid, pname, pplat, o.optString("key"), resumed = true)
+                    val rec = record
+                    if (rec == null || l.udpKey == null) { onPendingMessage(l, JSONObject().put("t", "reject").put("reason", "auth")); return }
+                    becomePaired(l, mine, pid, pname, pplat, rec.key, resumed = true)
                 }
+            }
+            "challenge" -> if (l.tag == "resume-out" || l.tag == "resume-auto") {
+                val rec = record; val cn = l.hsCn
+                val sn = PairCrypto.unhex(o.optString("sn"))?.takeIf { it.size == 16 }
+                val proof = PairCrypto.unhex(o.optString("proof"))
+                val peer = rec?.peerId.orEmpty()
+                if (rec == null || cn == null || sn == null || proof == null || !PairCrypto.equal(proof,
+                        PairCrypto.proof(keyBytes(rec.key), "sf-resume-s", cn, sn, myId.toByteArray(), peer.toByteArray()))) {
+                    telemetry.record("AUTH_FAILED", mapOf("stage" to "challenge", "peer" to peer))
+                    onPendingMessage(l, JSONObject().put("t", "reject").put("reason", "auth")); return
+                }
+                val key = keyBytes(rec.key)
+                l.hsSn = sn
+                l.udpKey = PairCrypto.udpKey(key, cn, sn)
+                l.send(JSONObject().put("t", "auth").put("proof", PairCrypto.hex(
+                    PairCrypto.proof(key, "sf-resume-c", cn, sn, myId.toByteArray(), peer.toByteArray()))))
             }
             "reject", "busy" -> {
                 val reason = o.optString("reason")
@@ -3198,6 +3286,7 @@ class Engine private constructor(private val app: Context) {
         }
         l.tag = "paired"
         link = l
+        udpKey = l.udpKey
         role = r; peerId = pid; peerName = pname; peerPlatform = pplat
         negotiatedCapabilities = peerCapabilities.intersect(setOf("addrs", "tcpClock", "tcpAudio", "eq", "spatialV1", "fileTransferV1"))
         phase = Phase.PAIRED
@@ -5464,8 +5553,9 @@ class Engine private constructor(private val app: Context) {
                 socket.receive(pkt)
                 val now = System.nanoTime()
                 udpPackets.incrementAndGet()
-                val m = Wire.decode(pkt.data, pkt.length)
-                if (m == null) { udpInvalid.incrementAndGet(); continue }
+                val key = udpKey
+                val m = if (key == null) null else Wire.decode(pkt.data, pkt.length, key)
+                if (m == null || key == null) { udpInvalid.incrementAndGet(); continue }
                 if (m.session != sessionId || sessionId == 0) { udpOtherSession.incrementAndGet(); continue }
                 val receivedAt = SystemClock.elapsedRealtime()
                 if (udpLastRx.getAndSet(receivedAt) == 0L) {
@@ -5476,7 +5566,7 @@ class Engine private constructor(private val app: Context) {
                 when (m) {
                     is UdpMsg.Ping -> if (role == Role.SERVER && phase == Phase.PAIRED && !debugStopUdpTraffic) {
                         pointUdp = pkt.socketAddress as InetSocketAddress
-                        val b = Wire.pong(sessionId, m.t1, now, System.nanoTime(), m.pingSeq)
+                        val b = Wire.pong(sessionId, m.t1, now, System.nanoTime(), m.pingSeq, key)
                         udp.send(DatagramPacket(b, b.size, pkt.socketAddress))
                     }
                     is UdpMsg.Nack -> if (role == Role.SERVER) resend(m)
@@ -5542,7 +5632,7 @@ class Engine private constructor(private val app: Context) {
         count: Int = packetFrameCount(st.source, start)): ByteArray {
         val pCh = Ch.other(st.channel)
         val s = ShortArray(count) { i -> (st.source.sample(start + i, pCh) * 32767f).roundToInt().coerceIn(-32768, 32767).toShort() }
-        return Wire.audio(sessionId, tl.epoch, seq, start, tl.timeOf(start), System.nanoTime(), flags, s, count)
+        return Wire.audio(sessionId, tl.epoch, seq, start, tl.timeOf(start), System.nanoTime(), flags, s, count, udpKey ?: ByteArray(32))
     }
 
     private fun serverSend() { synchronized(sendLock) {
@@ -5595,7 +5685,7 @@ class Engine private constructor(private val app: Context) {
             if (addr != null && now - lastPing >= interval) {
                 lastPing = now
                 if (pingBurst > 0) pingBurst--
-                val b = Wire.ping(sessionId, now, pingSeq++)
+                val b = Wire.ping(sessionId, now, pingSeq++, udpKey ?: return)
                 try {
                     udp.send(DatagramPacket(b, b.size, addr))
                     pointPingPacketsSent.incrementAndGet()
@@ -5607,7 +5697,7 @@ class Engine private constructor(private val app: Context) {
             if (currentAudioPath != "tcp") {
                 val nacks = rx.collectNacks(now)
                 if (nacks.isNotEmpty() && addr != null) {
-                    val b = Wire.nack(sessionId, rx.timeline.epoch, nacks)
+                    val b = Wire.nack(sessionId, rx.timeline.epoch, nacks, udpKey ?: return)
                     udp.send(DatagramPacket(b, b.size, addr))
                 }
             }

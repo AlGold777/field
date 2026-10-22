@@ -3,7 +3,7 @@ import os
 
 /// Общие константы. ОБЯЗАНЫ совпадать с Android (core/Constants.kt) — иначе смешанная пара не соберётся.
 enum SF {
-    static let protocolVersion: UInt8 = 1
+    static let protocolVersion: UInt8 = 2
     static let sampleRate = 48_000
     static let packetFrames = 480                  // 10 мс PCM в одном UDP-пакете
     static let leadNs: Int64 = 400_000_000         // Server отправляет аудио на 400 мс вперёд

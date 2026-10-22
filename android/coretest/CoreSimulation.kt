@@ -15,7 +15,7 @@ fun check(name: String, ok: Boolean, detail: String = "") {
 fun testWire() {
     println("[Wire]")
     val s = ShortArray(480) { (it * 37 - 9000).toShort() }
-    val b = Wire.audio(0x1234ABCD, 7, 99, 1_234_567_890_123L, -5L, 42L, UdpMsg.FLAG_RETRANSMIT, s, 480)
+    val b = Wire.audio(0x1234ABCD, 7, 99, 1_234_567_890_123L, -5L, 42L, UdpMsg.FLAG_RETRANSMIT, s, 480, ByteArray(32))
     val m = Wire.decode(b, b.size) as UdpMsg.Audio
     check("audio roundtrip", m.session == 0x1234ABCD && m.epoch == 7 && m.seq == 99 && m.startFrame == 1_234_567_890_123L &&
         m.playoutNs == -5L && m.sendNs == 42L && m.isRetransmit && m.samples.contentEquals(s))

@@ -5,7 +5,7 @@ package app.soundfield.core
  * иначе Android↔iPhone пара не соберётся.
  */
 object SF {
-    const val PROTOCOL_VERSION = 1
+    const val PROTOCOL_VERSION = 2
     const val SAMPLE_RATE = 48_000
     const val PACKET_FRAMES = 480                    // 10 мс PCM в одном UDP-пакете
     const val LEAD_NS = 400_000_000L                 // Server отправляет аудио на 400 мс вперёд
