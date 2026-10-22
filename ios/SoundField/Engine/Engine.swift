@@ -55,7 +55,7 @@ final class Engine {
     // сеть
     private var discovery: Discovery!
     private let udpBox = Locked<UdpSocket?>(nil)
-    private var udp: UdpSocket! { udpBox.value }
+    private var udp: UdpSocket? { udpBox.value }
     private var pathMonitor: NWPathMonitor?
     private var lastPathSignature: String?
 
@@ -166,8 +166,9 @@ final class Engine {
         }
         myName = defaults.string(forKey: "sf.name") ?? UIDevice.current.name
         record = Engine.loadPair(defaults)
-        let url = Bundle.main.url(forResource: "test_track", withExtension: "wav")!
-        let pcm = (try? Wav.decode(Data(contentsOf: url))) ?? []
+        let url = Bundle.main.url(forResource: "test_track", withExtension: "wav")
+        if url == nil { NSLog("SoundField: test_track.wav не найден в приложении") }
+        let pcm = url.flatMap { try? Wav.decode(Data(contentsOf: $0)) } ?? []
         music = PcmSource(pcm: pcm, title: "Тестовый трек SoundField", artist: "Стерео-демо · L: аккорды и бас · R: мелодия")
         source = music
         playBox = Locked(ServerPlayState(timeline: .none, source: music, channel: Ch.L, gain: 0.8))
@@ -222,6 +223,8 @@ final class Engine {
             mon.start(queue: q)
             pathMonitor = mon
             log("Запуск: UDP \(udpBox.value?.port ?? 0)")
+            if udpBox.value == nil { toast(Self.noUdpText) }
+            if music.totalFrames == 0 { toast("Тестовый трек не загружен — воспроизведение недоступно") }
             startSoloPlayback()
             if autoResume && record != nil { startAutoResume() }
         }
@@ -848,8 +851,11 @@ final class Engine {
         ["t": "accept", "id": myId, "name": myName, "platform": "ios", "key": key, "role": role, "tcpPort": Int(discovery.listenPort), "caps": ["fileTransferV1", "eq", "spatialV1"]]
     }
 
+    private static let noUdpText = "Не удалось открыть сетевой сокет — перезапустите приложение"
+
     private func doInvite(_ p: Peer) {
         guard phase == .idle else { return }
+        guard udp != nil else { toast(Self.noUdpText); return }
         stopAutoResume()
         pendingKey = Self.hex(16)
         phase = .inviting
@@ -860,6 +866,7 @@ final class Engine {
     private func doManualResume(auto: Bool = false) {
         if phase == .idle { stopAutoResume() }
         guard let rec = record, phase == .idle, pending == nil else { return }
+        guard udp != nil else { toast(Self.noUdpText); return }
         phase = .inviting
         manualResumeActive = true; manualResumeAuto = auto; resumeAttempt = 0
         ui { $0.phase = .inviting; $0.invitingName = rec.peerName; $0.resuming = true }
@@ -977,6 +984,7 @@ final class Engine {
     private func onFirstMessage(_ l: ControlLink, _ o: [String: Any]) {
         let pid = J.s(o, "id"), pname = J.s(o, "name", pid), pplat = J.s(o, "platform", "?")
         l.peerCapabilities = Set(o["caps"] as? [String] ?? [])
+        guard udp != nil else { l.tag = "dead"; l.close(); return }   // без UDP пара невозможна
         let t = J.s(o, "t")
         // версия протокола: поле необязательно, но если есть и не совпадает — отказ
         if (t == "invite" || t == "resume") && o["proto"] != nil && J.i64(o, "proto") != Int64(SF.protocolVersion) {
@@ -1282,7 +1290,10 @@ final class Engine {
             if PairKeychain.save(legacy) { defaults.removeObject(forKey: "sf.pair") }
         }
         guard let d = data else { return nil }
-        return try? JSONDecoder().decode(PairRecord.self, from: d)
+        do { return try JSONDecoder().decode(PairRecord.self, from: d) } catch {
+            NSLog("SoundField: запись пары повреждена, пара не загружена: \(error)")
+            return nil
+        }
     }
 
     private func saveServerParams() {
