@@ -123,7 +123,7 @@ class Engine private constructor(private val app: Context) {
         private const val SOLO_SERVICE_IDLE_MS = 5 * 60_000L
         @Volatile private var inst: Engine? = null
         fun get(ctx: Context): Engine = inst ?: synchronized(this) {
-            inst ?: Engine(ctx.applicationContext).also { inst = it; it.boot() }
+            inst ?: Engine(ctx.applicationContext).also { it.boot(); inst = it }
         }
         private val rnd = SecureRandom()
         private fun hex(bytes: Int) = ByteArray(bytes).also { rnd.nextBytes(it) }.joinToString("") { "%02x".format(it) }
@@ -298,6 +298,7 @@ class Engine private constructor(private val app: Context) {
     private var reconnectSince = 0L
     private var lastBrowseRestart = 0L
     private var manualResumeDeadline = 0L
+    private var unknownRejects = 0          // подряд отказов resume с причиной unknown (пара забыта на Server)
     /** Идёт восстановление сохранённой пары с экрана «Знакомая пара» (вручную или автоматически). */
     private var manualResumeActive = false
     private var manualResumeAuto = false
@@ -406,6 +407,7 @@ class Engine private constructor(private val app: Context) {
     @Volatile private var serverFileTransferToken = ""
     private val serverRenderer = ServerRenderer { serverPlay }
     private var calibRunning = false
+    private var calibSeq = 0                // номер текущей калибровки: при прерывании увеличивается
     @Volatile private var syncProbeActive = false
     private var syncProbeOp: String? = null
     private var syncProbeSavedPointChannel = Ch.R
@@ -1397,6 +1399,7 @@ class Engine private constructor(private val app: Context) {
         soloServiceActive = true
         try { PlaybackService.start(app) } catch (e: Exception) {
             Log.w(TAG, "fgs", e); telemetry.event("FOREGROUND_SERVICE_FAILED", error = e)
+            toast("Фоновый режим не запущен: при блокировке экрана звук может прерваться")
         }
     }
 
@@ -2989,7 +2992,13 @@ class Engine private constructor(private val app: Context) {
     private fun onFirstMessage(l: ControlLink, o: JSONObject) {
         incomingLinks.remove(l)
         val pid = o.optString("id"); val pname = o.optString("name", pid); val pplat = o.optString("platform", "?")
-        when (o.optString("t")) {
+        // несовпадение версии протокола: поле proto есть, но значение другое (отсутствие поля не ошибка)
+        val t = o.optString("t")
+        if ((t == "invite" || t == "resume") && o.has("proto") && o.optInt("proto") != SF.PROTOCOL_VERSION) {
+            l.tag = "dead"; l.sendAndClose(JSONObject().put("t", "reject").put("reason", "proto"))
+            return
+        }
+        when (t) {
             "invite" -> {
                 val advertised = parsePeerAddresses(o)
                 if (phase == Phase.IDLE) stopAutoResume()   // новое приглашение важнее фонового восстановления
@@ -3107,7 +3116,15 @@ class Engine private constructor(private val app: Context) {
                             else -> "Подключение отклонено"
                         })
                     }
-                    phase == Phase.RECONNECTING -> scheduleReconnect(if (reason == "crossed") 1_500 else 2_000)
+                    phase == Phase.RECONNECTING -> {
+                        if (reason == "unknown") unknownRejects++ else unknownRejects = 0
+                        if (unknownRejects >= 5) {
+                            // пара забыта на стороне Server — повторы бессмысленны
+                            unknownRejects = 0
+                            setAutoResume(false)
+                            goIdle(sendBye = false, reason = "«$peerName» больше не считает этот телефон парой")
+                        } else scheduleReconnect(if (reason == "crossed") 1_500 else 2_000)
+                    }
                 }
             }
             "ringing" -> if (l.tag == "invite-out" && !inviteRinging) {
@@ -3159,6 +3176,7 @@ class Engine private constructor(private val app: Context) {
         if (manualLanBlockedPeerId == pid) manualLanBlockedPeerId = null
         pendingTimeout?.cancel(false)
         reconnectTask?.cancel(false)
+        unknownRejects = 0
         if (pending === l) pending = null
         pending?.let { it.tag = "dead"; it.close() }; pending = null
         manualResumeActive = false
@@ -3284,14 +3302,16 @@ class Engine private constructor(private val app: Context) {
             audio.source = pointRenderer
         }
         audio.start()
-        try { PlaybackService.start(app) } catch (e: Exception) { Log.w(TAG, "fgs", e); telemetry.event("FOREGROUND_SERVICE_FAILED", error = e) }
+        var fgsFailed = false
+        try { PlaybackService.start(app) } catch (e: Exception) { Log.w(TAG, "fgs", e); telemetry.event("FOREGROUND_SERVICE_FAILED", error = e); fgsFailed = true }
         ui { copy(phase = Phase.PAIRED, role = r, peerName = pname, peerPlatform = pplat, linkOk = true, remembered = record,
             fileTransferAvailable = supportsFileTransferPeer(),
             autoResuming = false, audioMissing = false, calib = CalibUi(), eqAvailable = eqAvailableInPair(),
             eq = if (r == Role.SERVER) eqSettingsForWire() else eq, eqPreampDb = activeEqConfig().preampDb.toFloat(),
             eqRouteLabel = audio.routeLabel(), eqCurveDb = activeEqConfig().curveDb.map { it.toFloat() }) }
         PlaybackService.refresh(app)
-        toast(if (resumed) "Пара восстановлена" else "Стереопара создана")
+        val text = if (resumed) "Пара восстановлена" else "Стереопара создана"
+        toast(if (fgsFailed) "$text. Фоновый режим не запущен: при блокировке экрана звук может прерваться" else text)
     }
 
     /** Экспоненциальный backoff: 1с → 2с → 4с → 8с → 15с (потолок). */
@@ -3396,6 +3416,7 @@ class Engine private constructor(private val app: Context) {
         setClockPath("udp", "pair_disconnected")
         rx.reset(); clock.reset()
         calibRunning = false
+        calibSeq++   // результат калибровки, начатой в паре, не должен примениться после разрыва
         discovery.startBrowse()
         if (!appVisible && !resumePlaying) hideWhileBackground()   // пару разорвали, пока приложение в фоне
         ui { copy(phase = Phase.IDLE, soloMode = false, eqAvailable = false, linkOk = false, remembered = record, playing = false, audioMissing = false, calib = CalibUi(),
@@ -4117,10 +4138,11 @@ class Engine private constructor(private val app: Context) {
         ), op = op)
         when (o.optString("a")) {
             "play" -> cmdPlay()
-            "pause" -> cmdPause()
+            "pause" -> if (calibRunning) abortCalibration() else cmdPause()
             "toggle" -> if ((serverPlay.timeline.running || ui.value.audioBuffering) && mode != SourceMode.CALIBRATION) cmdPause() else cmdPlay()
-            "seek" -> seekFrame(o.optLong("ms") * SF.SAMPLE_RATE / 1000)
-            "skip" -> seekFrame(posFrame() + o.optLong("ms") * SF.SAMPLE_RATE / 1000)
+            // ms ограничиваются до умножения: большие значения из сети не должны переполнить Long
+            "seek" -> seekFrame(o.optLong("ms").coerceIn(0L, 86_400_000L) * SF.SAMPLE_RATE / 1000)
+            "skip" -> seekFrame(posFrame() + o.optLong("ms").coerceIn(-3_600_000L, 3_600_000L) * SF.SAMPLE_RATE / 1000)
             "next" -> selectTrack(navigationIndex() + 1, startPlayback = true)
             "previous" -> selectTrack(navigationIndex() - 1, startPlayback = true)
             "select" -> selectTrack(queue.indexOfFirst { it.id == o.optString("id") }, startPlayback = true)
@@ -4195,7 +4217,7 @@ class Engine private constructor(private val app: Context) {
                 if (tl.running) newEpoch(true, posFrame(), now + SF.START_DELAY_NS) else newEpoch(false, posFrame(), now)
                 toast("Каналы поменяны: этот телефон — ${Ch.name(serverChannel())}")
             }
-            "trim" -> {
+            "trim" -> if (!calibRunning) {
                 val ms = o.optDouble("ms", 0.0).coerceIn(-SF.MAX_TRIM_MS.toDouble(), SF.MAX_TRIM_MS.toDouble())
                 trimNs = (ms * 1e6).toLong()
                 delayCalib = if (o.optBoolean("reset")) DelayCalib() else DelayCalib("manual", System.currentTimeMillis(), 0.0)
@@ -4798,6 +4820,7 @@ class Engine private constructor(private val app: Context) {
             return
         }
         calibRunning = true
+        val my = ++calibSeq
         val op = java.util.UUID.randomUUID().toString()
         calibrationOp = op
         telemetry.record("CALIBRATION_START", mapOf("apply" to apply, "role" to role.name.lowercase()), op = op)
@@ -4811,23 +4834,26 @@ class Engine private constructor(private val app: Context) {
         io.execute {
             try {
                 val rec = mic.record(8_600) {
+                    val a = System.nanoTime() + 700_000_000L
+                    anchor.set(a)   // до post: чтение якоря ниже на этом же io-потоке видит значение без гонки
                     post {
-                        val a = System.nanoTime() + 700_000_000L
-                        anchor.set(a)
+                        if (my != calibSeq) return@post
                         newEpoch(true, 0, a)
                         telemetry.record("CALIBRATION_STAGE", mapOf("stage" to "signals"), op = op)
                         broadcastCalib(true, "Звучат тестовые сигналы — тишина, пожалуйста…", "", true, null)
                     }
                 }
                 post {
+                    if (my != calibSeq) return@post
                     telemetry.record("CALIBRATION_STAGE", mapOf("stage" to "analysis"), op = op)
                     broadcastCalib(true, "Анализ записи…", "", true, null)
                 }
                 val res = CalibrationAnalyzer.analyze(rec.samples, rec.sampleRate, rec.startNs, anchor.get(), trimUsed)
-                post { finishCalibration(res, apply, trimUsed) }
+                post { finishCalibration(res, apply, trimUsed, my) }
             } catch (e: Exception) {
                 Log.e(TAG, "calibration", e)
                 post {
+                    if (my != calibSeq) return@post
                     calibRunning = false; restoreMusic(savedPlaying)
                     telemetry.record("CALIBRATION_END", mapOf("result" to "error"), op = op, error = e)
                     calibrationOp = null
@@ -4915,7 +4941,18 @@ class Engine private constructor(private val app: Context) {
         ), op = op)
     }
 
-    private fun finishCalibration(res: CalibrationAnalyzer.Result, apply: Boolean, trimUsed: Long) {
+    /** Прерывание калибровки (потеря фокуса, пауза): результат не применяется, воспроизведение на паузе. */
+    private fun abortCalibration() {
+        if (!calibRunning) return
+        calibRunning = false
+        calibSeq++
+        calibrationOp = null
+        restoreMusic(false)
+        broadcastCalib(false, "", "Калибровка прервана — звук был приостановлен", false, null)
+    }
+
+    private fun finishCalibration(res: CalibrationAnalyzer.Result, apply: Boolean, trimUsed: Long, my: Int) {
+        if (my != calibSeq) return   // калибровка прервана — результат не применяем
         calibRunning = false
         val op = calibrationOp
         calibrationOp = null
@@ -5611,10 +5648,9 @@ class Engine private constructor(private val app: Context) {
 
     /** Прерывание на любом телефоне ставит на паузу всю пару — состояние остаётся согласованным. */
     private fun onInterrupted(reason: String) {
-        focusRequest = null
-        audioFocusHeld = false
+        abandonFocus()
         if (!ui.value.inPair) return
-        if (role == Role.SERVER) cmdPause() else link?.send(JSONObject().put("t", "cmd").put("a", "pause"))
+        if (role == Role.SERVER) { abortCalibration(); cmdPause() } else link?.send(JSONObject().put("t", "cmd").put("a", "pause"))
         toast(reason)
     }
 }
