@@ -6,6 +6,17 @@ import AVFoundation
 ///   present = hostTime(timestamp) + outputLatency
 /// Этот момент передаётся RenderSource (Server/Point), который выбирает кадр общей шкалы.
 /// Разница между моделями телефонов, не учтённая системой, убирается акустической калибровкой.
+/// Счётчик underrun: память освобождается в deinit самого контейнера, а не в AudioOutput,
+/// поэтому render-блок, держащий контейнер, не может остаться с висящим указателем.
+private final class UnderrunBox {
+    let ptr: UnsafeMutablePointer<Int64>
+    init() {
+        ptr = UnsafeMutablePointer<Int64>.allocate(capacity: 1)
+        ptr.initialize(to: 0)
+    }
+    deinit { ptr.deallocate() }
+}
+
 final class AudioOutput {
     private let engine = AVAudioEngine()
     private var node: AVAudioSourceNode?
@@ -20,22 +31,17 @@ final class AudioOutput {
 
     private(set) var latencyMs = 0.0
     // Счётчик пишет только реалтайм-callback (без блокировок и без self); читается на главном потоке.
-    private let underrunCounter: UnsafeMutablePointer<Int64> = {
-        let p = UnsafeMutablePointer<Int64>.allocate(capacity: 1)
-        p.initialize(to: 0)
-        return p
-    }()
+    // Владеет памятью отдельный объект, который захватывает и render-блок узла: память живёт, пока жив узел.
+    private let underrunBox = UnderrunBox()
     private(set) var underruns: Int64 {       // на iOS система не отдаёт счётчик — считаем отсутствие hostTime
-        get { underrunCounter.pointee }
-        set { underrunCounter.pointee = newValue }
+        get { underrunBox.ptr.pointee }
+        set { underrunBox.ptr.pointee = newValue }
     }
 
     var source: RenderSource? {
         get { sourceBox.value }
         set { sourceBox.value = newValue }
     }
-
-    deinit { underrunCounter.deallocate() }
 
     init() {
         let nc = NotificationCenter.default
@@ -94,7 +100,7 @@ final class AudioOutput {
         if node == nil {
             let src = sourceBox
             let lat = outLatencyNs
-            let underrunCount = underrunCounter
+            let underrunBox = self.underrunBox
             let n = AVAudioSourceNode(format: fmt) { _, ts, frameCount, abl -> OSStatus in
                 let bufs = UnsafeMutableAudioBufferListPointer(abl)
                 guard let first = bufs.first, let data = first.mData else { return noErr }
@@ -104,7 +110,7 @@ final class AudioOutput {
                 if ts.pointee.mFlags.contains(.hostTimeValid) {
                     present = MonoClock.ns(fromHost: ts.pointee.mHostTime) + lat.value
                 } else {
-                    underrunCount.pointee += 1
+                    underrunBox.ptr.pointee += 1
                     present = MonoClock.nowNs() + lat.value + 5_000_000
                 }
                 if bufs.count >= 2, let second = bufs[1].mData {
