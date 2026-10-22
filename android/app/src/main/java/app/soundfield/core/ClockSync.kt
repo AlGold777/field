@@ -79,6 +79,7 @@ class ClockSync {
     private val pendingModelStepsUs = ArrayDeque<Double>()
 
     private val buckets = ArrayDeque<Bucket>()
+    private var refBucketStart = Long.MIN_VALUE   // опорная корзина малой модели (для гистерезиса)
     private val rtts = ArrayDeque<Double>()
     private val lock = Any()
 
@@ -96,6 +97,7 @@ class ClockSync {
 
     fun reset() = synchronized(lock) {
         buckets.clear(); rtts.clear(); pongs = 0
+        refBucketStart = Long.MIN_VALUE
         model = Model(0, 0.0, 0.0, false)
         smoothed.reset()
         connectionStartNs = Long.MIN_VALUE
@@ -163,7 +165,7 @@ class ClockSync {
             }
             val den = sw * sxx - sx * sx
             b = if (abs(den) > 1e-12) (sw * sxy - sx * sy) / den else 0.0
-            if (abs(b) > MAX_DRIFT) b = 0.0
+            b = b.coerceIn(-MAX_DRIFT, MAX_DRIFT)
             a = base + (sy - b * sx) / sw
             // разброс остатков как оценка погрешности
             var r2 = 0.0
@@ -172,11 +174,17 @@ class ClockSync {
         } else {
             val recent = ok.takeLast(3)
             val best = recent.minBy { it.quality }
+            // гистерезис: опорный бакет меняем, только если новый лучше текущего минимум на 20% или текущий выпал из окна
+            val cur = recent.firstOrNull { it.start == refBucketStart }
+            val chosen = if (cur == null || best.quality < cur.quality * 0.8) best else cur
+            refBucketStart = chosen.start
             b = model.b
-            ref = best.mid
-            a = best.offset
-            uncertaintyMs = (best.quality - qMin) / 2e6 + (qMin / 1e6) * 0.1
+            ref = chosen.mid
+            a = chosen.offset
+            uncertaintyMs = (chosen.quality - qMin) / 2e6 + (qMin / 1e6) * 0.1
         }
+        // верхняя граница вклада асимметрии задержек: половина минимального RTT
+        uncertaintyMs = maxOf(uncertaintyMs, qMin / 1e6 * 0.5)
         driftPpm = b * 1e6
         val next = Model(ref, a, b, true)
         val now = System.nanoTime()

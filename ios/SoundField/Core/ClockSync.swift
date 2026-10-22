@@ -27,6 +27,7 @@ final class ClockSync {
     private let modelBox = Locked(Model())
     var model: Model { modelBox.value }
     private var buckets: [Bucket] = []
+    private var refBucketStart: Int64 = .min   // опорная корзина малой модели (для гистерезиса)
     private var rtts: [Double] = []
     private let lock = NSLock()
 
@@ -41,6 +42,7 @@ final class ClockSync {
     func reset() {
         lock.lock(); defer { lock.unlock() }
         buckets.removeAll(); rtts.removeAll()
+        refBucketStart = .min
         modelBox.value = Model()
     }
 
@@ -100,7 +102,7 @@ final class ClockSync {
             }
             let den = sw * sxx - sx * sx
             b = abs(den) > 1e-12 ? (sw * sxy - sx * sy) / den : 0
-            if abs(b) > Self.maxDrift { b = 0 }
+            b = min(max(b, -Self.maxDrift), Self.maxDrift)
             a = base + (sy - b * sx) / sw
             var r2 = 0.0
             for k in ok { let e = k.offset - (a + b * Double(k.mid - ref)); r2 += e * e }
@@ -108,11 +110,21 @@ final class ClockSync {
         } else {
             let recent = ok.suffix(3)
             let best = recent.min(by: { $0.quality < $1.quality })!
+            // гистерезис: опорный бакет меняем, только если новый лучше текущего минимум на 20% или текущий выпал из окна
+            let chosen: Bucket
+            if let cur = recent.first(where: { $0.start == refBucketStart }), !(best.quality < cur.quality * 0.8) {
+                chosen = cur
+            } else {
+                chosen = best
+            }
+            refBucketStart = chosen.start
             b = modelBox.value.b
-            ref = best.mid
-            a = best.offset
-            uncertaintyMs = (best.quality - qMin) / 2e6 + (qMin / 1e6) * 0.1
+            ref = chosen.mid
+            a = chosen.offset
+            uncertaintyMs = (chosen.quality - qMin) / 2e6 + (qMin / 1e6) * 0.1
         }
+        // верхняя граница вклада асимметрии задержек: половина минимального RTT
+        uncertaintyMs = max(uncertaintyMs, qMin / 1e6 * 0.5)
         driftPpm = b * 1e6
         modelBox.value = Model(ref: ref, a: a, b: b, ready: true)
     }

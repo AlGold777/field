@@ -37,8 +37,7 @@ object CalibrationAnalyzer {
         if (rec.size < recSr) return Result(false, 0.0, 0.0, 0, 0.0, "Запись слишком короткая")
         val up = Chirp.make(true, recSr)
         val down = Chirp.make(false, recSr)
-        val corrUp = xcorrAbs(rec, up)
-        val corrDown = xcorrAbs(rec, down)
+        val (corrUp, corrDown) = xcorrAbsBoth(rec, up, down)
 
         fun expectedSample(serverNs: Long) = (serverNs - recStartServerNs).toDouble() * recSr / 1e9
 
@@ -74,12 +73,15 @@ object CalibrationAnalyzer {
         val from = maxOf(1, (expected - 0.30 * sr).toInt())
         val to = minOf(c.size - 2, (expected + 0.45 * sr).toInt())
         if (to - from < sr / 20) return null
-        var best = from; var bestV = 0f
-        for (i in from..to) if (c[i] > bestV) { bestV = c[i]; best = i }
+        var argmax = from; var maxV = 0f
+        for (i in from..to) if (c[i] > maxV) { maxV = c[i]; argmax = i }
+        // первый локальный максимум, превышающий 50% глобального максимума окна (а не самый сильный путь)
+        var best = argmax
+        for (i in from..to) if (c[i] >= 0.5f * maxV && c[i] >= c[i - 1] && c[i] > c[i + 1]) { best = i; break }
         val window = FloatArray(to - from + 1) { c[from + it] }
         window.sort()
         val noise = window[window.size / 2].toDouble().coerceAtLeast(1e-9)
-        val ratio = bestV / noise
+        val ratio = c[best] / noise
         if (ratio < 8.0) return null
         // параболическая интерполяция
         val y0 = c[best - 1].toDouble(); val y1 = c[best].toDouble(); val y2 = c[best + 1].toDouble()
@@ -93,22 +95,29 @@ object CalibrationAnalyzer {
         return if (s.size % 2 == 1) s[m] else (s[m - 1] + s[m]) / 2
     }
 
-    /** |взаимная корреляция| через БПФ: c[i] = Σ tpl[j]·x[i+j]. */
-    fun xcorrAbs(x: FloatArray, tpl: FloatArray): FloatArray {
+    /** |взаимная корреляция| с двумя шаблонами: c[i] = Σ tpl[j]·x[i+j]. БПФ записи считается один раз. */
+    fun xcorrAbsBoth(x: FloatArray, tplA: FloatArray, tplB: FloatArray): Pair<FloatArray, FloatArray> {
         var n = 1
-        while (n < x.size + tpl.size) n = n shl 1
-        val xr = DoubleArray(n); val xi = DoubleArray(n)
+        while (n < x.size + maxOf(tplA.size, tplB.size)) n = n shl 1
+        val xr0 = DoubleArray(n); val xi0 = DoubleArray(n)
+        for (i in x.indices) xr0[i] = x[i].toDouble()
+        Fft.transform(xr0, xi0, false)
+        return Pair(corrWith(xr0, xi0, tplA, x.size), corrWith(xr0, xi0, tplB, x.size))
+    }
+
+    private fun corrWith(xr0: DoubleArray, xi0: DoubleArray, tpl: FloatArray, len: Int): FloatArray {
+        val n = xr0.size
+        val xr = xr0.copyOf(); val xi = xi0.copyOf()
         val tr = DoubleArray(n); val ti = DoubleArray(n)
-        for (i in x.indices) xr[i] = x[i].toDouble()
         for (i in tpl.indices) tr[i] = tpl[i].toDouble()
-        Fft.transform(xr, xi, false); Fft.transform(tr, ti, false)
+        Fft.transform(tr, ti, false)
         for (i in 0 until n) { // X · conj(T)
             val re = xr[i] * tr[i] + xi[i] * ti[i]
             val im = xi[i] * tr[i] - xr[i] * ti[i]
             xr[i] = re; xi[i] = im
         }
         Fft.transform(xr, xi, true)
-        return FloatArray(x.size) { abs(xr[it]).toFloat() }
+        return FloatArray(len) { abs(xr[it]).toFloat() }
     }
 }
 

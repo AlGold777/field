@@ -6,7 +6,7 @@ import java.nio.ByteOrder
 /**
  * Бинарный UDP-протокол медиаконтура (big-endian). Описание — README, раздел «Протокол».
  *
- * Заголовок (8 байт): 'S' 'F' | version u8 | type u8 | sessionId u32
+ * Заголовок (8 байт): 'S' 'F' | version u8 | type u8 | sessionId i32
  *  AUDIO (1): epoch i32 | seq i32 | startFrame i64 | playoutNs i64 | sendNs i64 | count u16 | flags u8 | 0 u8 | count × i16
  *  PING  (2): t1 i64 | pingSeq i32
  *  PONG  (3): t1 i64 | t2 i64 | t3 i64 | pingSeq i32
@@ -92,8 +92,14 @@ object Wire {
                     val s = ShortArray(count) { b.getShort() }
                     UdpMsg.Audio(session, epoch, seq, start, playout, send, flags, s, count)
                 }
-                UdpMsg.T_PING -> UdpMsg.Ping(session, b.getLong(), b.getInt())
-                UdpMsg.T_PONG -> UdpMsg.Pong(session, b.getLong(), b.getLong(), b.getLong(), b.getInt())
+                UdpMsg.T_PING -> {
+                    if (length < UdpMsg.HEADER + 12) return null
+                    UdpMsg.Ping(session, b.getLong(), b.getInt())
+                }
+                UdpMsg.T_PONG -> {
+                    if (length < UdpMsg.HEADER + 28) return null
+                    UdpMsg.Pong(session, b.getLong(), b.getLong(), b.getLong(), b.getInt())
+                }
                 UdpMsg.T_NACK -> {
                     val epoch = b.getInt(); val n = b.getShort().toInt() and 0xFFFF
                     if (n > UdpMsg.MAX_NACK || length < UdpMsg.HEADER + 6 + n * 4) return null
