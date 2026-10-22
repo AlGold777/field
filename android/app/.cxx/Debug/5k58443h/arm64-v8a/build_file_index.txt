@@ -1,0 +1,1 @@
+/Users/restart/Downloads/SoundField/.claude/worktrees/beautiful-wilbur-e3da84/dsp/CMakeLists.txt

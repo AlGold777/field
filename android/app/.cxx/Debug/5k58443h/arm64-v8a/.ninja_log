@@ -1,0 +1,9 @@
+# ninja log v5
+10	132	1792679559479284368	CMakeFiles/sfdsp.dir/jni/sfdsp_jni.cpp.o	4698846bc3bf8e6b
+3	541	1792679559885783532	CMakeFiles/sfdsp_core.dir/src/pcm24.cpp.o	751cc00d74fa7d6d
+2	546	1792679559892176075	CMakeFiles/sfdsp_core.dir/src/playout.cpp.o	ed196c757d3dcd4e
+1	831	1792679560176829503	CMakeFiles/sfdsp_core.dir/src/sinc.cpp.o	d216f8a510fe32f6
+10	889	1792679560233741447	CMakeFiles/sfdsp_core.dir/src/limiter.cpp.o	9d45d4dde0eb23c
+7	896	1792679560239010929	CMakeFiles/sfdsp_core.dir/src/src.cpp.o	ed65b3185bd79314
+896	959	1792679560309565000	libsfdsp_core.a	12ac918dae7a2225
+959	1012	1792679560358453626	/Users/restart/Downloads/SoundField/.claude/worktrees/beautiful-wilbur-e3da84/android/app/build/intermediates/cxx/Debug/5k58443h/obj/arm64-v8a/libsfdsp.so	c2db6a193ef8bc14

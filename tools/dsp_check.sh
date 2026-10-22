@@ -32,7 +32,7 @@ if [ "$ANDROID" = 1 ]; then
     "$B/sflab" gen-signals "$WORK/in" $ARGS
     JAVA_HOME=${JAVA_HOME:-/opt/homebrew/opt/openjdk@17} android/gradlew -p android --offline -q labRender \
         -PlabIn="$(pwd)/$WORK/in" -PlabOut="$(pwd)/$WORK/out"
-    ARGS="$ARGS --kotlin android_kotlin_pcm16=$WORK/out/pcm16 --kotlin android_kotlin_float=$WORK/out/float"
+    ARGS="$ARGS --kotlin android_kotlin_pcm24=$WORK/out/pcm24 --kotlin android_kotlin_float=$WORK/out/float"
 fi
 
 "$B/sflab" run $ARGS --out "$B/current.json"

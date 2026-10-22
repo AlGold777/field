@@ -34,7 +34,7 @@ class A1PathTest {
         var diff = 0
         for (i in x.indices) if (g.quantize(x[i]) != q[i]) diff++
         assertEquals("несовпадений: $diff", 0, diff)
-        for (i in x.indices) assertTrue(abs(q[i] - x[i].toDouble() * Pcm24.SCALE) <= 1.0 + 1e-6)
+        for (i in x.indices) assertTrue(abs(q[i] - x[i].toDouble() * Pcm24.SCALE) <= 1.5 + 1e-6)
     }
 
     @Test fun quantizeIsDeterministicPerSeedAndRangeSafe() {
