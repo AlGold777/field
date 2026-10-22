@@ -583,9 +583,9 @@ DSP использует каскад peaking-фильтров с подборо
 ### TCP (JSON), поле `t`
 | t | Направление | Поля |
 |---|---|---|
-| `invite` | инициатор → | `id, name, platform, proto=2, epk` (эфемерный открытый ключ X25519, hex), `tcpPort` |
+| `invite` | инициатор → | `id, name, platform, proto=3, epk` (эфемерный открытый ключ X25519, hex), `tcpPort` |
 | `accept` (на invite) | ← | `id, name, platform, role, tcpPort, epk, proof` |
-| `resume` | → | `id, name, platform, proto=2, cn` (nonce 16 байт, hex), `role` (роль отправителя), `tcpPort` |
+| `resume` | → | `id, name, platform, proto=3, cn` (nonce 16 байт, hex), `role` (роль отправителя), `tcpPort` |
 | `challenge` | ← (на resume) | `sn` (nonce 16 байт), `proof` — доказательство знания ключа пары приёмной стороной |
 | `auth` | → | `proof` — то же для инициатора resume; после проверки приёмная сторона шлёт `accept` (`id, name, platform, role, tcpPort`) |
 | `ringing` | ← (получатель invite) | — (диалог приглашения показан) |
@@ -600,6 +600,8 @@ DSP использует каскад peaking-фильтров с подборо
 | `hb`, `bye`, `name` | ↔ | heartbeat 1 с, разрыв, переименование |
 
 ### Аутентификация (протокол v2)
+
+*Схема ключей v2, пакеты — протокол v3.*
 
 Ключ пары по сети не передаётся. Все MAC — HMAC‑SHA256; части MAC склеиваются с префиксом длины u16 BE
 (`mac(k, p1, p2…)`), метка `label` — первая часть.
@@ -618,24 +620,27 @@ DSP использует каскад peaking-фильтров с подборо
   `udpKey = mac(pairKey, "sf-udp-v2", a, b)`, где `a, b` — `epkИнициатора, epkПринявшего` (invite) или `cn, sn` (resume).
   Тот же ключ защищает hello TCP‑аудио (Android): `tag = mac(udpKey, "sf-tcp-hello", peerId, session)[0..8]`.
 - **Защита от повтора.** Server меняет адрес Point и отвечает на PING только при `pingSeq` строго больше последнего принятого (счётчик сбрасывается со сменой `udpKey`); Point принимает PONG один раз и только для отправленного в этой сессии `pingSeq` (окно 64). Повторы отбрасываются, в телеметрии `UDP_REPLAY_DROPPED`.
-- **Совместимость.** `invite`/`resume` без `proto=2` получают `reject: proto`; UDP‑пакеты версии 1 отбрасываются.
+- **Совместимость.** `invite`/`resume` без `proto=3` (в том числе `proto=2`) получают `reject: proto`; UDP‑пакеты версий 1 и 2 отбрасываются.
   Оба телефона пары нужно обновить одновременно.
 - **Не защищено:** сам TCP‑канал управления после рукопожатия не шифруется и не имеет MAC (подмена возможна только для
   узла, перехватившего TCP‑сессию на пути); `sessionId` остаётся открытым, но без `udpKey` бесполезен.
 
-### UDP (big‑endian), заголовок `'S' 'F' | ver=2 | type | session i32`, в конце каждого пакета — тег 8 байт
+### UDP (big‑endian), заголовок `'S' 'F' | ver=3 | type | session i32`, в конце каждого пакета — тег 8 байт
 Тег = первые 8 байт HMAC‑SHA256(udpKey, все байты пакета до тега). Пакет с неверным или отсутствующим тегом отбрасывается
 до разбора полей.
 
 | type | Тело |
 |---|---|
-| 1 AUDIO | `epoch i32, seq i32, startFrame i64, playoutNs i64, sendNs i64, count u16, flags u8 (1=перепосылка), 0, count × i16` |
+| 1 AUDIO | `epoch i32, seq i32, startFrame i64, playoutNs i64, sendNs i64, count u16, flags u8 (1=перепосылка), 0, count × i24` (3 байта big‑endian, знак в дополнении до двух, −8388608…8388607; count ≤ 384) |
 | 2 PING | `t1 i64, pingSeq i32` |
 | 3 PONG | `t1 i64, t2 i64, t3 i64, pingSeq i32` |
 | 4 NACK | `epoch i32, n u16, n × seq i32` |
 
+Размер максимального AUDIO‑пакета: 44 + 384·3 + 8 = 1204 байта ≤ 1232 (IPv6 MTU 1280 − 40 − 8), поэтому IP‑фрагментации нет.
+TCP‑аудио (Android) передаёт PCM 24 бит; hello‑магик `SFA2` (версия 3), `SFA1` (PCM16) отвергается.
+
 Контрольный пример (одинаков в Kotlin и Swift, ключ `00 01 … 1f`): PING(session=0x01020304, t1=0x0A0B0C0D0E0F1011, seq=77) =
-`53460202 01020304 0a0b0c0d0e0f1011 0000004d 6099f86436a776c0`. Полные векторы (пакеты, RFC 7748 X25519, вывод ключей) —
+`53460302 01020304 0a0b0c0d0e0f1011 0000004d 59b2d54ac7c03f38`. Полные векторы (пакеты, RFC 7748 X25519, вывод ключей) —
 `tools/protocol_vectors.json`.
 
 ---

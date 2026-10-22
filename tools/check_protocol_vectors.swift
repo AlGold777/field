@@ -39,7 +39,7 @@ func encode(_ v: [String: Any]) -> [UInt8] {
                           seq: Int32(truncatingIfNeeded: jnum(v, "seq")), startFrame: jnum(v, "startFrame"),
                           playoutNs: jnum(v, "playoutNs"), sendNs: jnum(v, "sendNs"),
                           flags: UInt8(truncatingIfNeeded: jnum(v, "flags")),
-                          samples: jlist(jstr(v, "samples")).map { Int16($0) }, key: key)
+                          samples: jlist(jstr(v, "samples")).map { Int32($0) }, key: key)
     case "nack":
         return Wire.nack(session: session, epoch: Int32(truncatingIfNeeded: jnum(v, "epoch")),
                          seqs: jlist(jstr(v, "seqs")).map { Int32($0) }, key: key)
@@ -77,7 +77,7 @@ func check(_ name: String, _ ok: Bool) {
 }
 
 let packetTypes: Set<String> = ["ping", "pong", "audio", "nack"]
-check("vectors count = 9", vectors.count == 9)
+check("vectors count = 10", vectors.count == 10)
 for v in vectors {
     let name = jstr(v, "name")
     switch jstr(v, "type") {
@@ -109,6 +109,26 @@ for v in vectors {
         check("wrong key \(name) rejected", bytes.withUnsafeBytes { Wire.decode($0, key: [UInt8](repeating: 1, count: 32)) } == nil)
         check("untagged \(name) rejected", Array(bytes.dropLast(Wire.tag)).withUnsafeBytes { Wire.decode($0, key: key) } == nil)
     }
+}
+// (a) пакет версии 2 с верным тегом отвергается; та же форма с версией 3 принимается
+// (b) AUDIO с count = 385 и верным тегом отвергается
+// (c) длина максимального AUDIO-пакета 1204 байта и не больше 1232 (без IP-фрагментации)
+if let ping = vectors.first(where: { jstr($0, "name") == "ping" }),
+   let full = vectors.first(where: { jstr($0, "name") == "audio_full_384" }) {
+    let key = bytesFrom(hex: jstr(ping, "key"))
+    func retag(_ body: [UInt8]) -> [UInt8] { body + PairCrypto.hmac(key, body[...]).prefix(Wire.tag) }
+    var v2 = Array(bytesFrom(hex: jstr(ping, "hex")).dropLast(Wire.tag))
+    v2[2] = 2
+    check("(a) version 2 packet with valid tag rejected", retag(v2).withUnsafeBytes { Wire.decode($0, key: key) } == nil)
+    var v3 = v2; v3[2] = 3
+    check("(a) version 3 control with same body accepted", retag(v3).withUnsafeBytes { Wire.decode($0, key: key) } != nil)
+    var big = Array(bytesFrom(hex: jstr(full, "hex")).dropLast(Wire.tag)) + [0, 0, 0]
+    big[40] = 0x01; big[41] = 0x81 // count = 385 (u16 на смещении 40)
+    check("(b) audio count 385 with valid tag rejected", retag(big).withUnsafeBytes { Wire.decode($0, key: key) } == nil)
+    let fullBytes = bytesFrom(hex: jstr(full, "hex"))
+    check("(c) audio_full_384 is 1204 bytes and <= 1232", fullBytes.count == 1204 && fullBytes.count <= 1232)
+} else {
+    check("audio_full_384 and ping vectors present", false)
 }
 print(failures == 0 ? "ALL PASSED" : "FAILURES: \(failures)")
 exit(failures == 0 ? 0 : 1)
