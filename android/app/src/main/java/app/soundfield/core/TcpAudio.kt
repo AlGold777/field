@@ -14,22 +14,31 @@ object TcpAudioStartPolicy {
 
 data class TcpAudioChunk(val epoch: Int, val trackId: String, val startFrame: Long, val samples: ShortArray)
 
-/** Separate length-prefixed binary transport. The version-1 UDP packet format is untouched. */
+/** Separate length-prefixed binary transport. Hello carries an HMAC tag (protocol v2). */
 object TcpAudioWire {
     const val HELLO_MAGIC = 0x53464131 // SFA1
     private const val MAX_CHUNK_BYTES = 10_500
     const val CHUNK_FRAMES = 4_800 // 100 ms of mono 48 kHz PCM16
 
-    fun writeHello(out: DataOutputStream, peerId: String, sessionId: Int) {
+    /** Подтверждение hello: усечённый HMAC от udpKey соединения (тот же ключ, что у UDP-контура). */
+    fun helloTag(key: ByteArray, peerId: String, sessionId: Int): ByteArray =
+        PairCrypto.mac(key, "sf-tcp-hello", peerId.take(64), sessionId.toString()).copyOf(PairCrypto.TAG_BYTES)
+
+    fun writeHello(out: DataOutputStream, peerId: String, sessionId: Int, key: ByteArray) {
         out.writeInt(HELLO_MAGIC)
         out.writeUTF(peerId.take(64))
         out.writeInt(sessionId)
+        out.write(helloTag(key, peerId, sessionId))
         out.flush()
     }
 
-    fun readHello(input: DataInputStream): Pair<String, Int> {
+    /** Возвращает (peerId, session) только при верном теге, иначе бросает исключение. */
+    fun readHello(input: DataInputStream, key: ByteArray): Pair<String, Int> {
         require(input.readInt() == HELLO_MAGIC) { "Invalid TCP audio hello" }
-        return input.readUTF().take(64) to input.readInt()
+        val id = input.readUTF().take(64); val session = input.readInt()
+        val tag = ByteArray(PairCrypto.TAG_BYTES); input.readFully(tag)
+        require(PairCrypto.equal(tag, helloTag(key, id, session))) { "Invalid TCP audio hello tag" }
+        return id to session
     }
 
     fun writeChunk(out: DataOutputStream, chunk: TcpAudioChunk) {

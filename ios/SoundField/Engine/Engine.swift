@@ -68,6 +68,12 @@ final class Engine {
     private var pending: ControlLink?
     private var pendingPeer: Peer?
     private var pendingKey = ""
+    /// Эфемерный ключ исходящего приглашения и открытые ключи входящего (X25519, протокол v2).
+    private var inviteEph: PairCrypto.Ephemeral?
+    private var pendingInviterPub: [UInt8]?
+    private var pendingAcceptorPub: [UInt8]?
+    /// Ключ UDP-контура текущей пары (выводится при рукопожатии, см. PairCrypto.udpKey).
+    private let udpKeyBox = Locked<[UInt8]?>(nil)
     private var pendingTimeout: DispatchWorkItem?
     private var pendingInvitePort = 0
     private var peerId = "", peerName = "", peerPlatform = ""
@@ -839,16 +845,16 @@ final class Engine {
     }
 
     // ================================================================== установка пары
-    private func inviteJson(_ key: String) -> [String: Any] {
-        ["t": "invite", "id": myId, "name": myName, "platform": "ios", "proto": Int(SF.protocolVersion), "key": key,
+    private func inviteJson(_ epk: [UInt8]) -> [String: Any] {
+        ["t": "invite", "id": myId, "name": myName, "platform": "ios", "proto": Int(SF.protocolVersion), "epk": PairCrypto.hex(epk),
          "tcpPort": Int(discovery.listenPort), "caps": ["fileTransferV1", "eq", "spatialV1"]]
     }
     private func resumeJson(_ r: PairRecord) -> [String: Any] {
-        ["t": "resume", "id": myId, "name": myName, "platform": "ios", "proto": Int(SF.protocolVersion), "key": r.key, "role": r.myRole,
+        ["t": "resume", "id": myId, "name": myName, "platform": "ios", "proto": Int(SF.protocolVersion), "cn": PairCrypto.hex(PairCrypto.random(16)), "role": r.myRole,
          "tcpPort": Int(discovery.listenPort), "caps": ["fileTransferV1", "eq", "spatialV1"]]
     }
-    private func acceptJson(_ key: String, _ role: String) -> [String: Any] {
-        ["t": "accept", "id": myId, "name": myName, "platform": "ios", "key": key, "role": role, "tcpPort": Int(discovery.listenPort), "caps": ["fileTransferV1", "eq", "spatialV1"]]
+    private func acceptJson(_ role: String) -> [String: Any] {
+        ["t": "accept", "id": myId, "name": myName, "platform": "ios", "role": role, "tcpPort": Int(discovery.listenPort), "caps": ["fileTransferV1", "eq", "spatialV1"]]
     }
 
     private static let noUdpText = "Не удалось открыть сетевой сокет — перезапустите приложение"
@@ -857,10 +863,11 @@ final class Engine {
         guard phase == .idle else { return }
         guard udp != nil else { toast(Self.noUdpText); return }
         stopAutoResume()
-        pendingKey = Self.hex(16)
+        inviteEph = PairCrypto.ephemeral()
+        pendingKey = ""
         phase = .inviting
         ui { $0.phase = .inviting; $0.invitingName = p.name; $0.resuming = false }
-        connectOutgoing(p, tag: "invite-out", first: inviteJson(pendingKey), timeout: 30)
+        connectOutgoing(p, tag: "invite-out", first: inviteJson(inviteEph!.pub), timeout: 30)
     }
 
     private func doManualResume(auto: Bool = false) {
@@ -923,6 +930,7 @@ final class Engine {
         let l = newLink(NWConnection(to: p.endpoint, using: Discovery.tcpParams()))
         l.tag = tag
         pending = l
+        l.hsCn = (first["cn"] as? String).flatMap { PairCrypto.unhex($0) }
         l.start()
         l.send(first)
         pendingTimeout?.cancel()
@@ -941,13 +949,13 @@ final class Engine {
 
     private func onIncoming(_ c: NWConnection) {
         // не более 8 неавторизованных соединений одновременно (авторизация = invite/resume, тег меняется)
-        newLinks = newLinks.filter { $0.isOpen && $0.tag == "new" }
+        newLinks = newLinks.filter { $0.isOpen && ($0.tag == "new" || $0.tag == "resume-challenge") }
         guard newLinks.count < 8 else { NSLog("SoundField: лимит неавторизованных соединений, лишнее закрыто"); c.cancel(); return }
         let l = newLink(c)
         l.tag = "new"
         newLinks.append(l)
         l.start()
-        later(5) { if l.tag == "new" { l.close() } }
+        later(5) { if l.tag == "new" || l.tag == "resume-challenge" { l.close() } }
     }
 
     private func doCancelPending() {
@@ -958,7 +966,14 @@ final class Engine {
 
     private func doAccept() {
         guard let l = pending, let p = pendingPeer, phase == .incoming else { return }
-        l.send(acceptJson(pendingKey, Role.point.rawValue))
+        guard let inviterPub = pendingInviterPub, let acceptorPub = pendingAcceptorPub, let pairKey = PairCrypto.unhex(pendingKey) else {
+            pending = nil; l.tag = "dead"; l.sendAndClose(["t": "reject", "reason": "proto"])
+            phase = .idle; ui { $0.phase = .idle }; return
+        }
+        var acc = acceptJson(Role.point.rawValue)
+        acc["epk"] = PairCrypto.hex(acceptorPub)
+        acc["proof"] = PairCrypto.hex(PairCrypto.proof(pairKey, "sf-accept", [Array(p.id.utf8), Array(myId.utf8), inviterPub, acceptorPub]))
+        l.send(acc)
         peerTcpPortHint = pendingInvitePort
         becomePaired(l, .point, p.id, p.name, p.platform, pendingKey, resumed: false)
     }
@@ -975,6 +990,7 @@ final class Engine {
         if l === link { onPairedMessage(o) }
         else if l === pending { onPendingMessage(l, o) }
         else if l.tag == "new" { onFirstMessage(l, o) }
+        else if l.tag == "resume-challenge" { onResumeAuth(l, o) }
     }
 
     private func dummyPeer(_ id: String, _ name: String, _ platform: String, _ l: ControlLink) -> Peer {
@@ -987,8 +1003,21 @@ final class Engine {
         guard udp != nil else { l.tag = "dead"; l.close(); return }   // без UDP пара невозможна
         let t = J.s(o, "t")
         // версия протокола: поле необязательно, но если есть и не совпадает — отказ
-        if (t == "invite" || t == "resume") && o["proto"] != nil && J.i64(o, "proto") != Int64(SF.protocolVersion) {
+        if (t == "invite" || t == "resume") && (o["proto"] == nil || J.i64(o, "proto") != Int64(SF.protocolVersion)) {
             l.tag = "dead"; l.sendAndClose(["t": "reject", "reason": "proto"]); return
+        }
+        var adoptInvite: () -> Void = {}
+        if t == "invite" {
+            // X25519: ключ пары выводится из общего секрета, по сети ключ не передаётся
+            let myEph = PairCrypto.ephemeral()
+            guard let theirPub = PairCrypto.unhex(J.s(o, "epk")), theirPub.count == 32,
+                  let derived = PairCrypto.pairKey(priv: myEph.priv, theirPub: theirPub, inviterPub: theirPub, acceptorPub: myEph.pub) else {
+                l.tag = "dead"; l.sendAndClose(["t": "reject", "reason": "proto"]); return
+            }
+            adoptInvite = { [unowned self] in
+                self.pendingKey = PairCrypto.hex(derived); self.pendingInviterPub = theirPub; self.pendingAcceptorPub = myEph.pub
+                l.udpKey = PairCrypto.udpKey(derived, theirPub, myEph.pub)
+            }
         }
         switch t {
         case "invite":
@@ -996,7 +1025,7 @@ final class Engine {
             if phase == .idle && pending == nil {
                 l.tag = "incoming"; pending = l
                 pendingPeer = dummyPeer(pid, pname, pplat, l)
-                pendingKey = J.s(o, "key")
+                adoptInvite()
                 pendingInvitePort = Int(J.i64(o, "tcpPort"))
                 log("Приглашение от «\(pname)»")
                 phase = .incoming
@@ -1009,7 +1038,7 @@ final class Engine {
                     if let old = pending { old.tag = "dead"; pending = nil; old.close() }
                     l.tag = "incoming"; pending = l
                     pendingPeer = dummyPeer(pid, pname, pplat, l)
-                    pendingKey = J.s(o, "key")
+                    adoptInvite()
                     pendingInvitePort = Int(J.i64(o, "tcpPort"))
                     phase = .incoming
                     doAccept()
@@ -1020,29 +1049,52 @@ final class Engine {
                 l.tag = "dead"; l.sendAndClose(["t": "busy"])
             }
         case "resume":
-            guard let rec = record, rec.key == J.s(o, "key"), rec.peerId == pid, phase != .incoming else {
+            guard let rec = record, let cn = PairCrypto.unhex(J.s(o, "cn")), cn.count == 16, rec.peerId == pid, phase != .incoming else {
                 log("Отклонён resume от «\(pname)»: пара неизвестна")
                 l.tag = "dead"; l.sendAndClose(["t": "reject", "reason": "unknown"]); return
             }
-            if soloMode && playBox.value.timeline.playing && rec.role == .point && !manualResumeActive {
-                l.tag = "dead"; l.sendAndClose(["t": "busy"]); return
-            }
-            // Встречные попытки восстановления: входящее принимает телефон с бо́льшим id (как для приглашений).
-            // Отказываем, только если наше встречное соединение уже установлено (его примет второй телефон).
-            // Если наше ещё «висит» (например, старый адрес), принимаем входящее — иначе попытки могли
-            // бесконечно отклонять друг друга.
-            if let mine = pending, mine.tag == "resume-out" || mine.tag == "resume-auto", myId < pid, mine.ready {
-                l.tag = "dead"; l.sendAndClose(["t": "reject", "reason": "crossed"]); return
-            }
-            if let old = link { link = nil; old.tag = "dead"; old.close() }
-            if let p = pending { pending = nil; p.tag = "dead"; p.close() }
-            l.send(acceptJson(rec.key, rec.myRole))
-            peerTcpPortHint = Int(J.i64(o, "tcpPort"))
-            log("Входящее восстановление от «\(pname)»")
-            becomePaired(l, rec.role, pid, pname, pplat, rec.key, resumed: true)
+            // Challenge–response: сначала доказываем знание ключа мы, затем Point; ключ по сети не передаётся
+            let key = keyBytes(rec.key)
+            let sn = PairCrypto.random(16)
+            l.hsCn = cn; l.hsSn = sn; l.hsFirst = o
+            l.udpKey = PairCrypto.udpKey(key, cn, sn)
+            l.tag = "resume-challenge"
+            l.send(["t": "challenge", "sn": PairCrypto.hex(sn), "proof": PairCrypto.hex(
+                PairCrypto.proof(key, "sf-resume-s", [cn, sn, Array(pid.utf8), Array(myId.utf8)]))])
         default:
             l.tag = "dead"; l.close()
         }
+    }
+
+    private func keyBytes(_ key: String) -> [UInt8] { PairCrypto.unhex(key) ?? Array(key.utf8) }
+
+    /// Второй шаг входящего resume: Point доказал знание ключа пары — завершаем восстановление.
+    private func onResumeAuth(_ l: ControlLink, _ o: [String: Any]) {
+        newLinks.removeAll { $0 === l }
+        let first = l.hsFirst ?? [:]
+        let pid = J.s(first, "id"), pname = J.s(first, "name", pid), pplat = J.s(first, "platform", "?")
+        guard J.s(o, "t") == "auth", let rec = record, let cn = l.hsCn, let sn = l.hsSn, rec.peerId == pid,
+              let proof = PairCrypto.unhex(J.s(o, "proof")),
+              PairCrypto.equal(proof, PairCrypto.proof(keyBytes(rec.key), "sf-resume-c", [cn, sn, Array(pid.utf8), Array(myId.utf8)])),
+              phase != .incoming else {
+            log("Отклонён resume: неверное подтверждение ключа")
+            l.tag = "dead"; l.sendAndClose(["t": "reject", "reason": "unknown"]); return
+        }
+        l.peerCapabilities = Set(first["caps"] as? [String] ?? [])
+        if soloMode && playBox.value.timeline.playing && rec.role == .point && !manualResumeActive {
+            l.tag = "dead"; l.sendAndClose(["t": "busy"]); return
+        }
+        // Встречные попытки восстановления: входящее принимает телефон с бо́льшим id (как для приглашений).
+        // Отказываем, только если наше встречное соединение уже установлено (его примет второй телефон).
+        if let mine = pending, mine.tag == "resume-out" || mine.tag == "resume-auto", myId < pid, mine.ready {
+            l.tag = "dead"; l.sendAndClose(["t": "reject", "reason": "crossed"]); return
+        }
+        if let old = link { link = nil; old.tag = "dead"; old.close() }
+        if let p = pending { pending = nil; p.tag = "dead"; p.close() }
+        l.send(acceptJson(rec.myRole))
+        peerTcpPortHint = Int(J.i64(first, "tcpPort"))
+        log("Входящее восстановление от «\(pname)»")
+        becomePaired(l, rec.role, pid, pname, pplat, rec.key, resumed: true)
     }
 
     private func onPendingMessage(_ l: ControlLink, _ o: [String: Any]) {
@@ -1052,11 +1104,37 @@ final class Engine {
         case "accept":
             let hinted = Int(J.i64(o, "tcpPort"))
             peerTcpPortHint = hinted > 0 ? hinted : Self.endpointPort(pendingPeer?.endpoint)
-            if l.tag == "invite-out" { becomePaired(l, .server, pid, pname, pplat, pendingKey, resumed: false) }
+            if l.tag == "invite-out" {
+                guard let eph = inviteEph, let theirPub = PairCrypto.unhex(J.s(o, "epk")), theirPub.count == 32,
+                      let derived = PairCrypto.pairKey(priv: eph.priv, theirPub: theirPub, inviterPub: eph.pub, acceptorPub: theirPub),
+                      let proof = PairCrypto.unhex(J.s(o, "proof")),
+                      PairCrypto.equal(proof, PairCrypto.proof(derived, "sf-accept", [Array(myId.utf8), Array(pid.utf8), eph.pub, theirPub])) else {
+                    log("Неверное подтверждение ключа от «\(pname)»")
+                    onPendingMessage(l, ["t": "reject", "reason": "auth"]); return
+                }
+                pendingKey = PairCrypto.hex(derived)
+                l.udpKey = PairCrypto.udpKey(derived, eph.pub, theirPub)
+                inviteEph = nil
+                becomePaired(l, .server, pid, pname, pplat, pendingKey, resumed: false)
+            }
             else if l.tag == "resume-out" || l.tag == "resume-auto" {
                 let their = Role(rawValue: J.s(o, "role")) ?? .point
-                becomePaired(l, their == .server ? .point : .server, pid, pname, pplat, J.s(o, "key"), resumed: true)
+                guard let rec = record, l.udpKey != nil else { onPendingMessage(l, ["t": "reject", "reason": "auth"]); return }
+                becomePaired(l, their == .server ? .point : .server, pid, pname, pplat, rec.key, resumed: true)
             }
+        case "challenge":
+            guard l.tag == "resume-out" || l.tag == "resume-auto" else { return }
+            let peer = record?.peerId ?? ""
+            guard let rec = record, let cn = l.hsCn, let sn = PairCrypto.unhex(J.s(o, "sn")), sn.count == 16,
+                  let proof = PairCrypto.unhex(J.s(o, "proof")),
+                  PairCrypto.equal(proof, PairCrypto.proof(keyBytes(rec.key), "sf-resume-s", [cn, sn, Array(myId.utf8), Array(peer.utf8)])) else {
+                log("Неверное подтверждение ключа от второго телефона")
+                onPendingMessage(l, ["t": "reject", "reason": "auth"]); return
+            }
+            let key = keyBytes(rec.key)
+            l.hsSn = sn
+            l.udpKey = PairCrypto.udpKey(key, cn, sn)
+            l.send(["t": "auth", "proof": PairCrypto.hex(PairCrypto.proof(key, "sf-resume-c", [cn, sn, Array(myId.utf8), Array(peer.utf8)]))])
         case "reject", "busy":
             let reason = J.s(o, "reason"), t = J.s(o, "t")
             let wasAuto = l.tag == "resume-auto"
@@ -1119,6 +1197,7 @@ final class Engine {
     // ================================================================== пара
     private func becomePaired(_ l: ControlLink, _ r: Role, _ pid: String, _ pname: String, _ pplat: String, _ key: String, resumed: Bool) {
         peerCapabilities = l.peerCapabilities
+        udpKeyBox.value = l.udpKey
         serverFileToken = ""
         ui { $0.fileTransferAvailable = false }
         if soloMode {
@@ -1852,14 +1931,14 @@ final class Engine {
 
     // ================================================================== UDP
     private func onUdp(_ p: UnsafeRawBufferPointer, _ from: UdpSocket.Addr, _ now: Int64) {
-        guard let m = Wire.decode(p) else { return }
+        guard let key = udpKeyBox.value, let m = Wire.decode(p, key: key) else { return }
         let sid = sessionId
         guard sid != 0, m.session == sid else { return }
         switch m {
         case .ping(_, let t1, let seq):
             guard role == .server, phase == .paired else { return }
             pointUdpBox.value = from
-            udp?.send(Wire.pong(session: sid, t1: t1, t2: now, t3: MonoClock.nowNs(), pingSeq: seq), to: from)
+            udp?.send(Wire.pong(session: sid, t1: t1, t2: now, t3: MonoClock.nowNs(), pingSeq: seq, key: key), to: from)
         case .nack(_, let ep, let seqs):
             if role == .server { resend(epoch: ep, seqs: seqs) }
         case .pong(_, let t1, let t2, let t3, _):
@@ -1890,7 +1969,7 @@ final class Engine {
             s[i] = Int16(max(-32768, min(32767, v)))
         }
         return Wire.audio(session: sessionId, epoch: tl.epoch, seq: seq, startFrame: start, playoutNs: tl.timeOf(start),
-                          sendNs: MonoClock.nowNs(), flags: flags, samples: s)
+                          sendNs: MonoClock.nowNs(), flags: flags, samples: s, key: udpKeyBox.value ?? [])
     }
 
     private func serverSend() {
@@ -1931,17 +2010,17 @@ final class Engine {
     private func pointNet() {
         guard let addr = serverUdpBox.value else { return }
         let sid = sessionId
-        guard sid != 0 else { return }
+        guard sid != 0, let udpKey = udpKeyBox.value else { return }
         let now = MonoClock.nowNs()
         let interval: Int64 = pingBurst > 0 ? 50_000_000 : 200_000_000
         if now - lastPing >= interval {
             lastPing = now
             if pingBurst > 0 { pingBurst -= 1 }
-            udp?.send(Wire.ping(session: sid, t1: now, pingSeq: pingSeq), to: addr)
+            udp?.send(Wire.ping(session: sid, t1: now, pingSeq: pingSeq, key: udpKey), to: addr)
             pingSeq &+= 1
         }
         let nacks = rx.collectNacks(nowLocal: now)
-        if !nacks.isEmpty { udp?.send(Wire.nack(session: sid, epoch: rx.timeline.epoch, seqs: nacks), to: addr) }
+        if !nacks.isEmpty { udp?.send(Wire.nack(session: sid, epoch: rx.timeline.epoch, seqs: nacks, key: udpKey), to: addr) }
     }
 
     // ================================================================== прерывания

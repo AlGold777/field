@@ -9,6 +9,11 @@ final class ControlLink {
     var onMessage: ((ControlLink, [String: Any]) -> Void)?
     var onClosed: ((ControlLink) -> Void)?
     var tag = ""
+    /// Рукопожатие v2: ключ UDP-контура этого соединения и временные значения challenge–response.
+    var udpKey: [UInt8]?
+    var hsCn: [UInt8]?
+    var hsSn: [UInt8]?
+    var hsFirst: [String: Any]?
     // Handshake metadata belongs to this connection until Engine adopts it as the pair.
     var peerCapabilities = Set<String>()
     private(set) var lastRx = Date()

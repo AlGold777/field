@@ -13,10 +13,10 @@ class TcpAudioTest {
     @Test fun wireRoundTripsHelloAndPcmFrames() {
         val bytes = ByteArrayOutputStream()
         val out = DataOutputStream(bytes)
-        TcpAudioWire.writeHello(out, "point-id", 42)
+        TcpAudioWire.writeHello(out, "point-id", 42, ByteArray(32) { 3 })
         TcpAudioWire.writeChunk(out, TcpAudioChunk(7, "track-id", 48_000L, shortArrayOf(-32768, 0, 32767)))
         val input = DataInputStream(ByteArrayInputStream(bytes.toByteArray()))
-        assertEquals("point-id" to 42, TcpAudioWire.readHello(input))
+        assertEquals("point-id" to 42, TcpAudioWire.readHello(input, ByteArray(32) { 3 }))
         val chunk = TcpAudioWire.readChunk(input)
         assertEquals(7, chunk.epoch)
         assertEquals("track-id", chunk.trackId)

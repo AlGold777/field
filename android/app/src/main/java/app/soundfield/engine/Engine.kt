@@ -927,7 +927,7 @@ class Engine private constructor(private val app: Context) {
             socket.keepAlive = true
             socket.soTimeout = 5_000
             val input = DataInputStream(BufferedInputStream(socket.getInputStream()))
-            val (remoteId, remoteSession) = TcpAudioWire.readHello(input)
+            val (remoteId, remoteSession) = TcpAudioWire.readHello(input, udpKey ?: throw IllegalStateException("no udp key"))
             socket.soTimeout = 0
             val accepted = phase == Phase.PAIRED && role == Role.SERVER && peerId == remoteId &&
                 remoteSession == sessionId && "tcpAudio" in negotiatedCapabilities
@@ -1057,7 +1057,7 @@ class Engine private constructor(private val app: Context) {
                     "localAddress" to socket.localAddress.hostAddress, "localPort" to socket.localPort,
                     "remoteAddress" to socket.inetAddress.hostAddress, "remotePort" to socket.port, "result" to "connected"))
                 val out = DataOutputStream(BufferedOutputStream(socket.getOutputStream()))
-                TcpAudioWire.writeHello(out, myId, sessionId)
+                TcpAudioWire.writeHello(out, myId, sessionId, udpKey ?: throw IllegalStateException("no udp key"))
                 pointTcpAudioSocket = socket
                 telemetry.record("TCP_AUDIO_CONNECTED", mapOf("network" to (route?.label ?: "process_default"),
                     "networkId" to (route?.networkId ?: "unknown"), "localAddress" to socket.localAddress.hostAddress,

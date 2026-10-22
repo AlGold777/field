@@ -7,6 +7,7 @@ import Foundation
 ///  PING  (2): t1 i64 | pingSeq i32
 ///  PONG  (3): t1 i64 | t2 i64 | t3 i64 | pingSeq i32
 ///  NACK  (4): epoch i32 | n u16 | n × seq i32
+/// Версия 2: в конце каждого пакета — усечённый HMAC-SHA256 (tagBytes = 8) от всех предыдущих байт, ключ — udpKey соединения.
 struct AudioPacket {
     var session: Int32
     var epoch: Int32
@@ -41,6 +42,7 @@ enum Wire {
     static let header = 8
     static let audioHeader = header + 36
     static let maxNack = 64
+    static let tag = PairCrypto.tagBytes
 
     private struct W {
         var b: [UInt8] = []
@@ -69,35 +71,45 @@ enum Wire {
         }
     }
 
+    private static func seal(_ body: [UInt8], _ key: [UInt8]) -> [UInt8] {
+        body + PairCrypto.hmac(key, body[...]).prefix(tag)
+    }
+
     static func audio(session: Int32, epoch: Int32, seq: Int32, startFrame: Int64, playoutNs: Int64, sendNs: Int64,
-                      flags: UInt8, samples: [Int16]) -> [UInt8] {
+                      flags: UInt8, samples: [Int16], key: [UInt8]) -> [UInt8] {
         var w = W(capacity: audioHeader + samples.count * 2)
         w.head(tAudio, session)
         w.i32(epoch); w.i32(seq); w.i64(startFrame); w.i64(playoutNs); w.i64(sendNs)
         w.u16(UInt16(samples.count)); w.u8(flags); w.u8(0)
         for s in samples { w.i16(s) }
-        return w.b
+        return seal(w.b, key)
     }
 
-    static func ping(session: Int32, t1: Int64, pingSeq: Int32) -> [UInt8] {
-        var w = W(capacity: 20); w.head(tPing, session); w.i64(t1); w.i32(pingSeq); return w.b
+    static func ping(session: Int32, t1: Int64, pingSeq: Int32, key: [UInt8]) -> [UInt8] {
+        var w = W(capacity: 20); w.head(tPing, session); w.i64(t1); w.i32(pingSeq); return seal(w.b, key)
     }
 
-    static func pong(session: Int32, t1: Int64, t2: Int64, t3: Int64, pingSeq: Int32) -> [UInt8] {
-        var w = W(capacity: 36); w.head(tPong, session); w.i64(t1); w.i64(t2); w.i64(t3); w.i32(pingSeq); return w.b
+    static func pong(session: Int32, t1: Int64, t2: Int64, t3: Int64, pingSeq: Int32, key: [UInt8]) -> [UInt8] {
+        var w = W(capacity: 36); w.head(tPong, session); w.i64(t1); w.i64(t2); w.i64(t3); w.i32(pingSeq); return seal(w.b, key)
     }
 
-    static func nack(session: Int32, epoch: Int32, seqs: [Int32]) -> [UInt8] {
+    static func nack(session: Int32, epoch: Int32, seqs: [Int32], key: [UInt8]) -> [UInt8] {
         let n = min(seqs.count, maxNack)
         var w = W(capacity: header + 6 + n * 4)
         w.head(tNack, session); w.i32(epoch); w.u16(UInt16(n))
         for k in 0..<n { w.i32(seqs[k]) }
-        return w.b
+        return seal(w.b, key)
     }
 
-    /// nil — чужой или битый пакет.
-    static func decode(_ p: UnsafeRawBufferPointer) -> UdpMsg? {
-        guard p.count >= header else { return nil }
+    /// nil — чужой, битый пакет или пакет с неверным тегом.
+    static func decode(_ full: UnsafeRawBufferPointer, key: [UInt8]) -> UdpMsg? {
+        guard full.count >= header + tag, full[0] == 0x53, full[1] == 0x46, full[2] == SF.protocolVersion else { return nil }
+        let bodyCount = full.count - tag
+        let expect = PairCrypto.hmac(key, Array(full[0..<bodyCount])[...])
+        var diff: UInt8 = 0
+        for k in 0..<tag { diff |= expect[k] ^ full[bodyCount + k] }
+        guard diff == 0 else { return nil }
+        let p = UnsafeRawBufferPointer(rebasing: full[0..<bodyCount])
         var r = R(p)
         guard r.u8() == 0x53, r.u8() == 0x46, r.u8() == SF.protocolVersion else { return nil }
         let type = r.u8()
