@@ -80,6 +80,7 @@ final class Engine {
     private var record: PairRecord?
     private var reconnectTask: DispatchWorkItem?
     private var unknownRejects = 0
+    private var newLinks: [ControlLink] = []   // входящие соединения до invite/resume
     private var lastBrowseRestart = Date.distantPast
     private var manualResumeDeadline = Date.distantPast
     /// Идёт восстановление сохранённой пары (вручную или автоматически при запуске/возврате в приложение).
@@ -164,7 +165,7 @@ final class Engine {
             myId = String(format: "%08x", UInt32.random(in: 0...UInt32.max)); defaults.set(myId, forKey: "sf.id")
         }
         myName = defaults.string(forKey: "sf.name") ?? UIDevice.current.name
-        if let d = defaults.data(forKey: "sf.pair") { record = try? JSONDecoder().decode(PairRecord.self, from: d) }
+        record = Engine.loadPair(defaults)
         let url = Bundle.main.url(forResource: "test_track", withExtension: "wav")!
         let pcm = (try? Wav.decode(Data(contentsOf: url))) ?? []
         music = PcmSource(pcm: pcm, title: "Тестовый трек SoundField", artist: "Стерео-демо · L: аккорды и бас · R: мелодия")
@@ -375,7 +376,7 @@ final class Engine {
     func acceptIncoming() { q.async { self.doAccept() } }
     func rejectIncoming() { q.async { self.doReject() } }
     func resumeRemembered() { q.async { self.doManualResume() } }
-    func forgetPair() { q.async { self.record = nil; self.setAutoResume(false); self.stopAutoResume(); self.defaults.removeObject(forKey: "sf.pair"); self.ui { $0.remembered = nil } } }
+    func forgetPair() { q.async { self.record = nil; self.setAutoResume(false); self.stopAutoResume(); PairKeychain.delete(); self.defaults.removeObject(forKey: "sf.pair"); self.ui { $0.remembered = nil } } }
     func disconnect() { q.async { self.setAutoResume(false); self.goIdle(sendBye: true, reason: "Пара разорвана") } }
     func rename(_ name: String) {
         q.async {
@@ -932,8 +933,12 @@ final class Engine {
     }
 
     private func onIncoming(_ c: NWConnection) {
+        // не более 8 неавторизованных соединений одновременно (авторизация = invite/resume, тег меняется)
+        newLinks = newLinks.filter { $0.isOpen && $0.tag == "new" }
+        guard newLinks.count < 8 else { NSLog("SoundField: лимит неавторизованных соединений, лишнее закрыто"); c.cancel(); return }
         let l = newLink(c)
         l.tag = "new"
+        newLinks.append(l)
         l.start()
         later(5) { if l.tag == "new" { l.close() } }
     }
@@ -972,7 +977,12 @@ final class Engine {
     private func onFirstMessage(_ l: ControlLink, _ o: [String: Any]) {
         let pid = J.s(o, "id"), pname = J.s(o, "name", pid), pplat = J.s(o, "platform", "?")
         l.peerCapabilities = Set(o["caps"] as? [String] ?? [])
-        switch J.s(o, "t") {
+        let t = J.s(o, "t")
+        // версия протокола: поле необязательно, но если есть и не совпадает — отказ
+        if (t == "invite" || t == "resume") && o["proto"] != nil && J.i64(o, "proto") != Int64(SF.protocolVersion) {
+            l.tag = "dead"; l.sendAndClose(["t": "reject", "reason": "proto"]); return
+        }
+        switch t {
         case "invite":
             if phase == .idle { stopAutoResume() }   // новое приглашение важнее фонового восстановления
             if phase == .idle && pending == nil {
@@ -1062,7 +1072,7 @@ final class Engine {
                       : reason == "unknown" ? "Второй телефон не помнит эту пару — создайте её заново" : "Подключение отклонено")
             } else if phase == .reconnecting {
                 // пара забыта на стороне второго телефона: не повторять отказы бесконечно
-                unknownRejects = reason == "unknown" ? unknownRejects + 1 : 0
+                unknownRejects = (reason == "unknown" || reason == "proto") ? unknownRejects + 1 : 0
                 if unknownRejects >= 5 {
                     unknownRejects = 0
                     goIdle(sendBye: false, reason: "«\(peerName)» не подтверждает пару — переподключение остановлено")
@@ -1261,7 +1271,18 @@ final class Engine {
     }
 
     private func persistRecord() {
-        if let r = record, let d = try? JSONEncoder().encode(r) { defaults.set(d, forKey: "sf.pair") }
+        if let r = record, let d = try? JSONEncoder().encode(r) { PairKeychain.save(d) }
+    }
+
+    /// Пара из Keychain; запись прежнего формата из UserDefaults переносится в Keychain.
+    private static func loadPair(_ defaults: UserDefaults) -> PairRecord? {
+        var data = PairKeychain.load()
+        if data == nil, let legacy = defaults.data(forKey: "sf.pair") {
+            data = legacy
+            if PairKeychain.save(legacy) { defaults.removeObject(forKey: "sf.pair") }
+        }
+        guard let d = data else { return nil }
+        return try? JSONDecoder().decode(PairRecord.self, from: d)
     }
 
     private func saveServerParams() {
