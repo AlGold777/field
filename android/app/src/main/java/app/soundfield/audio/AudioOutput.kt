@@ -53,6 +53,8 @@ class AudioOutput(private val ctx: Context) {
     private var lastMetricsGeneration = -1L
 
     @Volatile private var thread: Thread? = null
+    /** Цикл, который stop() не дождался; start() ждёт его завершения перед новым циклом. */
+    private var retiring: Thread? = null
     private companion object {
         const val MAX_RECOVERY_ATTEMPTS = 5
     }
@@ -151,6 +153,9 @@ class AudioOutput(private val ctx: Context) {
 
     @Synchronized fun start() {
         if (isRunning) return
+        // Старый цикл, не успевший завершиться в stop(), должен полностью выйти до нового: иначе два цикла записи.
+        retiring?.join()
+        retiring = null
         failed = false
         routeSignature = currentRouteSignature()
         am.registerAudioDeviceCallback(deviceCallback, Handler(Looper.getMainLooper()))
@@ -188,6 +193,7 @@ class AudioOutput(private val ctx: Context) {
         worker.interrupt()
         // Non-blocking writes let the worker release its own track before another start.
         worker.join(1000)
+        if (worker.isAlive) retiring = worker
     }
 
     private fun active() = thread === Thread.currentThread() && !Thread.currentThread().isInterrupted
