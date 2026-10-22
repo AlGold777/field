@@ -64,9 +64,14 @@ final class ControlLink {
         })
     }
 
+    /// Отправить последнее сообщение и закрыть: после завершения отправки, запасной таймаут 1 с.
     func sendAndClose(_ o: [String: Any]) {
-        send(o)
-        queue.asyncAfter(deadline: .now() + 0.3) { [weak self] in self?.close() }
+        guard !closed, let body = try? JSONSerialization.data(withJSONObject: o) else { close(); return }
+        var len = UInt32(body.count).bigEndian
+        var frame = Data(bytes: &len, count: 4)
+        frame.append(body)
+        conn.send(content: frame, completion: .contentProcessed { [weak self] _ in self?.close() })
+        queue.asyncAfter(deadline: .now() + 1) { [weak self] in self?.close() }
     }
 
     private func readHeader() {

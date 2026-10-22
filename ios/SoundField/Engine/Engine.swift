@@ -79,6 +79,7 @@ final class Engine {
     private var lastAudioSessionResetNs: Int64 = 0
     private var record: PairRecord?
     private var reconnectTask: DispatchWorkItem?
+    private var unknownRejects = 0
     private var lastBrowseRestart = Date.distantPast
     private var manualResumeDeadline = Date.distantPast
     /// Идёт восстановление сохранённой пары (вручную или автоматически при запуске/возврате в приложение).
@@ -1056,7 +1057,14 @@ final class Engine {
                 phase = .idle; ui { $0.phase = .idle }
                 toast(t == "busy" ? "Телефон уже в другой паре"
                       : reason == "unknown" ? "Второй телефон не помнит эту пару — создайте её заново" : "Подключение отклонено")
-            } else if phase == .reconnecting { scheduleReconnect(reason == "crossed" ? 1.5 : 2) }
+            } else if phase == .reconnecting {
+                // пара забыта на стороне второго телефона: не повторять отказы бесконечно
+                unknownRejects = reason == "unknown" ? unknownRejects + 1 : 0
+                if unknownRejects >= 5 {
+                    unknownRejects = 0
+                    goIdle(sendBye: false, reason: "«\(peerName)» не подтверждает пару — переподключение остановлено")
+                } else { scheduleReconnect(reason == "crossed" ? 1.5 : 2) }
+            }
         case "cancel":
             if l.tag == "incoming" {
                 pending = nil; l.tag = "dead"; l.close()
@@ -1099,7 +1107,7 @@ final class Engine {
             soloMode = false
             ui { $0.soloMode = false }
         }
-        pendingTimeout?.cancel(); reconnectTask?.cancel()
+        pendingTimeout?.cancel(); reconnectTask?.cancel(); unknownRejects = 0
         if pending === l { pending = nil }
         if let p = pending { p.tag = "dead"; p.close(); pending = nil }
         manualResumeActive = false
@@ -1292,12 +1300,7 @@ final class Engine {
                 clock.reset(); rx.reset()
             }
             let port = UInt16(truncatingIfNeeded: J.i64(o, "udpPort"))
-            if let host = l.remoteHost, let addr = UdpSocket.resolve(host: host, port: port) {
-                serverUdpBox.value = addr
-                pingBurst = 20
-            } else {
-                NSLog("SoundField: не удалось определить адрес Server")
-            }
+            resolveServerUdp(l, port: port, attempt: 0)
         case "state": if role == .point { applyState(o) }
         case "queue": if role == .point { applyQueue(o) }
         case "timeline":
@@ -1308,6 +1311,21 @@ final class Engine {
         case "sdiag": if role == .point { let d = Diag.from(o); ui { $0.serverDiag = d } }
         case "calib": if role == .point { applyCalib(o) }
         default: break
+        }
+    }
+
+    /// Адрес UDP Server по адресу TCP-соединения; при неудаче — повтор через 2 с (до 5 раз), затем сообщение.
+    private func resolveServerUdp(_ l: ControlLink, port: UInt16, attempt: Int) {
+        if let host = l.remoteHost, let addr = UdpSocket.resolve(host: host, port: port) {
+            serverUdpBox.value = addr
+            pingBurst = 20
+            return
+        }
+        NSLog("SoundField: не удалось определить адрес Server (попытка \(attempt + 1))")
+        guard attempt < 5 else { toast("Не удалось определить адрес Server — звук не получен"); return }
+        later(2) { [weak self, weak l] in
+            guard let self, let l, self.link === l else { return }
+            self.resolveServerUdp(l, port: port, attempt: attempt + 1)
         }
     }
 
