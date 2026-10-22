@@ -75,9 +75,13 @@ object CalibrationAnalyzer {
         if (to - from < sr / 20) return null
         var argmax = from; var maxV = 0f
         for (i in from..to) if (c[i] > maxV) { maxV = c[i]; argmax = i }
-        // первый локальный максимум, превышающий 50% глобального максимума окна (а не самый сильный путь)
-        var best = argmax
-        for (i in from..to) if (c[i] >= 0.5f * maxV && c[i] >= c[i - 1] && c[i] > c[i + 1]) { best = i; break }
+        // первый индекс, где огибающая достигает 50% максимума окна; дальше — главный лепесток прямого пути
+        // (до 1 мс от начала). Лепестки несущей чирпа (±5 сэмплов, 60–90% пика) и отражения позже 1 мс не выбираются.
+        var i0 = argmax
+        for (i in from..to) if (c[i] >= 0.5f * maxV) { i0 = i; break }
+        val iEnd = minOf(to, i0 + (0.001 * sr + 0.5).toInt())
+        var best = i0
+        for (i in i0..iEnd) if (c[i] > c[best]) best = i
         val window = FloatArray(to - from + 1) { c[from + it] }
         window.sort()
         val noise = window[window.size / 2].toDouble().coerceAtLeast(1e-9)
