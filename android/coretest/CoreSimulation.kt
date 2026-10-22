@@ -212,8 +212,8 @@ fun testCorrectorFrames() {
     val a = (0 until 240).map { c.frame(it, 240) }
     check("no adjust contiguous", a.first() == 1000L && a.last() == 1239L && a.zipWithNext().all { it.second - it.first == 1L })
     // заставляем пропуск
-    repeat(30) { c.plan(c.start + 240.0 + 20, 240) }
-    check("slews toward ideal", abs(c.syncErrorMs) < 0.5, "err=%.3f".format(c.syncErrorMs))
+    repeat(30) { c.plan(c.position(0) + 240.0 + 20, 240) }
+    check("slews toward ideal", abs(c.syncErrorUs) < 500.0, "err=%.3f us".format(c.syncErrorUs))
 }
 
 fun testAudioGainLaws() {
