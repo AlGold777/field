@@ -30,6 +30,16 @@ final class AudioOutput {
     var onRouteWarning: ((String) -> Void)?
     var onRouteChanged: (() -> Void)?
     private var routeSignature: String?
+    /// Коррекция динамика (A2): по цепочке на канал (узел отдаёт неинтерливные буферы). nil-профиль — тождественно.
+    private let speakerL = SpeakerCorrector(sampleRate: SF.sampleRate, channels: 1)
+    private let speakerR = SpeakerCorrector(sampleRate: SF.sampleRate, channels: 1)
+    func setSpeakerProfile(_ profile: Profile?) {
+        speakerL.setProfile(profile, partnerKey: nil)
+        speakerR.setProfile(profile, partnerKey: nil)
+    }
+    var onBuiltInSpeaker: Bool {
+        AVAudioSession.sharedInstance().currentRoute.outputs.contains { $0.portType == .builtInSpeaker || $0.portType == .builtInReceiver }
+    }
 
     private(set) var latencyMs = 0.0
     // Счётчик пишет только реалтайм-callback (без блокировок и без self); читается на главном потоке.
@@ -121,6 +131,7 @@ final class AudioOutput {
             let src = sourceBox
             let lat = outLatencyNs
             let underrunBox = self.underrunBox
+            let speakerL = self.speakerL, speakerR = self.speakerR
             let n = AVAudioSourceNode(format: fmt) { _, ts, frameCount, abl -> OSStatus in
                 let bufs = UnsafeMutableAudioBufferListPointer(abl)
                 guard let first = bufs.first, let data = first.mData else { return noErr }
@@ -137,7 +148,9 @@ final class AudioOutput {
                     let right = second.assumingMemoryBound(to: Float.self)
                     if let r = src.value { r.renderStereo(out, right, count, present) }
                     else { out.update(repeating: 0, count: count); right.update(repeating: 0, count: count) }
-                } else if let r = src.value { r.render(out, count, present) }
+                    speakerL.process(out, frames: count)
+                    speakerR.process(right, frames: count)
+                } else if let r = src.value { r.render(out, count, present); speakerL.process(out, frames: count) }
                 else { out.update(repeating: 0, count: count) }
                 return noErr
             }

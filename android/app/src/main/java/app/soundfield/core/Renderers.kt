@@ -3,6 +3,8 @@ package app.soundfield.core
 import java.util.concurrent.atomic.AtomicLong
 import app.soundfield.dsp.LimiterStats
 import app.soundfield.dsp.PeakLimiter
+import app.soundfield.dsp.Profile
+import app.soundfield.dsp.SpeakerCorrector
 import app.soundfield.dsp.WindowedSinc
 
 /** Потолок финального true-peak лимитера устройства (A1.4): −1,0 dBTP. Сцепленный предлимитер Server — −1,5 dBTP. */
@@ -53,6 +55,12 @@ class ServerRenderer(
     private val limiter = PeakLimiter(SF.SAMPLE_RATE, 1, DEVICE_LIMITER_CEILING_DBTP)
     private val limiterStereo = PeakLimiter(SF.SAMPLE_RATE, 2, DEVICE_LIMITER_CEILING_DBTP)
     private var stereoLimiterUsed = false
+    /** Коррекция динамика (A2) стоит перед лимитером; без профиля — пустая цепочка (бит-в-бит). */
+    private val speaker = SpeakerCorrector(SF.SAMPLE_RATE, 1)
+    private val speakerStereo = SpeakerCorrector(SF.SAMPLE_RATE, 2)
+    fun setSpeakerProfile(profile: Profile?, partnerKey: String?) {
+        speaker.setProfile(profile, partnerKey); speakerStereo.setProfile(profile, partnerKey)
+    }
     /** Задержка лимитера, кадров: вычитается из времени предъявления, чтобы звук вышел в запланированный момент. */
     val limiterLatencyFrames: Int get() = limiter.latencyFrames
     val underruns = AtomicLong()
@@ -162,6 +170,7 @@ class ServerRenderer(
         rampRight.apply(stereoRight, n, gain)
         for (i in 0 until n) { samples[i * 2] = stereoLeft[i]; samples[i * 2 + 1] = stereoRight[i] }
         stereoLimiterUsed = true
+        speakerStereo.process(samples, 0, n)
         limiterStereo.process(samples, 0, n)
     }
 
@@ -171,6 +180,7 @@ class ServerRenderer(
         equalizer.processTone(out, n)
         spectrumCapture.add(out, n)
         ramp.apply(out, n, gain)
+        speaker.process(out, 0, n)
         limiter.process(out, 0, n)
     }
 }
@@ -206,6 +216,8 @@ class PointRenderer(
     private var inUnderrun = false
     private val fade = PauseFade()
     private val limiter = PeakLimiter(SF.SAMPLE_RATE, 1, DEVICE_LIMITER_CEILING_DBTP)
+    private val speaker = SpeakerCorrector(SF.SAMPLE_RATE, 1)
+    fun setSpeakerProfile(profile: Profile?, partnerKey: String?) { speaker.setProfile(profile, partnerKey) }
     val limiterLatencyFrames: Int get() = limiter.latencyFrames
     fun takeLimiterStats(): LimiterStats = limiter.takeStats()
 
@@ -247,6 +259,7 @@ class PointRenderer(
         equalizer.processTone(out, n)
         spectrumCapture.add(out, n)
         ramp.apply(out, n, p.gain)
+        speaker.process(out, 0, n)
         limiter.process(out, 0, n)
     }
 }

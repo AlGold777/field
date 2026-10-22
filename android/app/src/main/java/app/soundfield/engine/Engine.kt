@@ -38,6 +38,8 @@ import app.soundfield.diagnostics.AtomicSignalMeter
 import app.soundfield.diagnostics.TelemetryIdentifiers
 import app.soundfield.diagnostics.TelemetryText
 import app.soundfield.dsp.DSP_VERSION
+import app.soundfield.dsp.DeviceProfiles
+import app.soundfield.dsp.ProfileTable
 import app.soundfield.dsp.SpatialProfile
 import app.soundfield.dsp.SpatialProfiles
 import app.soundfield.dsp.XtcFilterDesigner
@@ -448,8 +450,28 @@ class Engine private constructor(private val app: Context) {
     private var lastRecv = 0L
     private var lastLost = 0L
 
+    private val profileTable: ProfileTable? by lazy {
+        runCatching { app.assets.open("devices.json").bufferedReader().use { DeviceProfiles.parse(it.readText()) } }.getOrNull()
+    }
+
+    /**
+     * A2.5: профиль динамика по модели телефона. Коррекция — только на встроенном динамике и только для моделей
+     * с настоящим (не generic, не synthetic) профилем; иначе пустая цепочка, звук не меняется.
+     */
+    private fun applySpeakerProfile() {
+        val table = profileTable
+        val found = table?.lookup(Build.MANUFACTURER, Build.MODEL, Build.DEVICE)?.takeIf { it.key != DeviceProfiles.GENERIC_KEY }
+        val active = if (audio.isBuiltInSpeakerRoute()) found else null
+        serverRenderer.setSpeakerProfile(active, null)
+        pointRenderer.setSpeakerProfile(active, null)
+        telemetry.record("speaker_profile", mapOf(
+            "model" to "${Build.MANUFACTURER}/${Build.MODEL}/${Build.DEVICE}", "profiles_version" to (table?.profilesVersion ?: "none"),
+            "found" to (found != null), "active" to (active != null), "key" to (active?.key ?: "")))
+    }
+
     init {
-        audio.onRouteChanged = { post { handleAudioRouteChanged() } }
+        audio.onRouteChanged = { post { applySpeakerProfile(); handleAudioRouteChanged() } }
+        applySpeakerProfile()
         telemetry.configure(context = {
             val currentRole = role
             val currentEpoch = if (currentRole == Role.SERVER) serverPlay.timeline.epoch else rx.timeline.epoch

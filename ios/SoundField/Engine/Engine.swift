@@ -200,7 +200,8 @@ final class Engine {
                 if began { self?.q.async { self?.onInterrupted("Звук прерван (звонок или другое приложение) — пара на паузе") } }
             }
             audio.onRouteWarning = { [weak self] text in self?.q.async { self?.toast(text) } }
-            audio.onRouteChanged = { [weak self] in self?.q.async { self?.handleAudioRouteChanged() } }
+            audio.onRouteChanged = { [weak self] in self?.applySpeakerProfile(); self?.q.async { self?.handleAudioRouteChanged() } }
+            applySpeakerProfile()
             let t = Thread { [weak self] in self?.tickLoop() }
             t.name = "sf-tick"; t.qualityOfService = .userInteractive; t.start()
             schedule(every: 1.0) { [weak self] in self?.heartbeat() }
@@ -449,6 +450,14 @@ final class Engine {
     func measureMicReference(_ position: Int) { cmd("levelMicReference", ["position": min(2, max(1, position))]) }
     func metronome(_ on: Bool) { cmd("metronome", ["on": on]) }
     func channelTest() { cmd("lrtest") }
+
+    /// A2.5: профиль динамика по hw.machine; только встроенный динамик и только модели с настоящим профилем.
+    private func applySpeakerProfile() {
+        let table = DeviceProfileLoader.loadBundled()
+        let found = table.lookup(hwMachine: DeviceProfileLoader.hwMachine())
+        let real = found.key == ProfileTable.genericKey ? nil : found
+        audio.setSpeakerProfile(audio.onBuiltInSpeaker ? real : nil)
+    }
 
     private func handleAudioRouteChanged() {
         if soloMode { loadSoundProfile(); rebuildPlayState(); publishState(); return }
