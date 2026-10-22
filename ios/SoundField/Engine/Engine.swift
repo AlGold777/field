@@ -1470,8 +1470,9 @@ final class Engine {
         case "play": cmdPlay()
         case "pause": cmdPause()
         case "toggle": if playBox.value.timeline.playing && mode != .calib { cmdPause() } else { cmdPlay() }
-        case "seek": seekFrame(J.i64(o, "ms") * sr / 1000)
-        case "skip": seekFrame(posFrame() + J.i64(o, "ms") * sr / 1000)
+        // ограничение до умножения: иначе переполнение Int64 на некорректном вводе (трап = падение приложения)
+        case "seek": seekFrame(min(max(0, J.i64(o, "ms")), 86_400_000) * sr / 1000)
+        case "skip": seekFrame(posFrame() + min(max(-3_600_000, J.i64(o, "ms")), 3_600_000) * sr / 1000)
         case "next": selectQueueTrack(at: navigationIndex + 1, startPlayback: true)
         case "previous": selectQueueTrack(at: navigationIndex - 1, startPlayback: true)
         case "select": selectQueueTrack(id: J.s(o, "id"))
