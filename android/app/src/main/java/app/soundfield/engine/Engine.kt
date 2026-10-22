@@ -4124,8 +4124,9 @@ class Engine private constructor(private val app: Context) {
             "play" -> cmdPlay()
             "pause" -> if (calibRunning) abortCalibration() else cmdPause()
             "toggle" -> if ((serverPlay.timeline.running || ui.value.audioBuffering) && mode != SourceMode.CALIBRATION) cmdPause() else cmdPlay()
-            "seek" -> seekFrame(o.optLong("ms") * SF.SAMPLE_RATE / 1000)
-            "skip" -> seekFrame(posFrame() + o.optLong("ms") * SF.SAMPLE_RATE / 1000)
+            // ms ограничиваются до умножения: большие значения из сети не должны переполнить Long
+            "seek" -> seekFrame(o.optLong("ms").coerceIn(0L, 86_400_000L) * SF.SAMPLE_RATE / 1000)
+            "skip" -> seekFrame(posFrame() + o.optLong("ms").coerceIn(-3_600_000L, 3_600_000L) * SF.SAMPLE_RATE / 1000)
             "next" -> selectTrack(navigationIndex() + 1, startPlayback = true)
             "previous" -> selectTrack(navigationIndex() - 1, startPlayback = true)
             "select" -> selectTrack(queue.indexOfFirst { it.id == o.optString("id") }, startPlayback = true)
