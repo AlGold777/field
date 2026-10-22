@@ -230,15 +230,19 @@ fun PlayerScreen(ui: UiState, engine: Engine, openCalibration: () -> Unit, openD
         )
         Spacer(Modifier.height(12.dp))
         val dur = ui.durationMs.coerceAtLeast(1)
+        // после отпускания держим позицию перемотки до прихода свежей позиции (или 300 мс), чтобы не было отката к старому pos
+        var seekHold by remember { mutableStateOf<Float?>(null) }
+        LaunchedEffect(seekHold) { if (seekHold != null) { delay(300); seekHold = null } }
+        LaunchedEffect(pos) { seekHold?.let { if (abs(pos - it * dur) < 500) seekHold = null } }
         Slider(
-            value = dragging ?: (pos.toFloat() / dur).coerceIn(0f, 1f),
+            value = dragging ?: seekHold ?: (pos.toFloat() / dur).coerceIn(0f, 1f),
             onValueChange = { dragging = it },
-            onValueChangeFinished = { dragging?.let { engine.seekMs((it * dur).toLong()) }; dragging = null },
+            onValueChangeFinished = { dragging?.let { engine.seekMs((it * dur).toLong()); seekHold = it }; dragging = null },
             colors = SliderDefaults.colors(thumbColor = SFColors.Accent1, activeTrackColor = SFColors.Accent1,
                 inactiveTrackColor = Color(0x1AFFFFFF)),
         )
         Row(Modifier.fillMaxWidth()) {
-            Text(fmtTime(dragging?.let { (it * dur).toLong() } ?: pos), color = SFColors.TextDim, fontSize = 12.sp)
+            Text(fmtTime((dragging ?: seekHold)?.let { (it * dur).toLong() } ?: pos), color = SFColors.TextDim, fontSize = 12.sp)
             Spacer(Modifier.weight(1f))
             Text(fmtTime(ui.durationMs), color = SFColors.TextDim, fontSize = 12.sp)
         }
