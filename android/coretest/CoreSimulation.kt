@@ -14,19 +14,22 @@ fun check(name: String, ok: Boolean, detail: String = "") {
 
 fun testWire() {
     println("[Wire]")
-    val s = ShortArray(480) { (it * 37 - 9000).toShort() }
-    val b = Wire.audio(0x1234ABCD, 7, 99, 1_234_567_890_123L, -5L, 42L, UdpMsg.FLAG_RETRANSMIT, s, 480, ByteArray(32))
-    val m = Wire.decode(b, b.size) as UdpMsg.Audio
+    val key = ByteArray(32) { it.toByte() }
+    val s = IntArray(480) { (it * 37 - 9000) * 256 } // 24 бит: код int16 * 256
+    val b = Wire.audio(0x1234ABCD, 7, 99, 1_234_567_890_123L, -5L, 42L, UdpMsg.FLAG_RETRANSMIT, s, 480, key)
+    val m = Wire.decode(b, b.size, key) as UdpMsg.Audio
     check("audio roundtrip", m.session == 0x1234ABCD && m.epoch == 7 && m.seq == 99 && m.startFrame == 1_234_567_890_123L &&
         m.playoutNs == -5L && m.sendNs == 42L && m.isRetransmit && m.samples.contentEquals(s))
-    check("audio size", b.size == 44 + 960, "${b.size}")
-    val p = Wire.decode(Wire.pong(1, 2, 3, 4, 5), 36) as UdpMsg.Pong
+    check("audio size", b.size == 44 + 480 * 3 + 8, "${b.size}")
+    val pb = Wire.pong(1, 2, 3, 4, 5, key)
+    val p = Wire.decode(pb, pb.size, key) as UdpMsg.Pong
     check("pong roundtrip", p.t1 == 2L && p.t2 == 3L && p.t3 == 4L && p.pingSeq == 5)
-    val n = Wire.decode(Wire.nack(9, 3, intArrayOf(10, 11, 12)).let { it }, 8 + 6 + 12) as UdpMsg.Nack
+    val nb = Wire.nack(9, 3, intArrayOf(10, 11, 12), key)
+    val n = Wire.decode(nb, nb.size, key) as UdpMsg.Nack
     check("nack roundtrip", n.epoch == 3 && n.seqs.contentEquals(intArrayOf(10, 11, 12)))
-    check("reject garbage", Wire.decode(ByteArray(20) { 1 }, 20) == null)
+    check("reject garbage", Wire.decode(ByteArray(20) { 1 }, 20, key) == null)
     // эталонный пакет для сверки со Swift-реализацией
-    val ref = Wire.ping(0x01020304, 0x0A0B0C0D0E0F1011L, 77)
+    val ref = Wire.ping(0x01020304, 0x0A0B0C0D0E0F1011L, 77, key)
     println("  PING hex: " + ref.joinToString("") { "%02x".format(it) })
 }
 
@@ -73,7 +76,8 @@ fun testEndToEnd(lossPct: Double, jitterMs: Double, spikePct: Double, limitP95: 
     val rnd = Random(7)
     val sr = SF.SAMPLE_RATE
     val clk = SimClocks(offsetNs = -3_210_000_000L, driftPpm = -60.0)
-    val pcm = ShortArray(sr * 2 * 50) { i -> ((i / 2) % 30000 - 15000).toShort() } // ramp: кадр → значение
+    val key = ByteArray(32) { it.toByte() }
+    val pcm = FloatArray(sr * 2 * 50) { i -> ((i / 2) % 30000 - 15000) / 32768f } // ramp: кадр → значение (float, /32768)
     val src = PcmSource(pcm, "t", "a")
     val cs = ClockSync()
     val rx = PointReceiver(cs)
@@ -105,8 +109,8 @@ fun testEndToEnd(lossPct: Double, jitterMs: Double, spikePct: Double, limitP95: 
         // Server: отправка вперёд на LEAD
         val target = tl.frameAt(serverNow + SF.LEAD_NS).toLong()
         while (nextFrame < target) {
-            val s = ShortArray(SF.PACKET_FRAMES) { pcm[((nextFrame + it) * 2).toInt()] }
-            val b = Wire.audio(session, tl.epoch, seq, nextFrame, tl.timeOf(nextFrame), serverNow, 0, s, s.size)
+            val s = IntArray(SF.PACKET_FRAMES) { (pcm[((nextFrame + it) * 2).toInt()] * Pcm24.SCALE).toInt() }
+            val b = Wire.audio(session, tl.epoch, seq, nextFrame, tl.timeOf(nextFrame), serverNow, 0, s, s.size, key)
             cache[seq] = nextFrame
             if (rnd.nextDouble() * 100 >= lossPct) toPoint.add(InFlight(serverNow + netDelay(), b))
             seq++; nextFrame += SF.PACKET_FRAMES
@@ -115,17 +119,17 @@ fun testEndToEnd(lossPct: Double, jitterMs: Double, spikePct: Double, limitP95: 
         if (serverNow >= nextPing) {
             nextPing += if (pingSeq < 20) 50_000_000L else 200_000_000L
             val t1 = clk.localFromServer(serverNow)
-            toServer.add(InFlight(serverNow + netDelay(), Wire.ping(session, t1, pingSeq++)))
+            toServer.add(InFlight(serverNow + netDelay(), Wire.ping(session, t1, pingSeq++, key)))
         }
         // доставка
         val now = serverNow
         toServer.filter { it.deliverAt <= now }.forEach { f ->
-            when (val m = Wire.decode(f.bytes, f.bytes.size)) {
-                is UdpMsg.Ping -> toPoint.add(InFlight(now + netDelay(), Wire.pong(session, m.t1, now, now + 50_000, m.pingSeq)))
+            when (val m = Wire.decode(f.bytes, f.bytes.size, key)) {
+                is UdpMsg.Ping -> toPoint.add(InFlight(now + netDelay(), Wire.pong(session, m.t1, now, now + 50_000, m.pingSeq, key)))
                 is UdpMsg.Nack -> m.seqs.forEach { sq -> cache[sq]?.let { sf ->
-                    val s = ShortArray(SF.PACKET_FRAMES) { pcm[((sf + it) * 2).toInt()] }
+                    val s = IntArray(SF.PACKET_FRAMES) { (pcm[((sf + it) * 2).toInt()] * Pcm24.SCALE).toInt() }
                     if (rnd.nextDouble() * 100 >= lossPct)
-                        toPoint.add(InFlight(now + netDelay(), Wire.audio(session, tl.epoch, sq, sf, tl.timeOf(sf), now, UdpMsg.FLAG_RETRANSMIT, s, s.size)))
+                        toPoint.add(InFlight(now + netDelay(), Wire.audio(session, tl.epoch, sq, sf, tl.timeOf(sf), now, UdpMsg.FLAG_RETRANSMIT, s, s.size, key)))
                 } }
                 else -> {}
             }
@@ -133,7 +137,7 @@ fun testEndToEnd(lossPct: Double, jitterMs: Double, spikePct: Double, limitP95: 
         toServer.removeAll { it.deliverAt <= now }
         toPoint.filter { it.deliverAt <= now }.forEach { f ->
             val local = clk.localFromServer(now)
-            when (val m = Wire.decode(f.bytes, f.bytes.size)) {
+            when (val m = Wire.decode(f.bytes, f.bytes.size, key)) {
                 is UdpMsg.Pong -> cs.addPong(m.t1, m.t2, m.t3, local)
                 is UdpMsg.Audio -> rx.onAudio(m, local)
                 else -> {}
@@ -141,7 +145,7 @@ fun testEndToEnd(lossPct: Double, jitterMs: Double, spikePct: Double, limitP95: 
         }
         toPoint.removeAll { it.deliverAt <= now }
         val nacks = rx.collectNacks(clk.localFromServer(now))
-        if (nacks.isNotEmpty()) toServer.add(InFlight(now + netDelay(), Wire.nack(session, tl.epoch, nacks)))
+        if (nacks.isNotEmpty()) toServer.add(InFlight(now + netDelay(), Wire.nack(session, tl.epoch, nacks, key)))
 
         // аудиоколбэки Point
         val local = clk.localFromServer(serverNow)
@@ -284,22 +288,25 @@ fun testWavAndSources() {
     check("level-match signals stay on their own channel", level.sample(0, Ch.R) == 0f && level.sample(activeFrames + SF.SAMPLE_RATE / 4L, Ch.R) == 0f)
 }
 
+/** Знаковое 24-бит little-endian значение (как Pcm24 в продакшен-коде). */
+private fun ByteBuffer.putInt24(at: Int, v: Int) { put(at, v.toByte()); put(at + 1, (v shr 8).toByte()); put(at + 2, (v shr 16).toByte()) }
+
 fun testSegmentedPcmSource() {
     println("[SegmentedPcmSource]")
     val dir = kotlin.io.path.createTempDirectory("sf-segments").toFile()
     try {
         val frames = SegmentedPcmSource.SEGMENT_FRAMES
-        fun segment(file: File, left: Short, right: Short) {
-            val bytes = ByteArray(frames * 4)
+        fun segment(file: File, left: Int, right: Int) {
+            val bytes = ByteArray(frames * SegmentedPcmSource.BYTES_PER_FRAME.toInt())
             ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN).apply {
-                putShort(0, left); putShort(2, right)
+                putInt24(0, left); putInt24(3, right)
             }
             file.writeBytes(bytes)
         }
 
         val source = SegmentedPcmSource(dir, "segmented", "", frames.toLong() * 2)
-        val first = File(dir, "first.pcm48").apply { segment(this, 16_384, (-16_384).toShort()) }
-        val second = File(dir, "second.pcm48").apply { segment(this, 8_192, (-8_192).toShort()) }
+        val first = File(dir, "first.pcm24").apply { segment(this, 16_384 * 256, -16_384 * 256) }
+        val second = File(dir, "second.pcm24").apply { segment(this, 8_192 * 256, -8_192 * 256) }
         source.publish(0, first, frames)
         check("first segment publishes stereo samples", source.readyFrames == frames.toLong() &&
             abs(source.sample(0, Ch.L) - 0.5f) < 0.001f && abs(source.sample(0, Ch.R) + 0.5f) < 0.001f)
