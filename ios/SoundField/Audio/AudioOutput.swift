@@ -220,6 +220,9 @@ final class AudioOutput {
         case .began:
             onInterruption?(true)
         case .ended:
+            // Флаг .shouldResume здесь не проверяется намеренно: движок запускается при любом окончании прерывания,
+            // если выход должен быть активен. Воспроизведение после прерывания само не возобновляется (пара на паузе),
+            // а остановленный движок дал бы тишину при следующем «Играть».
             if running { try? AVAudioSession.sharedInstance().setActive(true); try? engine.start() }
             onInterruption?(false)
         @unknown default: break
