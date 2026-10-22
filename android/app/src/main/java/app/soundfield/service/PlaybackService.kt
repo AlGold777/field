@@ -79,6 +79,8 @@ class PlaybackService : Service() {
             Telemetry.get(this).event("SERVICE_START_FAILED", error = e)
             running = false; stopSelf(); return START_NOT_STICKY
         }
+        // Engine.disconnect() выполняется асинхронно: если пара уже остановлена, сервис не должен остаться с уведомлением
+        if (!running) stopSelf()
         return START_NOT_STICKY
     }
 
@@ -146,7 +148,7 @@ class PlaybackService : Service() {
                 .setOngoing(true)
                 .setOnlyAlertOnce(true)
                 .setCategory(NotificationCompat.CATEGORY_TRANSPORT)
-                .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+                .setVisibility(NotificationCompat.VISIBILITY_PRIVATE)
                 .addAction(0, if (s.playing) "Пауза" else "Играть", toggle)
                 .build()
         }

@@ -123,7 +123,7 @@ class Engine private constructor(private val app: Context) {
         private const val SOLO_SERVICE_IDLE_MS = 5 * 60_000L
         @Volatile private var inst: Engine? = null
         fun get(ctx: Context): Engine = inst ?: synchronized(this) {
-            inst ?: Engine(ctx.applicationContext).also { inst = it; it.boot() }
+            inst ?: Engine(ctx.applicationContext).also { it.boot(); inst = it }
         }
         private val rnd = SecureRandom()
         private fun hex(bytes: Int) = ByteArray(bytes).also { rnd.nextBytes(it) }.joinToString("") { "%02x".format(it) }
@@ -4834,10 +4834,10 @@ class Engine private constructor(private val app: Context) {
         io.execute {
             try {
                 val rec = mic.record(8_600) {
+                    val a = System.nanoTime() + 700_000_000L
+                    anchor.set(a)   // до post: чтение якоря ниже на этом же io-потоке видит значение без гонки
                     post {
                         if (my != calibSeq) return@post
-                        val a = System.nanoTime() + 700_000_000L
-                        anchor.set(a)
                         newEpoch(true, 0, a)
                         telemetry.record("CALIBRATION_STAGE", mapOf("stage" to "signals"), op = op)
                         broadcastCalib(true, "Звучат тестовые сигналы — тишина, пожалуйста…", "", true, null)
@@ -5648,8 +5648,7 @@ class Engine private constructor(private val app: Context) {
 
     /** Прерывание на любом телефоне ставит на паузу всю пару — состояние остаётся согласованным. */
     private fun onInterrupted(reason: String) {
-        focusRequest = null
-        audioFocusHeld = false
+        abandonFocus()
         if (!ui.value.inPair) return
         if (role == Role.SERVER) { abortCalibration(); cmdPause() } else link?.send(JSONObject().put("t", "cmd").put("a", "pause"))
         toast(reason)

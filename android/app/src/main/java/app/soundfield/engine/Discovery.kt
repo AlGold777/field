@@ -46,6 +46,8 @@ class Discovery(
     @Volatile private var adPort = 0
     @Volatile private var adName = ""
     private var regAttempts = 0
+    private var lockHeld = false
+    private val retriedResolve = HashSet<String>()   // имена сервисов, резолв которых уже повторялся однажды
 
     /**
      * Публикация сервиса. Повторная публикация идёт с паузой после снятия старой: мгновенный
@@ -56,7 +58,7 @@ class Discovery(
         val had = regListener != null
         unadvertise()
         wantAdvertise = true; adPort = port; adName = name; regAttempts = 0
-        multicastLock.acquire()
+        acquireLock()
         if (had) main.postDelayed({ if (wantAdvertise && regListener == null) register() }, 700) else register()
     }
 
@@ -91,20 +93,36 @@ class Discovery(
         wantAdvertise = false
         regListener?.let { try { nsd.unregisterService(it) } catch (e: Exception) { telemetry.event("NSD_UNREGISTER_EXCEPTION", error = e) } }
         regListener = null
+        releaseLockIfIdle()
+    }
+
+    /** Multicast lock нужен, пока активны публикация или поиск; refcount отключён, поэтому держим флаг. */
+    private fun acquireLock() {
+        if (!lockHeld) { multicastLock.acquire(); lockHeld = true }
+    }
+
+    private fun releaseLockIfIdle() {
+        if (lockHeld && !wantAdvertise && discListener == null) {
+            lockHeld = false
+            try { multicastLock.release() } catch (_: Exception) {}
+        }
     }
 
     fun startBrowse() {
         wantBrowse = true
         if (discListener != null) return
-        multicastLock.acquire()
-        synchronized(lock) { peers.clear(); resolvedAt.clear(); resolveQueue.clear(); resolving = false; resolveToken++ }
+        acquireLock()
+        synchronized(lock) {
+            peers.clear(); resolvedAt.clear(); retriedResolve.clear()
+            if (!resolving) resolveQueue.clear()   // при активном резолве очередь не трогаем: иначе два резолва сразу
+        }
         publish()
         val l = object : NsdManager.DiscoveryListener {
             override fun onDiscoveryStarted(t: String) { telemetry.event("NSD_BROWSE_STARTED", t) }
             override fun onDiscoveryStopped(t: String) { telemetry.event("NSD_BROWSE_STOPPED", t) }
             override fun onStartDiscoveryFailed(t: String, e: Int) {
                 Log.w(TAG, "discovery failed $e"); telemetry.event("NSD_BROWSE_FAILED", "code=$e")
-                if (discListener === this) discListener = null
+                if (discListener === this) { discListener = null; releaseLockIfIdle() }
                 main.postDelayed({ if (wantBrowse && discListener == null) startBrowse() }, 2_000)
             }
             override fun onStopDiscoveryFailed(t: String, e: Int) { telemetry.event("NSD_STOP_FAILED", "code=$e") }
@@ -137,6 +155,7 @@ class Discovery(
         discListener = l
         try { nsd.discoverServices(SF.SERVICE_TYPE, NsdManager.PROTOCOL_DNS_SD, l) } catch (e: Exception) {
             Log.w(TAG, "discover", e); telemetry.event("NSD_BROWSE_EXCEPTION", error = e); discListener = null
+            releaseLockIfIdle()
         }
     }
 
@@ -144,6 +163,7 @@ class Discovery(
         wantBrowse = false
         discListener?.let { try { nsd.stopServiceDiscovery(it) } catch (e: Exception) { telemetry.event("NSD_STOP_EXCEPTION", error = e) } }
         discListener = null
+        releaseLockIfIdle()
     }
 
     /** Перезапуск поиска — обновляет адреса (после смены IP, выхода из сна и т. п.). */
@@ -187,10 +207,15 @@ class Discovery(
                     synchronized(lock) {
                         if (resolveToken == token) resolving = false
                         if (e == NsdManager.FAILURE_ALREADY_ACTIVE) resolveQueue.addLast(i)
+                        else if (retriedResolve.add(i.serviceName)) {
+                            // одна повторная попытка с паузой, иначе пир потеряется до следующего поиска
+                            main.postDelayed({ synchronized(lock) { resolveQueue.addLast(i) }; resolveNext() }, 1_000)
+                        } else retriedResolve.remove(i.serviceName)
                     }
                     if (e == NsdManager.FAILURE_ALREADY_ACTIVE) main.postDelayed({ resolveNext() }, 300) else resolveNext()
                 }
                 override fun onServiceResolved(i: NsdServiceInfo) {
+                    synchronized(lock) { retriedResolve.remove(i.serviceName) }
                     val attrs = i.attributes
                     fun attr(k: String) = attrs[k]?.let { String(it, Charsets.UTF_8) }
                     // id берётся из имени сервиса; TXT-запись только для сверки (TXT может подменить отправитель)
@@ -239,7 +264,10 @@ class Discovery(
         onPeers(list)
     }
 
-    fun shutdown() { stopBrowse(); unadvertise(); try { multicastLock.release() } catch (_: Exception) {} }
+    fun shutdown() {
+        stopBrowse(); unadvertise()
+        if (lockHeld) { lockHeld = false; try { multicastLock.release() } catch (_: Exception) {} }
+    }
 
     companion object { private const val TAG = "SoundField.NSD" }
 }

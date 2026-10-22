@@ -7,6 +7,7 @@ import app.soundfield.core.EqMagnet
 import app.soundfield.core.EqSettings
 import app.soundfield.core.EqPreset
 import app.soundfield.core.SpatialSettings
+import android.util.Log
 import org.json.JSONObject
 import java.net.InetAddress
 
@@ -123,7 +124,10 @@ data class PairRecord(
                     SpatialSettings.fromJson(it.optJSONObject("spatial")),
                 )
             }
-        } catch (e: Exception) { null }
+        } catch (e: Exception) {
+            Log.w("SoundField", "pair record unreadable, dropped", e)   // поведение прежнее: запись считается отсутствующей
+            null
+        }
     }
 }
 
