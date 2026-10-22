@@ -1,7 +1,7 @@
 // sflab: лаборатория метрик ядра sfdsp (ТЗ §A0.3).
 //   sflab run   [--corpus DIR] [--kotlin NAME=DIR]... [--out FILE]   метрики текущих цепочек → JSON
 //   sflab gen-signals DIR [--corpus DIR]                      входные WAV для JVM-рендера Android
-//   sflab check BASELINE CURRENT [--skip PREFIX]...           сравнение с базовой линией, код 1 при регрессии
+//   sflab check BASELINE CURRENT [--skip SUBSTR]...           сравнение с базовой линией, код 1 при регрессии
 #include <dirent.h>
 
 #include <algorithm>
@@ -148,10 +148,10 @@ int cmdCheck(int argc, char** argv) {
     int bad = 0, checked = 0, missing = 0;
     for (const auto& [key, b] : base) {
         bool skipped = false;
-        for (const auto& s : skip) if (key.compare(0, s.size(), s) == 0) skipped = true;
+        for (const auto& s : skip) if (key.find(s) != std::string::npos) skipped = true;
         if (skipped) continue;
         auto it = cur.find(key);
-        if (it == cur.end()) { if (key.find(".corpus.") != std::string::npos) continue; std::printf("MISSING  %s\n", key.c_str()); bad++; missing++; continue; }
+        if (it == cur.end()) { std::printf("MISSING  %s\n", key.c_str()); bad++; missing++; continue; }
         checked++;
         const double v = it->second.v, d = v - b.v;
         bool fail = false;

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Собирает корпус sflab: скачивает источники из manifest.json (curl), декодирует через afconvert (macOS),
-вырезает 20 с начиная с start_s и пишет 48 кГц / 16 бит / стерео WAV в tools/audio-corpus/wav/<id>.wav.
+вырезает 20 с начиная с start_s и пишет 48 кГц / 24 бит / стерео WAV в tools/audio-corpus/wav/<id>.wav.
 Источники и готовые WAV в git не хранятся (см. .gitignore); их sha256 фиксируются в manifest.json.
 Запуск: python3 tools/audio-corpus/fetch.py [--pin]   (--pin записывает sha256 и выбирает start_s по самому громкому окну)."""
 import hashlib, json, os, struct, subprocess, sys, wave, array
@@ -45,21 +45,21 @@ for item in manifest:
     if item.get('source_sha256') and item['source_sha256'] != digest:
         print('SOURCE HASH MISMATCH', item['id']); failed += 1; continue
     full = os.path.join(SRC, item['id'] + '.full.wav')
-    subprocess.run(['afconvert', '-f', 'WAVE', '-d', 'LEI16@48000', '-c', '2', src, full], check=True)
+    subprocess.run(['afconvert', '-f', 'WAVE', '-d', 'LEI24@48000', '-c', '2', src, full], check=True)
     with wave.open(full, 'rb') as w:
         rate, ch, frames = w.getframerate(), w.getnchannels(), w.getnframes()
         raw = w.readframes(frames)
-    samples = array.array('h'); samples.frombytes(raw)
-    if sys.byteorder == 'big': samples.byteswap()
     if frames < CLIP_S * rate:
         print('TOO SHORT', item['id'], frames / rate, 's'); failed += 1; continue
-    if pin: item['start_s'] = loudest_start(samples, ch, rate)
-    s0 = int(item['start_s'] * rate) * ch
-    clip = samples[s0:s0 + CLIP_S * rate * ch]
-    if sys.byteorder == 'big': clip.byteswap()
+    if pin:  # грубая оценка громкости по старшему байту 24-битных отсчётов
+        hi = array.array('b'); hi.frombytes(raw[2::3])
+        item['start_s'] = loudest_start(hi, ch, rate)
+    frame_bytes = 3 * ch
+    s0 = int(item['start_s'] * rate) * frame_bytes
+    clip = raw[s0:s0 + CLIP_S * rate * frame_bytes]
     dst = os.path.join(OUT, item['id'] + '.wav')
     with wave.open(dst, 'wb') as w:
-        w.setnchannels(ch); w.setsampwidth(2); w.setframerate(rate); w.writeframes(clip.tobytes())
+        w.setnchannels(ch); w.setsampwidth(3); w.setframerate(rate); w.writeframes(clip)
     os.remove(full)
     out_digest = sha(dst)
     if pin:

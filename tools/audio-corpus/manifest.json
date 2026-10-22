@@ -1,78 +1,83 @@
 [
   {
     "id": "bass_dubstep",
-    "title": "International Dubstep",
-    "artist": "Dj Catan",
+    "title": "Mystified- Dubstep Odyssey [treetrunk 293] — 02_Dubstep_Spinning.flac",
+    "artist": "Mystified",
     "role": "dubstep; sub-bass candidate (UNVERIFIED)",
-    "license": "CC-BY-4.0",
-    "license_url": "http://creativecommons.org/licenses/by/4.0/",
-    "item": "https://archive.org/details/ImternationalDubstep",
-    "url": "https://archive.org/download/ImternationalDubstep/Imternational%20Dubstep.MP3",
-    "format": "MP3",
-    "attribution": "\"International Dubstep\" by Dj Catan, CC BY 4.0, https://archive.org/details/ImternationalDubstep",
-    "start_s": 324.0,
-    "source_sha256": "e2444c6e6e30288d0a7328b101ddd6024eaa2ef054dcd6dd499609c87aa24a30",
-    "wav_sha256": "b39b28bb1f29680e39b4c337e9a2ebb6260b3ea36798d7981ffb4278748d38ca"
+    "license": "PD Mark 1.0",
+    "license_url": "http://creativecommons.org/publicdomain/mark/1.0/",
+    "item": "https://archive.org/details/Dubstep_Odyssey",
+    "url": "https://archive.org/download/Dubstep_Odyssey/02_Dubstep_Spinning.flac",
+    "format": "FLAC",
+    "attribution": "\"Mystified- Dubstep Odyssey [treetrunk 293]\" by Mystified, PD Mark 1.0, https://archive.org/details/Dubstep_Odyssey",
+    "start_s": 166.0,
+    "source_sha256": "89b2ccf4f240385fe8f41d46976bf6d41893972ae0a446c91228efdf80affdb4",
+    "wav_sha256": "422b30b54406c48bd244bf6983c6ec945e6d18280bf859dc6c57a77f52d11617",
+    "lossy": false
   },
   {
     "id": "bass_dub",
-    "title": "Sound Stabs - Bloody Radio (from Singles 2012)",
-    "artist": "Sound Stabs",
+    "title": "Ninjeh - Reborn — 09.06.2019 Ninjeh - Reborn.flac",
+    "artist": "Ninjeh",
     "role": "electronic / dub-style",
-    "license": "CC-BY-4.0",
-    "license_url": "http://creativecommons.org/licenses/by/4.0/",
-    "item": "https://archive.org/details/sound-stabs-singles-2012",
-    "url": "https://archive.org/download/sound-stabs-singles-2012/Sound%20Stabs%20-%20Bloody%20Radio.mp3",
-    "format": "MP3",
-    "attribution": "\"Sound Stabs - Singles from 2012\" by Sound Stabs, CC BY 4.0, https://archive.org/details/sound-stabs-singles-2012",
-    "start_s": 74.0,
-    "source_sha256": "80a278c40c6eb1c71ea8c9cdf6de564f9862341118d450c77b850c64dee75ff5",
-    "wav_sha256": "b10ac8804b504b2de715f0b15e88f3cc60385c5e5920f0ee4fc1cd472ab53f12"
+    "license": "CC0-1.0",
+    "license_url": "http://creativecommons.org/publicdomain/zero/1.0/",
+    "item": "https://archive.org/details/ninjeh-reborn",
+    "url": "https://archive.org/download/ninjeh-reborn/09.06.2019%20Ninjeh%20-%20Reborn.flac",
+    "format": "FLAC",
+    "attribution": "None required (CC0)",
+    "start_s": 160.0,
+    "source_sha256": "9c52821a06ca6d6b3eb892df64d228f9c5da5433331c327b3ce3ac47752c9ab7",
+    "wav_sha256": "1c4d401d550931e8199147b6ff1ea2b837c756cb585069e991f80fd67e19d18b",
+    "lossy": false
   },
   {
     "id": "guitar",
-    "title": "Purple Circle",
-    "artist": "Larry Evans",
+    "title": "Monplaisir - Back Of Feedlack — Monplaisir - Back of Feedlack - 02 To Lose.flac",
+    "artist": "Monplaisir",
     "role": "guitar (subject tag, UNVERIFIED)",
-    "license": "CC-BY-4.0",
-    "license_url": "http://creativecommons.org/licenses/by/4.0/",
-    "item": "https://archive.org/details/PurpleCircle",
-    "url": "https://archive.org/download/PurpleCircle/Purple%20Circle.mp3",
-    "format": "MP3",
-    "attribution": "\"Purple Circle\" by Larry Evans, CC BY 4.0, https://archive.org/details/PurpleCircle",
-    "start_s": 36.0,
-    "source_sha256": "a6a5be5667791ced1f997d96e74e0c8f7693143103f3bcffc0f618d17307de32",
-    "wav_sha256": "049635a0b7c5af2a08cc6696504a4b756f48a32a78a24d4b3fc3aa6bea29be7d"
+    "license": "CC0-1.0",
+    "license_url": "http://creativecommons.org/publicdomain/zero/1.0/",
+    "item": "https://archive.org/details/Monplaisir-BackOfFeedlack",
+    "url": "https://archive.org/download/Monplaisir-BackOfFeedlack/Monplaisir%20-%20Back%20of%20Feedlack%20-%2002%20To%20Lose.flac",
+    "format": "FLAC",
+    "attribution": "None required (CC0)",
+    "start_s": 120.0,
+    "source_sha256": "f361ed58afb29fc37654a28f290f9c6b242f9bea69048f5680be2592c360d2b4",
+    "wav_sha256": "c9cb0619962c3ea26aeeb50bb05564842ea857cff27d4c066235902d284666f0",
+    "lossy": false
   },
   {
     "id": "piano",
-    "title": "DMCMMV 01012019",
-    "artist": "Michael M. Van Damme",
+    "title": "2lovers Staccato — 2lovers_staccato.flac",
+    "artist": "Nickolas Nikolic",
     "role": "piano (subject tag, UNVERIFIED)",
-    "license": "CC-BY-4.0",
-    "license_url": "http://creativecommons.org/licenses/by/4.0/",
-    "item": "https://archive.org/details/DMCMMV01012019",
-    "url": "https://archive.org/download/DMCMMV01012019/DMCMMV01012019.mp3",
-    "format": "MP3",
-    "attribution": "\"DMCMMV 01012019\" by Michael M. Van Damme, CC BY 4.0, https://archive.org/details/DMCMMV01012019",
-    "start_s": 60.0,
-    "source_sha256": "7f40512fe3b3754d7eac28fe0f5f9cfcb47fd746652a905e8ea96fabebba797a",
-    "wav_sha256": "6f8d3bbc5127ccebdbbef5a2251e6341529b67663faeb2aadd135a1eca98394c"
+    "license": "CC0-1.0",
+    "license_url": "http://creativecommons.org/publicdomain/zero/1.0/",
+    "item": "https://archive.org/details/2-lovers-in-staccato",
+    "url": "https://archive.org/download/2-lovers-in-staccato/2lovers_staccato.flac",
+    "format": "FLAC",
+    "attribution": "None required (CC0)",
+    "start_s": 134.0,
+    "source_sha256": "d3f5b4ef95815aa59c2f7eb1efe374940c59a27f7f7a2d2bb3672a15c47ac005",
+    "wav_sha256": "e47331b3d2df4d7099fa2cc81736c0b7f3cd4eb739cf7d31e5fadf8fa7dc246b",
+    "lossy": false
   },
   {
     "id": "vocal_folk",
-    "title": "Josh Woodward - Ashes (track 11, A Thousand Skins Pt 1)",
-    "artist": "Josh Woodward",
+    "title": "Jigglewaltz Live On 2016-08-06 On the Wood Stage at Backwoods Pondfest 10 — 02.Lies.flac",
+    "artist": "Jigglewaltz",
     "role": "vocal folk/pop",
-    "license": "CC-BY-4.0",
-    "license_url": "http://creativecommons.org/licenses/by/4.0/",
-    "item": "https://archive.org/details/JoshWoodward-Ashes",
-    "url": "https://archive.org/download/JoshWoodward-Ashes/JoshWoodward-Ashes-11-AThousandSkinsPt1.mp3",
-    "format": "MP3",
-    "attribution": "\"Josh Woodward - Ashes\" by Josh Woodward, CC BY 4.0, https://archive.org/details/JoshWoodward-Ashes",
-    "start_s": 314.0,
-    "source_sha256": "07e7bd0b84ca063f346be2d292e759461f63de863807d4d9b765ea063b8e6d0e",
-    "wav_sha256": "c850f7864fc643880b234d96e0dc8c6cb1d855ee510ddad39213767b36e69a4a"
+    "license": "CC0-1.0",
+    "license_url": "http://creativecommons.org/publicdomain/zero/1.0/",
+    "item": "https://archive.org/details/Jigglewaltz2016-08-06.tc-flac16",
+    "url": "https://archive.org/download/Jigglewaltz2016-08-06.tc-flac16/02.Lies.flac",
+    "format": "FLAC",
+    "attribution": "None required (CC0)",
+    "start_s": 36.0,
+    "source_sha256": "94d76e3743aba1838aaa7714c49d8f5d8d9e40af6c6fcc4015df08401c492b9e",
+    "wav_sha256": "a3c690a4a59c5fc62f2da03d507e49dd97324bcbda7a6075121337d282ed1ca1",
+    "lossy": false
   },
   {
     "id": "harpsichord",
@@ -87,7 +92,8 @@
     "attribution": "None required (PDM); credit optional",
     "start_s": 694.0,
     "source_sha256": "ec72a2c980d9cf17210517399b58757f423c124cff079d842663a6f005c73f0d",
-    "wav_sha256": "c34bef2954c6d031fca37271d5daa8a2f9e179fa12ec0c4b2f1c85afe829a171"
+    "wav_sha256": "19f35a70e6f4c98f78ad2fd17eee2dea1f4b4043c91f00f8d0b480cf591bac88",
+    "lossy": false
   },
   {
     "id": "bells",
@@ -102,7 +108,8 @@
     "attribution": "None required (CC0)",
     "start_s": 10.0,
     "source_sha256": "e93cef5a33fc6fd62eac3873aba61b1e01cc7cfc1f8e56ce7548492702af836e",
-    "wav_sha256": "2e9998bdabbba8aedc45ef15ddcdaad000df83d96fbfbae0782e10fd14acf700"
+    "wav_sha256": "1d0096fc745a4ee50ecbe0fb12182c066ee2998206cb9189f0612747fb85c3a6",
+    "lossy": true
   },
   {
     "id": "mono_jazz_a",
@@ -117,7 +124,8 @@
     "attribution": "None required (CC0)",
     "start_s": 120.0,
     "source_sha256": "f6dbd02d07eaef5e96177b9f40cb22869ce9c08033210a6a0c0afdea2e2a8776",
-    "wav_sha256": "c459b8505b59d520b025fa8a2ceb61e8dbccf6cdb0c06c9379b8c2a9ee29acb9"
+    "wav_sha256": "4e93e0daaaf212c52f549337cbf4d07fad499070616653e2c10e0c0d6b79eabc",
+    "lossy": true
   },
   {
     "id": "mono_jazz_b",
@@ -132,7 +140,8 @@
     "attribution": "None required (CC0)",
     "start_s": 150.0,
     "source_sha256": "8bc7ca4ac17e44732012f45545247d47da6102347d2d93deabbced5b0f1e1ec1",
-    "wav_sha256": "57cc1216ce4e6df577ebc4116b033aba5a3754928358ab2bc4624b0d1e40799b"
+    "wav_sha256": "3f28677430664d27be5e4c222deddb9d15ac4d1a5bd19fde22dbc29f6f4f7cf3",
+    "lossy": true
   },
   {
     "id": "string_quartet",
@@ -147,7 +156,8 @@
     "attribution": "None required per item metadata; performer rights NOT checked",
     "start_s": 202.0,
     "source_sha256": "c1db036136ead369b88348cfec104a9a6aadd0dbec8cef45422cd57bf81880cd",
-    "wav_sha256": "92c2dc71f3852ce8d9c9c10d99d13a1b489f29c1229f912abfc40c99a46348ff"
+    "wav_sha256": "c3ec29b6313c1fa42a273e5f523ecaae31001c44f05729f3a40e52f053816d8c",
+    "lossy": true
   },
   {
     "id": "orchestra",
@@ -162,22 +172,24 @@
     "attribution": "None required (CC0)",
     "start_s": 460.0,
     "source_sha256": "fd0ea384dd702ad9316b3a2bdb1bb859a2db031c866bc00fd9ab41de9e0cf037",
-    "wav_sha256": "7f22bfce605b90d0fe2c9e272db2cb254c1a9d69eb4e4a189f78fe0b89842503"
+    "wav_sha256": "21229045583ff441465e002ae1f7db9aeef42b92a2b9f7f7bd222246bcc9c5bd",
+    "lossy": true
   },
   {
     "id": "dense_rock",
-    "title": "s65008 - Toxic Chicken - Trash On Tape (side A)",
-    "artist": "Toxic Chicken",
+    "title": "FML — FML.flac",
+    "artist": "John Hancock",
     "role": "loud rock / noise candidate (UNVERIFIED), 1903 s",
-    "license": "CC-BY-4.0",
-    "license_url": "http://creativecommons.org/licenses/by/4.0/",
-    "item": "https://archive.org/details/s65008",
-    "url": "https://archive.org/download/s65008/side%20A.mp3",
-    "format": "MP3",
-    "attribution": "\"s65008 - Toxic Chicken - Trash On Tape\" by Toxic Chicken, CC BY 4.0, https://archive.org/details/s65008",
-    "start_s": 1448.0,
-    "source_sha256": "1f4fff18012c9100dbb6a093215e90dcb82f2913580345f450947b7a158bedb8",
-    "wav_sha256": "25e98bf645e79f6c9c55e406938553deffc1990306e260a8ec6cd320319e38e9"
+    "license": "CC0-1.0",
+    "license_url": "http://creativecommons.org/publicdomain/zero/1.0/",
+    "item": "https://archive.org/details/johnclaytonhancock_gmail_FML",
+    "url": "https://archive.org/download/johnclaytonhancock_gmail_FML/FML.flac",
+    "format": "FLAC",
+    "attribution": "None required (CC0)",
+    "start_s": 32.0,
+    "source_sha256": "1f1725517504cd2c8147e7e38b91bf02e5397ea5d57e4dfa3beea967f1943c63",
+    "wav_sha256": "c7c7e00912f7a61ab0179960ac6c246417e2b0d3c5986c2791655d9d7314f3cf",
+    "lossy": false
   },
   {
     "id": "dense_metal",
@@ -192,21 +204,23 @@
     "attribution": "\"LarvaovCum - resistenza\" by tr0n, CC BY 4.0, https://archive.org/details/Larvaovcum-Resistenza",
     "start_s": 0.0,
     "source_sha256": "5438271470caa2f01fa43526f67be9f285219d9dc5a5c7a3733d5e5bb934d342",
-    "wav_sha256": "321b0815baba27debc4f5a1fb598f03517592524b6361b81fe7e9d9a11fd7562"
+    "wav_sha256": "e62194d5b2b777279728be3fc2a493d275df5560867bc5971bb9783263772ea4",
+    "lossy": true
   },
   {
     "id": "percussion",
-    "title": "Celebración",
-    "artist": "Valentín Luque",
+    "title": "Laminaire — 02-Turbine.flac",
+    "artist": "Mathias Pontevia",
     "role": "percussion (subject tag, UNVERIFIED)",
-    "license": "CC-BY-4.0",
-    "license_url": "http://creativecommons.org/licenses/by/4.0/",
-    "item": "https://archive.org/details/Celebracin",
-    "url": "https://archive.org/download/Celebracin/Celebracin.mp3",
-    "format": "MP3",
-    "attribution": "\"Celebración\" by Valentín Luque, CC BY 4.0, https://archive.org/details/Celebracin",
-    "start_s": 56.0,
-    "source_sha256": "d1d671a08bd77a479c9f4bd416e236ee81b034c7106b01ddd71f6333d96caa90",
-    "wav_sha256": "bae658c29721f3b4fb2e232abe8668352febefd3291957dd6f7cecd60d3fc15f"
+    "license": "CC0-1.0",
+    "license_url": "http://creativecommons.org/publicdomain/zero/1.0/",
+    "item": "https://archive.org/details/Laminaire",
+    "url": "https://archive.org/download/Laminaire/02-Turbine.flac",
+    "format": "FLAC",
+    "attribution": "None required (CC0)",
+    "start_s": 100.0,
+    "source_sha256": "0b68d4fdb7e701a33f46e5c3972d9d7b3a536479ff2242f1cebff673541bafc3",
+    "wav_sha256": "dd305402262cc7f87c2b5dc51f1e0d8c35e82f1c0e77ed8361c94f94c8061034",
+    "lossy": false
   }
 ]
