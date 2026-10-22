@@ -15,6 +15,7 @@ final class ControlLink {
     /// TCP-соединение установлено (для исходящих — после .ready).
     private(set) var ready = false
     private var closed = false
+    private var waitingTimer: DispatchWorkItem?
 
     init(_ conn: NWConnection, queue: DispatchQueue) {
         self.conn = conn
@@ -25,9 +26,18 @@ final class ControlLink {
         conn.stateUpdateHandler = { [weak self] st in
             guard let self else { return }
             switch st {
-            case .ready: self.ready = true
+            case .ready:
+                self.ready = true
+                self.waitingTimer?.cancel(); self.waitingTimer = nil
             case .failed, .cancelled: self.close()
-            case .waiting(let e): NSLog("SoundField link waiting: \(e)"); self.close()
+            case .waiting(let e):
+                // сеть временно недоступна: даём 8 с на восстановление, затем закрываем
+                NSLog("SoundField link waiting: \(e)")
+                if self.waitingTimer == nil {
+                    let w = DispatchWorkItem { [weak self] in self?.close() }
+                    self.waitingTimer = w
+                    self.queue.asyncAfter(deadline: .now() + 8, execute: w)
+                }
             default: break
             }
         }
@@ -82,6 +92,7 @@ final class ControlLink {
     func close() {
         guard !closed else { return }
         closed = true
+        waitingTimer?.cancel(); waitingTimer = nil
         conn.cancel()
         onClosed?(self)
     }
