@@ -173,22 +173,38 @@ object Wav {
     fun decode(bytes: ByteArray): Decoded {
         val b = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN)
         require(bytes.size > 44 && String(bytes, 0, 4) == "RIFF" && String(bytes, 8, 4) == "WAVE") { "Не WAV" }
-        var pos = 12
+        var pos = 12L
         var channels = 0; var rate = 0; var bits = 0; var fmt = 0
         var dataOff = -1; var dataLen = 0
         while (pos + 8 <= bytes.size) {
-            val id = String(bytes, pos, 4)
-            val len = b.getInt(pos + 4)
-            val body = pos + 8
+            val p = pos.toInt()
+            val id = String(bytes, p, 4)
+            val len = b.getInt(p + 4)
+            val body = p + 8
             when (id) {
-                "fmt " -> { fmt = b.getShort(body).toInt(); channels = b.getShort(body + 2).toInt()
-                            rate = b.getInt(body + 4); bits = b.getShort(body + 14).toInt() }
-                "data" -> { dataOff = body; dataLen = minOf(len, bytes.size - body) }
+                "fmt " -> {
+                    require(len >= 16 && body + 16 <= bytes.size) { "Повреждённый WAV: короткий fmt" }
+                    fmt = b.getShort(body).toInt() and 0xFFFF
+                    channels = b.getShort(body + 2).toInt() and 0xFFFF
+                    rate = b.getInt(body + 4)
+                    bits = b.getShort(body + 14).toInt() and 0xFFFF
+                    // WAVE_FORMAT_EXTENSIBLE: реальный формат — первые 2 байта GUID подформата
+                    if (fmt == 0xFFFE) {
+                        require(len >= 40 && body + 40 <= bytes.size) { "Повреждённый WAV: короткий fmt" }
+                        fmt = b.getShort(body + 24).toInt() and 0xFFFF
+                    }
+                }
+                "data" -> {
+                    // потоковые WAV иногда пишут отрицательную длину data: читаем до конца файла
+                    val avail = bytes.size - body
+                    dataOff = body; dataLen = if (len < 0 || len > avail) avail else len
+                }
+                else -> require(len >= 0) { "Повреждённый WAV: отрицательная длина чанка" }
             }
             if (dataOff >= 0 && channels > 0) break
-            pos = body + len + (len and 1)
+            pos = body.toLong() + len.toLong().coerceAtLeast(0L) + (len and 1)
         }
-        require(fmt == 1 && bits == 16 && channels in 1..2 && dataOff >= 0) { "Нужен PCM 16 бит" }
+        require(fmt == 1 && bits == 16 && channels in 1..2 && rate > 0 && dataOff >= 0) { "Нужен PCM 16 бит" }
         val frames = dataLen / (2 * channels)
         var st = ShortArray(frames * 2)
         for (f in 0 until frames) {
