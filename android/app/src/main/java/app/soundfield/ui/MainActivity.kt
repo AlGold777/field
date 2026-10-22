@@ -120,7 +120,7 @@ fun AppRoot(engine: Engine) {
     }
     // Главная страница — плеер. Экран подключения закрывается сам, когда пара создана; калибровка бывает только в паре.
     LaunchedEffect(ui.inPair) { if (ui.inPair && sub == Sub.PAIRING) sub = Sub.NONE }
-    if (!ui.inPair && sub == Sub.CALIBRATION) sub = Sub.NONE
+    LaunchedEffect(ui.inPair) { if (!ui.inPair && sub == Sub.CALIBRATION) sub = Sub.NONE }
     BackHandler(enabled = sub != Sub.NONE) {
         if (sub == Sub.STABILITY) engine.dismissStabilitySettings()
         if (sub == Sub.LAN_BLOCKED) engine.dismissLanBlockedHint()
