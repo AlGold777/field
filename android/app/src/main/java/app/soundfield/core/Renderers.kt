@@ -4,6 +4,28 @@ import java.util.concurrent.atomic.AtomicLong
 import app.soundfield.dsp.WindowedSinc
 
 /**
+ * Затухание ≈5 мс при переходе из воспроизведения в паузу без запланированного stopFrame
+ * (образец — PauseFade в ios/SoundField/Core/Renderers.swift). Без аллокаций.
+ * remember — на буфере воспроизведения до громкости; apply — на нулевом буфере паузы.
+ */
+private class PauseFade {
+    private val frames = SF.SAMPLE_RATE / 200
+    private var level = 0f
+    private var left = 0
+    fun remember(out: FloatArray, n: Int) {
+        if (n <= 0) return
+        level = out[n - 1]; left = frames
+    }
+    fun apply(out: FloatArray, n: Int) {
+        var i = 0
+        while (left > 0 && i < n) {
+            out[i] = level * left / frames
+            left--; i++
+        }
+    }
+}
+
+/**
  * Рендер на Server: канал serverCh текущего источника, по общей временной шкале.
  * Часы Server — эталон, поэтому presentLocalNs уже в «часах Server».
  */
@@ -16,6 +38,8 @@ class ServerRenderer(
     private val equalizerRight = EqualizerProcessor()
     val spectrumCapture = EqSpectrumCapture()
     private val rampRight = GainRamp()
+    private val fade = PauseFade()
+    private val fadeRight = PauseFade()
     private val stereoAnalysis = FloatArray(4_096)
     private val stereoLeft = FloatArray(4_096)
     private val stereoRight = FloatArray(4_096)
@@ -30,7 +54,7 @@ class ServerRenderer(
         val st = state()
         val tl = st.timeline
         if (!tl.playing) {
-            java.util.Arrays.fill(out, 0, n, 0f); corrector.reset(); finish(out, n, st.gain, st.equalizer); return
+            java.util.Arrays.fill(out, 0, n, 0f); corrector.reset(); finish(out, n, st.gain, st.equalizer, playing = false); return
         }
         corrector.plan(tl.frameAt(presentLocalNs) - WindowedSinc.GROUP_DELAY_FRAMES, n)
         val src = st.source
@@ -61,7 +85,7 @@ class ServerRenderer(
             inSourceUnderrun = true
         } else inSourceUnderrun = false
         positionFrame = corrector.frame(n - 1, n)
-        finish(out, n, st.gain, st.equalizer)
+        finish(out, n, st.gain, st.equalizer, playing = true)
     }
 
     override fun renderStereo(interleaved: FloatArray, n: Int, presentLocalNs: Long) {
@@ -70,7 +94,7 @@ class ServerRenderer(
         if (!tl.playing) {
             java.util.Arrays.fill(interleaved, 0, n * 2, 0f)
             corrector.reset()
-            finishStereo(interleaved, n, st.gain, st.equalizer)
+            finishStereo(interleaved, n, st.gain, st.equalizer, playing = false)
             return
         }
         corrector.plan(tl.frameAt(presentLocalNs) - WindowedSinc.GROUP_DELAY_FRAMES, n)
@@ -105,12 +129,14 @@ class ServerRenderer(
             inSourceUnderrun = true
         } else inSourceUnderrun = false
         positionFrame = corrector.frame(n - 1, n)
-        finishStereo(interleaved, n, st.gain, st.equalizer)
+        finishStereo(interleaved, n, st.gain, st.equalizer, playing = true)
     }
 
-    private fun finishStereo(samples: FloatArray, n: Int, gain: Float, config: EqConfig) {
+    private fun finishStereo(samples: FloatArray, n: Int, gain: Float, config: EqConfig, playing: Boolean) {
         equalizer.setConfig(config); equalizerRight.setConfig(config)
         for (i in 0 until n) { stereoLeft[i] = samples[i * 2]; stereoRight[i] = samples[i * 2 + 1] }
+        if (playing) { fade.remember(stereoLeft, n); fadeRight.remember(stereoRight, n) }
+        else { fade.apply(stereoLeft, n); fadeRight.apply(stereoRight, n) }
         equalizer.processTone(stereoLeft, n)
         equalizerRight.processTone(stereoRight, n)
         for (i in 0 until n) stereoAnalysis[i] = (stereoLeft[i] + stereoRight[i]) * 0.5f
@@ -122,7 +148,8 @@ class ServerRenderer(
         for (i in 0 until n) { samples[i * 2] = stereoLeft[i]; samples[i * 2 + 1] = stereoRight[i] }
     }
 
-    private fun finish(out: FloatArray, n: Int, gain: Float, config: EqConfig) {
+    private fun finish(out: FloatArray, n: Int, gain: Float, config: EqConfig, playing: Boolean) {
+        if (playing) fade.remember(out, n) else fade.apply(out, n)
         equalizer.setConfig(config)
         equalizer.processTone(out, n)
         spectrumCapture.add(out, n)
@@ -160,13 +187,14 @@ class PointRenderer(
     val underrunEvents = AtomicLong()
     @Volatile var debugSilence = false
     private var inUnderrun = false
+    private val fade = PauseFade()
     fun takeLimiterStats() = equalizer.takeLimiterStats()
 
     override fun render(out: FloatArray, n: Int, presentLocalNs: Long) {
         val tl = rx.timeline
         val p = params()
         if (!tl.playing || !clock.ready) {
-            java.util.Arrays.fill(out, 0, n, 0f); corrector.reset(); finish(out, n, p); return
+            java.util.Arrays.fill(out, 0, n, 0f); corrector.reset(); finish(out, n, p, playing = false); return
         }
         val serverNs = clock.toServer(presentLocalNs) - p.trimNs
         corrector.plan(tl.frameAt(serverNs) - WindowedSinc.GROUP_DELAY_FRAMES, n)
@@ -190,11 +218,12 @@ class PointRenderer(
             if (!inUnderrun) { underrunEvents.incrementAndGet(); inUnderrun = true }
         } else inUnderrun = false
         rx.lastRenderedFrame = corrector.frame(n - 1, n)
-        finish(out, n, p)
+        finish(out, n, p, playing = true)
         if (debugSilence) java.util.Arrays.fill(out, 0, n, 0f)
     }
 
-    private fun finish(out: FloatArray, n: Int, p: PointParams) {
+    private fun finish(out: FloatArray, n: Int, p: PointParams, playing: Boolean) {
+        if (playing) fade.remember(out, n) else fade.apply(out, n)
         equalizer.setConfig(p.equalizer)
         equalizer.processTone(out, n)
         spectrumCapture.add(out, n)
