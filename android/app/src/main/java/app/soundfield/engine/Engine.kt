@@ -298,6 +298,7 @@ class Engine private constructor(private val app: Context) {
     private var reconnectSince = 0L
     private var lastBrowseRestart = 0L
     private var manualResumeDeadline = 0L
+    private var unknownRejects = 0          // подряд отказов resume с причиной unknown (пара забыта на Server)
     /** Идёт восстановление сохранённой пары с экрана «Знакомая пара» (вручную или автоматически). */
     private var manualResumeActive = false
     private var manualResumeAuto = false
@@ -3109,7 +3110,15 @@ class Engine private constructor(private val app: Context) {
                             else -> "Подключение отклонено"
                         })
                     }
-                    phase == Phase.RECONNECTING -> scheduleReconnect(if (reason == "crossed") 1_500 else 2_000)
+                    phase == Phase.RECONNECTING -> {
+                        if (reason == "unknown") unknownRejects++ else unknownRejects = 0
+                        if (unknownRejects >= 5) {
+                            // пара забыта на стороне Server — повторы бессмысленны
+                            unknownRejects = 0
+                            setAutoResume(false)
+                            goIdle(sendBye = false, reason = "«$peerName» больше не считает этот телефон парой")
+                        } else scheduleReconnect(if (reason == "crossed") 1_500 else 2_000)
+                    }
                 }
             }
             "ringing" -> if (l.tag == "invite-out" && !inviteRinging) {
@@ -3161,6 +3170,7 @@ class Engine private constructor(private val app: Context) {
         if (manualLanBlockedPeerId == pid) manualLanBlockedPeerId = null
         pendingTimeout?.cancel(false)
         reconnectTask?.cancel(false)
+        unknownRejects = 0
         if (pending === l) pending = null
         pending?.let { it.tag = "dead"; it.close() }; pending = null
         manualResumeActive = false
