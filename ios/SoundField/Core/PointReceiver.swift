@@ -31,6 +31,10 @@ final class PointReceiver {
     private var seqInit = false   // expectedSeq уже задан (seq может быть отрицательным после переполнения Int32)
     private struct Pending { var firstSeen: Int64; var lastNack: Int64 = 0; var tries = 0 }
     private var pending: [Int32: Pending] = [:]
+    // Порядок вставки pending (аналог LinkedHashMap): самый старый — по pendingHead. Ключи, уже удалённые
+    // из pending (повтор, NACK, сброс), в массиве остаются и пропускаются; массив сжимается, когда устареет.
+    private var pendingOrder: [Int32] = []
+    private var pendingHead = 0
     private var lastTransit: Int64 = .min
 
     init(clock: ClockSync, capacityPow2: Int = 17) {
@@ -53,7 +57,7 @@ final class PointReceiver {
     func reset() {
         lock.lock(); defer { lock.unlock() }
         tlBox.value = .none
-        clearBuffer(); expectedSeq = -1; seqInit = false; pending.removeAll(); lastTransit = .min
+        clearBuffer(); expectedSeq = -1; seqInit = false; pendingClear(); lastTransit = .min
     }
 
     private func clearBuffer() {
@@ -62,11 +66,37 @@ final class PointReceiver {
         lastRenderedFrame = .min
     }
 
+    private func pendingClear() {
+        pending.removeAll()
+        pendingOrder.removeAll(keepingCapacity: true)
+        pendingHead = 0
+    }
+
+    /// Вставка с сохранением порядка. O(1) амортизированно.
+    private func pendingInsert(_ seq: Int32, firstSeen: Int64) {
+        pending[seq] = Pending(firstSeen: firstSeen)
+        pendingOrder.append(seq)
+        if pendingOrder.count - pendingHead > 2 * pending.count + 1024 {
+            pendingOrder = Array(pendingOrder[pendingHead...].filter { pending[$0] != nil })
+            pendingHead = 0
+        }
+    }
+
+    /// Удаляет самый старый живой pending. nil — очередь пуста.
+    private func pendingEvictOldest() -> Int32? {
+        while pendingHead < pendingOrder.count {
+            let key = pendingOrder[pendingHead]
+            pendingHead += 1
+            if pending.removeValue(forKey: key) != nil { return key }
+        }
+        return nil
+    }
+
     func onTimeline(_ tl: Timeline) {
         lock.lock(); defer { lock.unlock() }
         let cur = tlBox.value
         if tl.epoch < cur.epoch { return }
-        if tl.epoch > cur.epoch { clearBuffer(); expectedSeq = -1; seqInit = false; pending.removeAll(); lastTransit = .min }
+        if tl.epoch > cur.epoch { clearBuffer(); expectedSeq = -1; seqInit = false; pendingClear(); lastTransit = .min }
         tlBox.value = tl
     }
 
@@ -75,7 +105,7 @@ final class PointReceiver {
         let cur = tlBox.value
         if p.epoch < cur.epoch { stale += 1; return }
         if p.epoch > cur.epoch {
-            clearBuffer(); expectedSeq = -1; seqInit = false; pending.removeAll(); lastTransit = .min
+            clearBuffer(); expectedSeq = -1; seqInit = false; pendingClear(); lastTransit = .min
             tlBox.value = Timeline(epoch: p.epoch, playing: true, anchorFrame: p.startFrame, anchorNs: p.playoutNs)
         } else if !cur.playing { stale += 1; return }
 
@@ -97,11 +127,10 @@ final class PointReceiver {
                     var s = expectedSeq
                     while s != p.seq {
                         // очередь полна: вытесняем самый старый, потерю учитываем (как в Kotlin)
-                        if pending.count >= 512, let oldest = pending.min(by: { $0.value.firstSeen < $1.value.firstSeen }) {
-                            pending.removeValue(forKey: oldest.key)
+                        if pending.count >= 512, pendingEvictOldest() != nil {
                             lostFinal += 1
                         }
-                        pending[s] = Pending(firstSeen: arrivalLocalNs)
+                        pendingInsert(s, firstSeen: arrivalLocalNs)
                         s &+= 1
                     }
                 }

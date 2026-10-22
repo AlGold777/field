@@ -48,9 +48,13 @@ enum CalibrationAnalyzer {
         guard to - from >= sr / 20 else { return nil }
         var argmax = from; var maxV: Float = 0
         for i in from...to where c[i] > maxV { maxV = c[i]; argmax = i }
-        // первый локальный максимум, превышающий 50% глобального максимума окна (а не самый сильный путь)
-        var best = argmax
-        for i in from...to where c[i] >= 0.5 * maxV && c[i] >= c[i - 1] && c[i] > c[i + 1] { best = i; break }
+        // первый индекс, где огибающая достигает 50% максимума окна; дальше — главный лепесток прямого пути
+        // (до 1 мс от начала). Лепестки несущей чирпа (±5 сэмплов, 60–90% пика) и отражения позже 1 мс не выбираются.
+        var i0 = argmax
+        for i in from...to where c[i] >= 0.5 * maxV { i0 = i; break }
+        let iEnd = min(to, i0 + Int(0.001 * Double(sr) + 0.5))
+        var best = i0
+        for i in i0...iEnd where c[i] > c[best] { best = i }
         var window = Array(c[from...to]); window.sort()
         let noise = max(Double(window[window.count / 2]), 1e-9)
         let ratio = Double(c[best]) / noise
