@@ -2992,7 +2992,13 @@ class Engine private constructor(private val app: Context) {
     private fun onFirstMessage(l: ControlLink, o: JSONObject) {
         incomingLinks.remove(l)
         val pid = o.optString("id"); val pname = o.optString("name", pid); val pplat = o.optString("platform", "?")
-        when (o.optString("t")) {
+        // несовпадение версии протокола: поле proto есть, но значение другое (отсутствие поля не ошибка)
+        val t = o.optString("t")
+        if ((t == "invite" || t == "resume") && o.has("proto") && o.optInt("proto") != SF.PROTOCOL_VERSION) {
+            l.tag = "dead"; l.sendAndClose(JSONObject().put("t", "reject").put("reason", "proto"))
+            return
+        }
+        when (t) {
             "invite" -> {
                 val advertised = parsePeerAddresses(o)
                 if (phase == Phase.IDLE) stopAutoResume()   // новое приглашение важнее фонового восстановления

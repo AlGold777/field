@@ -193,7 +193,16 @@ class Discovery(
                 override fun onServiceResolved(i: NsdServiceInfo) {
                     val attrs = i.attributes
                     fun attr(k: String) = attrs[k]?.let { String(it, Charsets.UTF_8) }
-                    val id = attr("id") ?: i.serviceName.removePrefix(SF.SERVICE_PREFIX)
+                    // id берётся из имени сервиса; TXT-запись только для сверки (TXT может подменить отправитель)
+                    val id = i.serviceName.removePrefix(SF.SERVICE_PREFIX)
+                    val txtId = attr("id")
+                    if (txtId != null && txtId != id) {
+                        Log.w(TAG, "peer ${i.serviceName} ignored: TXT id does not match service name")
+                        telemetry.event("NSD_ID_MISMATCH", i.serviceName)
+                        synchronized(lock) { if (resolveToken == token) resolving = false }
+                        resolveNext()
+                        return
+                    }
                     // Keep every mDNS address; the engine orders candidates and matches each against
                     // available local Wi-Fi networks. Link-local IPv6 is omitted because NSD's
                     // InetAddress value does not retain the interface scope needed by Socket.connect.
