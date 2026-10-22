@@ -46,6 +46,13 @@ for sub in DSP_SUBDIRS:
     if os.path.isdir(os.path.join(DSP, sub)):
         dsp_root.append((sub, 'group'))
 groups['dsp'] = ('dsp', '../dsp', dsp_root)
+
+# profiles: единый источник данных профилей устройств (A2), кладётся в бандл как ресурс
+PROFILES_DIR = os.path.normpath(os.path.join(ROOT, '..', 'profiles'))
+PROFILES_FILES = ('devices.json',)
+if all(os.path.isfile(os.path.join(PROFILES_DIR, f)) for f in PROFILES_FILES):
+    groups['profiles'] = ('profiles', '../profiles', [(f, 'json') for f in PROFILES_FILES])
+    resources += [os.path.join('profiles', f) for f in PROFILES_FILES]
 for sub in DSP_SUBDIRS:
     full_dir = os.path.join(DSP, sub)
     if not os.path.isdir(full_dir):
@@ -63,7 +70,8 @@ for sub in DSP_SUBDIRS:
     groups['dsp/' + sub] = (sub, sub, entries)
 
 ftype = {'swift': 'sourcecode.swift', 'assets': 'folder.assetcatalog', 'wav': 'audio.wav', 'plist': 'text.plist.xml',
-         'header': 'sourcecode.c.h', 'cpp': 'sourcecode.cpp.cpp', 'cpph': 'sourcecode.cpp.h', 'cheader': 'sourcecode.c.h'}
+         'header': 'sourcecode.c.h', 'cpp': 'sourcecode.cpp.cpp', 'cpph': 'sourcecode.cpp.h', 'cheader': 'sourcecode.c.h',
+         'json': 'text.json'}
 L = []
 w = L.append
 w('// !$*UTF8*$!\n{\n\tarchiveVersion = 1;\n\tclasses = {\n\t};\n\tobjectVersion = 56;\n\tobjects = {\n')
@@ -91,7 +99,7 @@ w(f'\t\t{oid("fw")} /* Frameworks */ = {{isa = PBXFrameworksBuildPhase; buildAct
 w('/* End PBXFrameworksBuildPhase section */\n')
 
 w('\n/* Begin PBXGroup section */\n')
-w(f'\t\t{oid("maingroup")} = {{isa = PBXGroup; children = ({oid("g..")} /* SoundField */, {oid("g.dsp")} /* dsp */, {oid("products")} /* Products */, ); sourceTree = "<group>"; }};\n')
+w(f'\t\t{oid("maingroup")} = {{isa = PBXGroup; children = ({oid("g..")} /* SoundField */, {oid("g.dsp")} /* dsp */, {oid("g.profiles") + " /* profiles */, " if "profiles" in groups else ""}{oid("products")} /* Products */, ); sourceTree = "<group>"; }};\n')
 w(f'\t\t{oid("products")} /* Products */ = {{isa = PBXGroup; children = ({oid("product")} /* SoundField.app */, ); name = Products; sourceTree = "<group>"; }};\n')
 for rel, (name, path_attr, entries) in groups.items():
     kids = []
