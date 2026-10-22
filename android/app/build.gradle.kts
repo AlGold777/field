@@ -7,13 +7,21 @@ plugins {
 android {
     namespace = "app.soundfield"
     compileSdk = 35
+    ndkVersion = "27.3.13750724"
 
     defaultConfig {
         applicationId = "app.soundfield"
         minSdk = 26
         targetSdk = 35
-        versionCode = 68
-        versionName = "1.10.30"
+        versionCode = 69
+        versionName = "1.10.31"
+        ndk { abiFilters += "arm64-v8a" }
+    }
+    externalNativeBuild {
+        cmake {
+            path = file("../../dsp/CMakeLists.txt")
+            version = "3.22.1"
+        }
     }
 
     buildTypes {
@@ -33,6 +41,33 @@ android {
         buildConfig = true
     }
     androidResources { noCompress += "wav" }
+}
+
+// Хост-сборка ядра (libsfdsp.dylib с JNI) для JUnit на JVM: тесты загружают её через System.load.
+val buildHostDsp = tasks.register<Exec>("buildHostDsp") {
+    group = "verification"
+    description = "Builds the host (macOS) sfdsp library, sflab and dsp_tests with clang++."
+    val repo = rootProject.projectDir.parentFile
+    workingDir = repo
+    commandLine("sh", "tools/build_dsp.sh")
+    inputs.dir(File(repo, "dsp/src")); inputs.dir(File(repo, "dsp/include")); inputs.dir(File(repo, "dsp/jni"))
+    inputs.file(File(repo, "tools/build_dsp.sh"))
+    outputs.dir(File(repo, "dsp/build/host"))
+    isIgnoreExitValue = true  // нет clang++/JDK-заголовков — тесты ядра пропускаются (Assume)
+}
+
+tasks.withType<Test>().configureEach {
+    dependsOn(buildHostDsp)
+    systemProperty("sfdsp.host.lib", File(rootProject.projectDir.parentFile, "dsp/build/host/libsfdsp.dylib").absolutePath)
+}
+
+tasks.register<JavaExec>("labRender") {
+    group = "verification"
+    description = "Renders sflab input WAVs through the app's Kotlin render path (ServerRenderer). Args: -PlabIn=DIR -PlabOut=DIR"
+    dependsOn("compileDebugKotlin")
+    classpath = files(layout.buildDirectory.dir("tmp/kotlin-classes/debug")) + configurations.getByName("debugRuntimeClasspath")
+    mainClass.set("app.soundfield.tools.LabRenderMain")
+    args(providers.gradleProperty("labIn").getOrElse(""), providers.gradleProperty("labOut").getOrElse(""))
 }
 
 tasks.register<JavaExec>("spatialRender") {

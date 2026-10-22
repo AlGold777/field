@@ -1,0 +1,69 @@
+{
+	"configurations" : 
+	[
+		{
+			"directories" : 
+			[
+				{
+					"build" : ".",
+					"jsonFile" : "directory-.-Debug-f5ebdc15457944623624.json",
+					"minimumCMakeVersion" : 
+					{
+						"string" : "3.6.0"
+					},
+					"projectIndex" : 0,
+					"source" : ".",
+					"targetIndexes" : 
+					[
+						0,
+						1
+					]
+				}
+			],
+			"name" : "Debug",
+			"projects" : 
+			[
+				{
+					"directoryIndexes" : 
+					[
+						0
+					],
+					"name" : "sfdsp",
+					"targetIndexes" : 
+					[
+						0,
+						1
+					]
+				}
+			],
+			"targets" : 
+			[
+				{
+					"directoryIndex" : 0,
+					"id" : "sfdsp::@6890427a1f51a3e7e1df",
+					"jsonFile" : "target-sfdsp-Debug-c842b7a564dd492c9db4.json",
+					"name" : "sfdsp",
+					"projectIndex" : 0
+				},
+				{
+					"directoryIndex" : 0,
+					"id" : "sfdsp_core::@6890427a1f51a3e7e1df",
+					"jsonFile" : "target-sfdsp_core-Debug-4199d2d799eabdd534b9.json",
+					"name" : "sfdsp_core",
+					"projectIndex" : 0
+				}
+			]
+		}
+	],
+	"kind" : "codemodel",
+	"paths" : 
+	{
+		"build" : "/Users/restart/Downloads/SoundField/.claude/worktrees/gifted-sanderson-6367df/android/app/.cxx/Debug/86p6i2a2/arm64-v8a",
+		"source" : "/Users/restart/Downloads/SoundField/.claude/worktrees/gifted-sanderson-6367df/dsp"
+	},
+	"version" : 
+	{
+		"major" : 2,
+		"minor" : 3
+	}
+}

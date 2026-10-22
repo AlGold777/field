@@ -1,0 +1,17 @@
+[
+{
+  "directory": "/Users/restart/Downloads/SoundField/.claude/worktrees/gifted-sanderson-6367df/android/app/.cxx/Debug/86p6i2a2/arm64-v8a",
+  "command": "/Users/restart/Library/Android/sdk/ndk/27.3.13750724/toolchains/llvm/prebuilt/darwin-x86_64/bin/clang++ --target=aarch64-none-linux-android26 --sysroot=/Users/restart/Library/Android/sdk/ndk/27.3.13750724/toolchains/llvm/prebuilt/darwin-x86_64/sysroot -I/Users/restart/Downloads/SoundField/.claude/worktrees/gifted-sanderson-6367df/dsp/include -g -DANDROID -fdata-sections -ffunction-sections -funwind-tables -fstack-protector-strong -no-canonical-prefixes -D_FORTIFY_SOURCE=2 -Wformat -Werror=format-security   -fno-limit-debug-info  -fPIC -ffp-contract=off -fno-fast-math -Wall -Wextra -Wno-unused-parameter -std=gnu++20 -o CMakeFiles/sfdsp_core.dir/src/sinc.cpp.o -c /Users/restart/Downloads/SoundField/.claude/worktrees/gifted-sanderson-6367df/dsp/src/sinc.cpp",
+  "file": "/Users/restart/Downloads/SoundField/.claude/worktrees/gifted-sanderson-6367df/dsp/src/sinc.cpp"
+},
+{
+  "directory": "/Users/restart/Downloads/SoundField/.claude/worktrees/gifted-sanderson-6367df/android/app/.cxx/Debug/86p6i2a2/arm64-v8a",
+  "command": "/Users/restart/Library/Android/sdk/ndk/27.3.13750724/toolchains/llvm/prebuilt/darwin-x86_64/bin/clang++ --target=aarch64-none-linux-android26 --sysroot=/Users/restart/Library/Android/sdk/ndk/27.3.13750724/toolchains/llvm/prebuilt/darwin-x86_64/sysroot -I/Users/restart/Downloads/SoundField/.claude/worktrees/gifted-sanderson-6367df/dsp/include -g -DANDROID -fdata-sections -ffunction-sections -funwind-tables -fstack-protector-strong -no-canonical-prefixes -D_FORTIFY_SOURCE=2 -Wformat -Werror=format-security   -fno-limit-debug-info  -fPIC -ffp-contract=off -fno-fast-math -Wall -Wextra -Wno-unused-parameter -std=gnu++20 -o CMakeFiles/sfdsp_core.dir/src/playout.cpp.o -c /Users/restart/Downloads/SoundField/.claude/worktrees/gifted-sanderson-6367df/dsp/src/playout.cpp",
+  "file": "/Users/restart/Downloads/SoundField/.claude/worktrees/gifted-sanderson-6367df/dsp/src/playout.cpp"
+},
+{
+  "directory": "/Users/restart/Downloads/SoundField/.claude/worktrees/gifted-sanderson-6367df/android/app/.cxx/Debug/86p6i2a2/arm64-v8a",
+  "command": "/Users/restart/Library/Android/sdk/ndk/27.3.13750724/toolchains/llvm/prebuilt/darwin-x86_64/bin/clang++ --target=aarch64-none-linux-android26 --sysroot=/Users/restart/Library/Android/sdk/ndk/27.3.13750724/toolchains/llvm/prebuilt/darwin-x86_64/sysroot -Dsfdsp_EXPORTS -I/Users/restart/Downloads/SoundField/.claude/worktrees/gifted-sanderson-6367df/dsp/include -g -DANDROID -fdata-sections -ffunction-sections -funwind-tables -fstack-protector-strong -no-canonical-prefixes -D_FORTIFY_SOURCE=2 -Wformat -Werror=format-security   -fno-limit-debug-info  -fPIC -fvisibility=hidden -ffp-contract=off -fno-fast-math -Wall -Wextra -Wno-unused-parameter -std=gnu++20 -o CMakeFiles/sfdsp.dir/jni/sfdsp_jni.cpp.o -c /Users/restart/Downloads/SoundField/.claude/worktrees/gifted-sanderson-6367df/dsp/jni/sfdsp_jni.cpp",
+  "file": "/Users/restart/Downloads/SoundField/.claude/worktrees/gifted-sanderson-6367df/dsp/jni/sfdsp_jni.cpp"
+}
+]

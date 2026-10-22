@@ -1,0 +1,6 @@
+# ninja log v5
+0	91	1792675703709138283	CMakeFiles/sfdsp.dir/jni/sfdsp_jni.cpp.o	dfa3a3f5f5753e28
+0	533	1792675704151022639	CMakeFiles/sfdsp_core.dir/src/playout.cpp.o	f3cf4ac2ae39020f
+0	852	1792675704465463110	CMakeFiles/sfdsp_core.dir/src/sinc.cpp.o	60014d962721561a
+852	926	1792675704546625000	libsfdsp_core.a	6d958051f404dca5
+926	984	1792675704601822076	/Users/restart/Downloads/SoundField/.claude/worktrees/gifted-sanderson-6367df/android/app/build/intermediates/cxx/Debug/86p6i2a2/obj/arm64-v8a/libsfdsp.so	b5522afdcbaa8e5c

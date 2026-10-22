@@ -1,0 +1,44 @@
+{
+  "buildFiles": [
+    "/Users/restart/Downloads/SoundField/.claude/worktrees/gifted-sanderson-6367df/dsp/CMakeLists.txt"
+  ],
+  "cleanCommandsComponents": [
+    [
+      "/Users/restart/Library/Android/sdk/cmake/3.22.1/bin/ninja",
+      "-C",
+      "/Users/restart/Downloads/SoundField/.claude/worktrees/gifted-sanderson-6367df/android/app/.cxx/Debug/86p6i2a2/arm64-v8a",
+      "clean"
+    ]
+  ],
+  "buildTargetsCommandComponents": [
+    "/Users/restart/Library/Android/sdk/cmake/3.22.1/bin/ninja",
+    "-C",
+    "/Users/restart/Downloads/SoundField/.claude/worktrees/gifted-sanderson-6367df/android/app/.cxx/Debug/86p6i2a2/arm64-v8a",
+    "{LIST_OF_TARGETS_TO_BUILD}"
+  ],
+  "libraries": {
+    "sfdsp::@6890427a1f51a3e7e1df": {
+      "toolchain": "toolchain",
+      "abi": "arm64-v8a",
+      "artifactName": "sfdsp",
+      "output": "/Users/restart/Downloads/SoundField/.claude/worktrees/gifted-sanderson-6367df/android/app/build/intermediates/cxx/Debug/86p6i2a2/obj/arm64-v8a/libsfdsp.so",
+      "runtimeFiles": []
+    },
+    "sfdsp_core::@6890427a1f51a3e7e1df": {
+      "toolchain": "toolchain",
+      "abi": "arm64-v8a",
+      "artifactName": "sfdsp_core",
+      "output": "/Users/restart/Downloads/SoundField/.claude/worktrees/gifted-sanderson-6367df/android/app/.cxx/Debug/86p6i2a2/arm64-v8a/libsfdsp_core.a"
+    }
+  },
+  "toolchains": {
+    "toolchain": {
+      "cCompilerExecutable": "/Users/restart/Library/Android/sdk/ndk/27.3.13750724/toolchains/llvm/prebuilt/darwin-x86_64/bin/clang.lld",
+      "cppCompilerExecutable": "/Users/restart/Library/Android/sdk/ndk/27.3.13750724/toolchains/llvm/prebuilt/darwin-x86_64/bin/clang++.lld"
+    }
+  },
+  "cFileExtensions": [],
+  "cppFileExtensions": [
+    "cpp"
+  ]
+}

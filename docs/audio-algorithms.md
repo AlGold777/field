@@ -459,6 +459,7 @@ FFT является вычислительным инструментом дл�
 | Android тесты аудио | `android/app/src/test/java/app/soundfield/core/AudioGainTest.kt`, `PacketizingTest.kt`, `SpatialSourceTest.kt`, `EqualizerTest.kt`, `PlayoutCorrectorTest.kt`; `.../dsp/SpatialInvariantsTest.kt`, `SpatialProcessorTest.kt`, `XtcTest.kt` |
 | Android data/configuration | `android/app/src/main/assets/spatial_profiles.json`, `device_speakers.json`; DSP version — `android/app/src/main/java/app/soundfield/dsp/DspVersion.kt` |
 | iOS decoder/output | `ios/SoundField/Core/Sources.swift`, `ios/SoundField/Core/Renderers.swift`, `ios/SoundField/Core/Playout.swift`, `ios/SoundField/Core/AudioGain.swift`, `ios/SoundField/Audio/AudioOutput.swift`, `ios/SoundField/Audio/MicRecorder.swift` |
+| DSP-ядро и лаборатория (A0) | `dsp/include/sfdsp.h`, `dsp/src/*`, `dsp/jni/sfdsp_jni.cpp`, `dsp/lab/*`, `dsp/tests/test_main.cpp`, `dsp/lab/baseline.json`; `tools/build_dsp.sh`, `tools/dsp_check.sh`; Android `dsp/SfDsp.kt`, `tools/LabRenderMain.kt`; iOS `Core/SfDsp.swift`, `SoundField-Bridging-Header.h` |
 | iOS clock/diagnostics | `ios/SoundField/Core/ClockSync.swift`, `Calibration.swift`, `LevelAnalyzer.swift`, `PointReceiver.swift`, `Wire.swift` |
 
 ## 12. Ограничения интерпретации
@@ -469,3 +470,54 @@ FFT является вычислительным инструментом дл�
 4. EQ и spatial algorithms в данном снимке находятся на Android. Наличие UI/алгоритма на Android не означает, что такая же обработка включена на iPhone или в смешанной паре Android↔iOS.
 5. Числа `LevelAnalyzer` и синхронизационных проб являются диагностическими оценками, зависят от микрофона/его системной обработки и не равны калиброванному SPL или лабораторной проверке.
 6. Этот файл фиксирует работу исходников версии, указанной в заголовке. При изменении кода связанных модулей документ нужно пересмотреть вместе с функциональной документацией.
+
+## 13. Общее DSP-ядро `sfdsp` и лаборатория `sflab` (программа A, этап A0)
+
+Спецификация программы — `docs/tz-audiophile-2026.md`. Этап A0 **не меняет звук**: добавляет инфраструктуру и базовую линию.
+
+### 13.1 Ядро `dsp/`
+
+C++20, C ABI (`dsp/include/sfdsp.h`, версия `SFDSP_VERSION` в `sfdsp_version.h`, сейчас 0.1.0, ABI 1). Правила аудиопотока: без аллокаций и блокировок в `render`, FTZ/DAZ на время вызова (`dsp/src/rt.hpp`), арифметика без FMA-слияния.
+
+Перенесено из Kotlin без изменения арифметики:
+
+- `sf_sinc_*` — `WindowedSinc`: 32 отвода, 256 фаз, окно Кайзера β = 8,6, коэффициенты считаются в double, хранятся float; фаза округляется до ближайшей из 256 (без интерполяции между фазами); отсутствующий кадр → NaN; групповая задержка 16 кадров (`SF_SINC_GROUP_DELAY_FRAMES`).
+- `sf_playout_*` — `PlayoutCorrector`: PI-регулятор дробной фазы (Kp = 2/3 с⁻¹, Ki = 1/9 с⁻², фильтр ошибки 0,1/блок, ограничение ±200 ppm, жёсткий прыжок > 960 кадров).
+
+Kotlin пока использует собственные реализации; ядро подключено как `app.soundfield.dsp.SfDsp` / `NativePlayout` и покрыто сверкой `SfDspNativeTest` (коэффициенты, интерполяция, позиции корректора, отрисованные блоки; порог ≤ −120 dB), на iOS — `SfDsp.swift` через bridging header. Подключение к звуку — этап A4.1.
+
+Сборка: Android — CMake/NDK r27 (`android/README-native.md`), iOS — `ios/project.yml` + `tools/gen_xcodeproj.py`, проверка типов и синтаксиса C++ — `tools/ios_typecheck.sh`, хост — `tools/build_dsp.sh`.
+
+### 13.2 Лаборатория `sflab`
+
+`sh tools/dsp_check.sh` собирает ядро на Mac, запускает `dsp_tests` и `sflab`, сравнивает метрики с `dsp/lab/baseline.json` (допуски записаны в самой базовой линии; регрессия — код возврата 1). `--android` добавляет настоящий Kotlin-тракт, `--update` перезаписывает базовую линию.
+
+Метрики: THD+N (окно Кайзера β = 26, режекция ±12 бин, полоса 20 Гц–20 кГц), H2–H5, шумовая полка, ESS (метод Фарины, 20 Гц–23,5 кГц, 6 с; АЧХ/ГВЗ относительно самого свипа, гармоники H2/H3 на 1 кГц), IMD SMPTE (60 Гц + 7 кГц, 4:1) и CCIF (19 + 20 кГц), null-тест с поиском целого лага, true-peak 4× (128 отводов — точнее 48-отводного фильтра BS.1770 Annex 2), интегральная громкость BS.1770-4 (K-взвешивание, гейты −70 LUFS / −10 LU; проверка калибровкой 997 Гц), симуляция синхронизации двух корректоров (дрейф ±ppm, гауссов шум оценки момента вывода, выбросы, скачок модели). Корпус — `tools/audio-corpus` (14 фрагментов по 20 с, CC0/PD/CC-BY, `LICENSES.md`, получение `python3 tools/audio-corpus/fetch.py`).
+
+### 13.3 Базовая линия (A0, ядро 0.1.0, Android 1.10.31 / iOS 1.3.13)
+
+Цепочки: `playout_int` — корректор на целой позиции (эквивалент iOS сегодня, побитово тождествен входу); `playout_frac05` — постоянное смещение 0,5 кадра (худшая фаза sinc); `playout_drift50` — ядро с дрейфом 50 ppm; `android_kotlin_float` — настоящий `ServerRenderer` (корректор, нейтральный EQ, усиление 1, лимитер) с float-источником; `android_kotlin_pcm16` — он же с кэшем PCM16, как в приложении. Все значения — dB, если не указано иное.
+
+| Метрика | playout_int | playout_frac05 | playout_drift50 | android float | android PCM16 |
+|---|---|---|---|---|---|
+| THD+N 1 кГц, −1 dBFS | −159,2 | −142,7 | −76,7 | −159,2 | **−96,1** |
+| THD+N 1 кГц, −20 dBFS | −155,0 | −139,2 | −76,7 | −155,0 | **−80,9** |
+| THD+N 1 кГц, −60 dBFS | −154,1 | −140,3 | −76,7 | −154,1 | **−41,9** |
+| THD+N 20 кГц, −6 dBFS | −151,8 | −142,3 | **−53,5** | −151,8 | −91,0 |
+| Null на широкополосном шуме | −200 | не применим | не применим | −200 | −84,3 |
+| Шумовая полка (тишина), dBFS | −200 | −200 | −200 | −200 | −200 |
+| АЧХ 20 Гц–20 кГц, макс. откл. | 0,00 | 0,00 | — | 0,00 | 0,00 |
+| Разброс ГВЗ 100 Гц–16 кГц, мкс | 0,0 | 0,9 | — | 0,0 | 0,1 |
+| H2 на 1 кГц (ESS) | −167,9 | −160,3 | — | −167,9 | −118,4 |
+| IMD SMPTE / CCIF | −157 / −156 | −153 / −143 | −96 / −85 | −157 / −156 | −105 / −102 |
+| Задержка цепочки, кадров | 16 | 16 | 16 | 64 | 64 |
+
+Выводы для следующих этапов:
+
+1. Float-тракт Android прозрачен (null −200 dB, побитово совпадает с ядром). Узкое место точности звука — **кэш PCM16** (THD+N −96 / −81 / −42 dB на −1 / −20 / −60 dBFS при цели ≤ −110) — устраняется в A1.1.
+2. **Дробный корректор при дрейфе**: THD+N −77 dB на 1 кГц и −53 dB на 20 кГц (цель A4.1 ≤ −110): причина — округление фазы до 1/256 кадра (скачки времени ≈ 2 мкс). Постоянное смещение безвредно (−140 dB); шум создаёт именно движущаяся фаза. Решение A4.1 — интерполяция между соседними фазами или поли-фазная таблица с 2-й разностью.
+3. Задержка Android-цепочки 64 кадра = 16 (sinc) + 48 (lookahead лимитера EQ, 1 мс): это единственная компенсируемая в A1.4 величина.
+4. Лимитер EQ — sample-peak; корпус содержит клипованные мастеринги (true-peak до +0,6 dBTP, сэмпл-пик 0 dBFS, до −2,6 LUFS у `dense_rock`) — материал для A1.4/A3.1.
+5. Синхронизация L/R в цифровом домене (корректор, ±100 ppm): p95 / макс., мкс — шум оценки σ = 20 мкс: 3,4 / 5,8; σ = 100 мкс: 17,1 / 29,0; σ = 50 мкс без дрейфа: 8,6 / 14,5; σ = 50 мкс + 1% выбросов 3 мс: 40,9 / 64,6; скачок модели 100 мкс: 13,1 / 102. Цифровой бюджет A4 (p95 ≤ 10 мкс) достижим только если ошибка оценки момента вывода σ ≲ 40 мкс.
+
+Не измерено в A0 (нет телефона/микрофона): расход JNI на блок (бюджет ≤ 2%), CPU на Redmi 14C, акустические метрики — выполняются на этапах A2/A4.

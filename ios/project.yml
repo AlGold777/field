@@ -11,6 +11,10 @@ targets:
     sources:
       - path: SoundField
         excludes: ["Info.plist"]
+      - path: ../dsp/src
+        type: group
+      - path: ../dsp/include
+        type: group
     info:
       path: SoundField/Info.plist
     settings:
@@ -18,10 +22,15 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: app.soundfield
         INFOPLIST_FILE: SoundField/Info.plist
         GENERATE_INFOPLIST_FILE: NO
-        MARKETING_VERSION: 1.3.12
-        CURRENT_PROJECT_VERSION: 31
+        MARKETING_VERSION: 1.3.13
+        CURRENT_PROJECT_VERSION: 32
         SWIFT_VERSION: 5.0
         SWIFT_STRICT_CONCURRENCY: minimal
         TARGETED_DEVICE_FAMILY: 1
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         CODE_SIGN_STYLE: Automatic
+        SWIFT_OBJC_BRIDGING_HEADER: SoundField/SoundField-Bridging-Header.h
+        HEADER_SEARCH_PATHS: $(SRCROOT)/../dsp/include
+        CLANG_CXX_LANGUAGE_STANDARD: c++20
+        CLANG_CXX_LIBRARY: libc++
+        OTHER_CPLUSPLUSFLAGS: -ffp-contract=off
