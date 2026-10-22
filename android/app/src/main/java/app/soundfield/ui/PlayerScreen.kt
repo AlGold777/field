@@ -34,6 +34,7 @@ import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.role
 import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.semantics.onLongClick
 import app.soundfield.core.AudioGain
@@ -250,7 +251,9 @@ fun PlayerScreen(ui: UiState, engine: Engine, openCalibration: () -> Unit, openD
         Row(Modifier.fillMaxWidth().padding(vertical = 18.dp), horizontalArrangement = Arrangement.SpaceEvenly,
             verticalAlignment = Alignment.CenterVertically) {
             RoundIcon("⏮", "Предыдущий трек") { engine.previousTrack() }
-            Box(Modifier.size(76.dp).clip(CircleShape).background(SFColors.accent).clickable { engine.togglePlay() },
+            Box(Modifier.size(76.dp).clip(CircleShape).background(SFColors.accent)
+                .semantics { contentDescription = if (ui.playing || ui.audioBuffering) "Пауза" else "Воспроизведение"; role = androidx.compose.ui.semantics.Role.Button }
+                .clickable { engine.togglePlay() },
                 contentAlignment = Alignment.Center) {
                 Text(if (ui.playing || ui.audioBuffering) "❚❚" else "▶", color = Color.White, fontSize = 28.sp)
             }
@@ -446,7 +449,9 @@ private fun DeviceChoiceTile(name: String, platform: String, modifier: Modifier 
 
 @Composable
 private fun RoundIcon(icon: String, label: String, onClick: () -> Unit) {
-    Box(Modifier.size(54.dp).clip(CircleShape).background(SFColors.Secondary).clickable(onClickLabel = label, onClick = onClick),
+    Box(Modifier.size(54.dp).clip(CircleShape).background(SFColors.Secondary)
+        .semantics { contentDescription = label; role = androidx.compose.ui.semantics.Role.Button }
+        .clickable(onClickLabel = label, onClick = onClick),
         contentAlignment = Alignment.Center) { Text(icon, color = Color.White, fontSize = 20.sp) }
 }
 

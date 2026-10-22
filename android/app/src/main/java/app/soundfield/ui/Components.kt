@@ -20,6 +20,9 @@ import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.role
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
@@ -283,7 +286,9 @@ fun SearchingDots() {
 @Composable
 fun BackBar(title: String, onBack: () -> Unit) {
     Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(bottom = 12.dp)) {
-        Box(Modifier.size(40.dp).clip(RoundedCornerShape(12.dp)).background(SFColors.Secondary).clickable(onClick = onBack),
+        Box(Modifier.size(40.dp).clip(RoundedCornerShape(12.dp)).background(SFColors.Secondary)
+            .semantics { contentDescription = "Назад"; role = androidx.compose.ui.semantics.Role.Button }
+            .clickable(onClick = onBack),
             contentAlignment = Alignment.Center) { Text("←", color = Color.White, fontSize = 20.sp) }
         Spacer(Modifier.width(14.dp))
         H2(title)
