@@ -1,7 +1,13 @@
 package app.soundfield.core
 
 import java.util.concurrent.atomic.AtomicLong
+import app.soundfield.dsp.LimiterStats
+import app.soundfield.dsp.PeakLimiter
 import app.soundfield.dsp.WindowedSinc
+
+/** Потолок финального true-peak лимитера устройства (A1.4): −1,0 dBTP. Сцепленный предлимитер Server — −1,5 dBTP. */
+const val DEVICE_LIMITER_CEILING_DBTP = -1.0
+const val PRE_LIMITER_CEILING_DBTP = -1.5
 
 /**
  * Затухание ≈5 мс при переходе из воспроизведения в паузу без запланированного stopFrame
@@ -43,12 +49,23 @@ class ServerRenderer(
     private val stereoAnalysis = FloatArray(4_096)
     private val stereoLeft = FloatArray(4_096)
     private val stereoRight = FloatArray(4_096)
+    /** Финальный true-peak лимитер устройства в ядре; моно — для пары, сцепленный стерео — для Solo. */
+    private val limiter = PeakLimiter(SF.SAMPLE_RATE, 1, DEVICE_LIMITER_CEILING_DBTP)
+    private val limiterStereo = PeakLimiter(SF.SAMPLE_RATE, 2, DEVICE_LIMITER_CEILING_DBTP)
+    private var stereoLimiterUsed = false
+    /** Задержка лимитера, кадров: вычитается из времени предъявления, чтобы звук вышел в запланированный момент. */
+    val limiterLatencyFrames: Int get() = limiter.latencyFrames
     val underruns = AtomicLong()
     val sourceMissingFrames = AtomicLong()
     val windowSourceMissingFrames = AtomicLong()
     private var inSourceUnderrun = false
     @Volatile var positionFrame = 0L; private set
-    fun takeLimiterStats() = equalizer.takeLimiterStats()
+    fun takeLimiterStats(): LimiterStats {
+        val m = limiter.takeStats()
+        if (!stereoLimiterUsed) return m
+        val s = limiterStereo.takeStats()
+        return LimiterStats(m.blocks + s.blocks, m.activeBlocks + s.activeBlocks, maxOf(m.maxReductionDb, s.maxReductionDb))
+    }
 
     override fun render(out: FloatArray, n: Int, presentLocalNs: Long) {
         val st = state()
@@ -56,7 +73,7 @@ class ServerRenderer(
         if (!tl.playing) {
             java.util.Arrays.fill(out, 0, n, 0f); corrector.reset(); finish(out, n, st.gain, st.equalizer, playing = false); return
         }
-        corrector.plan(tl.frameAt(presentLocalNs) - WindowedSinc.GROUP_DELAY_FRAMES, n)
+        corrector.plan(tl.frameAt(presentLocalNs) - WindowedSinc.GROUP_DELAY_FRAMES + limiterLatencyFrames, n)
         val src = st.source
         var sourceMissing = 0L
         val readyFrames = src.readyFrames
@@ -97,7 +114,7 @@ class ServerRenderer(
             finishStereo(interleaved, n, st.gain, st.equalizer, playing = false)
             return
         }
-        corrector.plan(tl.frameAt(presentLocalNs) - WindowedSinc.GROUP_DELAY_FRAMES, n)
+        corrector.plan(tl.frameAt(presentLocalNs) - WindowedSinc.GROUP_DELAY_FRAMES + limiterLatencyFrames, n)
         val src = st.source
         var sourceMissing = 0L
         val readyFrames = src.readyFrames
@@ -143,9 +160,9 @@ class ServerRenderer(
         spectrumCapture.add(stereoAnalysis, n)
         ramp.apply(stereoLeft, n, gain)
         rampRight.apply(stereoRight, n, gain)
-        equalizer.processLimiter(stereoLeft, n)
-        equalizerRight.processLimiter(stereoRight, n)
         for (i in 0 until n) { samples[i * 2] = stereoLeft[i]; samples[i * 2 + 1] = stereoRight[i] }
+        stereoLimiterUsed = true
+        limiterStereo.process(samples, 0, n)
     }
 
     private fun finish(out: FloatArray, n: Int, gain: Float, config: EqConfig, playing: Boolean) {
@@ -154,7 +171,7 @@ class ServerRenderer(
         equalizer.processTone(out, n)
         spectrumCapture.add(out, n)
         ramp.apply(out, n, gain)
-        equalizer.processLimiter(out, n)
+        limiter.process(out, 0, n)
     }
 }
 
@@ -188,7 +205,9 @@ class PointRenderer(
     @Volatile var debugSilence = false
     private var inUnderrun = false
     private val fade = PauseFade()
-    fun takeLimiterStats() = equalizer.takeLimiterStats()
+    private val limiter = PeakLimiter(SF.SAMPLE_RATE, 1, DEVICE_LIMITER_CEILING_DBTP)
+    val limiterLatencyFrames: Int get() = limiter.latencyFrames
+    fun takeLimiterStats(): LimiterStats = limiter.takeStats()
 
     override fun render(out: FloatArray, n: Int, presentLocalNs: Long) {
         val tl = rx.timeline
@@ -197,7 +216,7 @@ class PointRenderer(
             java.util.Arrays.fill(out, 0, n, 0f); corrector.reset(); finish(out, n, p, playing = false); return
         }
         val serverNs = clock.toServer(presentLocalNs) - p.trimNs
-        corrector.plan(tl.frameAt(serverNs) - WindowedSinc.GROUP_DELAY_FRAMES, n)
+        corrector.plan(tl.frameAt(serverNs) - WindowedSinc.GROUP_DELAY_FRAMES + limiterLatencyFrames, n)
         var missing = 0
         for (i in 0 until n) {
             val position = corrector.position(i)
@@ -228,7 +247,7 @@ class PointRenderer(
         equalizer.processTone(out, n)
         spectrumCapture.add(out, n)
         ramp.apply(out, n, p.gain)
-        equalizer.processLimiter(out, n)
+        limiter.process(out, 0, n)
     }
 }
 

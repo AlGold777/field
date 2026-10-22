@@ -3,11 +3,13 @@ import Foundation
 /// Бинарный UDP-протокол медиаконтура (big-endian), байт-в-байт как Android core/Wire.kt.
 ///
 /// Заголовок (8 байт): 'S' 'F' | version u8 | type u8 | sessionId i32
-///  AUDIO (1): epoch i32 | seq i32 | startFrame i64 | playoutNs i64 | sendNs i64 | count u16 | flags u8 | 0 | count × i16
+///  AUDIO (1): epoch i32 | seq i32 | startFrame i64 | playoutNs i64 | sendNs i64 | count u16 | flags u8 | 0 | count × i24
 ///  PING  (2): t1 i64 | pingSeq i32
 ///  PONG  (3): t1 i64 | t2 i64 | t3 i64 | pingSeq i32
 ///  NACK  (4): epoch i32 | n u16 | n × seq i32
-/// Версия 2: в конце каждого пакета — усечённый HMAC-SHA256 (tagBytes = 8) от всех предыдущих байт, ключ — udpKey соединения.
+/// Версия 3: PCM 24 бит со знаком (3 байта big-endian на отсчёт), не более maxAudioFrames = 384 кадров на пакет. В конце каждого
+/// пакета — усечённый HMAC-SHA256 (tagBytes = 8) от всех предыдущих байт, ключ — udpKey соединения; версия входит в заголовок под
+/// тегом, поэтому пакеты версии 2 отбрасываются.
 struct AudioPacket {
     var session: Int32
     var epoch: Int32
@@ -16,7 +18,8 @@ struct AudioPacket {
     var playoutNs: Int64
     var sendNs: Int64
     var flags: UInt8
-    var samples: [Int16]
+    /// Знаковые 24-бит значения (диапазон -8388608...8388607), по одному на кадр.
+    var samples: [Int32]
     var isRetransmit: Bool { flags & Wire.flagRetransmit != 0 }
 }
 
@@ -41,6 +44,8 @@ enum Wire {
     static let tAudio: UInt8 = 1, tPing: UInt8 = 2, tPong: UInt8 = 3, tNack: UInt8 = 4
     static let header = 8
     static let audioHeader = header + 36
+    static let maxAudioFrames = 384
+    static let sampleBytes = 3
     static let maxNack = 64
     static let tag = PairCrypto.tagBytes
 
@@ -48,7 +53,7 @@ enum Wire {
         var b: [UInt8] = []
         init(capacity: Int) { b.reserveCapacity(capacity) }
         mutating func u8(_ v: UInt8) { b.append(v) }
-        mutating func i16(_ v: Int16) { let u = UInt16(bitPattern: v); b.append(UInt8(u >> 8)); b.append(UInt8(u & 0xFF)) }
+        mutating func i24(_ v: Int32) { b.append(UInt8(truncatingIfNeeded: v >> 16)); b.append(UInt8(truncatingIfNeeded: v >> 8)); b.append(UInt8(truncatingIfNeeded: v)) }
         mutating func u16(_ v: UInt16) { b.append(UInt8(v >> 8)); b.append(UInt8(v & 0xFF)) }
         mutating func i32(_ v: Int32) { let u = UInt32(bitPattern: v); for s in stride(from: 24, through: 0, by: -8) { b.append(UInt8((u >> UInt32(s)) & 0xFF)) } }
         mutating func i64(_ v: Int64) { let u = UInt64(bitPattern: v); for s in stride(from: 56, through: 0, by: -8) { b.append(UInt8((u >> UInt64(s)) & 0xFF)) } }
@@ -62,7 +67,11 @@ enum Wire {
         var remaining: Int { p.count - i }
         mutating func u8() -> UInt8 { let v = p[i]; i += 1; return v }
         mutating func u16() -> UInt16 { let v = UInt16(p[i]) << 8 | UInt16(p[i + 1]); i += 2; return v }
-        mutating func i16() -> Int16 { Int16(bitPattern: u16()) }
+        mutating func i24() -> Int32 {
+            var v = Int32(p[i]) << 16 | Int32(p[i + 1]) << 8 | Int32(p[i + 2]); i += 3
+            if v & 0x800000 != 0 { v -= 0x1000000 }
+            return v
+        }
         mutating func i32() -> Int32 {
             var u: UInt32 = 0; for k in 0..<4 { u = u << 8 | UInt32(p[i + k]) }; i += 4; return Int32(bitPattern: u)
         }
@@ -76,12 +85,13 @@ enum Wire {
     }
 
     static func audio(session: Int32, epoch: Int32, seq: Int32, startFrame: Int64, playoutNs: Int64, sendNs: Int64,
-                      flags: UInt8, samples: [Int16], key: [UInt8]) -> [UInt8] {
-        var w = W(capacity: audioHeader + samples.count * 2)
+                      flags: UInt8, samples: [Int32], key: [UInt8]) -> [UInt8] {
+        precondition(samples.count <= maxAudioFrames, "audio packet too long")
+        var w = W(capacity: audioHeader + samples.count * sampleBytes + tag)
         w.head(tAudio, session)
         w.i32(epoch); w.i32(seq); w.i64(startFrame); w.i64(playoutNs); w.i64(sendNs)
         w.u16(UInt16(samples.count)); w.u8(flags); w.u8(0)
-        for s in samples { w.i16(s) }
+        for s in samples { w.i24(s) }
         return seal(w.b, key)
     }
 
@@ -119,9 +129,9 @@ enum Wire {
             guard p.count >= audioHeader else { return nil }
             let epoch = r.i32(), seq = r.i32(), start = r.i64(), playout = r.i64(), send = r.i64()
             let count = Int(r.u16()); let flags = r.u8(); _ = r.u8()
-            guard p.count >= audioHeader + count * 2 else { return nil }
-            var s = [Int16](repeating: 0, count: count)
-            for k in 0..<count { s[k] = r.i16() }
+            guard count <= maxAudioFrames, p.count >= audioHeader + count * sampleBytes else { return nil }
+            var s = [Int32](repeating: 0, count: count)
+            for k in 0..<count { s[k] = r.i24() }
             return .audio(AudioPacket(session: session, epoch: epoch, seq: seq, startFrame: start, playoutNs: playout,
                                       sendNs: send, flags: flags, samples: s))
         case tPing:

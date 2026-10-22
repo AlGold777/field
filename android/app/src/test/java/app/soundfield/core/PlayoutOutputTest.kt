@@ -8,25 +8,27 @@ import org.junit.Test
  * Реальные выходные сэмплы Point: источник кодирует номер кадра в значение сэмпла, каждый выходной сэмпл
  * сверяется с ожидаемым. Цепочка: PointReceiver → PointRenderer (PlayoutCorrector, sinc-интерполяция,
  * огибающая, EQ в обходе, лимитер). Часы идеальны (смещение 0, дрейфа нет), поэтому позиции целые и
- * ожидание точное. Лимитер задерживает выход на EqualizerMath.LOOKAHEAD_FRAMES на всех путях — ожидание сдвинуто.
+ * ожидание точное. Лимитер ядра задерживает выход на limiterLatencyFrames, но корректор вперёд компенсирует эту задержку
+ * (план позиции + latency): звук выходит в запланированный момент, первые latency кадров после старта — тишина.
  */
 class PlayoutOutputTest {
     private val blockFrames = 480
     private val blocks = 12
     private val firstCallback = 2L            // 20 мс: огибающая нарастания уже позади
     private val callbacks = 6
-    private val lookahead = EqualizerMath.LOOKAHEAD_FRAMES
+    private var lookahead = 0
     /** Кадр источника, который попадает в первый выходной сэмпл первого колбэка. */
     private val base = firstCallback * blockFrames - WindowedSinc.GROUP_DELAY_FRAMES
 
-    private fun code(frame: Long): Short = ((frame % 30_000L) - 15_000L).toInt().toShort()
-    private fun sampleOf(frame: Long): Float = code(frame).toFloat() / 32768f
+    /** 24-битный код: значения ±0,46 полной шкалы, ниже потолка лимитера. */
+    private fun code(frame: Long): Int = (((frame % 30_000L) - 15_000L) * 256L).toInt()
+    private fun sampleOf(frame: Long): Float = code(frame).toFloat() / Pcm24.SCALE
     /** Ожидаемое значение выходного сэмпла с глобальным индексом j (по всем колбэкам). */
-    private fun expectedAt(j: Int): Float = if (j < lookahead) 0f else sampleOf(base + j - lookahead)
+    private fun expectedAt(j: Int): Float = if (j < lookahead) 0f else sampleOf(base + j)
 
     private fun packet(seq: Int, flags: Int = 0): UdpMsg.Audio {
         val start = seq * blockFrames.toLong()
-        val samples = ShortArray(blockFrames) { code(start + it) }
+        val samples = IntArray(blockFrames) { code(start + it) }
         // arrival = 0, sendNs = -1 мс: односторонняя задержка 1 мс совпадает с замерами pong
         return UdpMsg.Audio(1, 1, seq, start, 0L, -1_000_000L, flags, samples, blockFrames)
     }
@@ -40,6 +42,7 @@ class PlayoutOutputTest {
         val rx = PointReceiver(clock)
         rx.onTimeline(Timeline(1, true, 0L, 0L))
         val renderer = PointRenderer(rx, clock, TcpAudioBuffer(10), { "udp" }, { PointParams(1f, 0L, Long.MAX_VALUE) })
+        lookahead = renderer.limiterLatencyFrames
         return rx to renderer
     }
 
@@ -68,7 +71,7 @@ class PlayoutOutputTest {
         for (seq in 0 until blocks) if (seq != gapSeq) rx.onAudio(packet(seq), 0L)
         val got = renderRun(renderer)
         for (j in got.indices) {
-            val frame = base + j - lookahead
+            val frame = base + j
             // окно sinc-интерполяции [frame - HALF + 1, frame + HALF] задевает пропуск — тишина
             val touchesGap = j >= lookahead && frame + WindowedSinc.HALF >= gapStart && frame - WindowedSinc.HALF + 1 < gapEnd
             val expected = if (touchesGap) 0f else expectedAt(j)

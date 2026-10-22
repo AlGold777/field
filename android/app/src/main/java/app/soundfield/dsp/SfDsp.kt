@@ -11,7 +11,11 @@ object SfDsp {
     /** Загружает libsfdsp из APK. На JVM-тестах — [loadFrom]. */
     @Synchronized fun load(): Boolean {
         loaded?.let { return it }
-        return runCatching { System.loadLibrary("sfdsp"); nativeInit() }.isSuccess.also { loaded = it }
+        val ok = runCatching { System.loadLibrary("sfdsp"); nativeInit() }.isSuccess ||
+            // JVM-тесты и лабораторные утилиты: хост-сборка по системному свойству (задаёт Gradle)
+            System.getProperty("sfdsp.host.lib")?.let { path -> runCatching { System.load(path); nativeInit() }.isSuccess } == true
+        loaded = ok
+        return ok
     }
 
     /** Хост-сборка для JUnit (абсолютный путь к libsfdsp.dylib). */
@@ -50,6 +54,33 @@ object SfDsp {
     @JvmStatic external fun nativePlayoutRender(
         handle: Long, src: FloatArray, base: Long, len: Int, ideal: Double, n: Int, out: FloatArray,
     )
+
+    // ---- A1: PCM 24 бит, SRC, лимитер ----
+    @JvmStatic external fun nativeDitherCreate(seed: Long): Long
+    @JvmStatic external fun nativeDitherDestroy(handle: Long)
+    @JvmStatic external fun nativePcm24Encode(
+        dither: Long, input: FloatArray, inOff: Int, inStride: Int, n: Int,
+        out: ByteArray, outOff: Int, outStride: Int, bigEndian: Boolean,
+    )
+    @JvmStatic external fun nativePcm24Decode(
+        input: ByteArray, inOff: Int, inStride: Int, n: Int, bigEndian: Boolean,
+        out: FloatArray, outOff: Int, outStride: Int,
+    )
+    @JvmStatic external fun nativeSrcCreate(channels: Int, inRate: Int, outRate: Int): Long
+    @JvmStatic external fun nativeSrcDestroy(handle: Long)
+    @JvmStatic external fun nativeSrcReset(handle: Long)
+    @JvmStatic external fun nativeSrcTaps(handle: Long): Int
+    @JvmStatic external fun nativeSrcMaxOutput(handle: Long, nIn: Long): Long
+    @JvmStatic external fun nativeSrcProcess(
+        handle: Long, input: FloatArray, inOffFrames: Int, nIn: Int, out: FloatArray, outOffFrames: Int, outCapFrames: Int,
+    ): Long
+    @JvmStatic external fun nativeSrcFlush(handle: Long, out: FloatArray, outOffFrames: Int, outCapFrames: Int): Long
+    @JvmStatic external fun nativeLimiterCreate(sampleRate: Int, channels: Int, ceilingDbtp: Double): Long
+    @JvmStatic external fun nativeLimiterDestroy(handle: Long)
+    @JvmStatic external fun nativeLimiterReset(handle: Long)
+    @JvmStatic external fun nativeLimiterLatency(handle: Long): Int
+    @JvmStatic external fun nativeLimiterProcess(handle: Long, io: FloatArray, offFloats: Int, frames: Int)
+    @JvmStatic external fun nativeLimiterTakeStats(handle: Long, stats: DoubleArray)
 }
 
 /** Дробный корректор воспроизведения в ядре (порт PlayoutCorrector). Не потокобезопасен; [close] обязателен. */

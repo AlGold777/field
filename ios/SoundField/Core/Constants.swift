@@ -3,9 +3,9 @@ import os
 
 /// Общие константы. ОБЯЗАНЫ совпадать с Android (core/Constants.kt) — иначе смешанная пара не соберётся.
 enum SF {
-    static let protocolVersion: UInt8 = 2
+    static let protocolVersion: UInt8 = 3
     static let sampleRate = 48_000
-    static let packetFrames = 480                  // 10 мс PCM в одном UDP-пакете
+    static let packetFrames = 384                  // 8 мс PCM 24 бит в одном UDP-пакете: 44 + 1152 + 8 = 1204 ≤ 1232 байт, без IP-фрагментации
     static let leadNs: Int64 = 400_000_000         // Server отправляет аудио на 400 мс вперёд
     static let startDelayNs: Int64 = 300_000_000   // play/seek стартуют через 300 мс
     static let serviceType = "_soundfield._tcp"

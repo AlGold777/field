@@ -97,6 +97,7 @@ void sf_src_reset(sf_src* s) {
 
 int sf_src_taps(const sf_src* s) { return s->taps; }
 int sf_src_phases(const sf_src* s) { return (int)s->phases; }
+int sf_src_channels(const sf_src* s) { return s->channels; }
 
 int64_t sf_src_max_output(const sf_src* s, int64_t n_in) {
     return (n_in + s->taps) * (int64_t)s->outRate / s->inRate + 4;

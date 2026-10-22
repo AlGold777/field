@@ -59,7 +59,6 @@ object EqPresets {
  */
 object EqualizerMath {
     const val BAND_COUNT = 10
-    const val LOOKAHEAD_FRAMES = 48 // fixed 1 ms on every render path
     val frequencies = doubleArrayOf(31.5, 63.0, 125.0, 250.0, 500.0, 1_000.0, 2_000.0, 4_000.0, 8_000.0, 16_000.0)
     private const val SAMPLE_RATE = 48_000.0
     private const val Q = 1.4142135623730951
@@ -236,7 +235,6 @@ class EqualizerProcessor {
     private val gains = DoubleArray(EqualizerMath.BAND_COUNT)
     private val target = DoubleArray(EqualizerMath.BAND_COUNT)
     private val coeffs = DoubleArray(EqualizerMath.BAND_COUNT * 5)
-    private val delay = DoubleArray(EqualizerMath.LOOKAHEAD_FRAMES + 1)
     private val states = Array(EqualizerMath.BAND_COUNT) { DoubleArray(4) } // x1,x2,y1,y2
     private var preamp = 0.0
     private var targetPreamp = 0.0
@@ -245,22 +243,11 @@ class EqualizerProcessor {
     private var bypassComp = 0.0
     private var targetBypassComp = 0.0
     private var smoothRemaining = 0
-    private var delayIndex = 0
-    private var limiterGain = 1.0
-    private val release = exp(-1.0 / (48_000.0 * 0.050))
-    private val limiterActivations = AtomicLong()
-    private val maxReductionMilliDb = AtomicLong()
-    private var limiterWasActive = false
 
     fun setConfig(config: EqConfig) { pending = config }
-    fun limiterCount(): Long = limiterActivations.get()
-    fun maxLimiterReductionDb(): Double = maxReductionMilliDb.get() / 1_000.0
-    fun takeLimiterStats(): Pair<Long, Double> = limiterActivations.getAndSet(0) to maxReductionMilliDb.getAndSet(0) / 1_000.0
 
-    fun process(samples: FloatArray, n: Int) {
-        processTone(samples, n)
-        processLimiter(samples, n)
-    }
+    /** Тон-цепочка EQ. Пиковое ограничение — не здесь, а в лимитере ядра (PeakLimiter, A1.4). */
+    fun process(samples: FloatArray, n: Int) = processTone(samples, n)
 
     fun processTone(samples: FloatArray, n: Int) {
         val next = pending
@@ -304,29 +291,8 @@ class EqualizerProcessor {
             frame += step
         }
     }
-
-    fun processLimiter(samples: FloatArray, n: Int) {
-        for (k in 0 until n) {
-            delay[delayIndex] = samples[k].toDouble()
-            var peak = 0.0
-            for (look in delay.indices) peak = max(peak, abs(delay[look]))
-            val delayedIndex = (delayIndex + 1) % delay.size
-            val delayed = delay[delayedIndex]
-            delayIndex = delayedIndex
-            val wantedGain = if (peak > 1.0) 1.0 / peak else 1.0
-            limiterGain = if (wantedGain < limiterGain) wantedGain else 1.0 - (1.0 - limiterGain) * release
-            val reduction = if (limiterGain < 1.0) -20.0 * log10(limiterGain) else 0.0
-            if (reduction > 0.01) {
-                if (!limiterWasActive) limiterActivations.incrementAndGet()
-                limiterWasActive = true
-                maxReductionMilliDb.accumulateAndGet((reduction * 1_000.0).toLong()) { old, next -> max(old, next) }
-            } else limiterWasActive = false
-            samples[k] = (delayed * limiterGain).coerceIn(-1.0, 1.0).toFloat()
-        }
-    }
 }
 
-/** 1 ms lookahead is baked into EqualizerProcessor and remains present when EQ is bypassed. */
 class EqSpectrumCapture(private val capacity: Int = 8192) {
     private val samples = FloatArray(capacity)
     @Volatile private var writeIndex = 0L

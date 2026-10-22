@@ -12,13 +12,14 @@ object TcpAudioStartPolicy {
         minimumFrames > 0 && contiguousFrames >= minimumFrames
 }
 
-data class TcpAudioChunk(val epoch: Int, val trackId: String, val startFrame: Long, val samples: ShortArray)
+/** [samples] — знаковые 24-бит значения (диапазон Pcm24.MIN..Pcm24.MAX), по одному на кадр. */
+data class TcpAudioChunk(val epoch: Int, val trackId: String, val startFrame: Long, val samples: IntArray)
 
-/** Separate length-prefixed binary transport. Hello carries an HMAC tag (protocol v2). */
+/** Separate length-prefixed binary transport. Hello carries an HMAC tag (protocol v2 keys); chunks are PCM 24 bit (protocol v3). */
 object TcpAudioWire {
-    const val HELLO_MAGIC = 0x53464131 // SFA1
-    private const val MAX_CHUNK_BYTES = 10_500
-    const val CHUNK_FRAMES = 4_800 // 100 ms of mono 48 kHz PCM16
+    const val HELLO_MAGIC = 0x53464132 // SFA2: версия 3 (PCM 24 бит); SFA1 (PCM16) отвергается
+    private const val MAX_CHUNK_BYTES = 14_700
+    const val CHUNK_FRAMES = 4_800 // 100 ms of mono 48 kHz PCM 24 bit
 
     /** Подтверждение hello: усечённый HMAC от udpKey соединения (тот же ключ, что у UDP-контура). */
     fun helloTag(key: ByteArray, peerId: String, sessionId: Int): ByteArray =
@@ -43,13 +44,13 @@ object TcpAudioWire {
 
     fun writeChunk(out: DataOutputStream, chunk: TcpAudioChunk) {
         require(chunk.samples.size in 1..CHUNK_FRAMES)
-        val bytes = ByteArrayOutputStream(32 + chunk.samples.size * 2)
+        val bytes = ByteArrayOutputStream(32 + chunk.samples.size * 3)
         DataOutputStream(bytes).use { frame ->
             frame.writeInt(chunk.epoch)
             frame.writeUTF(chunk.trackId.take(96))
             frame.writeLong(chunk.startFrame)
             frame.writeInt(chunk.samples.size)
-            chunk.samples.forEach { frame.writeShort(it.toInt()) }
+            chunk.samples.forEach { v -> frame.writeByte(v shr 16); frame.writeByte(v shr 8); frame.writeByte(v) }
         }
         val payload = bytes.toByteArray()
         out.writeInt(payload.size)
@@ -67,10 +68,10 @@ object TcpAudioWire {
             val track = frame.readUTF().take(96)
             val start = frame.readLong()
             val count = frame.readInt()
-            require(count in 1..CHUNK_FRAMES && frame.available() == count * 2) {
+            require(count in 1..CHUNK_FRAMES && frame.available() == count * 3) {
                 "Invalid TCP audio frame count: $count"
             }
-            val samples = ShortArray(count) { frame.readShort() }
+            val samples = IntArray(count) { (frame.readByte().toInt() shl 16) or (frame.readUnsignedByte() shl 8) or frame.readUnsignedByte() }
             return TcpAudioChunk(epoch, track, start, samples)
         }
     }
@@ -82,7 +83,7 @@ class TcpAudioBuffer(capacityPow2: Int = 21) {
     private val mask = (capacity - 1).toLong()
 
     private class Slot(capacity: Int) {
-        val samples = ShortArray(capacity)
+        val samples = IntArray(capacity)
         val tags = IntArray(capacity) { Int.MIN_VALUE }
         @Volatile var epoch = Int.MIN_VALUE
         @Volatile var maxFrame = -1L
@@ -93,7 +94,7 @@ class TcpAudioBuffer(capacityPow2: Int = 21) {
             maxFrame = -1L
         }
 
-        fun write(startFrame: Long, data: ShortArray) {
+        fun write(startFrame: Long, data: IntArray) {
             for (i in data.indices) {
                 val frame = startFrame + i
                 val index = (frame and (samples.size - 1).toLong()).toInt()
@@ -108,7 +109,7 @@ class TcpAudioBuffer(capacityPow2: Int = 21) {
             val publishedThrough = maxFrame
             if (frame > publishedThrough) return Float.NaN
             val index = (frame and (samples.size - 1).toLong()).toInt()
-            return if (tags[index] == frame.toInt()) samples[index] / 32768f else Float.NaN
+            return if (tags[index] == frame.toInt()) samples[index] / Pcm24.SCALE else Float.NaN
         }
 
         fun contiguousFrom(startFrame: Long, limit: Int): Int {

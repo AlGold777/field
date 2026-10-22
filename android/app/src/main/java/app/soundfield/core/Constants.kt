@@ -5,9 +5,9 @@ package app.soundfield.core
  * иначе Android↔iPhone пара не соберётся.
  */
 object SF {
-    const val PROTOCOL_VERSION = 2
+    const val PROTOCOL_VERSION = 3
     const val SAMPLE_RATE = 48_000
-    const val PACKET_FRAMES = 480                    // 10 мс PCM в одном UDP-пакете
+    const val PACKET_FRAMES = 384                    // 8 мс PCM 24 бит в одном UDP-пакете: 44 + 1152 + 8 = 1204 ≤ 1232 байт, без IP-фрагментации (IPv6 MTU 1280)
     const val LEAD_NS = 400_000_000L                 // Server отправляет аудио на 400 мс вперёд
     const val START_DELAY_NS = 300_000_000L          // play/seek стартуют через 300 мс (успеть разослать)
     const val PAUSE_LEAD_NS = 150_000_000L           // пауза наступает через 150 мс — одновременно на обоих телефонах

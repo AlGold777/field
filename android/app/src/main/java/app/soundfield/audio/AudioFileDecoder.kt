@@ -10,14 +10,14 @@ import android.net.Uri
 import android.os.SystemClock
 import app.soundfield.core.AudioSource
 import app.soundfield.core.SegmentedPcmSource
-import app.soundfield.core.StreamResampler
+import app.soundfield.core.Pcm24StereoEncoder
+import app.soundfield.core.SampleRateConverter
 import app.soundfield.core.SF
 import java.io.BufferedOutputStream
 import java.io.File
 import java.io.FileOutputStream
 import java.nio.ByteOrder
 import java.util.UUID
-import kotlin.math.roundToInt
 
 /**
  * Трек очереди — ссылка на исходный файл (content:// с постоянным доступом), без копии внутри приложения.
@@ -53,7 +53,7 @@ object AudioFileDecoder {
         File(context.filesDir, "audio_queue").listFiles()?.forEach { it.deleteRecursively() }   // копии из версий ≤ 1.2.0
     }
 
-    /** Файл с декодированным PCM (48 кГц, стерео, int16). */
+    /** Каталог с декодированным PCM: 48 кГц, стерео, 24 бит little-endian сегментами `*.pcm24` (A1.1). */
     fun pcmFile(context: Context, track: PreparedAudioFile) = File(pcmDir(context), track.id)
 
     /**
@@ -71,11 +71,14 @@ object AudioFileDecoder {
         val directory = pcmFile(context, track)
         val completeFile = File(directory, "complete")
         if (completeFile.exists()) {
-            val totalFrames = completeFile.readText().toLongOrNull() ?: 0L
-            val source = SegmentedPcmSource(directory, track.title, track.artist, totalFrames)
-            loadSegments(source, directory)
-            source.finish(totalFrames)
-            return source
+            // Метка формата «v3 <кадры>»: кэш PCM16 прежних версий (сегменты *.pcm48, метка без префикса) перекодируется заново.
+            val totalFrames = parseComplete(completeFile)
+            if (totalFrames != null) {
+                val source = SegmentedPcmSource(directory, track.title, track.artist, totalFrames)
+                loadSegments(source, directory)
+                source.finish(totalFrames)
+                return source
+            }
         }
         directory.deleteRecursively()
         directory.mkdirs()
@@ -84,7 +87,7 @@ object AudioFileDecoder {
             val source = decodeToFile(context, track, directory, cancelled, onProgress) { readySource ->
                 if (!notified) { notified = true; onReady(readySource) }
             }
-            File(directory, "complete.tmp").writeText(source.totalFrames.toString())
+            File(directory, "complete.tmp").writeText("$CACHE_FORMAT ${source.totalFrames}")
             check(File(directory, "complete.tmp").renameTo(completeFile)) { "Не удалось завершить декодирование" }
             onProgress(source)
             return source
@@ -94,11 +97,18 @@ object AudioFileDecoder {
         }
     }
 
+    /** Число кадров из метки завершённого кэша или null, если это кэш другого формата (PCM16 до A1) — его нужно перекодировать. */
+    internal fun parseComplete(file: File): Long? {
+        val parts = runCatching { file.readText().trim().split(' ') }.getOrNull() ?: return null
+        if (parts.size != 2 || parts[0] != CACHE_FORMAT) return null
+        return parts[1].toLongOrNull()?.takeIf { it > 0 }
+    }
+
     private fun loadSegments(source: SegmentedPcmSource, directory: File) {
-        directory.listFiles { f -> f.extension == "pcm48" }.orEmpty().sortedBy { it.nameWithoutExtension.toLongOrNull() ?: Long.MAX_VALUE }
+        directory.listFiles { f -> f.extension == "pcm24" }.orEmpty().sortedBy { it.nameWithoutExtension.toLongOrNull() ?: Long.MAX_VALUE }
             .forEach { f ->
                 val index = f.nameWithoutExtension.toLongOrNull() ?: return@forEach
-                val frames = (f.length() / 4).toInt().coerceIn(1, SegmentedPcmSource.SEGMENT_FRAMES)
+                val frames = (f.length() / SegmentedPcmSource.BYTES_PER_FRAME).toInt().coerceIn(1, SegmentedPcmSource.SEGMENT_FRAMES)
                 source.publish(index, f, frames)
             }
     }
@@ -146,8 +156,20 @@ object AudioFileDecoder {
                 var sampleRate = inputFormat.getInteger(MediaFormat.KEY_SAMPLE_RATE)
                 var channels = inputFormat.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
                 var encoding = AudioFormat.ENCODING_PCM_16BIT
-                var resampler: StreamResampler? = null
-                var resamplerRate = -1
+                var converter: SampleRateConverter? = null
+                var converterRate = -1
+                val inFrames = BLOCK_FRAMES
+                val inBlock = FloatArray(inFrames * 2)
+                var inCount = 0
+                var outBlock = FloatArray(0)
+                // Накопленный интерлив → ресемплер ядра → запись 24 бит. final=true дописывает хвост ресемплера.
+                fun flushInput(final: Boolean) {
+                    val c = converter ?: return
+                    if (outBlock.size < (c.maxOutputFrames(maxOf(inCount, BLOCK_FRAMES)) + 16) * 2)
+                        outBlock = FloatArray((c.maxOutputFrames(maxOf(inCount, BLOCK_FRAMES)) + 16) * 2)
+                    if (inCount > 0) { sink.write(outBlock, c.process(inBlock, inCount, outBlock)); inCount = 0 }
+                    if (final) sink.write(outBlock, c.finish(outBlock))
+                }
                 var lastProgressAt = SystemClock.elapsedRealtime()
                 while (!outputEnded) {
                     if (cancelled()) throw CancelledException()
@@ -180,11 +202,11 @@ object AudioFileDecoder {
                             lastProgressAt = SystemClock.elapsedRealtime()
                             if (info.size > 0) {
                                 require(sampleRate > 0 && channels in 1..8) { "Неподдерживаемые параметры аудио" }
-                                if (resamplerRate != sampleRate) {
-                                    resampler?.finish()
-                                    resamplerRate = sampleRate
-                                resampler = if (sampleRate == SF.SAMPLE_RATE) null
-                                        else StreamResampler(sampleRate, SF.SAMPLE_RATE, sink::write)
+                                if (converterRate != sampleRate) {
+                                    flushInput(final = true)
+                                    converter?.close()
+                                    converterRate = sampleRate
+                                    converter = SampleRateConverter(sampleRate, SF.SAMPLE_RATE)
                                 }
                                 val buffer = codec.getOutputBuffer(outputIndex) ?: error("Пустой аудиобуфер")
                                 buffer.position(info.offset)
@@ -198,12 +220,12 @@ object AudioFileDecoder {
                                     else -> error("Кодек вернул неподдерживаемый PCM формат ($encoding)")
                                 }
                                 val frames = info.size / (bps * channels)
-                                val rs = resampler
                                 for (fr in 0 until frames) {
                                     val l = readSample(buffer, encoding)
                                     val r = if (channels >= 2) readSample(buffer, encoding) else l
                                     for (c in 2 until channels) readSample(buffer, encoding)   // остальные каналы пропускаем
-                                    if (rs != null) rs.push(l, r) else sink.write(l, r)
+                                    inBlock[inCount * 2] = l; inBlock[inCount * 2 + 1] = r
+                                    if (++inCount == inFrames) flushInput(final = false)
                                 }
                             }
                             outputEnded = info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0
@@ -212,7 +234,8 @@ object AudioFileDecoder {
                     }
                     check(SystemClock.elapsedRealtime() - lastProgressAt < 30_000) { "Декодер аудио не отвечает" }
                 }
-                resampler?.finish()
+                flushInput(final = true)
+                converter?.close(); converter = null
                 sink.finish()
                 require(sink.framesOut > 0) { "В файле нет аудиоданных" }
                 source.finish(sink.framesOut)
@@ -241,14 +264,19 @@ object AudioFileDecoder {
     private const val ENCODING_PCM_24BIT_PACKED = 21
     private const val ENCODING_PCM_32BIT = 22
 
+    /** Формат кэша: PCM 24 бит little-endian, `*.pcm24`, метка завершения «v3 <кадры>». */
+    private const val CACHE_FORMAT = "v3"
+    private const val BLOCK_FRAMES = 4096
+
     private class PcmSegmentWriter(
         private val directory: File,
         private val source: SegmentedPcmSource,
         private val onProgress: (SegmentedPcmSource) -> Unit,
         private val onReady: (SegmentedPcmSource) -> Unit,
     ) {
-        private val bytes = ByteArray(4)
         private val readyThreshold = minOf(source.totalFrames, SegmentedPcmSource.SEGMENT_FRAMES.toLong())
+        private val encoder = Pcm24StereoEncoder(seed = 0x5F24)
+        private var bytes = ByteArray(0)
         private var index = 0L
         private var segmentFrames = 0
         private var output: BufferedOutputStream? = null
@@ -256,27 +284,30 @@ object AudioFileDecoder {
         var framesOut = 0L
             private set
 
-        fun write(left: Float, right: Float) {
-            val l = (left * 32767f).roundToInt().coerceIn(-32768, 32767)
-            val r = (right * 32767f).roundToInt().coerceIn(-32768, 32767)
-            bytes[0] = l.toByte(); bytes[1] = (l shr 8).toByte()
-            bytes[2] = r.toByte(); bytes[3] = (r shr 8).toByte()
-            if (output == null) output = BufferedOutputStream(
-                FileOutputStream(File(directory, "$index.tmp")), 1 shl 16)
-            output!!.write(bytes)
-            segmentFrames++; framesOut++
-            if (segmentFrames == SegmentedPcmSource.SEGMENT_FRAMES) publishSegment()
+        /** [frames] кадров интерлива L/R (float) → 24 бит с TPDF-дизерингом, сегментами по 5 с. */
+        fun write(block: FloatArray, frames: Int) {
+            var done = 0
+            while (done < frames) {
+                val n = minOf(frames - done, SegmentedPcmSource.SEGMENT_FRAMES - segmentFrames)
+                if (bytes.size < n * 6) bytes = ByteArray(n * 6)
+                if (done == 0 && n == frames) encoder.encode(block, n, bytes)
+                else encoder.encode(block.copyOfRange(done * 2, (done + n) * 2), n, bytes)
+                if (output == null) output = BufferedOutputStream(FileOutputStream(File(directory, "$index.tmp")), 1 shl 16)
+                output!!.write(bytes, 0, n * 6)
+                segmentFrames += n; framesOut += n; done += n
+                if (segmentFrames == SegmentedPcmSource.SEGMENT_FRAMES) publishSegment()
+            }
         }
 
         fun finish() { if (segmentFrames > 0) publishSegment() }
 
-        fun close() { try { output?.close() } finally { output = null } }
+        fun close() { try { output?.close() } finally { output = null; encoder.close() } }
 
         private fun publishSegment() {
             val stream = output ?: return
             stream.flush(); stream.close(); output = null
             val tmp = File(directory, "$index.tmp")
-            val segment = File(directory, "$index.pcm48")
+            val segment = File(directory, "$index.pcm24")
             check(tmp.renameTo(segment)) { "Не удалось сохранить сегмент аудио" }
             source.publish(index, segment, segmentFrames)
             segmentFrames = 0

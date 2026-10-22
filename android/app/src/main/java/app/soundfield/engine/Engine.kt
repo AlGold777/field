@@ -334,8 +334,12 @@ class Engine private constructor(private val app: Context) {
     private val lanBlockedLogCount = ConcurrentHashMap<String, Int>()
     private var lastTelemetry = 0L
     private var lastLimiterWindowAtMs = 0L
-    private var limiterWindowCount = 0L
+    private var limiterWindowBlocks = 0L
+    private var limiterWindowActive = 0L
     private var limiterWindowMaxDb = 0.0
+    private var preLimiterWindowBlocks = 0L
+    private var preLimiterWindowActive = 0L
+    private var preLimiterWindowMaxDb = 0.0
     private var lastSpatialPerfAtMs = 0L
     private val udpPackets = AtomicLong()
     private val udpInvalid = AtomicLong()
@@ -1006,9 +1010,7 @@ class Engine private constructor(private val app: Context) {
                 }
                 val count = minOf(TcpAudioWire.CHUNK_FRAMES.toLong(), limit - cursor).toInt()
                 if (count <= 0) { Thread.sleep(20); continue }
-                val samples = ShortArray(count) { index ->
-                    (audioSource.sample(cursor + index, channel) * 32767f).roundToInt().coerceIn(-32768, 32767).toShort()
-                }
+                val samples = quantizeChannel(audioSource, cursor, channel, count)
                 TcpAudioWire.writeChunk(out, TcpAudioChunk(activeEpoch, trackId, cursor, samples))
                 cursor += count
                 tcpAudioFramesSent.addAndGet(count.toLong())
@@ -2374,7 +2376,7 @@ class Engine private constructor(private val app: Context) {
             misses = current?.misses ?: 0,
             sideMidDb = current?.sideMidDb ?: 0.0,
             correlation = current?.correlation ?: 1.0,
-            limiterDb = current?.limiterReductionDb ?: 0.0,
+            limiterDb = currentPreLimited?.maxReductionDb ?: 0.0,
             loudnessCompDb = current?.loudnessCompensationDb ?: 0.0,
             xtcApplied = current?.xtcApplied ?: false,
             xtcDesignTimedOut = current?.xtcDesignTimedOut ?: false,
@@ -3779,7 +3781,26 @@ class Engine private constructor(private val app: Context) {
             "xtc=${soloMode && deviceXtcVerified()}"
     }
 
-    private fun renderSourceFor(input: AudioSource, startAtFrame: Long = 0L): AudioSource {
+    /** Источник для рендера Server: spatial (если включён) под сцепленным предлимитером −1,5 dBTP (A1.4); служебные сигналы не ограничиваются. */
+    private fun renderSourceFor(input: AudioSource, startAtFrame: Long = 0L): AudioSource =
+        limitedFor(spatialSourceFor(input, startAtFrame), startAtFrame)
+
+    @Volatile private var currentPreLimited: PreLimitedSource? = null
+
+    private fun limitedFor(rendered: AudioSource, startAtFrame: Long): AudioSource {
+        val current = currentPreLimited
+        if (rendered.mode != SourceMode.MUSIC) {
+            if (current != null) { currentPreLimited = null; closeSpatialLater(current) }
+            return rendered
+        }
+        if (current != null && current.innerSource === rendered) return current
+        val created = PreLimitedSource(rendered, startAtFrame.coerceIn(0L, rendered.totalFrames))
+        currentPreLimited = created
+        if (current != null) closeSpatialLater(current)
+        return created
+    }
+
+    private fun spatialSourceFor(input: AudioSource, startAtFrame: Long = 0L): AudioSource {
         if (!spatialEnabledFor(input)) {
             val old = activeSpatialSource
             activeSpatialSource = null; activeSpatialInput = null; activeSpatialSignature = ""
@@ -3823,6 +3844,7 @@ class Engine private constructor(private val app: Context) {
     private fun closeSpatialTree(source: AudioSource) {
         when (source) {
             is SpatialSource -> source.close()
+            is PreLimitedSource -> source.close()
             is CrossfadeAudioSource -> { closeSpatialTree(source.previous); closeSpatialTree(source.next) }
         }
     }
@@ -3869,7 +3891,7 @@ class Engine private constructor(private val app: Context) {
                 val previous = serverPlay.source
                 val fadeFrames = SF.SAMPLE_RATE / 20
                 serverPlay = ServerPlayState(timeline,
-                    CrossfadeAudioSource(previous, input, frame, fadeFrames),
+                    CrossfadeAudioSource(previous, limitedFor(input, frame), frame, fadeFrames),
                     renderChannel(), serverGain(), activeEqConfig())
                 spatialReprocessFrame = frame
                 spatialReprocessToken++
@@ -5117,13 +5139,26 @@ class Engine private constructor(private val app: Context) {
         val heartbeatP95 = percentile95(telemetryRateSamples.toList())
         val tickP95 = tickIntervals.takeP95Ms()
         val output = audio.takeWindow(audioFocusHeld)
+        // Финальный лимитер устройства (−1,0 dBTP) и сцепленный предлимитер Server (−1,5 dBTP): доля блоков с ослаблением > 0,5 dB (A1.4).
         val limiterStats = if (role == Role.POINT) pointRenderer.takeLimiterStats() else serverRenderer.takeLimiterStats()
-        limiterWindowCount += limiterStats.first
-        limiterWindowMaxDb = maxOf(limiterWindowMaxDb, limiterStats.second)
+        limiterWindowBlocks += limiterStats.blocks
+        limiterWindowActive += limiterStats.activeBlocks
+        limiterWindowMaxDb = maxOf(limiterWindowMaxDb, limiterStats.maxReductionDb)
+        if (role == Role.SERVER) currentPreLimited?.takeStats()?.let {
+            preLimiterWindowBlocks += it.blocks; preLimiterWindowActive += it.activeBlocks
+            preLimiterWindowMaxDb = maxOf(preLimiterWindowMaxDb, it.maxReductionDb)
+        }
         if (lastLimiterWindowAtMs == 0L) lastLimiterWindowAtMs = nowMs
         else if (nowMs - lastLimiterWindowAtMs >= 10_000L) {
-            telemetry.record("LIMITER_ACTIVE", mapOf("count" to limiterWindowCount, "maxReductionDb" to limiterWindowMaxDb))
-            limiterWindowCount = 0L; limiterWindowMaxDb = 0.0; lastLimiterWindowAtMs = nowMs
+            telemetry.record("LIMITER_ACTIVE", mapOf(
+                "count" to limiterWindowActive, "blocks" to limiterWindowBlocks, "maxReductionDb" to limiterWindowMaxDb,
+                "activeShare" to if (limiterWindowBlocks > 0) limiterWindowActive.toDouble() / limiterWindowBlocks else 0.0,
+                "preActiveShare" to if (preLimiterWindowBlocks > 0) preLimiterWindowActive.toDouble() / preLimiterWindowBlocks else 0.0,
+                "preMaxReductionDb" to preLimiterWindowMaxDb,
+            ))
+            limiterWindowBlocks = 0L; limiterWindowActive = 0L; limiterWindowMaxDb = 0.0
+            preLimiterWindowBlocks = 0L; preLimiterWindowActive = 0L; preLimiterWindowMaxDb = 0.0
+            lastLimiterWindowAtMs = nowMs
         }
         if (output.recoveryCount > 0) {
             Log.w(TAG, "Recreating audio output after ${output.recoveryCount} failures", output.recoveryError)
@@ -5170,7 +5205,7 @@ class Engine private constructor(private val app: Context) {
                 "cacheAheadMs" to ((activeSpatial.readyFrames - currentPosition).coerceAtLeast(0) * 1000.0 / SF.SAMPLE_RATE),
                 "restarts" to activeSpatial.restarts,
                 "misses" to activeSpatial.misses,
-                "limiterDb" to activeSpatial.limiterReductionDb,
+                "limiterDb" to (currentPreLimited?.maxReductionDb ?: 0.0),
                 "loudnessCompDb" to activeSpatial.loudnessCompensationDb,
                 "sideMidDb" to activeSpatial.sideMidDb,
                 "corrMin" to activeSpatial.correlation,
@@ -5183,7 +5218,7 @@ class Engine private constructor(private val app: Context) {
             ))
             lastSpatialPerfAtMs = nowMs
         }
-        val progressive = if (role == Role.SERVER) serverPlay.source as? SegmentedPcmSource else null
+        val progressive = if (role == Role.SERVER && mode == SourceMode.MUSIC) source as? SegmentedPcmSource else null
         val readyFrames = progressive?.readyFrames ?: -1L
         val decodeTrack = currentDecodeTrackTag()
         if (decodeTrack != decodeReadyTrackTag || readyFrames != decodeReadyAtLastCheck) {
@@ -5633,13 +5668,21 @@ class Engine private constructor(private val app: Context) {
         pointChannelSignal.add(samples, 0, samples.size)
     }
 
+    /** [count] кадров канала [channel] от [start] → знаковые 24 бит с TPDF-дизерингом; seed зависит от кадра и канала — перепосылка идентична. */
+    private fun quantizeChannel(source: AudioSource, start: Long, channel: Int, count: Int): IntArray {
+        val f = FloatArray(count) { i -> source.sample(start + i, channel).let { if (it.isNaN()) 0f else it } }
+        val q = IntArray(count)
+        Pcm24.quantize(f, count, start * 2 + channel + 1, q)
+        return q
+    }
+
     /** Число кадров в пакете, начинающемся с [start]: не больше PACKET_FRAMES и только из готовой части источника. */
     private fun packetFrameCount(source: AudioSource, start: Long): Int = Packetizing.frameCount(source, start)
 
     private fun packet(st: ServerPlayState, tl: Timeline, seq: Int, start: Long, flags: Int,
         count: Int = packetFrameCount(st.source, start)): ByteArray {
         val pCh = Ch.other(st.channel)
-        val s = ShortArray(count) { i -> (st.source.sample(start + i, pCh) * 32767f).roundToInt().coerceIn(-32768, 32767).toShort() }
+        val s = quantizeChannel(st.source, start, pCh, count)
         return Wire.audio(sessionId, tl.epoch, seq, start, tl.timeOf(start), System.nanoTime(), flags, s, count, udpKey ?: ByteArray(32))
     }
 

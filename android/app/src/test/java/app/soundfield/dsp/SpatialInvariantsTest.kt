@@ -2,11 +2,13 @@ package app.soundfield.dsp
 
 import app.soundfield.core.AudioSource
 import app.soundfield.core.Ch
+import app.soundfield.core.PreLimitedSource
 import app.soundfield.core.SF
 import app.soundfield.core.SourceMode
 import app.soundfield.core.SpatialSource
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
+import org.junit.Assume.assumeTrue
 import org.junit.Test
 import kotlin.math.PI
 import kotlin.math.abs
@@ -127,13 +129,22 @@ class SpatialInvariantsTest {
         assertEquals(SF.SAMPLE_RATE, peakAt(outR))
     }
 
-    @Test fun outputNeverExceedsTheLimiterCeiling() {
+    /** Spatial сам не ограничивает пики: потолок держит сцепленный предлимитер Server (PreLimitedSource, −1,5 dBTP, A1.4). */
+    @Test fun outputUnderThePreLimiterNeverExceedsItsCeiling() {
+        assumeTrue("libsfdsp unavailable", SfDsp.load())
         val n = SF.SAMPLE_RATE * 4
         val tone = FloatArray(n) { (sin(2 * PI * 1_000.0 * it / SF.SAMPLE_RATE) * 0.98).toFloat() }
         val other = FloatArray(n) { (sin(2 * PI * 1_300.0 * it / SF.SAMPLE_RATE) * 0.98).toFloat() }
-        val (outL, outR) = render(Buffer(tone, other), wide.copy(gMidDb = 8.0, gHighDb = 8.0))
-        var peak = 0.0
-        for (i in 0 until n) peak = max(peak, max(abs(outL[i].toDouble()), abs(outR[i].toDouble())))
-        assertTrue("peak ${db(peak)} dBFS", db(peak) <= -0.25)
+        val spatial = SpatialSource(Buffer(tone, other), spatialConfig = wide.copy(gMidDb = 8.0, gHighDb = 8.0))
+        PreLimitedSource(spatial).use { limited ->
+            limited.requestThrough(n.toLong())
+            val deadline = System.nanoTime() + 20_000_000_000L
+            while (!limited.complete && limited.processingError == null && spatial.processingError == null && System.nanoTime() < deadline) Thread.sleep(2)
+            assertTrue("render timed out", limited.complete)
+            var peak = 0.0
+            for (i in 0 until n) for (c in 0..1) peak = max(peak, abs(limited.sample(i.toLong(), c).toDouble()))
+            assertTrue("peak ${db(peak)} dBFS", db(peak) <= -1.5 + 0.01)
+        }
+        spatial.close()
     }
 }

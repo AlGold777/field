@@ -1,5 +1,6 @@
 package app.soundfield.core
 
+import app.soundfield.dsp.PeakLimiter
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -27,17 +28,13 @@ class EqualizerTest {
         }
     }
 
-    @Test fun flatEnabledCurveIsBitExactBeforeTheFixedLimiterDelay() {
+    @Test fun flatEnabledCurveIsBitExact() {
         val input = FloatArray(4096) { i -> (sin(i * 0.091) * 0.7).toFloat() }
         val output = input.copyOf()
         val processor = EqualizerProcessor()
         processor.setConfig(EqualizerMath.config(EqSettings(enabled = true)))
         processor.processTone(output, output.size)
-        processor.processLimiter(output, output.size)
-        for (i in output.indices) {
-            val expected = if (i < EqualizerMath.LOOKAHEAD_FRAMES) 0f else input[i - EqualizerMath.LOOKAHEAD_FRAMES]
-            assertEquals("sample $i", expected, output[i], 0f)
-        }
+        for (i in output.indices) assertEquals("sample $i", input[i], output[i], 0f)
     }
 
     @Test fun magnetUsesGaussianOctaveDistanceAndOffMovesOneBand() {
@@ -82,13 +79,19 @@ class EqualizerTest {
         assertTrue("max sample jump $maxStep, base $plainStep", maxStep <= plainStep * 1.05f)
     }
 
-    @Test fun limiterAddsTheSameFortyEightSampleDelay() {
+    @Test fun processorAddsNoDelayAndTheCoreLimiterAddsItsReportedLatency() {
         val processor = EqualizerProcessor()
         processor.setConfig(EqConfig.neutral())
         val impulse = FloatArray(512).also { it[0] = 0.5f }
         processor.process(impulse, impulse.size)
-        assertEquals(0.5f, impulse[EqualizerMath.LOOKAHEAD_FRAMES], 0f)
-        assertEquals(0f, impulse[EqualizerMath.LOOKAHEAD_FRAMES - 1], 0f)
+        assertEquals(0.5f, impulse[0], 0f)
+        val limiter = PeakLimiter(48_000, 1, -1.0)
+        try {
+            val x = FloatArray(512).also { it[0] = 0.5f }
+            limiter.process(x, 0, x.size)
+            assertEquals(0.5f, x[limiter.latencyFrames], 0f)
+            if (limiter.isNative) assertEquals(87, limiter.latencyFrames)
+        } finally { limiter.close() }
     }
 
     @Test fun pairedProcessorsProduceBitIdenticalOutput() {
@@ -108,8 +111,13 @@ class EqualizerTest {
         assertTrue("preamp=${config.preampDb}", config.preampDb <= -11.0)
         val samples = pinkMultisine(48_000, peakLevel = 1.0)
         val processor = EqualizerProcessor(); processor.setConfig(config); processor.process(samples, samples.size)
-        assertTrue("output peak=${samples.maxOf { abs(it) }}", samples.maxOf { abs(it) } <= 1f)
-        assertTrue("limiter reduction=${processor.maxLimiterReductionDb()}", processor.maxLimiterReductionDb() <= 1.0)
+        val limiter = PeakLimiter(48_000, 1, -1.0)
+        try {
+            limiter.process(samples, 0, samples.size)
+            assertTrue("output peak=${samples.maxOf { abs(it) }}", samples.maxOf { abs(it) } <= 1f)
+            val reduction = limiter.takeStats().maxReductionDb
+            assertTrue("limiter reduction=$reduction", reduction <= 2.0)   // потолок −1,0 dBTP: запас автоматического предусиления ≈ 0 dB
+        } finally { limiter.close() }
     }
 
     @Test fun loudnessPreservationNeverConsumesTheTruePeakHeadroom() {

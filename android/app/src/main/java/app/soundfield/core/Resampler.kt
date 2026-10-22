@@ -12,9 +12,8 @@ import kotlin.math.min
 import kotlin.math.sin
 
 /**
- * Потоковый стерео-ресемплер с окном-sinc (24 отвода, полифазная таблица без приближений по фазе).
- * Заменяет линейную интерполяцию: при 44,1 → 48 кГц линейная давала заметные зеркальные
- * искажения в верхних частотах. Работает на входе произвольными порциями, память — O(порции).
+ * Запасной потоковый стерео-ресемплер (24 отвода, окно Блэкмана) на случай, если библиотека ядра недоступна
+ * (32-битное устройство без libsfdsp). Основной путь — SampleRateConverter поверх ядра (A1.2).
  */
 class StreamResampler(private val inRate: Int, private val outRate: Int, private val emit: (Float, Float) -> Unit) {
     private val half = 12
@@ -99,32 +98,6 @@ class StreamResampler(private val inRate: Int, private val outRate: Int, private
 }
 
 /**
- * Трек, декодированный в файл (48 кГц, стерео, int16 LE) и отображённый в память (mmap).
- * Раньше весь трек держался в куче Java (для 10-минутного файла на пике декодирования ~400 МБ) —
- * длинные файлы роняли приложение с OutOfMemoryError. Отображённый файл кучу не занимает.
- */
-class MappedPcmSource(file: File, override val title: String, override val artist: String) : AudioSource {
-    private val buf: MappedByteBuffer
-    override val mode = SourceMode.MUSIC
-    override val totalFrames: Long
-
-    init {
-        RandomAccessFile(file, "r").use { raf ->
-            val size = raf.length()
-            require(size in 4..Int.MAX_VALUE.toLong()) { "Трек слишком длинный" }
-            buf = raf.channel.map(FileChannel.MapMode.READ_ONLY, 0, size)
-            buf.order(ByteOrder.LITTLE_ENDIAN)
-            totalFrames = size / 4
-        }
-    }
-
-    override fun sample(frame: Long, ch: Int): Float {
-        if (frame < 0 || frame >= totalFrames) return 0f
-        return buf.getShort(((frame * 2 + ch) * 2).toInt()) / 32768f
-    }
-}
-
-/**
  * PCM-файл, публикуемый декодером частями. Реалтайм-чтение никогда не ждёт декодер:
  * ещё не готовый сегмент возвращает тишину. Server отправляет эту же тишину в UDP,
  * поэтому обе стороны сохраняют одну временную шкалу. Размер трека не ограничен Int.MAX_VALUE.
@@ -173,13 +146,13 @@ class SegmentedPcmSource(
         val index = frame / SEGMENT_FRAMES
         val mapped = segments[index] ?: return 0f
         val within = (frame % SEGMENT_FRAMES).toInt()
-        val offset = (within * BYTES_PER_FRAME + ch * 2).toInt()
-        if (offset + 2 > mapped.limit()) return 0f
-        return mapped.getShort(offset) / 32768f
+        val offset = (within * BYTES_PER_FRAME + ch * Pcm24.BYTES).toInt()
+        if (offset + Pcm24.BYTES > mapped.limit()) return 0f
+        return Pcm24.readLe(mapped, offset)
     }
 
     companion object {
         const val SEGMENT_FRAMES = 5 * SF.SAMPLE_RATE
-        private const val BYTES_PER_FRAME = 4L
+        const val BYTES_PER_FRAME = 6L          // стерео, 24 бит little-endian, интерлив
     }
 }

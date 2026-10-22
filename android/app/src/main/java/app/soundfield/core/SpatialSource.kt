@@ -3,7 +3,6 @@ package app.soundfield.core
 import app.soundfield.dsp.Radix2Fft
 import app.soundfield.dsp.SpatialDspConfig
 import app.soundfield.dsp.SpatialLoudnessCompensator
-import app.soundfield.dsp.SpatialPeakLimiter
 import app.soundfield.dsp.SpatialReflectionProcessor
 import app.soundfield.dsp.SpatialProcessor
 import app.soundfield.dsp.XtcFilterDesigner
@@ -39,7 +38,6 @@ class SpatialSource(
     private val spatialProcessor = SpatialProcessor(spatialConfig)
     private val reflectionProcessor = if (spatialConfig.reflectionsEnabled && spatialConfig.reflectionTaps.isNotEmpty())
         SpatialReflectionProcessor(spatialConfig.reflectionTaps, strength = spatialConfig.strength) else null
-    private val peakLimiter = SpatialPeakLimiter()
     @Volatile private var xtcProcessor: XtcProcessor? = null
     @Volatile var xtcApplied: Boolean = false
         private set
@@ -71,7 +69,6 @@ class SpatialSource(
         private set
     val sideMidDb: Double get() = spatialProcessor.sideMidDb
     val correlation: Double get() = spatialProcessor.correlation
-    val limiterReductionDb: Double get() = peakLimiter.maxReductionDb
     val loudnessCompensationDb: Double get() = loudnessCompensator.compensationDb
     private val missCount = java.util.concurrent.atomic.AtomicLong()
     val misses: Long get() = missCount.get()
@@ -138,7 +135,7 @@ class SpatialSource(
                 val wanted = requestedHead.get()
                 val xtc = xtcProcessor
                 val xtcAhead = if (xtc != null) XTC_INPUT_AHEAD_FRAMES else 0L
-                val tailFrames = peakLimiter.lookaheadFrames.toLong() + xtcAhead
+                val tailFrames = xtcAhead
                 val processingTarget = (wanted + tailFrames).coerceAtMost(inner.totalFrames + tailFrames)
                 var progressed = false
                 if (bypass) {
@@ -160,7 +157,7 @@ class SpatialSource(
                         progressed = true
                     }
                 }
-                while (!bypass && workerRunning.get() && nextFrameStart - spatialProcessor.lookaheadHops * HOP_SIZE - peakLimiter.lookaheadFrames < processingTarget &&
+                while (!bypass && workerRunning.get() && nextFrameStart - spatialProcessor.lookaheadHops * HOP_SIZE < processingTarget &&
                     nextFrameStart - spatialProcessor.lookaheadHops * HOP_SIZE < inner.totalFrames + tailFrames &&
                     (sourceComplete || nextFrameStart + FFT_SIZE <= ready)) {
                     if (restartAtFrame.get() != NO_RESTART) break
@@ -201,7 +198,6 @@ class SpatialSource(
         spatialProcessor.reset()
         reflectionProcessor?.reset()
         xtcProcessor?.reset()
-        peakLimiter.reset()
         loudnessCompensator.reset()
         processedHead = warmupStart
         realtimeFactor = 0.0
@@ -242,7 +238,7 @@ class SpatialSource(
 
     private fun publishHop(frameStart: Long) {
         val xtc = xtcProcessor
-        val tailFrames = peakLimiter.lookaheadFrames.toLong() + if (xtc != null) XTC_INPUT_AHEAD_FRAMES else 0L
+        val tailFrames = if (xtc != null) XTC_INPUT_AHEAD_FRAMES else 0L
         val blockEnd = minOf(frameStart + HOP_SIZE, inner.totalFrames + tailFrames)
         val blockStart = maxOf(frameStart, 0L)
         for (frame in blockStart until blockEnd) {
@@ -268,23 +264,22 @@ class SpatialSource(
             val compensation = loudnessCompensator.gain()
             val compensatedLeft = (processedLeft * compensation).toFloat()
             val compensatedRight = (processedRight * compensation).toFloat()
-            if (xtc == null) processLimited(frame, compensatedLeft, compensatedRight)
+            if (xtc == null) publishFrame(frame, compensatedLeft, compensatedRight)
             else xtc.push(frame, compensatedLeft, compensatedRight)
         }
     }
 
-    private fun processXtcFrame(frame: Long, left: Float, right: Float) = processLimited(frame, left, right)
+    private fun processXtcFrame(frame: Long, left: Float, right: Float) = publishFrame(frame, left, right)
 
-    private fun processLimited(frame: Long, left: Float, right: Float) {
-        if (!peakLimiter.process(frame, left, right)) return
-        val outputFrame = peakLimiter.outputFrame
-        if (outputFrame in startAtFrame until inner.totalFrames) {
-            val cacheIndex = ((outputFrame % cacheCapacityFrames) * 2L).toInt()
-            cache[cacheIndex] = peakLimiter.outputLeft
-            cache[cacheIndex + 1] = peakLimiter.outputRight
+    /** Пиковое ограничение — не здесь: выход Spatial проходит сцепленный предлимитер Server ([PreLimitedSource], A1.4). */
+    private fun publishFrame(frame: Long, left: Float, right: Float) {
+        if (frame in startAtFrame until inner.totalFrames) {
+            val cacheIndex = ((frame % cacheCapacityFrames) * 2L).toInt()
+            cache[cacheIndex] = left
+            cache[cacheIndex + 1] = right
         }
-        if (outputFrame >= 0L && outputFrame + 1 > processedHead)
-            processedHead = minOf(outputFrame + 1, inner.totalFrames)
+        if (frame >= 0L && frame + 1 > processedHead)
+            processedHead = minOf(frame + 1, inner.totalFrames)
     }
 
     override fun close() {

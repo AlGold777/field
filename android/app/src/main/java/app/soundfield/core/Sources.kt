@@ -24,15 +24,15 @@ interface PrefetchableAudioSource {
     fun requestThrough(frameExclusive: Long)
 }
 
-/** Декодированный стереофайл (int16 interleaved). */
+/** Декодированный стереофайл в памяти (float32, интерлив L/R, 48 кГц): встроенный тестовый трек и лаборатория. */
 class PcmSource(
-    private val pcm: ShortArray, override val title: String, override val artist: String,
+    private val pcm: FloatArray, override val title: String, override val artist: String,
 ) : AudioSource {
     override val mode = SourceMode.MUSIC
     override val totalFrames = (pcm.size / 2).toLong()
     override fun sample(frame: Long, ch: Int): Float {
         if (frame < 0 || frame >= totalFrames) return 0f
-        return pcm[(frame * 2 + ch).toInt()] / 32768f
+        return pcm[(frame * 2 + ch).toInt()]
     }
 }
 
@@ -166,9 +166,9 @@ class SyncProbeSource : AudioSource {
     }
 }
 
-/** Минимальный WAV-парсер: PCM 16 бит, моно/стерео; приводит к 48 кГц стерео. */
+/** Минимальный WAV-парсер: PCM 8/16/24/32 бит и float32, моно/стерео; приводит к 48 кГц стерео float (ресемплер ядра). */
 object Wav {
-    class Decoded(val pcm: ShortArray, val sampleRate: Int)
+    class Decoded(val pcm: FloatArray, val sampleRate: Int)
 
     fun decode(bytes: ByteArray): Decoded {
         val b = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN)
@@ -204,29 +204,27 @@ object Wav {
             if (dataOff >= 0 && channels > 0) break
             pos = body.toLong() + len.toLong().coerceAtLeast(0L) + (len and 1)
         }
-        require(fmt == 1 && bits == 16 && channels in 1..2 && rate > 0 && dataOff >= 0) { "Нужен PCM 16 бит" }
-        val frames = dataLen / (2 * channels)
-        var st = ShortArray(frames * 2)
+        val isFloat = fmt == 3 && bits == 32
+        require((fmt == 1 && bits in intArrayOf(8, 16, 24, 32) || isFloat) && channels in 1..2 && rate > 0 && dataOff >= 0) {
+            "Нужен PCM 8/16/24/32 бит или float32"
+        }
+        val bytesPer = bits / 8
+        val frames = dataLen / (bytesPer * channels)
+        fun at(frame: Int, c: Int): Float {
+            val o = dataOff + (frame * channels + c) * bytesPer
+            return when {
+                isFloat -> b.getFloat(o)
+                bits == 16 -> b.getShort(o) / 32768f
+                bits == 24 -> (((bytes[o + 2].toInt() shl 16) or ((bytes[o + 1].toInt() and 0xFF) shl 8) or (bytes[o].toInt() and 0xFF))) / 8388608f
+                bits == 32 -> b.getInt(o) / 2147483648f
+                else -> ((bytes[o].toInt() and 0xFF) - 128) / 128f
+            }
+        }
+        val st = FloatArray(frames * 2)
         for (f in 0 until frames) {
-            val l = b.getShort(dataOff + (f * channels) * 2)
-            val r = if (channels == 2) b.getShort(dataOff + (f * channels + 1) * 2) else l
-            st[f * 2] = l; st[f * 2 + 1] = r
+            val l = at(f, 0)
+            st[f * 2] = l; st[f * 2 + 1] = if (channels == 2) at(f, 1) else l
         }
-        if (rate != SF.SAMPLE_RATE) st = resample(st, rate, SF.SAMPLE_RATE)
-        return Decoded(st, SF.SAMPLE_RATE)
-    }
-
-    private fun resample(src: ShortArray, from: Int, to: Int): ShortArray {
-        val inFrames = src.size / 2
-        val outFrames = (inFrames.toLong() * to / from).toInt()
-        val out = ShortArray(outFrames * 2)
-        for (i in 0 until outFrames) {
-            val x = i.toDouble() * from / to
-            val i0 = x.toInt().coerceAtMost(inFrames - 1)
-            val i1 = (i0 + 1).coerceAtMost(inFrames - 1)
-            val fr = x - i0
-            for (c in 0..1) out[i * 2 + c] = (src[i0 * 2 + c] * (1 - fr) + src[i1 * 2 + c] * fr).toInt().toShort()
-        }
-        return out
+        return Decoded(if (rate != SF.SAMPLE_RATE) SampleRateConverter.convertAll(st, frames, rate, SF.SAMPLE_RATE) else st, SF.SAMPLE_RATE)
     }
 }

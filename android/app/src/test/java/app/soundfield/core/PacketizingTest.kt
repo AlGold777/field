@@ -26,7 +26,7 @@ class PacketizingTest {
 
     @Test fun shortReadyTailDoesNotSkipFrames() {
         val source = Fake(totalFrames = 1_000_000, readyFrames = 99_840 + 161)
-        val sent = sendAll(source, 99_840 - 480 * 3)
+        val sent = sendAll(source, 99_840L - SF.PACKET_FRAMES * 3)
         val last = sent.last()
         assertEquals(161, last.second)
         for (i in 1 until sent.size) assertEquals(sent[i - 1].first + sent[i - 1].second, sent[i].first)

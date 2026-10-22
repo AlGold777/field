@@ -86,6 +86,7 @@ SFDSP_API void sf_src_destroy(sf_src* s);
 SFDSP_API void sf_src_reset(sf_src* s);
 SFDSP_API int sf_src_taps(const sf_src* s);
 SFDSP_API int sf_src_phases(const sf_src* s);
+SFDSP_API int sf_src_channels(const sf_src* s);
 /* Верхняя граница числа выходных кадров для n_in входных (и для flush при n_in = 0). */
 SFDSP_API int64_t sf_src_max_output(const sf_src* s, int64_t n_in);
 /* Возвращает число выходных кадров (< 0 — ошибка). out_capacity ≥ sf_src_max_output. */

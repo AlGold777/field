@@ -28,7 +28,7 @@ constexpr int kTpHalf = kTpPerPhase / 2;            // 16: задержка де
 constexpr double kFastReleaseS = 0.050, kSlowReleaseS = 0.400, kDensityS = 1.000;
 constexpr double kDensityThreshold = 0.98855;       // −0,1 dB: ослабление «держится»
 constexpr double kDensityDeadZone = 0.20, kDensitySpan = 0.50;  // c = clamp((доля времени с ослаблением − 0,2) / 0,5)
-constexpr double kGuardDb = 0.02;                    // запас потолка на изменение усиления внутри окна детектора
+constexpr double kGuardDb = 0.005;                   // запас потолка на изменение усиления внутри окна детектора
 
 // Коэффициенты фаз 1..3: tp[ph][j], j = 0..31, применяются к x[k + 16 − j].
 struct TpTable {

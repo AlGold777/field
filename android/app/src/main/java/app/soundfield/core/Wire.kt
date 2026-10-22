@@ -7,13 +7,14 @@ import java.nio.ByteOrder
  * Бинарный UDP-протокол медиаконтура (big-endian). Описание — README, раздел «Протокол».
  *
  * Заголовок (8 байт): 'S' 'F' | version u8 | type u8 | sessionId i32
- *  AUDIO (1): epoch i32 | seq i32 | startFrame i64 | playoutNs i64 | sendNs i64 | count u16 | flags u8 | 0 u8 | count × i16
+ *  AUDIO (1): epoch i32 | seq i32 | startFrame i64 | playoutNs i64 | sendNs i64 | count u16 | flags u8 | 0 u8 | count × i24
  *  PING  (2): t1 i64 | pingSeq i32
  *  PONG  (3): t1 i64 | t2 i64 | t3 i64 | pingSeq i32
  *  NACK  (4): epoch i32 | n u16 | n × seq i32
  *
- * Версия 2: в конце каждого пакета — усечённый HMAC-SHA256 (TAG_BYTES = 8) от всех предыдущих байт, ключ — udpKey
- * соединения (PairCrypto.udpKey). Пакет с неверным тегом отбрасывается.
+ * Версия 3: PCM 24 бит со знаком (3 байта big-endian на отсчёт), не более MAX_AUDIO_FRAMES = 384 кадров на пакет. В конце
+ * каждого пакета — усечённый HMAC-SHA256 (TAG_BYTES = 8) от всех предыдущих байт, ключ — udpKey соединения
+ * (PairCrypto.udpKey); версия входит в заголовок под тегом, поэтому пакеты версии 2 отбрасываются. Пакет с неверным тегом отбрасывается.
  *
  * playoutNs — момент (по монотонным часам Server), когда кадр startFrame должен прозвучать.
  * sendNs — момент отправки (часы Server), нужен Point для оценки jitter.
@@ -23,7 +24,7 @@ sealed class UdpMsg {
 
     class Audio(
         override val session: Int, val epoch: Int, val seq: Int, val startFrame: Long,
-        val playoutNs: Long, val sendNs: Long, val flags: Int, val samples: ShortArray, val count: Int,
+        val playoutNs: Long, val sendNs: Long, val flags: Int, val samples: IntArray, val count: Int,
     ) : UdpMsg() { val isRetransmit get() = flags and FLAG_RETRANSMIT != 0 }
 
     class Ping(override val session: Int, val t1: Long, val pingSeq: Int) : UdpMsg()
@@ -36,6 +37,8 @@ sealed class UdpMsg {
         const val HEADER = 8
         const val TAG = PairCrypto.TAG_BYTES
         const val AUDIO_HEADER = HEADER + 36
+        const val MAX_AUDIO_FRAMES = 384
+        const val SAMPLE_BYTES = 3
         const val MAX_NACK = 64
     }
 }
@@ -55,12 +58,13 @@ object Wire {
     }
 
     fun audio(session: Int, epoch: Int, seq: Int, startFrame: Long, playoutNs: Long, sendNs: Long,
-              flags: Int, samples: ShortArray, count: Int, key: ByteArray): ByteArray {
-        val b = ByteBuffer.allocate(UdpMsg.AUDIO_HEADER + count * 2 + UdpMsg.TAG).order(ByteOrder.BIG_ENDIAN)
+              flags: Int, samples: IntArray, count: Int, key: ByteArray): ByteArray {
+        require(count in 0..UdpMsg.MAX_AUDIO_FRAMES) { "count=$count" }
+        val b = ByteBuffer.allocate(UdpMsg.AUDIO_HEADER + count * UdpMsg.SAMPLE_BYTES + UdpMsg.TAG).order(ByteOrder.BIG_ENDIAN)
         header(b, UdpMsg.T_AUDIO, session)
         b.putInt(epoch); b.putInt(seq); b.putLong(startFrame); b.putLong(playoutNs); b.putLong(sendNs)
         b.putShort(count.toShort()); b.put(flags.toByte()); b.put(0)
-        for (i in 0 until count) b.putShort(samples[i])
+        for (i in 0 until count) { val v = samples[i]; b.put((v shr 16).toByte()); b.put((v shr 8).toByte()); b.put(v.toByte()) }
         return seal(b, key)
     }
 
@@ -106,8 +110,8 @@ object Wire {
                     val playout = b.getLong(); val send = b.getLong()
                     val count = b.getShort().toInt() and 0xFFFF
                     val flags = b.get().toInt() and 0xFF; b.get()
-                    if (length < UdpMsg.AUDIO_HEADER + count * 2) return null
-                    val s = ShortArray(count) { b.getShort() }
+                    if (count > UdpMsg.MAX_AUDIO_FRAMES || length < UdpMsg.AUDIO_HEADER + count * UdpMsg.SAMPLE_BYTES) return null
+                    val s = IntArray(count) { (b.get().toInt() shl 16) or ((b.get().toInt() and 0xFF) shl 8) or (b.get().toInt() and 0xFF) }
                     UdpMsg.Audio(session, epoch, seq, start, playout, send, flags, s, count)
                 }
                 UdpMsg.T_PING -> {

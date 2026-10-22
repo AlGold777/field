@@ -2,6 +2,8 @@ package app.soundfield.tools
 
 import app.soundfield.core.AudioSource
 import app.soundfield.core.Ch
+import app.soundfield.core.Pcm24
+import app.soundfield.core.Pcm24StereoEncoder
 import app.soundfield.core.ServerPlayState
 import app.soundfield.core.ServerRenderer
 import app.soundfield.core.SF
@@ -10,13 +12,12 @@ import app.soundfield.core.Timeline
 import java.io.File
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
-import kotlin.math.roundToInt
 
 /**
  * Лаборатория sflab, сторона Android: прогоняет входные WAV (float32 mono, 48 кГц) через тот же ServerRenderer,
- * что и приложение (корректор + sinc, нейтральный EQ, усиление 1, лимитер), и пишет name.out.wav.
- * Два варианта источника: pcm16 — реальный кэш приложения (PcmSource, квантование до 16 бит), float — тот же тракт
- * без квантования источника. Вход создаёт `sflab gen-signals`, результат читает `sflab run --kotlin`.
+ * что и приложение (корректор + sinc, нейтральный EQ, усиление 1, финальный true-peak лимитер ядра), и пишет name.out.wav.
+ * Два варианта источника: pcm24 — как реальный кэш приложения (float → 24 бит с TPDF-дизерингом ядра → float), float — тот же
+ * тракт без квантования источника. Вход создаёт `sflab gen-signals`, результат читает `sflab run --kotlin`.
  */
 object LabRenderMain {
     private const val BLOCK = 480
@@ -29,18 +30,21 @@ object LabRenderMain {
         override fun sample(frame: Long, ch: Int): Float = if (frame < 0 || frame >= totalFrames) 0f else x[frame.toInt()]
     }
 
-    private class Pcm16Source(x: FloatArray) : AudioSource {
-        private val pcm = ShortArray(x.size * 2).also { out ->
-            for (i in x.indices) {
-                val v = (x[i] * 32768f).roundToInt().coerceIn(-32768, 32767).toShort()
-                out[i * 2] = v; out[i * 2 + 1] = v
-            }
+    /** Кэш приложения: интерлив L/R → 24 бит с TPDF (Pcm24StereoEncoder, как PcmSegmentWriter) → чтение как SegmentedPcmSource. */
+    private class Pcm24Source(x: FloatArray) : AudioSource {
+        private val bytes = ByteArray(x.size * 6)
+        init {
+            val stereo = FloatArray(x.size * 2)
+            for (i in x.indices) { stereo[i * 2] = x[i]; stereo[i * 2 + 1] = x[i] }
+            Pcm24StereoEncoder(seed = 0x5F24).use { it.encode(stereo, x.size, bytes) }
         }
+        private val buf = java.nio.ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN)
         override val mode = SourceMode.MUSIC
         override val title = "lab"
         override val artist = "lab"
         override val totalFrames = x.size.toLong()
-        override fun sample(frame: Long, ch: Int): Float = if (frame < 0 || frame >= totalFrames) 0f else pcm[(frame * 2 + ch).toInt()] / 32768f
+        override fun sample(frame: Long, ch: Int): Float =
+            if (frame < 0 || frame >= totalFrames) 0f else Pcm24.readLe(buf, (frame * 6 + ch * 3).toInt())
     }
 
     @JvmStatic fun main(args: Array<String>) {
@@ -48,11 +52,11 @@ object LabRenderMain {
         val inDir = File(args[0]).canonicalFile
         val outDir = File(args[1]).canonicalFile
         val inputs = inDir.listFiles { f -> f.name.endsWith(".wav") && !f.name.endsWith(".out.wav") }!!.sortedBy { it.name }
-        for (variant in listOf("pcm16", "float")) {
+        for (variant in listOf("pcm24", "float")) {
             val dir = File(outDir, variant).also { it.mkdirs() }
             for (file in inputs) {
                 val x = readFloatWav(file)
-                val source: AudioSource = if (variant == "pcm16") Pcm16Source(x) else FloatSource(x)
+                val source: AudioSource = if (variant == "pcm24") Pcm24Source(x) else FloatSource(x)
                 writeFloatWav(File(dir, file.nameWithoutExtension + ".out.wav"), render(source))
             }
             println("lab render $variant: ${inputs.size} files -> $dir")

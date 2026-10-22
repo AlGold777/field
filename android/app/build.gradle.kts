@@ -64,7 +64,8 @@ tasks.withType<Test>().configureEach {
 tasks.register<JavaExec>("labRender") {
     group = "verification"
     description = "Renders sflab input WAVs through the app's Kotlin render path (ServerRenderer). Args: -PlabIn=DIR -PlabOut=DIR"
-    dependsOn("compileDebugKotlin")
+    dependsOn("compileDebugKotlin", buildHostDsp)
+    systemProperty("sfdsp.host.lib", File(rootProject.projectDir.parentFile, "dsp/build/host/libsfdsp.dylib").absolutePath)
     classpath = files(layout.buildDirectory.dir("tmp/kotlin-classes/debug")) + configurations.getByName("debugRuntimeClasspath")
     mainClass.set("app.soundfield.tools.LabRenderMain")
     args(providers.gradleProperty("labIn").getOrElse(""), providers.gradleProperty("labOut").getOrElse(""))
@@ -73,7 +74,8 @@ tasks.register<JavaExec>("labRender") {
 tasks.register<JavaExec>("spatialRender") {
     group = "verification"
     description = "Render WAV files through the app's JVM SpatialSource pipeline."
-    dependsOn("compileDebugKotlin")
+    dependsOn("compileDebugKotlin", buildHostDsp)
+    systemProperty("sfdsp.host.lib", File(rootProject.projectDir.parentFile, "dsp/build/host/libsfdsp.dylib").absolutePath)
     classpath = files(layout.buildDirectory.dir("tmp/kotlin-classes/debug")) + configurations.getByName("debugRuntimeClasspath")
     mainClass.set("app.soundfield.tools.SpatialRenderMain")
 }

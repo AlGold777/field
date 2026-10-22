@@ -125,7 +125,7 @@ class PointReceiver(private val clock: ClockSync, capacityPow2: Int = 17) {
         for (i in 0 until p.count) {
             val f = p.startFrame + i
             val idx = (f and mask).toInt()
-            samples[idx] = p.samples[i] / 32768f
+            samples[idx] = p.samples[i] / Pcm24.SCALE
             tags[idx] = f
         }
         val end = p.startFrame + p.count - 1

@@ -9,6 +9,7 @@
 #include <cstring>
 #include <set>
 
+#include "a1.hpp"
 #include "sfdsp.h"
 #include "suite.hpp"
 
@@ -96,6 +97,18 @@ int cmdRun(int argc, char** argv) {
         runChainSuite(c.name, fn, sink, ChainTraits{c.integer, c.invariant});
         for (const auto& f : wavs) runCorpus(c.name, fn, stem(f), readWav(corpus + "/" + f), sink, c.integer);
     }
+    // A1.1: кэш 24 бит с TPDF-дизерингом (как кэш Android/iOS и сетевой пакет)
+    {
+        auto fn = [](const std::string&, const std::vector<float>& in) { return cache24Roundtrip(in, 77); };
+        runChainSuite("cache24_tpdf", fn, sink, ChainTraits{true, true});
+        for (const auto& f : wavs) runCorpus("cache24_tpdf", fn, stem(f), readWav(corpus + "/" + f), sink, true);
+    }
+    // A1.2: SRC
+    runSrcSuite(sink);
+    for (const auto& f : wavs) runSrcCorpus(stem(f), readWav(corpus + "/" + f), sink);
+    // A1.4: лимитеры
+    runLimiterSynth(sink);
+    for (const auto& f : wavs) runLimiterCorpus(stem(f), readWav(corpus + "/" + f), sink);
     const SyncScenario scs[] = {
         {"drift100_jit20", 100, 20, 0, 0, 0},
         {"drift100_jit100", 100, 100, 0, 0, 0},
