@@ -82,8 +82,13 @@ fun AppRoot(engine: Engine) {
     LaunchedEffect(Unit) {
         if (Build.VERSION.SDK_INT >= 33) notifLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
     }
+    // id последнего показанного сообщения переживает пересоздание активности, чтобы тост не повторялся
+    var shownMsgId by rememberSaveable { mutableStateOf(0) }
     LaunchedEffect(ui.messageId) {
-        if (ui.messageId > 0 && ui.message.isNotEmpty()) Toast.makeText(ctx, ui.message, Toast.LENGTH_SHORT).show()
+        if (ui.messageId > 0 && ui.messageId != shownMsgId && ui.message.isNotEmpty()) {
+            shownMsgId = ui.messageId
+            Toast.makeText(ctx, ui.message, Toast.LENGTH_SHORT).show()
+        }
     }
     LaunchedEffect(ui.filePickerRequest) {
         if (ui.filePickerRequest > handledPickerRequest) {
