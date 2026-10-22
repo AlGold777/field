@@ -6,10 +6,23 @@ import AVFoundation
 ///   present = hostTime(timestamp) + outputLatency
 /// Этот момент передаётся RenderSource (Server/Point), который выбирает кадр общей шкалы.
 /// Разница между моделями телефонов, не учтённая системой, убирается акустической калибровкой.
+/// Счётчик underrun: память освобождается в deinit самого контейнера, а не в AudioOutput,
+/// поэтому render-блок, держащий контейнер, не может остаться с висящим указателем.
+private final class UnderrunBox {
+    let ptr: UnsafeMutablePointer<Int64>
+    init() {
+        ptr = UnsafeMutablePointer<Int64>.allocate(capacity: 1)
+        ptr.initialize(to: 0)
+    }
+    deinit { ptr.deallocate() }
+}
+
 final class AudioOutput {
-    private let engine = AVAudioEngine()
+    private var engine = AVAudioEngine()
     private var node: AVAudioSourceNode?
-    private let equalizer = AVAudioUnitEQ(numberOfBands: 10)
+    private var equalizer = AVAudioUnitEQ(numberOfBands: 10)
+    private var configObserver: NSObjectProtocol?
+    private var eqState: (EqSettings, Bool)?     // последние параметры EQ: переприменяются после пересборки движка
     private let sourceBox = Locked<RenderSource?>(nil)
     private let outLatencyNs = Locked<Int64>(0)
     private(set) var running = false
@@ -20,22 +33,17 @@ final class AudioOutput {
 
     private(set) var latencyMs = 0.0
     // Счётчик пишет только реалтайм-callback (без блокировок и без self); читается на главном потоке.
-    private let underrunCounter: UnsafeMutablePointer<Int64> = {
-        let p = UnsafeMutablePointer<Int64>.allocate(capacity: 1)
-        p.initialize(to: 0)
-        return p
-    }()
+    // Владеет памятью отдельный объект, который захватывает и render-блок узла: память живёт, пока жив узел.
+    private let underrunBox = UnderrunBox()
     private(set) var underruns: Int64 {       // на iOS система не отдаёт счётчик — считаем отсутствие hostTime
-        get { underrunCounter.pointee }
-        set { underrunCounter.pointee = newValue }
+        get { underrunBox.ptr.pointee }
+        set { underrunBox.ptr.pointee = newValue }
     }
 
     var source: RenderSource? {
         get { sourceBox.value }
         set { sourceBox.value = newValue }
     }
-
-    deinit { underrunCounter.deallocate() }
 
     init() {
         let nc = NotificationCenter.default
@@ -46,16 +54,34 @@ final class AudioOutput {
             self?.handleRouteChange(n)
         }
         nc.addObserver(forName: AVAudioSession.mediaServicesWereResetNotification, object: nil, queue: .main) { [weak self] _ in
-            guard let self, self.running else { return }
-            // Старый source node остаётся в графе движка: отсоединяем, иначе рендер идёт дважды.
-            if let old = self.node { self.engine.detach(old) }
-            self.running = false; self.node = nil; self.start()
+            guard let self else { return }
+            // После сброса медиасервисов все аудиообъекты недействительны (документация Apple):
+            // движок, узлы и EQ пересоздаются, граф строится тем же кодом, что при первом start().
+            let wasRunning = self.running
+            self.rebuildEngine()
+            if wasRunning { self.start() }
+            if let eq = self.eqState { self.setEqualizer(eq.0, music: eq.1) }
         }
-        nc.addObserver(forName: .AVAudioEngineConfigurationChange, object: engine, queue: .main) { [weak self] _ in
+        observeEngineConfiguration()
+    }
+
+    private func observeEngineConfiguration() {
+        configObserver = NotificationCenter.default.addObserver(forName: .AVAudioEngineConfigurationChange, object: engine, queue: .main) { [weak self] _ in
             guard let self, self.running else { return }
             self.updateLatency()
             if !self.engine.isRunning { try? self.engine.start() }
         }
+    }
+
+    /// Новый движок и EQ вместо недействительных после сброса медиасервисов; source node создаётся заново в start().
+    private func rebuildEngine() {
+        engine.stop()
+        if let token = configObserver { NotificationCenter.default.removeObserver(token) }
+        engine = AVAudioEngine()
+        equalizer = AVAudioUnitEQ(numberOfBands: 10)
+        node = nil
+        running = false
+        observeEngineConfiguration()
     }
 
     /// Обычный режим — воспроизведение. Категория .playback: звук не глушится переключателем «бесшумно»
@@ -94,7 +120,7 @@ final class AudioOutput {
         if node == nil {
             let src = sourceBox
             let lat = outLatencyNs
-            let underrunCount = underrunCounter
+            let underrunBox = self.underrunBox
             let n = AVAudioSourceNode(format: fmt) { _, ts, frameCount, abl -> OSStatus in
                 let bufs = UnsafeMutableAudioBufferListPointer(abl)
                 guard let first = bufs.first, let data = first.mData else { return noErr }
@@ -104,7 +130,7 @@ final class AudioOutput {
                 if ts.pointee.mFlags.contains(.hostTimeValid) {
                     present = MonoClock.ns(fromHost: ts.pointee.mHostTime) + lat.value
                 } else {
-                    underrunCount.pointee += 1
+                    underrunBox.ptr.pointee += 1
                     present = MonoClock.nowNs() + lat.value + 5_000_000
                 }
                 if bufs.count >= 2, let second = bufs[1].mData {
@@ -128,6 +154,7 @@ final class AudioOutput {
 
     /// Main-thread graph parameters; the unit owns its render state.
     func setEqualizer(_ settings: EqSettings, music: Bool) {
+        eqState = (settings, music)
         let active = music && settings.enabled && !settings.bypass
         for i in 0..<10 {
             let band = equalizer.bands[i]
@@ -193,6 +220,9 @@ final class AudioOutput {
         case .began:
             onInterruption?(true)
         case .ended:
+            // Флаг .shouldResume здесь не проверяется намеренно: движок запускается при любом окончании прерывания,
+            // если выход должен быть активен. Воспроизведение после прерывания само не возобновляется (пара на паузе),
+            // а остановленный движок дал бы тишину при следующем «Играть».
             if running { try? AVAudioSession.sharedInstance().setActive(true); try? engine.start() }
             onInterruption?(false)
         @unknown default: break
