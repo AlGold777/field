@@ -80,6 +80,15 @@ tasks.register<JavaExec>("spatialRender") {
     mainClass.set("app.soundfield.tools.SpatialRenderMain")
 }
 
+// Профили устройств (контракт A2, profiles/devices.json) кладутся в assets APK копией.
+val profilesAssetsDir = File(layout.buildDirectory.get().asFile, "generated/profiles/assets")
+val copyProfilesAssets = tasks.register<Copy>("copyProfilesAssets") {
+    from(File(rootProject.projectDir.parentFile, "profiles/devices.json"))
+    into(profilesAssetsDir)
+}
+android.sourceSets.getByName("main").assets.srcDir(profilesAssetsDir)
+tasks.named("preBuild") { dependsOn(copyProfilesAssets) }
+
 dependencies {
     testImplementation("junit:junit:4.13.2")
     val composeBom = platform("androidx.compose:compose-bom:2024.12.01")
