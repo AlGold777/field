@@ -19,12 +19,23 @@ final class AudioOutput {
     private var routeSignature: String?
 
     private(set) var latencyMs = 0.0
-    private(set) var underruns: Int64 = 0      // на iOS система не отдаёт счётчик — считаем отсутствие hostTime
+    // Счётчик пишет только реалтайм-callback (без блокировок и без self); читается на главном потоке.
+    private let underrunCounter: UnsafeMutablePointer<Int64> = {
+        let p = UnsafeMutablePointer<Int64>.allocate(capacity: 1)
+        p.initialize(to: 0)
+        return p
+    }()
+    private(set) var underruns: Int64 {       // на iOS система не отдаёт счётчик — считаем отсутствие hostTime
+        get { underrunCounter.pointee }
+        set { underrunCounter.pointee = newValue }
+    }
 
     var source: RenderSource? {
         get { sourceBox.value }
         set { sourceBox.value = newValue }
     }
+
+    deinit { underrunCounter.deallocate() }
 
     init() {
         let nc = NotificationCenter.default
@@ -36,6 +47,8 @@ final class AudioOutput {
         }
         nc.addObserver(forName: AVAudioSession.mediaServicesWereResetNotification, object: nil, queue: .main) { [weak self] _ in
             guard let self, self.running else { return }
+            // Старый source node остаётся в графе движка: отсоединяем, иначе рендер идёт дважды.
+            if let old = self.node { self.engine.detach(old) }
             self.running = false; self.node = nil; self.start()
         }
         nc.addObserver(forName: .AVAudioEngineConfigurationChange, object: engine, queue: .main) { [weak self] _ in
@@ -81,7 +94,8 @@ final class AudioOutput {
         if node == nil {
             let src = sourceBox
             let lat = outLatencyNs
-            let n = AVAudioSourceNode(format: fmt) { [weak self] _, ts, frameCount, abl -> OSStatus in
+            let underrunCount = underrunCounter
+            let n = AVAudioSourceNode(format: fmt) { _, ts, frameCount, abl -> OSStatus in
                 let bufs = UnsafeMutableAudioBufferListPointer(abl)
                 guard let first = bufs.first, let data = first.mData else { return noErr }
                 let out = data.assumingMemoryBound(to: Float.self)
@@ -90,7 +104,7 @@ final class AudioOutput {
                 if ts.pointee.mFlags.contains(.hostTimeValid) {
                     present = MonoClock.ns(fromHost: ts.pointee.mHostTime) + lat.value
                 } else {
-                    self?.underruns += 1
+                    underrunCount.pointee += 1
                     present = MonoClock.nowNs() + lat.value + 5_000_000
                 }
                 if bufs.count >= 2, let second = bufs[1].mData {
@@ -149,7 +163,27 @@ final class AudioOutput {
         engine.stop()
         updateLatency()
         engine.prepare()
-        try? engine.start()
+        startAfterRestart(retry: true)
+    }
+
+    /// Движок не запустился после restart(), даже после повтора.
+    private(set) var restartFailed = false
+
+    private func startAfterRestart(retry: Bool) {
+        do {
+            try engine.start()
+            restartFailed = false
+        } catch {
+            NSLog("SoundField engine restart: \(error)")
+            if retry {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+                    guard let self, self.running else { return }
+                    self.startAfterRestart(retry: false)
+                }
+            } else {
+                restartFailed = true
+            }
+        }
     }
 
     private func handleInterruption(_ n: Notification) {
@@ -159,7 +193,10 @@ final class AudioOutput {
         case .began:
             onInterruption?(true)
         case .ended:
-            if running { try? AVAudioSession.sharedInstance().setActive(true); try? engine.start() }
+            // Возобновляется только запуск сессии и движка; воспроизведение решает приложение.
+            let rawOptions = info[AVAudioSessionInterruptionOptionKey] as? UInt ?? 0
+            let shouldResume = AVAudioSession.InterruptionOptions(rawValue: rawOptions).contains(.shouldResume)
+            if running && shouldResume { try? AVAudioSession.sharedInstance().setActive(true); try? engine.start() }
             onInterruption?(false)
         @unknown default: break
         }

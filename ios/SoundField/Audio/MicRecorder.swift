@@ -60,8 +60,9 @@ final class MicRecorder {
             lock.lock(); let done = finished; finished = true; let got = out; lock.unlock()
             if !done {
                 input.removeTap(onBus: 0); engine.stop()
-                if got.count > sr { completion(.success(Recording(samples: got, sampleRate: sr, startNs: startNs))) }
-                else { completion(.failure(NSError(domain: "SoundField", code: 2, userInfo: [NSLocalizedDescriptionKey: "Нет данных с микрофона"]))) }
+                // Частичная запись не считается успехом: Engine покажет причину из описания ошибки.
+                let message = got.isEmpty ? "Нет данных с микрофона" : "Запись с микрофона прервана: получено \(got.count * 100 / max(total, 1))% нужной длины"
+                completion(.failure(NSError(domain: "SoundField", code: 2, userInfo: [NSLocalizedDescriptionKey: message])))
             }
         }
     }

@@ -158,9 +158,12 @@ final class ChannelTestSource: AudioSource {
     let title = "Проверка каналов"
     let artist = "Сначала левый, затем правый"
     let totalFrames = Int64(Double(SF.sampleRate) * 3.8)
+    // Вынесено из sample(): литерал массива создавался бы на каждый сэмпл.
+    private static let leftStarts = [0.3, 0.8, 1.3]
+    private static let rightStarts = [2.1, 2.6, 3.1]
     func sample(_ frame: Int64, _ ch: Int) -> Float {
         let t = Double(frame) / Double(SF.sampleRate)
-        let starts = ch == Ch.L ? [0.3, 0.8, 1.3] : [2.1, 2.6, 3.1]
+        let starts = ch == Ch.L ? Self.leftStarts : Self.rightStarts
         let f = ch == Ch.L ? 880.0 : 1_320.0
         for s in starts {
             let dt = t - s
@@ -262,7 +265,16 @@ enum Wav {
         while pos + 8 <= b.count {
             let id = String(bytes: b[pos..<pos + 4], encoding: .ascii) ?? ""
             let len = u32(pos + 4); let body = pos + 8
-            if id == "fmt " { fmt = u16(body); channels = u16(body + 2); rate = u32(body + 4); bits = u16(body + 14) }
+            if id == "fmt " {
+                // Обрезанный fmt-чанк — невалидный файл, а не выход за границы массива.
+                guard len >= 16, body + 16 <= b.count else { throw WavError.format }
+                fmt = u16(body); channels = u16(body + 2); rate = u32(body + 4); bits = u16(body + 14)
+                // WAVE_FORMAT_EXTENSIBLE: реальный формат — первые 2 байта под-GUID (смещение 24 в fmt).
+                if fmt == 0xFFFE {
+                    guard len >= 40, body + 26 <= b.count else { throw WavError.format }
+                    fmt = u16(body + 24)
+                }
+            }
             if id == "data" { dataOff = body; dataLen = min(len, b.count - body) }
             if dataOff >= 0 && channels > 0 { break }
             pos = body + len + (len & 1)
