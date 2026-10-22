@@ -136,4 +136,40 @@ JNIEXPORT void JNICALL JFN(nativeMeterProcess)(JNIEnv* env, jclass, jlong h, jfl
 }
 JNIEXPORT jdouble JNICALL JFN(nativeMeterTruePeak)(JNIEnv*, jclass, jlong h) { return sf_meter_true_peak_dbtp((const sf_meter*)(intptr_t)h); }
 
+// ---- A2: коррекция динамика (sf_speaker) ----
+
+JNIEXPORT jlong JNICALL JFN(nativeSpeakerCreate)(JNIEnv*, jclass, jint sampleRate, jint channels) {
+    return (jlong)(intptr_t)sf_speaker_create(sampleRate, channels);
+}
+JNIEXPORT void JNICALL JFN(nativeSpeakerDestroy)(JNIEnv*, jclass, jlong h) { sf_speaker_destroy((sf_speaker*)(intptr_t)h); }
+JNIEXPORT void JNICALL JFN(nativeSpeakerReset)(JNIEnv*, jclass, jlong h) { sf_speaker_reset((sf_speaker*)(intptr_t)h); }
+// Массивы одной длины n (≤ SF_SPEAKER_MAX_SECTIONS): type — SF_SECTION_*, f0/q/gainDb — по секциям. Возвращает 0 или -1.
+JNIEXPORT jint JNICALL JFN(nativeSpeakerSetChain)(JNIEnv* env, jclass, jlong h, jintArray types, jdoubleArray f0,
+                                                  jdoubleArray q, jdoubleArray gainDb, jdouble preampDb) {
+    sf_speaker* s = (sf_speaker*)(intptr_t)h;
+    if (!s || !types || !f0 || !q || !gainDb) return -1;
+    const jsize n = env->GetArrayLength(types);
+    if (n < 0 || n > SF_SPEAKER_MAX_SECTIONS || env->GetArrayLength(f0) != n ||
+        env->GetArrayLength(q) != n || env->GetArrayLength(gainDb) != n) return -1;
+    if (n == 0) return sf_speaker_set_chain(s, nullptr, 0, preampDb);
+    sf_speaker_section sec[SF_SPEAKER_MAX_SECTIONS];
+    {
+        Critical t(env, types), a(env, f0), b(env, q), g(env, gainDb);
+        if (!t.p || !a.p || !b.p || !g.p) return -1;
+        for (jsize i = 0; i < n; i++) {
+            sec[i].type = ((const jint*)t.p)[i];
+            sec[i].f0_hz = ((const jdouble*)a.p)[i];
+            sec[i].q = ((const jdouble*)b.p)[i];
+            sec[i].gain_db = ((const jdouble*)g.p)[i];
+        }
+    }
+    return sf_speaker_set_chain(s, sec, (int)n, preampDb);
+}
+// io — интерлив; смещение в float'ах.
+JNIEXPORT void JNICALL JFN(nativeSpeakerProcess)(JNIEnv* env, jclass, jlong h, jfloatArray io, jint offFloats, jint frames) {
+    Critical a(env, io);
+    if (!a.p) return;
+    sf_speaker_process((sf_speaker*)(intptr_t)h, (float*)a.p + offFloats, frames);
+}
+
 }

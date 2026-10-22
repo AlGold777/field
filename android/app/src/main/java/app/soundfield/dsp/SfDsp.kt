@@ -85,6 +85,17 @@ object SfDsp {
     @JvmStatic external fun nativeMeterDestroy(handle: Long)
     @JvmStatic external fun nativeMeterProcess(handle: Long, interleavedStereo: FloatArray, offFrames: Int, frames: Int)
     @JvmStatic external fun nativeMeterTruePeak(handle: Long): Double
+
+    // ---- A2: коррекция динамика ----
+    @JvmStatic external fun nativeSpeakerCreate(sampleRate: Int, channels: Int): Long
+    @JvmStatic external fun nativeSpeakerDestroy(handle: Long)
+    @JvmStatic external fun nativeSpeakerReset(handle: Long)
+    /** Публикует цепочку (0 — успех, -1 — отклонено; цепочка тогда не меняется). Массивы одной длины. */
+    @JvmStatic external fun nativeSpeakerSetChain(
+        handle: Long, types: IntArray, f0: DoubleArray, q: DoubleArray, gainDb: DoubleArray, preampDb: Double,
+    ): Int
+    /** На месте, интерлив; [offFloats] — смещение в float'ах. */
+    @JvmStatic external fun nativeSpeakerProcess(handle: Long, io: FloatArray, offFloats: Int, frames: Int)
 }
 
 /** Дробный корректор воспроизведения в ядре (порт PlayoutCorrector). Не потокобезопасен; [close] обязателен. */
