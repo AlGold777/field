@@ -134,6 +134,7 @@ final class Engine {
     private let pointUdpBox = Locked<UdpSocket.Addr?>(nil)
     private var serverRenderer: ServerRenderer!
     private var calibRunning = false
+    private var calibAborted = false     // калибровка прервана (звонок и т.п.): результат не применять
     private var pointClockReady = false
     private var resent: Int64 = 0
     private let sendLock = NSLock()
@@ -1509,6 +1510,7 @@ final class Engine {
             if tl.playing { newEpoch(true, posFrame(), now + SF.startDelayNs) } else { newEpoch(false, tl.anchorFrame, now) }
             toast("Каналы поменяны: этот телефон — \(Ch.name(serverChannel))")
         case "trim":
+            guard !calibRunning else { return }
             let ms = min(SF.maxTrimMs, max(-SF.maxTrimMs, J.d(o, "ms")))
             trimNs = Int64(ms * 1e6)
             delayCalib = J.b(o, "reset") ? DelayCalib() : DelayCalib(state: "manual", atMs: Int64(Date().timeIntervalSince1970 * 1000))
@@ -1663,6 +1665,7 @@ final class Engine {
             return
         }
         calibRunning = true
+        calibAborted = false
         if mode == .music { savedFrame = posFrame(); savedPlaying = playBox.value.timeline.playing }
         mode = .calib; source = CalibrationSource(pointCh: pointChannel)
         newEpoch(false, 0, MonoClock.nowNs())
@@ -1674,11 +1677,15 @@ final class Engine {
                 try AudioOutput.configureMeasurementSession()
                 self.audio.restart()
             } catch {
+                // восстанавливаем сессию воспроизведения, иначе после ошибки звук остаётся в режиме записи
+                AudioOutput.configurePlaybackSession()
+                self.audio.restart()
                 self.q.async { self.calibFailed("Не удалось включить микрофон: \(error.localizedDescription)") }
                 return
             }
             self.mic.record(durationSec: 8.6, onStarted: {
                 self.q.async {
+                    guard !self.calibAborted else { return }
                     let a = MonoClock.nowNs() + 700_000_000
                     anchor.value = a
                     self.newEpoch(true, 0, a)
@@ -1704,6 +1711,7 @@ final class Engine {
 
     private func calibFailed(_ text: String) {
         calibRunning = false
+        calibAborted = false
         restoreMusic(savedPlaying)
         broadcastCalib(false, "", text, false, nil)
     }
@@ -1711,6 +1719,10 @@ final class Engine {
     private func finishCalibration(_ res: CalibrationAnalyzer.Result, apply: Bool, trimUsed: Int64) {
         calibRunning = false
         restoreMusic(savedPlaying)
+        if calibAborted {
+            calibAborted = false
+            broadcastCalib(false, "", "Калибровка прервана — результат не применён", false, nil); return
+        }
         guard res.ok else { broadcastCalib(false, "", res.message, false, nil); return }
         let who = res.lateMs >= 0 ? "опаздывал" : "спешил"
         if apply {
@@ -1883,7 +1895,11 @@ final class Engine {
     /// Прерывание (звонок, Siri, другое приложение) на любом телефоне ставит на паузу всю пару.
     private func onInterrupted(_ reason: String) {
         guard state.inPair || soloMode else { return }
-        if role == .server { cmdPause() } else { link?.send(["t": "cmd", "a": "pause"]) }
+        if role == .server && calibRunning {
+            // калибровка отменяется: сигналы останавливаем сразу, результат запишется как прерванный
+            calibAborted = true
+            newEpoch(false, 0, MonoClock.nowNs())
+        } else if role == .server { cmdPause() } else { link?.send(["t": "cmd", "a": "pause"]) }
         toast(reason)
     }
     // Queue editing uses track IDs, including commands received from Point.
