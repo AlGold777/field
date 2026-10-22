@@ -153,7 +153,9 @@ final class Engine {
     private var pointRenderer: PointRenderer!
     private let serverUdpBox = Locked<UdpSocket.Addr?>(nil)
     private var pingSeq: Int32 = 0
-    private var pingBurst = 0
+    // пишется с q (сессия) и уменьшается на sf-tick (pointNet): доступ через Locked
+    private let pingBurstBox = Locked(0)
+    private var pingBurst: Int { get { pingBurstBox.value } set { pingBurstBox.value = newValue } }
     private var lastPing: Int64 = 0
     private var lastRecv: Int64 = 0, lastLost: Int64 = 0
 
@@ -228,6 +230,7 @@ final class Engine {
         udpBox.value?.close()
         guard let s = UdpSocket() else { log("Не удалось открыть UDP-сокет"); udpBox.value = nil; return }
         s.onPacket = { [weak self] p, from, now in self?.onUdp(p, from, now) }
+        s.start()   // после назначения onPacket, иначе первые датаграммы уйдут в пустоту
         udpBox.value = s
     }
 
