@@ -13,6 +13,7 @@ import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.os.Process
+import android.util.Log
 import app.soundfield.core.AudioPlayoutClock
 import app.soundfield.core.RenderSource
 import app.soundfield.core.StereoRenderSource
@@ -40,6 +41,8 @@ class AudioOutput(private val ctx: Context) {
     @Volatile var latencyMs = 0.0; private set
     @Volatile var underruns = 0L; private set
     @Volatile var timestampOk = false; private set
+    /** true, если вывод остановлен после [MAX_RECOVERY_ATTEMPTS] подряд неудачных попыток восстановления. */
+    @Volatile var failed = false; private set
     private val outputSignal = AtomicSignalMeter()
     private val timestampFrames = AtomicLong()
     private val timestampGeneration = AtomicLong()
@@ -50,6 +53,9 @@ class AudioOutput(private val ctx: Context) {
     private var lastMetricsGeneration = -1L
 
     @Volatile private var thread: Thread? = null
+    private companion object {
+        const val MAX_RECOVERY_ATTEMPTS = 5
+    }
     private val am = ctx.getSystemService(Context.AUDIO_SERVICE) as AudioManager
     @Volatile private var track: AudioTrack? = null
     private val routeHandler = Handler(Looper.getMainLooper())
@@ -145,6 +151,7 @@ class AudioOutput(private val ctx: Context) {
 
     @Synchronized fun start() {
         if (isRunning) return
+        failed = false
         routeSignature = currentRouteSignature()
         am.registerAudioDeviceCallback(deviceCallback, Handler(Looper.getMainLooper()))
         thread = Thread({ loop() }, "sf-audio").apply { priority = Thread.MAX_PRIORITY }
@@ -185,6 +192,9 @@ class AudioOutput(private val ctx: Context) {
 
     private fun active() = thread === Thread.currentThread() && !Thread.currentThread().isInterrupted
 
+    /** Подряд неудачных пересозданий трека (только с аудиопотока). Сбрасывается после успешной записи. */
+    private var failedAttempts = 0
+
     /** Стереопара звучит именно из динамика телефона, а не из подключённых наушников. */
     private fun pinSpeaker() {
         val t = track ?: return
@@ -209,7 +219,14 @@ class AudioOutput(private val ctx: Context) {
                 } catch (e: Exception) {
                     recoveryCount.incrementAndGet()
                     recoveryError.set(e)
-                    if (active()) Thread.sleep(250)
+                    if (!active()) break
+                    if (++failedAttempts >= MAX_RECOVERY_ATTEMPTS) {
+                        Log.e("SoundField", "AudioTrack: лимит попыток восстановления исчерпан, вывод остановлен", e)
+                        failed = true
+                        break
+                    }
+                    // пауза перед пересозданием трека: не крутиться на неисправном треке
+                    Thread.sleep(50)
                 }
             }
         } catch (_: InterruptedException) {
@@ -311,6 +328,7 @@ class AudioOutput(private val ctx: Context) {
                         off += written
                         timing.accepted(written / channels)
                         lastWrite = System.nanoTime()
+                        failedAttempts = 0
                     }
                 }
                 underruns = t.underrunCount.toLong()
