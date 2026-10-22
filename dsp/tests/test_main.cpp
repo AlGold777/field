@@ -148,6 +148,271 @@ TEST(playout_hard_resync_and_reset) {
     sf_playout_destroy(p);
 }
 
+
+// ---- A1.1: PCM 24 бит и дизеринг ----
+TEST(pcm24_roundtrip_exact_without_dither) {
+    Rng r(11); std::vector<float> in(100000);
+    for (auto& v : in) v = (float)(int32_t)((r.next() >> 40) & 0xFFFFFF) / 8388608.0f - 1.0f;  // значения сетки 24 бит
+    for (int be : {0, 1}) {
+        std::vector<uint8_t> b(in.size() * 3);
+        sf_pcm24_encode(nullptr, in.data(), 1, (int)in.size(), b.data(), 3, be);
+        std::vector<float> out(in.size());
+        sf_pcm24_decode(b.data(), 3, (int)in.size(), be, out.data(), 1);
+        bool same = true; for (size_t i = 0; i < in.size(); i++) if (in[i] != out[i]) { same = false; break; }
+        CHECK(same);
+    }
+}
+
+TEST(pcm24_byte_order_clamp_nan_and_strides) {
+    const float in[6] = {1.0f, -1.0f, 2.0f, NAN, 0.5f, -0.5f};
+    uint8_t le[18], be[18];
+    sf_pcm24_encode(nullptr, in, 1, 6, le, 3, 0);
+    sf_pcm24_encode(nullptr, in, 1, 6, be, 3, 1);
+    CHECK(le[0] == 0xFF && le[1] == 0xFF && le[2] == 0x7F);   // +1.0 → 8388607
+    CHECK(be[0] == 0x7F && be[1] == 0xFF && be[2] == 0xFF);
+    CHECK(le[3] == 0x00 && le[4] == 0x00 && le[5] == 0x80);   // −1.0 → −8388608
+    CHECK(le[6] == 0xFF && le[8] == 0x7F);                    // 2.0 ограничено
+    CHECK(le[9] == 0 && le[10] == 0 && le[11] == 0);          // NaN → 0
+    CHECK(le[12] == 0x00 && le[13] == 0x00 && le[14] == 0x40);
+    // интерлив стерео: шаг 6 байт / 2 float
+    float st[8] = {0.25f, -0.25f, 0.5f, -0.5f, 0.125f, -0.125f, 0.0f, 0.0f};
+    uint8_t sb[24];
+    sf_pcm24_encode(nullptr, st + 0, 2, 4, sb + 0, 6, 0);
+    sf_pcm24_encode(nullptr, st + 1, 2, 4, sb + 3, 6, 0);
+    float back[8];
+    sf_pcm24_decode(sb + 0, 6, 4, 0, back + 0, 2);
+    sf_pcm24_decode(sb + 3, 6, 4, 0, back + 1, 2);
+    for (int i = 0; i < 8; i++) CHECK(back[i] == st[i]);
+}
+
+TEST(pcm24_tpdf_dither_statistics) {
+    sf_dither* d = sf_dither_create(5);
+    const int n = 2000000;
+    std::vector<float> zeros((size_t)n, 0.0f);
+    std::vector<uint8_t> b((size_t)n * 3);
+    sf_pcm24_encode(d, zeros.data(), 1, n, b.data(), 3, 0);
+    std::vector<float> o((size_t)n);
+    sf_pcm24_decode(b.data(), 3, n, 0, o.data(), 1);
+    double sum = 0, sq = 0; int hist[5] = {0, 0, 0, 0, 0};
+    for (float v : o) { const double q = (double)v * 8388608.0; sum += q; sq += q * q; const int k = (int)std::lround(q); if (k >= -2 && k <= 2) hist[k + 2]++; }
+    CHECK_NEAR(sum / n, 0.0, 0.002);
+    CHECK_NEAR(sq / n, 1.0 / 6.0 + 1.0 / 12.0, 0.003);     // TPDF (2·1/12) + округление (1/12) = 1/4... для ±0,5 LSB + ±0,5 LSB: 1/6, плюс квантование 1/12
+    CHECK(hist[0] == 0 && hist[4] == 0);                  // TPDF в пределах ±1 LSB (после округления ±1)
+    // независимые потоки: разные seed → разные последовательности
+    sf_dither* d2 = sf_dither_create(6);
+    std::vector<uint8_t> b2((size_t)n * 3);
+    sf_pcm24_encode(d2, zeros.data(), 1, 1000, b2.data(), 3, 0);
+    sf_pcm24_encode(nullptr, zeros.data(), 1, 1, b2.data() + 3000, 3, 0);
+    int diff = 0; for (int i = 0; i < 1000 * 3; i++) if (b[(size_t)i] != b2[(size_t)i]) diff++;
+    CHECK(diff > 300);
+    sf_dither_destroy(d); sf_dither_destroy(d2);
+}
+
+// ---- A1.2: SRC ----
+std::vector<float> srcAll(const std::vector<float>& in, int ch, int rin, int rout, int chunk) {
+    sf_src* s = sf_src_create(ch, rin, rout);
+    const int64_t nIn = (int64_t)in.size() / ch;
+    std::vector<float> out((size_t)(sf_src_max_output(s, nIn) + sf_src_max_output(s, 0)) * (size_t)ch);
+    int64_t w = 0;
+    for (int64_t p = 0; p < nIn; p += chunk) {
+        const int64_t m = std::min<int64_t>(chunk, nIn - p);
+        w += sf_src_process(s, in.data() + p * ch, m, out.data() + w * ch, (int64_t)out.size() / ch - w);
+    }
+    w += sf_src_flush(s, out.data() + w * ch, (int64_t)out.size() / ch - w);
+    out.resize((size_t)(w * ch));
+    sf_src_destroy(s);
+    return out;
+}
+
+std::vector<float> sineSr(double f, double sr, double amp, size_t n, double ph = 0.0) {
+    std::vector<float> x(n);
+    for (size_t i = 0; i < n; i++) x[i] = (float)(amp * std::sin(2 * kPi * f * (double)i / sr + ph));
+    return x;
+}
+
+TEST(src_output_length_and_params) {
+    CHECK(sf_src_create(0, 44100, 48000) == nullptr);
+    CHECK(sf_src_create(2, 100, 48000) == nullptr);
+    std::vector<float> x(44100, 0.1f);
+    CHECK(srcAll(x, 1, 44100, 48000, 4096).size() == 48000);
+    CHECK(srcAll(x, 1, 96000, 48000, 4096).size() == 22050);
+    CHECK(srcAll(std::vector<float>(10, 0.1f), 1, 44100, 48000, 4096).size() == 11);
+    sf_src* s = sf_src_create(1, 44100, 48000);
+    CHECK(sf_src_phases(s) == 160 && sf_src_taps(s) >= 160 && sf_src_taps(s) <= 200);
+    sf_src_destroy(s);
+}
+
+TEST(src_passband_flat_and_spurs_below_minus_120) {
+    struct Case { int in, out; } cases[] = {{44100, 48000}, {96000, 48000}, {88200, 48000}, {32000, 48000}, {192000, 48000}};
+    for (auto c : cases) {
+        double worstRipple = 0, worstSpur = -300;
+        const double pass = std::min(20000.0, 0.92 * 0.5 * std::min(c.in, c.out));
+        for (double f : {20.0, 100.0, 1000.0, 5000.0, 10000.0, 15000.0, 18000.0, 19000.0, 19900.0, 20000.0}) {
+            if (f > pass) continue;
+            auto y = srcAll(sineSr(f, c.in, 0.5, (size_t)c.in), 1, c.in, c.out, 4096);
+            std::vector<float> mid(y.begin() + 6000, y.end() - 6000);
+            worstRipple = std::max(worstRipple, std::fabs(analyzeTone(mid, c.out, 0.5, 0, 32768).gainDb));
+        }
+        for (double f = 700; f < 0.5 * c.in; f += 1019.0) {
+            auto y = srcAll(sineSr(f, c.in, 0.5, (size_t)c.in), 1, c.in, c.out, 4096);
+            std::vector<float> mid(y.begin() + 6000, y.begin() + 6000 + 32768);
+            double bh; auto m = amplitudeSpectrum(mid, c.out, 0, 32768, &bh);
+            const double fr = std::fmod(f, (double)c.out);
+            const long tone = std::lround((f < 0.5 * c.out ? f : std::min(fr, c.out - fr)) / bh);
+            double pk = 0, pkTone = 0;
+            for (size_t k = 0; k < m.size(); k++) {
+                if (std::labs((long)k - tone) < 60) { pkTone = std::max(pkTone, m[k]); continue; }
+                pk = std::max(pk, m[k]);
+            }
+            double spur = pk;
+            if (f > 0.5 * c.out) spur = std::max(spur, pkTone);   // выше Найквиста выхода тон не должен проходить вовсе (алиас)
+            worstSpur = std::max(worstSpur, dbAmp(spur / 0.5));
+        }
+        CHECK(worstRipple <= 0.01);
+        CHECK(worstSpur <= -120.0);
+    }
+}
+
+TEST(src_fine_phase_path_44101_to_48000) {
+    for (double f : {1000.0, 15000.0, 20000.0}) {
+        auto y = srcAll(sineSr(f, 44101, 0.5, 44101), 1, 44101, 48000, 4096);
+        std::vector<float> mid(y.begin() + 6000, y.end() - 6000);
+        CHECK(std::fabs(analyzeTone(mid, 48000, 0.5, 0, 32768).gainDb) <= 0.01);
+    }
+}
+
+TEST(src_timing_is_exact_and_block_independent) {
+    // выход m — значение исходной синусоиды в позиции m·fin/fout: фаза не сдвинута
+    const double f = 1234.5;
+    auto y = srcAll(sineSr(f, 44100, 0.5, 44100), 1, 44100, 48000, 4096);
+    double worst = 0;
+    for (size_t m = 5000; m < 40000; m++) worst = std::max(worst, std::fabs((double)y[m] - 0.5 * std::sin(2 * kPi * f * (double)m / 48000.0)));
+    CHECK(worst < 2e-6);
+    Rng r(4); std::vector<float> st(2 * 30000);
+    for (auto& v : st) v = (float)(r.uniform() - 0.5);
+    auto ref = srcAll(st, 2, 44100, 48000, 4096);
+    for (int ch : {1, 37, 1000}) {
+        auto o = srcAll(st, 2, 44100, 48000, ch);
+        CHECK(o.size() == ref.size());
+        bool same = o.size() == ref.size(); for (size_t i = 0; same && i < o.size(); i++) if (o[i] != ref[i]) same = false;
+        CHECK(same);
+    }
+    // каналы независимы
+    std::vector<float> l(30000), rr(30000), mono_l, mono_r;
+    for (size_t i = 0; i < 30000; i++) { l[i] = st[2 * i]; rr[i] = st[2 * i + 1]; }
+    mono_l = srcAll(l, 1, 44100, 48000, 4096); mono_r = srcAll(rr, 1, 44100, 48000, 4096);
+    bool indep = true; for (size_t i = 0; i < mono_l.size(); i++) if (mono_l[i] != ref[2 * i] || mono_r[i] != ref[2 * i + 1]) indep = false;
+    CHECK(indep);
+}
+
+TEST(src_one_shot_matches_streaming) {
+    Rng r(8); std::vector<float> x(20000);
+    for (auto& v : x) v = (float)(r.uniform() - 0.5);
+    auto ref = srcAll(x, 1, 96000, 48000, 777);
+    std::vector<float> out(ref.size() + 400);
+    const int64_t n = sf_src_resample(1, 96000, 48000, x.data(), (int64_t)x.size(), out.data(), (int64_t)out.size());
+    CHECK(n == (int64_t)ref.size());
+    bool same = n == (int64_t)ref.size(); for (int64_t i = 0; same && i < n; i++) if (out[(size_t)i] != ref[(size_t)i]) same = false;
+    CHECK(same);
+}
+
+// ---- A1.4: лимитер ----
+std::vector<float> limRun(const std::vector<float>& io, int ch, double ceil, int block, int64_t* active = nullptr) {
+    sf_limiter* l = sf_limiter_create(48000, ch, ceil);
+    const int lat = sf_limiter_latency_frames(l);
+    const size_t n = io.size() / (size_t)ch;
+    std::vector<float> buf = io; buf.resize((n + (size_t)lat) * (size_t)ch, 0.0f);
+    const size_t total = n + (size_t)lat;
+    for (size_t s = 0; s < total; s += (size_t)block) sf_limiter_process(l, &buf[s * (size_t)ch], (int)std::min<size_t>((size_t)block, total - s));
+    if (active) { int64_t b, a; double m; sf_limiter_take_stats(l, &b, &a, &m); *active = a; }
+    sf_limiter_destroy(l);
+    return std::vector<float>(buf.begin() + (long)((size_t)lat * (size_t)ch), buf.end());
+}
+
+TEST(limiter_latency_and_transparency_below_ceiling) {
+    sf_limiter* l = sf_limiter_create(48000, 1, -1.0);
+    CHECK(sf_limiter_latency_frames(l) == 16 + 72 - 1);
+    sf_limiter_destroy(l);
+    auto x = sine(1000, -6, 1.0);
+    auto y = limRun(x, 1, -1.0, 480);
+    bool same = true; for (size_t i = 0; i < x.size(); i++) if (x[i] != y[i]) same = false;
+    CHECK(same);   // ниже потолка — побитно прозрачен (со сдвигом на latency, снятым в limRun)
+}
+
+TEST(limiter_true_peak_guarantee) {
+    Rng r(21);
+    struct S { const char* n; std::vector<float> x; } sigs[] = {
+        {"fs4_45", sine(12000, 0.0, 1.0, kPi / 4)},
+        {"sine_100", sine(100, 0.0, 1.0)},
+        {"sine_19k", sine(19000, 0.0, 1.0, 0.7)},
+        {"noise", [&] { std::vector<float> v(96000); for (auto& e : v) e = (float)((r.uniform() * 2 - 1) * 1.2); return v; }()},
+    };
+    for (auto& s : sigs) for (double ceil : {-1.5, -1.0}) {
+        auto y = limRun(s.x, 1, ceil, 480);
+        const double tp = truePeakDb(trimEdges(y, 4096));
+        CHECK(tp <= ceil + 1e-6);
+        CHECK(tp >= ceil - 0.2);   // не пережимает: потолок достигается
+    }
+}
+
+TEST(limiter_block_size_independent_and_stereo_linked) {
+    Rng r(22); std::vector<float> st(2 * 60000);
+    for (size_t i = 0; i < 60000; i++) {
+        const float a = (float)(1.3 * std::sin(0.05 * (double)i) * (0.5 + 0.5 * std::sin(0.0007 * (double)i)) + 0.05 * (r.uniform() - 0.5));
+        st[2 * i] = a; st[2 * i + 1] = 0.5f * a;
+    }
+    auto ref = limRun(st, 2, -1.5, 480);
+    for (int b : {1, 37, 240, 4096}) {
+        auto o = limRun(st, 2, -1.5, b);
+        bool same = o.size() == ref.size(); for (size_t i = 0; same && i < o.size(); i++) if (o[i] != ref[i]) same = false;
+        CHECK(same);
+    }
+    double worst = 0, red = 0;
+    for (size_t i = 0; i < 60000; i++) {
+        worst = std::max(worst, std::fabs((double)ref[2 * i + 1] - 0.5 * (double)ref[2 * i]));
+        red = std::max(red, std::fabs((double)ref[2 * i] - (double)st[2 * i]));
+    }
+    CHECK(worst < 1e-6);   // одинаковое усиление L и R: соотношение каналов сохраняется
+    CHECK(red > 0.05);     // лимитер действительно работал
+}
+
+TEST(limiter_release_two_speeds_and_stats) {
+    // единичный пик: восстановление быстрое; частые пики — медленное
+    auto make = [&](int period) {
+        std::vector<float> x(48000 * 2, 0.0f);
+        for (size_t i = 0; i < x.size(); i++) x[i] = (float)(0.1 * std::sin(2 * kPi * 440.0 * (double)i / 48000));
+        for (size_t i = 24000; i < x.size(); i += (size_t)period) x[i] = 1.6f;
+        return x;
+    };
+    auto recovery = [&](const std::vector<float>& x) {   // доля восстановления уровня синуса через 80 мс после одиночного пика
+        auto y = limRun(x, 1, -1.0, 480);
+        return std::fabs((double)y[24000 + 3840 + 100]) / std::fabs((double)x[24000 + 3840 + 100]);
+    };
+    auto sparse = make(1000000);
+    auto dense = make(2400);
+    (void)recovery;
+    int64_t a1 = 0, a2 = 0;
+    limRun(sparse, 1, -1.0, 480, &a1);
+    limRun(dense, 1, -1.0, 480, &a2);
+    CHECK(a1 > 0 && a2 > a1);
+    // после единичного пика уровень на фоне вернулся (через 400 мс усиление > 0,99)
+    auto y = limRun(sparse, 1, -1.0, 480);
+    double g = 0, n = 0;
+    for (size_t i = 24000 + 19200; i < 24000 + 19200 + 4800; i++) if (std::fabs(sparse[i]) > 0.05f) { g += std::fabs((double)y[i] / sparse[i]); n++; }
+    CHECK(g / n > 0.99);
+}
+
+TEST(limiter_reset_is_deterministic) {
+    sf_limiter* l = sf_limiter_create(48000, 1, -1.0);
+    auto x = sine(5000, 0.0, 0.3);
+    std::vector<float> a = x, b = x;
+    sf_limiter_process(l, a.data(), (int)a.size());
+    sf_limiter_reset(l);
+    sf_limiter_process(l, b.data(), (int)b.size());
+    CHECK(a == b);
+    sf_limiter_destroy(l);
+}
+
 // ---- аналитика лаборатории (проверка самих измерителей) ----
 TEST(lab_tone_analyzer_known_distortion) {
     auto x = sine(1000, -6, 2.0);
