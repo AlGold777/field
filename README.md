@@ -861,7 +861,8 @@ Capabilities из приглашения хранятся в его TCP-соед
 - Звук не меняется. Добавлено C++20-ядро `dsp/` (C ABI) с портом `WindowedSinc` и `PlayoutCorrector`; сборка в APK (`lib/arm64-v8a/libsfdsp.so`, NDK r27, CMake 3.22.1 — `android/README-native.md`), в Xcode-проект (`project.yml`, `gen_xcodeproj.py`, bridging header) и на Mac для JUnit.
 - Лаборатория `sflab` и базовая линия метрик тракта (`dsp/lab/baseline.json`): `sh tools/dsp_check.sh` (`--android` — через настоящий Kotlin-тракт). Корпус — `tools/audio-corpus` (CC0/PD/CC-BY, `fetch.py`).
 - `tools/ios_typecheck.sh` проверяет также синтаксис C++-ядра и bridging header.
-- Результаты и выводы: `docs/audio-algorithms.md` §13.
+- Результаты, отклонения от ТЗ, команды и список того, что потребует физического участия (A2/A3.3/A4.6/A6.2): `docs/audio-algorithms.md` §13.
+- Команды: `sh tools/dsp_check.sh [--android|--update]`, `python3 tools/audio-corpus/fetch.py`, `sh tools/ios_typecheck.sh`.
 
 
 ### Android 1.10.30 / iOS 1.3.12 · защита от повтора
