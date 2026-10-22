@@ -22,11 +22,8 @@ struct PlayerView: View {
     @State private var selectingTracks = false
     @State private var selectedTracks = Set<String>()
     @State private var showPlaylists = false
-    @State private var showPlaylistName = false
+    @State private var playlistPrompt: PlaylistPrompt?
     @State private var playlistName = ""
-    @State private var editingPlaylist: PlaylistInfo?
-    @State private var playlistToOpen: PlaylistInfo?
-    @State private var playlistToDelete: PlaylistInfo?
     @State private var master = 0.8
     @State private var masterDragging = false
     @State private var balance = 0.5
@@ -251,14 +248,6 @@ struct PlayerView: View {
                 }, onImport: { engine.addAudioFiles($0, securityRoot: root) })
             }
         }
-        .alert("Отменить передачу?", isPresented: $confirmCancelTransfer) {
-            Button("Продолжить", role: .cancel) {}
-            Button("Отменить передачу", role: .destructive) { engine.cancelFileTransfer() }
-        }
-        .alert("Disconnect \((ui.peerName.isEmpty ? "Phone" : String(ui.peerName.prefix(7))))?", isPresented: $confirmDisconnect) {
-            Button("No", role: .cancel) {}
-            Button("Yes", role: .destructive) { engine.disconnect() }
-        }
     }
 
     private func connectAction() {
@@ -297,6 +286,11 @@ struct PlayerView: View {
                     else { engine.toggleSoloMode() }
                 }
         }.frame(height: 48)
+        // Отдельный alert на каждом view: на одном view SwiftUI показывает только один
+        .alert("Disconnect \((ui.peerName.isEmpty ? "Phone" : String(ui.peerName.prefix(7))))?", isPresented: $confirmDisconnect) {
+            Button("No", role: .cancel) {}
+            Button("Yes", role: .destructive) { engine.disconnect() }
+        }
     }
 
     private var connectChooser: some View {
@@ -402,6 +396,10 @@ struct PlayerView: View {
             .contentShape(Rectangle()).onTapGesture {
                 if ui.role == .point && !ui.fileTransferText.isEmpty { confirmCancelTransfer = true }
             }
+            .alert("Отменить передачу?", isPresented: $confirmCancelTransfer) {
+                Button("Продолжить", role: .cancel) {}
+                Button("Отменить передачу", role: .destructive) { engine.cancelFileTransfer() }
+            }
     }
 
     private var queueSection: some View {
@@ -489,38 +487,69 @@ struct PlayerView: View {
     private var playlistsView: some View {
         NavigationStack {
             List {
-                Button("Сохранить текущую очередь…") { playlistName = ""; editingPlaylist = nil; showPlaylistName = true }
+                Button("Сохранить текущую очередь…") { playlistName = ""; playlistPrompt = .create }
                     .disabled(ui.queueTracks.isEmpty)
                 ForEach(ui.playlists) { playlist in
-                    Button { playlistToOpen = playlist } label: {
+                    Button { playlistPrompt = .open(playlist) } label: {
                         HStack { Text(playlist.name); Spacer(); Text("\(playlist.count)").foregroundColor(SFColor.dim) }
                     }.contextMenu {
-                        Button("Переименовать") { editingPlaylist = playlist; playlistName = playlist.name; showPlaylistName = true }
-                        Button("Удалить", role: .destructive) { playlistToDelete = playlist }
+                        Button("Переименовать") { playlistName = playlist.name; playlistPrompt = .rename(playlist) }
+                        Button("Удалить", role: .destructive) { playlistPrompt = .delete(playlist) }
                     }
                 }
             }.navigationTitle("Плейлисты").navigationBarTitleDisplayMode(.inline)
                 .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Закрыть") { showPlaylists = false } } }
-                .alert(editingPlaylist == nil ? "Новый плейлист" : "Переименовать плейлист", isPresented: $showPlaylistName) {
-                    TextField("Название", text: $playlistName)
-                    Button("Отмена", role: .cancel) {}
-                    Button("Сохранить") {
-                        if let playlist = editingPlaylist { engine.renamePlaylist(playlist.id, name: playlistName) }
-                        else { engine.savePlaylist(playlistName) }
-                    }.disabled(playlistName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                }
-                .confirmationDialog("Открыть плейлист", isPresented: Binding(get: { playlistToOpen != nil }, set: { if !$0 { playlistToOpen = nil } })) {
-                    if let playlist = playlistToOpen {
-                        Button("Добавить в конец") { engine.openPlaylist(playlist.id, append: true); showPlaylists = false }
-                        Button("Заменить очередь") { engine.openPlaylist(playlist.id, append: false); showPlaylists = false }
-                    }
-                    Button("Отмена", role: .cancel) {}
-                }
-                .alert("Удалить плейлист?", isPresented: Binding(get: { playlistToDelete != nil }, set: { if !$0 { playlistToDelete = nil } })) {
-                    Button("Отмена", role: .cancel) {}
-                    Button("Удалить", role: .destructive) { if let playlist = playlistToDelete { engine.deletePlaylist(playlist.id) } }
+                // Один alert на весь список: SwiftUI не показывает несколько alert/dialog на одном view
+                .alert(playlistPromptTitle, isPresented: Binding(get: { playlistPrompt != nil }, set: { if !$0 { playlistPrompt = nil } }),
+                       presenting: playlistPrompt) { prompt in
+                    playlistPromptActions(prompt)
                 }
         }.preferredColorScheme(.dark)
+    }
+
+    private enum PlaylistPrompt: Identifiable {
+        case create
+        case rename(PlaylistInfo)
+        case open(PlaylistInfo)
+        case delete(PlaylistInfo)
+
+        var id: String {
+            switch self {
+            case .create: return "create"
+            case .rename(let playlist): return "rename-\(playlist.id)"
+            case .open(let playlist): return "open-\(playlist.id)"
+            case .delete(let playlist): return "delete-\(playlist.id)"
+            }
+        }
+    }
+
+    private var playlistPromptTitle: String {
+        switch playlistPrompt {
+        case .rename?: return "Переименовать плейлист"
+        case .open?: return "Открыть плейлист"
+        case .delete?: return "Удалить плейлист?"
+        case .create, nil: return "Новый плейлист"
+        }
+    }
+
+    @ViewBuilder
+    private func playlistPromptActions(_ prompt: PlaylistPrompt) -> some View {
+        switch prompt {
+        case .create, .rename:
+            TextField("Название", text: $playlistName)
+            Button("Отмена", role: .cancel) {}
+            Button("Сохранить") {
+                if case .rename(let playlist) = prompt { engine.renamePlaylist(playlist.id, name: playlistName) }
+                else { engine.savePlaylist(playlistName) }
+            }.disabled(playlistName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+        case .open(let playlist):
+            Button("Добавить в конец") { engine.openPlaylist(playlist.id, append: true); showPlaylists = false }
+            Button("Заменить очередь") { engine.openPlaylist(playlist.id, append: false); showPlaylists = false }
+            Button("Отмена", role: .cancel) {}
+        case .delete(let playlist):
+            Button("Отмена", role: .cancel) {}
+            Button("Удалить", role: .destructive) { engine.deletePlaylist(playlist.id) }
+        }
     }
 
     private var stage: some View {
