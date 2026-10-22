@@ -41,7 +41,8 @@ class AudioOutput(private val ctx: Context) {
     @Volatile var latencyMs = 0.0; private set
     @Volatile var underruns = 0L; private set
     @Volatile var timestampOk = false; private set
-    /** true, если вывод остановлен после [MAX_RECOVERY_ATTEMPTS] подряд неудачных попыток восстановления. */
+    /** true, если вывод остановлен после [MAX_RECOVERY_ATTEMPTS] подряд неудачных попыток восстановления
+     *  (а не вызовом stop()); Engine перезапускает такой вывод из heartbeat. */
     @Volatile var failed = false; private set
     private val outputSignal = AtomicSignalMeter()
     private val timestampFrames = AtomicLong()
@@ -153,8 +154,9 @@ class AudioOutput(private val ctx: Context) {
 
     @Synchronized fun start() {
         if (isRunning) return
-        // Старый цикл, не успевший завершиться в stop(), должен полностью выйти до нового: иначе два цикла записи.
-        retiring?.join()
+        // Старый цикл, не успевший завершиться в stop(), выходит сам (active() == false после смены thread);
+        // ждём его ограниченно, чтобы start() на главном потоке не мог зависнуть.
+        retiring?.join(500)
         retiring = null
         failed = false
         routeSignature = currentRouteSignature()
@@ -187,6 +189,7 @@ class AudioOutput(private val ctx: Context) {
     }
 
     @Synchronized fun stop() {
+        failed = false   // остановка намеренная: Engine не должен перезапускать вывод
         val worker = thread ?: return
         thread = null
         try { am.unregisterAudioDeviceCallback(deviceCallback) } catch (_: Exception) {}

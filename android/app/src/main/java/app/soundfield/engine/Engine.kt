@@ -154,6 +154,7 @@ class Engine private constructor(private val app: Context) {
     private val incomingTelemetry = ConcurrentHashMap<String, IncomingTelemetryTransfer>()
     private val telemetryRateSamples = ArrayDeque<Long>()
     private var lastHeartbeatAtMs = 0L
+    private var lastAudioFailRestartMs = 0L
     private var lastHeartbeatState: Map<String, Any?>? = null
     private var previousUdpPackets = 0L
     private var previousSentAudioPackets = 0L
@@ -5038,6 +5039,12 @@ class Engine private constructor(private val app: Context) {
         if (output.recoveryCount > 0) {
             Log.w(TAG, "Recreating audio output after ${output.recoveryCount} failures", output.recoveryError)
             telemetry.record("AUDIO_RECOVERY", mapOf("attempts" to output.recoveryCount), error = output.recoveryError)
+        }
+        // Вывод остановлен после исчерпания попыток пересоздать трек: молча перезапускаем не чаще раза в 10 с.
+        if (audio.failed && !audio.isRunning && nowMs - lastAudioFailRestartMs >= 10_000L) {
+            lastAudioFailRestartMs = nowMs
+            telemetry.record("AUDIO_OUTPUT_RESTART", mapOf("reason" to "recovery_exhausted"))
+            audio.start()
         }
         if (udpFirstPacketPending.getAndSet(false)) {
             telemetry.record("UDP_FIRST_PACKET", mapOf("from" to udpFirstPacketFrom.get(),
