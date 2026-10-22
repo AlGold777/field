@@ -19,7 +19,7 @@ import app.soundfield.engine.UiState
 import kotlin.math.abs
 
 @Composable
-fun CalibrationScreen(ui: UiState, engine: Engine, requestMic: () -> Unit, onBack: () -> Unit) {
+fun CalibrationScreen(ui: UiState, engine: Engine, requestMic: () -> Unit, onBack: () -> Unit, micDeniedForever: Boolean = false) {
     val c = ui.calib
     val pointCh = ui.pointChannel
     val serverCh = Ch.other(pointCh)
@@ -53,7 +53,14 @@ fun CalibrationScreen(ui: UiState, engine: Engine, requestMic: () -> Unit, onBac
                 PrimaryButton("🎯  Запустить автокалибровку") { engine.calibrate() }
                 SecondaryButton("📏  Только измерить рассогласование") { engine.measure() }
             }
-            if (c.needsMicPermission && ui.role == Role.SERVER) SecondaryButton("🎤  Разрешить доступ к микрофону") { requestMic() }
+            if (c.needsMicPermission && ui.role == Role.SERVER) {
+                if (micDeniedForever) {
+                    Text("Доступ к микрофону запрещён. Откройте настройки приложения и включите «Микрофон».",
+                        color = SFColors.Warn, fontSize = 13.sp, lineHeight = 19.sp)
+                    Spacer(Modifier.height(8.dp))
+                }
+                SecondaryButton(if (micDeniedForever) "⚙  Открыть настройки приложения" else "🎤  Разрешить доступ к микрофону") { requestMic() }
+            }
             if (c.resultText.isNotEmpty() && !c.running) {
                 Text(c.resultText, color = if (c.resultOk) SFColors.Good else SFColors.Warn, fontSize = 14.sp, lineHeight = 20.sp)
             }
