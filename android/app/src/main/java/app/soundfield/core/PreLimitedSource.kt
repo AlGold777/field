@@ -22,6 +22,7 @@ class PreLimitedSource(
     ceilingDbtp: Double = PRE_LIMITER_CEILING_DBTP,
 ) : AudioSource, PrefetchableAudioSource, AutoCloseable, TrackMeters {
     override val truePeakDbtp: Double get() = (inner as? TrackMeters)?.truePeakDbtp ?: Double.NaN
+    override val loudnessLufs: Double get() = (inner as? TrackMeters)?.loudnessLufs ?: Double.NaN
     override val mode get() = inner.mode
     override val title get() = inner.title
     override val artist get() = inner.artist
@@ -41,8 +42,13 @@ class PreLimitedSource(
     @Volatile private var processedHead = maxOf(0L, startAtFrame - WARMUP_FRAMES)
     private var nextInput = processedHead
     private val buffer = FloatArray(CHUNK_FRAMES * 2)
-    /** Текущее статическое усиление, линейное. Цель = min(0, −1,55 − tp) dB по измеренному true-peak трека; меняется плавно в пределах блока. */
-    private var currentGain = Math.pow(10.0, TruePeakMeter.staticGainDb((inner as? TrackMeters)?.truePeakDbtp ?: Double.NaN) / 20.0)
+    /**
+     * Текущее статическое усиление. Цель — нормализация громкости (A3.1, [TruePeakMeter.normalizationGainDb]); пока громкость
+     * неизвестна (трек ещё декодируется) — min(0, −1,55 − tp). Уменьшение применяется сразу (в пределах блока), увеличение —
+     * не быстрее [MAX_RISE_DB_PER_S]: если анализ закончился посреди трека, уровень «подъезжает», а не прыгает.
+     */
+    private var currentDb = initialGainDb()
+    private var currentGain = Math.pow(10.0, currentDb / 20.0)
     @Volatile var staticGainDb = 0.0
         private set
     private val statBlocks = AtomicLong()
@@ -149,7 +155,9 @@ class PreLimitedSource(
      * уменьшается); смена цели сглаживается линейно на блок (21 мс). Предлимитер остаётся страховкой (Spatial/EQ могут поднять пики).
      */
     private fun applyStaticGain(n: Int) {
-        val db = TruePeakMeter.staticGainDb(truePeakDbtp)
+        val goal = TruePeakMeter.normalizationGainDb(loudnessLufs, truePeakDbtp)
+        val db = if (goal <= currentDb) goal else minOf(goal, currentDb + MAX_RISE_DB_PER_S * n / SF.SAMPLE_RATE)
+        currentDb = db
         staticGainDb = db
         val target = Math.pow(10.0, db / 20.0)
         if (target == 1.0 && currentGain == 1.0) return
@@ -160,6 +168,8 @@ class PreLimitedSource(
         }
         currentGain = target
     }
+
+    private fun initialGainDb() = TruePeakMeter.normalizationGainDb(loudnessLufs, truePeakDbtp)
 
     private fun collectStats() {
         val s = limiter.takeStats()
@@ -174,7 +184,8 @@ class PreLimitedSource(
         if (target == NO_RESTART) return
         val from = maxOf(0L, target - WARMUP_FRAMES)
         limiter.reset()
-        currentGain = Math.pow(10.0, TruePeakMeter.staticGainDb(truePeakDbtp) / 20.0)   // после перемотки без «подъезда»
+        currentDb = initialGainDb()   // после перемотки без «подъезда»
+        currentGain = Math.pow(10.0, currentDb / 20.0)
         nextInput = from
         processedHead = from
         requestedHead.set(minOf(inner.totalFrames, maxOf(requestedHead.get(), target + 1)))
@@ -191,5 +202,7 @@ class PreLimitedSource(
         const val WARMUP_FRAMES = SF.SAMPLE_RATE
         private const val CHUNK_FRAMES = 1_024
         private const val NO_RESTART = Long.MIN_VALUE
+        /** Максимальная скорость подъёма усиления нормализации, dB в секунду. */
+        const val MAX_RISE_DB_PER_S = 3.0
     }
 }

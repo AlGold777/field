@@ -85,6 +85,7 @@ object SfDsp {
     @JvmStatic external fun nativeMeterDestroy(handle: Long)
     @JvmStatic external fun nativeMeterProcess(handle: Long, interleavedStereo: FloatArray, offFrames: Int, frames: Int)
     @JvmStatic external fun nativeMeterTruePeak(handle: Long): Double
+    @JvmStatic external fun nativeMeterLoudness(handle: Long): Double
 
     // ---- A2: коррекция динамика ----
     @JvmStatic external fun nativeSpeakerCreate(sampleRate: Int, channels: Int): Long

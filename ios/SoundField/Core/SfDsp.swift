@@ -151,8 +151,11 @@ final class SfTrackMeter {
     }
 
     /// Статическое усиление трека, линейное, по громкости и true-peak.
+    /// На iOS нет предлимитера и лимитера (A7), поэтому превышение потолка недопустимо: пик после усиления не выше −1,55 dBTP.
     static func staticGain(lufs: Double, truePeakDbtp tp: Double) -> Float {
-        Float(pow(10.0, normalizationGainDb(lufs: lufs, truePeakDbtp: tp) / 20.0))
+        var db = normalizationGainDb(lufs: lufs, truePeakDbtp: tp)
+        if !tp.isNaN { db = min(db, -1.55 - tp) }
+        return Float(pow(10.0, db / 20.0))
     }
 
     /// Старое статическое усиление по true-peak: min(0, −1,55 − tp) dB. Оставлено для совместимости.

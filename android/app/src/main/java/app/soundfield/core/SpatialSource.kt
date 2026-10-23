@@ -23,6 +23,7 @@ class SpatialSource(
     private val xtcDesign: CompletableFuture<XtcFilterSet>? = null,
 ) : AudioSource, AutoCloseable, PrefetchableAudioSource, TrackMeters {
     override val truePeakDbtp: Double get() = (inner as? TrackMeters)?.truePeakDbtp ?: Double.NaN
+    override val loudnessLufs: Double get() = (inner as? TrackMeters)?.loudnessLufs ?: Double.NaN
     private val bypass = !spatialConfig.enabled &&
         !(spatialConfig.reflectionsEnabled && spatialConfig.reflectionTaps.isNotEmpty())
     override val mode get() = inner.mode

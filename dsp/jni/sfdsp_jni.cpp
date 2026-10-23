@@ -134,6 +134,7 @@ JNIEXPORT void JNICALL JFN(nativeMeterProcess)(JNIEnv* env, jclass, jlong h, jfl
     if (!a.p) return;
     sf_meter_process((sf_meter*)(intptr_t)h, (const float*)a.p + (int64_t)offFrames * 2, frames);   // стерео интерлив
 }
+JNIEXPORT jdouble JNICALL JFN(nativeMeterLoudness)(JNIEnv*, jclass, jlong h) { return sf_meter_loudness_lufs((const sf_meter*)(intptr_t)h); }
 JNIEXPORT jdouble JNICALL JFN(nativeMeterTruePeak)(JNIEnv*, jclass, jlong h) { return sf_meter_true_peak_dbtp((const sf_meter*)(intptr_t)h); }
 
 // ---- A2: коррекция динамика (sf_speaker) ----

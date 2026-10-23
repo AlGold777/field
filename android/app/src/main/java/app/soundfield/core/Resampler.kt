@@ -111,6 +111,8 @@ class SegmentedPcmSource(
     override val mode = SourceMode.MUSIC
     /** Максимальный true-peak по уже декодированной части (растёт по мере декодирования), NaN — пока нет данных. */
     @Volatile override var truePeakDbtp: Double = Double.NaN
+    /** Громкость известна только у полностью декодированного трека (частичная ввела бы в заблуждение). */
+    @Volatile override var loudnessLufs: Double = Double.NaN
     @Volatile override var totalFrames: Long = estimatedFrames.coerceAtLeast(0)
         private set
     @Volatile override var readyFrames: Long = 0

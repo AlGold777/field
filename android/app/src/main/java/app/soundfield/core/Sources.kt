@@ -22,6 +22,8 @@ interface AudioSource {
 /** Источник знает true-peak трека (анализ при импорте); NaN — неизвестно или анализ ещё идёт (значение — максимум по уже декодированному). */
 interface TrackMeters {
     val truePeakDbtp: Double
+    /** Интегральная громкость трека BS.1770-4, LUFS; NaN — неизвестна или анализ не завершён (A3.1). */
+    val loudnessLufs: Double get() = Double.NaN
 }
 
 /** Sources with a forward worker can precompute frames before a consumer reads them. */
@@ -36,9 +38,11 @@ class PcmSource(
     override val mode = SourceMode.MUSIC
     override val totalFrames = (pcm.size / 2).toLong()
     /** true-peak считается лениво одним проходом ядра (встроенный трек, лаборатория). */
-    override val truePeakDbtp: Double by lazy {
-        app.soundfield.dsp.TruePeakMeter().use { it.process(pcm, pcm.size / 2); it.truePeakDbtp }
+    private val analysis by lazy {
+        app.soundfield.dsp.TruePeakMeter().use { it.process(pcm, pcm.size / 2); Pair(it.truePeakDbtp, it.loudnessLufs) }
     }
+    override val truePeakDbtp: Double get() = analysis.first
+    override val loudnessLufs: Double get() = analysis.second
     override fun sample(frame: Long, ch: Int): Float {
         if (frame < 0 || frame >= totalFrames) return 0f
         return pcm[(frame * 2 + ch).toInt()]
