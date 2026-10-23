@@ -1,0 +1,17 @@
+{
+  "doc": "A3.1: нормализация громкости. g = -16 - L; headroom = -1.55 - tp; g = min(g, headroom + 3); g = min(g, 12). L = NaN или L <= -100 -> min(0, -1.55 - tp); tp = NaN: при известной L усиление не выше 0, иначе 0. Значения в dB, допуск 1e-9. null = NaN.",
+  "target_lufs": -16.0,
+  "vectors": [
+    {"lufs": -16.0, "tp": -3.0,  "gain_db": 0.0},
+    {"lufs": -23.0, "tp": -10.0, "gain_db": 7.0},
+    {"lufs": -23.0, "tp": -3.0,  "gain_db": 4.45},
+    {"lufs": -30.0, "tp": -20.0, "gain_db": 12.0},
+    {"lufs": -8.0,  "tp": -0.1,  "gain_db": -8.0},
+    {"lufs": -14.0, "tp": 0.5,   "gain_db": -2.0},
+    {"lufs": null,  "tp": -0.5,  "gain_db": -1.05},
+    {"lufs": null,  "tp": -6.0,  "gain_db": 0.0},
+    {"lufs": -200.0,"tp": -6.0,  "gain_db": 0.0},
+    {"lufs": -20.0, "tp": null,  "gain_db": 0.0},
+    {"lufs": null,  "tp": null,  "gain_db": 0.0}
+  ]
+}
