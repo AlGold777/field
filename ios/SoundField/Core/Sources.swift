@@ -80,8 +80,9 @@ enum AudioFileDecoder {
             throw NSError(domain: "SoundField.Audio", code: 5, userInfo: [NSLocalizedDescriptionKey: "Кодек не вернул аудиоданные"])
         }
         let tp = meter.truePeakDbtp
+        let lufs = meter.loudnessLufs
         return PcmSource(pcm24: pcm24, title: item.title, artist: item.artist,
-                         staticGain: SfTrackMeter.staticGain(truePeakDbtp: tp), truePeakDbtp: tp)
+                         staticGain: SfTrackMeter.staticGain(lufs: lufs, truePeakDbtp: tp), truePeakDbtp: tp, loudnessLufs: lufs)
     }
 }
 
@@ -104,17 +105,20 @@ final class PcmSource: AudioSource {
     let staticGain: Float
     /// Измеренный true-peak трека, dBTP (для диагностики; −200 — не измерялся).
     let truePeakDbtp: Double
+    /// Измеренная интегральная громкость BS.1770-4, LUFS (для диагностики; −200 — нет данных).
+    let loudnessLufs: Double
     private let pcm: [UInt8]
-    init(pcm24: [UInt8], title: String, artist: String, staticGain: Float = 1, truePeakDbtp: Double = -200) {
+    init(pcm24: [UInt8], title: String, artist: String, staticGain: Float = 1, truePeakDbtp: Double = -200, loudnessLufs: Double = -200) {
         self.pcm = pcm24; self.title = title; self.artist = artist; totalFrames = Int64(pcm24.count / 6)
-        self.staticGain = staticGain; self.truePeakDbtp = truePeakDbtp
+        self.staticGain = staticGain; self.truePeakDbtp = truePeakDbtp; self.loudnessLufs = loudnessLufs
     }
     convenience init(interleavedFloat: [Float], title: String, artist: String) {
         let meter = SfTrackMeter()
         meter.process(interleavedFloat)
         let tp = meter.truePeakDbtp
+        let lufs = meter.loudnessLufs
         self.init(pcm24: Pcm24StereoEncoder(seed: 0x5F24).encode(interleavedFloat), title: title, artist: artist,
-                  staticGain: SfTrackMeter.staticGain(truePeakDbtp: tp), truePeakDbtp: tp)
+                  staticGain: SfTrackMeter.staticGain(lufs: lufs, truePeakDbtp: tp), truePeakDbtp: tp, loudnessLufs: lufs)
     }
     func sample(_ frame: Int64, _ ch: Int) -> Float {
         guard frame >= 0 && frame < totalFrames else { return 0 }

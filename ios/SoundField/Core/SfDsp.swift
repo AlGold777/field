@@ -127,7 +127,7 @@ enum Pcm24 {
     }
 }
 
-/// Одноходовой анализатор трека при импорте (true-peak 4×; громкость BS.1770 добавится в A3.1 в тот же проход).
+/// Одноходовой анализатор трека при импорте (true-peak 4×, громкость BS.1770-4).
 final class SfTrackMeter {
     private let handle: OpaquePointer?
     init() { handle = sf_meter_create(2) }
@@ -142,7 +142,20 @@ final class SfTrackMeter {
     /// Максимальный true-peak с начала потока, dBTP (−200 — тишина).
     var truePeakDbtp: Double { handle.map { sf_meter_true_peak_dbtp($0) } ?? -200 }
 
-    /// Статическое усиление трека, линейное: min(0, −1,55 − tp) dB (запас 0,05 dB под потолок предлимитера −1,5 dBTP).
+    /// Интегральная громкость BS.1770-4, LUFS (−200 — нет данных или нет handle).
+    var loudnessLufs: Double { handle.map { sf_meter_loudness_lufs($0) } ?? -200 }
+
+    /// Усиление нормализации в dB (формула: LoudnessGain.db, правила в tools/loudness_gain_vectors.json).
+    static func normalizationGainDb(lufs: Double, truePeakDbtp: Double) -> Double {
+        LoudnessGain.db(lufs: lufs, truePeakDbtp: truePeakDbtp)
+    }
+
+    /// Статическое усиление трека, линейное, по громкости и true-peak.
+    static func staticGain(lufs: Double, truePeakDbtp tp: Double) -> Float {
+        Float(pow(10.0, normalizationGainDb(lufs: lufs, truePeakDbtp: tp) / 20.0))
+    }
+
+    /// Старое статическое усиление по true-peak: min(0, −1,55 − tp) dB. Оставлено для совместимости.
     static func staticGain(truePeakDbtp tp: Double) -> Float {
         let db = min(0.0, -1.55 - tp)
         return Float(pow(10.0, db / 20.0))
