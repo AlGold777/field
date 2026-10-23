@@ -613,6 +613,54 @@ TEST(speaker_chain_change_crossfades_and_rejects_invalid) {
     sf_speaker_destroy(sp);
 }
 
+
+// ---- громкость BS.1770 в анализаторе (A3.1) ----
+static double meterLufs(const std::vector<float>& st, int block) {
+    sf_meter* m = sf_meter_create(2);
+    for (size_t o = 0; o < st.size() / 2; o += (size_t)block)
+        sf_meter_process(m, st.data() + 2 * o, (int64_t)std::min<size_t>((size_t)block, st.size() / 2 - o));
+    const double l = sf_meter_loudness_lufs(m);
+    sf_meter_destroy(m);
+    return l;
+}
+
+static std::vector<float> stereoSine(double hz, double dbfs, double seconds, double phase = 0) {
+    const size_t n = (size_t)(seconds * 48000);
+    std::vector<float> x(2 * n);
+    const double a = std::pow(10.0, dbfs / 20.0);
+    for (size_t i = 0; i < n; i++) x[2 * i] = x[2 * i + 1] = (float)(a * std::sin(2 * 3.14159265358979323846 * hz * (double)i / 48000.0 + phase));
+    return x;
+}
+
+TEST(meter_loudness_ebu_reference_sine) {
+    CHECK_NEAR(meterLufs(stereoSine(997, -23.0, 20), 480), -23.0, 0.1);   // EBU Tech 3341, случай 1
+    CHECK_NEAR(meterLufs(stereoSine(997, -33.0, 20), 480), -33.0, 0.1);   // случай 2
+}
+
+TEST(meter_loudness_matches_lab_reference_and_block_size) {
+    std::vector<float> x(2 * 48000 * 12);
+    uint32_t r = 12345;
+    for (size_t i = 0; i < x.size(); i++) { r = r * 1664525u + 1013904223u; x[i] = (float)(((double)(r >> 8) / 8388608.0 - 1.0) * 0.1 * (1.0 + std::sin((double)i * 2e-6))); }
+    std::vector<std::vector<float>> ch(2, std::vector<float>(x.size() / 2));
+    for (size_t i = 0; i < x.size() / 2; i++) { ch[0][i] = x[2 * i]; ch[1][i] = x[2 * i + 1]; }
+    const double ref = sflab::lufsIntegrated(ch, 48000);
+    CHECK_NEAR(meterLufs(x, 4096), ref, 1e-9);
+    CHECK_NEAR(meterLufs(x, 1), ref, 1e-9);
+    CHECK_NEAR(meterLufs(x, 37), ref, 1e-9);
+}
+
+TEST(meter_loudness_gating_and_silence) {
+    auto a = stereoSine(997, -20.0, 10), b = stereoSine(997, -70.0, 10);   // −70 dBFS: ниже абсолютного порога
+    a.insert(a.end(), b.begin(), b.end());
+    CHECK_NEAR(meterLufs(a, 480), -20.0, 0.1);
+    auto c = stereoSine(997, -20.0, 10), d = stereoSine(997, -45.0, 10);   // выше −70, но ниже −10 LU от общего → отсечён
+    c.insert(c.end(), d.begin(), d.end());
+    CHECK_NEAR(meterLufs(c, 480), -20.0, 0.1);
+    std::vector<float> z(2 * 48000 * 2, 0.f);
+    CHECK(meterLufs(z, 480) == -200.0);
+    CHECK(meterLufs(std::vector<float>(2 * 1000, 0.5f), 480) == -200.0);   // короче 400 мс
+}
+
 }  // namespace
 
 int main() {

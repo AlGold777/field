@@ -119,6 +119,11 @@ SFDSP_API void sf_meter_destroy(sf_meter* m);
 SFDSP_API void sf_meter_process(sf_meter* m, const float* interleaved, int64_t frames);
 /* Максимальный true-peak с начала потока, dBTP (−200 для тишины); можно вызывать в любой момент (хвост детектора учитывается). */
 SFDSP_API double sf_meter_true_peak_dbtp(const sf_meter* m);
+/*
+ * Интегральная громкость BS.1770-4 (K-взвешивание для 48 кГц, блоки 400 мс с шагом 100 мс, пороги −70 LUFS и −10 LU), LUFS.
+ * −200 — нет блоков выше порога. Входной поток обязан быть 48 кГц (кэш приложения всегда 48 кГц).
+ */
+SFDSP_API double sf_meter_loudness_lufs(const sf_meter* m);
 
 /* ---- Коррекция динамика (A2.4): каскад биквадов RBJ (TDF-II, double), смена профиля кроссфейдом 50 мс ---- */
 
