@@ -3,6 +3,12 @@
 **Для:** руководства SoundField
 **Период:** 26–27 октября 2026 г. (повторная сверка источников — 28 октября)
 **Источники:** чат DeepSeek в Chrome и инженерный чат `DeepSeek` проекта `SoundField Research` в Gemini/Antigravity.
+
+### Где открыть исходные чаты
+
+- **DeepSeek в Chrome:** [https://chat.deepseek.com/a/chat/s/60413fad-806e-416b-be83-7ae58aff2caa](https://chat.deepseek.com/a/chat/s/60413fad-806e-416b-be83-7ae58aff2caa)
+- **Gemini / Antigravity:** проект `SoundField Research` → чат `DeepSeek`; ID беседы: `d39422fa-a155-4999-a515-032b08625a27`.
+
 **Последнее состояние по просмотренным источникам:** собраны APK до v0.114; сквозное разделение исходного стерео на чистый Left в JBL и Right на телефоне акустически не подтверждено.
 
 ## Краткий вывод
