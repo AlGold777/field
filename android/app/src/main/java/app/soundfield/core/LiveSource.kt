@@ -67,6 +67,60 @@ class LiveSource(title: String, artist: String, capacitySeconds: Int = 30) : Aud
 }
 
 /**
+ * Правила автомата живого потока (`Engine.liveTick`). Запас = голова − позиция воспроизведения.
+ * Нижняя граница запаса: опережение отправки на Point ([SF.LEAD_NS], 400 мс) + упреждение сцены и предлимитера
+ * (~100 мс) + пакет.
+ */
+object LivePolicy {
+    const val TARGET_MARGIN_FRAMES = SF.SAMPLE_RATE * 1L
+    const val MIN_MARGIN_FRAMES = SF.SAMPLE_RATE * 6L / 10L
+    const val MAX_MARGIN_FRAMES = SF.SAMPLE_RATE * 18L / 10L
+    const val START_MARGIN_FRAMES = SF.SAMPLE_RATE * 9L / 10L
+    /** Позиция паузы отстала от головы больше, чем приёмник держит впереди: она от другого участка потока. */
+    const val STALE_FRAMES = SF.SAMPLE_RATE * 6L
+    private const val MAX_PAD_FRAMES = SF.SAMPLE_RATE * 2L
+
+    enum class Action {
+        NONE,
+        /** Дописать тишину до целевого запаса, шкалу не останавливать. */
+        PAD,
+        /** Перезапустить шкалу от головы. */
+        REANCHOR,
+        /** Остановить шкалу на текущем кадре и ждать, пока запас вернётся. */
+        STARVED,
+    }
+
+    /**
+     * Шкала идёт. [capture] — поток реального времени (захват YouTube): он встаёт, когда источник не играет,
+     * поэтому разрыв закрывается тишиной. Иначе источник читается с опережением (Spotify): при нехватке — остановка.
+     */
+    fun whileRunning(capture: Boolean, marginFrames: Long): Action = when {
+        capture && marginFrames < -SF.SAMPLE_RATE -> Action.REANCHOR   // позиция ушла далеко за голову: процесс стоял
+        capture && marginFrames < MIN_MARGIN_FRAMES -> Action.PAD
+        marginFrames < MIN_MARGIN_FRAMES -> Action.STARVED
+        capture && marginFrames > MAX_MARGIN_FRAMES -> Action.REANCHOR
+        else -> Action.NONE
+    }
+
+    fun padFrames(marginFrames: Long): Int = (TARGET_MARGIN_FRAMES - marginFrames).coerceIn(0L, MAX_PAD_FRAMES).toInt()
+
+    /**
+     * Кадр старта потока реального времени: к моменту старта голова уйдёт на [startDelayFrames], запас станет целевым.
+     * −1 — принятого звука пока мало.
+     */
+    fun captureStartFrame(head: Long, startDelayFrames: Long, segmentStart: Long): Long =
+        (head + startDelayFrames - TARGET_MARGIN_FRAMES).let { if (it < segmentStart) -1L else it }
+
+    /** Кадр, с которого продолжает источник с опережением: место паузы, а если оно устарело — голова. */
+    fun resumeFrame(head: Long, anchorFrame: Long, segmentStart: Long): Long {
+        val paused = maxOf(anchorFrame, segmentStart)
+        return if (head - paused > STALE_FRAMES) head else paused
+    }
+
+    fun readyToStart(head: Long, frame: Long): Boolean = head - frame >= START_MARGIN_FRAMES
+}
+
+/**
  * Привязка потока реального времени к шкале воспроизведения. Захваченный звук идёт по часам аудиотракта,
  * шкала — по системным часам; расхождение в десятки ppm за час съедает запас. Поток передискретизируется
  * (32-точечный sinc ядра рендера) с отношением 1 ± [MAX_PPM]·10⁻⁶ так, чтобы запас держался у цели.

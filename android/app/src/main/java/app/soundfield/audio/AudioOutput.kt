@@ -62,6 +62,12 @@ class AudioOutput(private val ctx: Context) {
     private var retiring: Thread? = null
     private companion object {
         const val MAX_RECOVERY_ATTEMPTS = 5
+        /** Внешние выходы в порядке, в котором Android выбирает их для медиа (до API 33 точного запроса нет). */
+        val EXTERNAL_OUTPUT_TYPES = intArrayOf(
+            AudioDeviceInfo.TYPE_BLUETOOTH_A2DP, AudioDeviceInfo.TYPE_BLE_HEADSET, AudioDeviceInfo.TYPE_BLE_SPEAKER,
+            AudioDeviceInfo.TYPE_WIRED_HEADSET, AudioDeviceInfo.TYPE_WIRED_HEADPHONES, AudioDeviceInfo.TYPE_USB_HEADSET,
+            AudioDeviceInfo.TYPE_USB_DEVICE, AudioDeviceInfo.TYPE_LINE_ANALOG, AudioDeviceInfo.TYPE_HDMI,
+        )
     }
     private val am = ctx.getSystemService(Context.AUDIO_SERVICE) as AudioManager
     @Volatile private var track: AudioTrack? = null
@@ -218,13 +224,28 @@ class AudioOutput(private val ctx: Context) {
     private fun pinSpeaker() {
         val t = track ?: return
         if (!preferPhoneSpeaker) {
-            try { t.setPreferredDevice(null) } catch (_: Exception) {}
+            // Поток будильника по умолчанию звучит из динамика и из наушников одновременно. В соло вывод должен идти
+            // туда же, куда шла музыка, поэтому устройство закрепляется явно.
+            val device = if (usage == AudioAttributes.USAGE_ALARM) mediaRouteDevice() else null
+            try { t.setPreferredDevice(device) } catch (_: Exception) {}
             return
         }
         val outs = am.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
         val spk = outs.firstOrNull { it.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER }
             ?: if (Build.VERSION.SDK_INT >= 30) outs.firstOrNull { it.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER_SAFE } else null
         try { t.setPreferredDevice(spk) } catch (_: Exception) {}
+    }
+
+    /** Устройство, на которое система направляет медиа: наушники или внешний выход, если подключены. null — выбор системы. */
+    private fun mediaRouteDevice(): AudioDeviceInfo? {
+        if (Build.VERSION.SDK_INT >= 33) {
+            val media = AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_MEDIA)
+                .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC).build()
+            try { am.getAudioDevicesForAttributes(media).firstOrNull()?.let { return it } } catch (_: Exception) {}
+        }
+        val outs = am.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
+        for (type in EXTERNAL_OUTPUT_TYPES) outs.firstOrNull { it.type == type }?.let { return it }
+        return null
     }
 
     private fun loop() {

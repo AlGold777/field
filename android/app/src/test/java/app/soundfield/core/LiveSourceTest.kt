@@ -101,4 +101,59 @@ class LiveSourceTest {
         println("MEASURED servo 10 kHz level at +1000 ppm: ${"%.4f".format(db)} dB")
         assertTrue("level $db dB", abs(db) < 0.02)
     }
+
+    // ---- автомат живого потока
+
+    private val second = SF.SAMPLE_RATE.toLong()
+
+    @Test fun captureGapIsPaddedWithSilenceInsteadOfStopping() {
+        assertEquals(LivePolicy.Action.NONE, LivePolicy.whileRunning(capture = true, marginFrames = second))
+        assertEquals(LivePolicy.Action.NONE, LivePolicy.whileRunning(capture = true, marginFrames = LivePolicy.MIN_MARGIN_FRAMES))
+        assertEquals(LivePolicy.Action.PAD, LivePolicy.whileRunning(capture = true, marginFrames = LivePolicy.MIN_MARGIN_FRAMES - 1))
+        assertEquals(LivePolicy.Action.PAD, LivePolicy.whileRunning(capture = true, marginFrames = -second))
+        // Тишина доводит запас до цели, но не больше 2 с за такт.
+        assertEquals((second * 6 / 10).toInt(), LivePolicy.padFrames(second * 4 / 10))
+        assertEquals((second * 2).toInt(), LivePolicy.padFrames(-second))
+        assertEquals(0, LivePolicy.padFrames(second * 2))
+    }
+
+    @Test fun captureIsReanchoredWhenThePositionOrTheMarginRunsAway() {
+        assertEquals(LivePolicy.Action.REANCHOR, LivePolicy.whileRunning(capture = true, marginFrames = -second - 1))
+        assertEquals(LivePolicy.Action.NONE, LivePolicy.whileRunning(capture = true, marginFrames = LivePolicy.MAX_MARGIN_FRAMES))
+        assertEquals(LivePolicy.Action.REANCHOR, LivePolicy.whileRunning(capture = true, marginFrames = LivePolicy.MAX_MARGIN_FRAMES + 1))
+    }
+
+    @Test fun bufferedSourceStopsWhenStarvedAndIsNeverPaddedOrReanchored() {
+        assertEquals(LivePolicy.Action.NONE, LivePolicy.whileRunning(capture = false, marginFrames = LivePolicy.MIN_MARGIN_FRAMES))
+        assertEquals(LivePolicy.Action.STARVED, LivePolicy.whileRunning(capture = false, marginFrames = LivePolicy.MIN_MARGIN_FRAMES - 1))
+        assertEquals(LivePolicy.Action.STARVED, LivePolicy.whileRunning(capture = false, marginFrames = -10 * second))
+        assertEquals(LivePolicy.Action.NONE, LivePolicy.whileRunning(capture = false, marginFrames = 10 * second))
+    }
+
+    @Test fun captureStartsOnceTheMarginWillReachTheTargetAtTheStartMoment() {
+        val delay = second * 3 / 10
+        assertEquals(-1L, LivePolicy.captureStartFrame(head = second * 7 / 10 - 1, startDelayFrames = delay, segmentStart = 0))
+        assertEquals(0L, LivePolicy.captureStartFrame(head = second * 7 / 10, startDelayFrames = delay, segmentStart = 0))
+        // К моменту старта голова уйдёт на delay: запас = (head + delay) − frame = цель.
+        val head = 5 * second
+        val frame = LivePolicy.captureStartFrame(head, delay, segmentStart = 0)
+        assertEquals(LivePolicy.TARGET_MARGIN_FRAMES, head + delay - frame)
+        assertEquals(-1L, LivePolicy.captureStartFrame(head, delay, segmentStart = head))
+    }
+
+    @Test fun bufferedSourceResumesFromThePauseUnlessItIsStale() {
+        // Пауза: продолжаем с того же кадра, не раньше начала текущего участка.
+        assertEquals(1_000L, LivePolicy.resumeFrame(head = 3 * second, anchorFrame = 1_000, segmentStart = 0))
+        assertEquals(2_000L, LivePolicy.resumeFrame(head = 3 * second, anchorFrame = 1_000, segmentStart = 2_000))
+        // Место паузы отстало от головы больше, чем приёмник держит впереди: с головы.
+        assertEquals(10 * second, LivePolicy.resumeFrame(head = 10 * second, anchorFrame = 1_000, segmentStart = 0))
+        assertTrue(LivePolicy.STALE_FRAMES > app.soundfield.spotify.SpotifyReceiver.MAX_AHEAD_FRAMES + second)
+        assertTrue(!LivePolicy.readyToStart(head = second, frame = second / 5))
+        assertTrue(LivePolicy.readyToStart(head = second, frame = second / 10))
+    }
+
+    @Test fun spotifyBackpressureLeavesRoomAboveTheStartMargin() {
+        // Приёмник держит впереди позиции больше, чем нужно для старта, иначе воспроизведение не начнётся.
+        assertTrue(app.soundfield.spotify.SpotifyReceiver.MAX_AHEAD_FRAMES >= LivePolicy.START_MARGIN_FRAMES + second / 2)
+    }
 }

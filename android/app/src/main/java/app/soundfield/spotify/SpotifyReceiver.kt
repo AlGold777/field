@@ -21,9 +21,11 @@ interface SpotifySink {
 
 /** JNI-мост к `libsfspotify.so` (крейт `spotify/`, librespot). */
 internal object SpotifyNative {
-    external fun start(deviceName: String, cacheDir: String, sink: SpotifySink): Long
+    /** [initialVolume] — положение регулятора громкости 0..65535, которое устройство сообщит приложению Spotify. */
+    external fun start(deviceName: String, cacheDir: String, initialVolume: Int, sink: SpotifySink): Long
     external fun stop(handle: Long)
     external fun command(handle: Long, command: Int)
+    external fun setVolume(handle: Long, volume: Int)
     external fun version(): String
 }
 
@@ -87,6 +89,9 @@ class SpotifyReceiver(
                 SpotifyEvent.SESSION_CONNECTED -> sessionActive = true
                 SpotifyEvent.SESSION_DISCONNECTED -> sessionActive = false
                 SpotifyEvent.DISCOVERY_READY -> { if (b == 0L) advertise(this, a.toInt(), text1 ?: "/"); return }
+                // Граница нового участка фиксируется здесь, а не в очереди движка: библиотека не пишет звук новой
+                // позиции, пока этот вызов не вернулся, а к разбору события движком первый пакет уже был бы записан.
+                SpotifyEvent.FLUSH -> { this@SpotifyReceiver.onEvent(kind, live.readyFrames, b, text1, text2); return }
             }
             this@SpotifyReceiver.onEvent(kind, a, b, text1, text2)
         }
@@ -96,14 +101,14 @@ class SpotifyReceiver(
         fun close() { converter.close() }
     }
 
-    fun start(deviceName: String, live: LiveSource, bufferedFrames: () -> Long) {
+    fun start(deviceName: String, live: LiveSource, initialVolume: Int, bufferedFrames: () -> Long) {
         worker.execute {
             stopNow()
             if (!available) return@execute
             val created = Session(deviceName, live, bufferedFrames)
             try { multicastLock.acquire() } catch (_: Exception) {}
             val cache = File(ctx.filesDir, "spotify").apply { mkdirs() }
-            val handle = try { SpotifyNative.start(deviceName, cache.absolutePath, created) } catch (t: Throwable) {
+            val handle = try { SpotifyNative.start(deviceName, cache.absolutePath, initialVolume.coerceIn(0, VOLUME_MAX), created) } catch (t: Throwable) {
                 Log.w(TAG, "spotify start", t); 0L
             }
             if (handle == 0L) {
@@ -123,6 +128,12 @@ class SpotifyReceiver(
     fun command(command: Int) {
         val handle = session?.handle?.takeIf { it != 0L } ?: return
         try { SpotifyNative.command(handle, command) } catch (t: Throwable) { Log.w(TAG, "spotify command", t) }
+    }
+
+    /** Положение регулятора громкости SoundField (0..[VOLUME_MAX]) → приложению Spotify. */
+    fun setVolume(volume: Int) {
+        val handle = session?.handle?.takeIf { it != 0L } ?: return
+        try { SpotifyNative.setVolume(handle, volume.coerceIn(0, VOLUME_MAX)) } catch (t: Throwable) { Log.w(TAG, "spotify volume", t) }
     }
 
     private fun stopNow() {
@@ -168,15 +179,27 @@ class SpotifyReceiver(
         private const val TAG = "SoundField"
         private const val SOURCE_RATE = 44_100
         /** Насколько декодер может опережать воспроизведение. */
-        const val MAX_AHEAD_FRAMES = SF.SAMPLE_RATE * 5L / 2L
+        const val MAX_AHEAD_FRAMES = SF.SAMPLE_RATE * 3L / 2L
+        const val VOLUME_MAX = 65_535
+        /** Версия крейта `spotify/`, с которой согласован этот JNI-контракт. */
+        const val NATIVE_VERSION = "0.1.1"
         /** Дольше держать поток плеера нельзя: на нём же librespot исполняет паузу, перемотку и смену трека. */
         private const val MAX_BLOCK_MS = 400
 
         /** Библиотека собирается отдельно (`tools/build_spotify.sh`); без неё источник Spotify недоступен. */
-        val available: Boolean by lazy {
-            try { System.loadLibrary("sfspotify"); true } catch (_: Throwable) { false }
+        val available: Boolean get() = unavailableReason == null
+
+        /** null — источник доступен; иначе причина для пользователя. Устаревшая библиотека не используется: её JNI-контракт другой. */
+        val unavailableReason: String? by lazy {
+            val loaded = try { System.loadLibrary("sfspotify"); true } catch (_: Throwable) { false }
+            if (!loaded) return@lazy "Приёмник Spotify не входит в эту сборку"
+            nativeVersion = runCatching { SpotifyNative.version() }.getOrDefault("")
+            if (nativeVersion.startsWith("sfspotify $NATIVE_VERSION ")) null
+            else { Log.e(TAG, "libsfspotify: '$nativeVersion', нужна $NATIVE_VERSION"); "Приёмник Spotify в этой сборке устарел" }
         }
 
-        fun version(): String = if (available) runCatching { SpotifyNative.version() }.getOrDefault("") else ""
+        @Volatile private var nativeVersion = ""
+
+        fun version(): String { unavailableReason; return nativeVersion }
     }
 }

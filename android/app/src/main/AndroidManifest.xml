@@ -13,6 +13,8 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
     <!-- Источник YouTube: захват звука другого приложения (AudioPlaybackCapture) после системного запроса -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
+    <!-- Возврат громкостей медиа и будильника после перезагрузки, если она застала режим YouTube -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <!-- Doze exemption: без неё Xiaomi/Samsung/Huawei замораживают сокеты через 1–5 мин экрана выключенного -->
@@ -59,6 +61,15 @@
             android:name=".capture.CaptureService"
             android:exported="false"
             android:foregroundServiceType="mediaProjection" />
+
+        <!-- Таймер и загрузка телефона: возврат громкостей, изменённых режимом YouTube (CaptureVolumeGuard) -->
+        <receiver
+            android:name=".capture.CaptureVolumeReceiver"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+            </intent-filter>
+        </receiver>
 
         <provider
             android:name="androidx.core.content.FileProvider"

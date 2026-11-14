@@ -36,7 +36,7 @@ fn main() {
     log::set_max_level(log::LevelFilter::Info);
     let dir = std::env::temp_dir().join(format!("sfspotify-smoke-{}", std::process::id()));
     let r = Receiver::start(
-        Options { device_name: name, cache_dir: dir.clone(), native_mdns: true },
+        Options { device_name: name, cache_dir: dir.clone(), native_mdns: true, initial_volume: u16::MAX },
         Arc::new(LogHost),
     )
     .expect("start");

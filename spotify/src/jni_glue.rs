@@ -173,7 +173,13 @@ fn build_host(env: &mut JNIEnv, sink: &JObject) -> jni::errors::Result<JavaHost>
     })
 }
 
-fn do_start(env: &mut JNIEnv, name: &JString, cache: &JString, sink: &JObject) -> jlong {
+fn do_start(
+    env: &mut JNIEnv,
+    name: &JString,
+    cache: &JString,
+    initial_volume: jint,
+    sink: &JObject,
+) -> jlong {
     let Ok(mut active) = ACTIVE.lock() else { return 0 };
     if active.is_some() {
         return 0;
@@ -203,6 +209,7 @@ fn do_start(env: &mut JNIEnv, name: &JString, cache: &JString, sink: &JObject) -
         cache_dir: PathBuf::from(cache),
         // На Android службу объявляет Kotlin (NsdManager).
         native_mdns: !cfg!(target_os = "android"),
+        initial_volume: initial_volume.clamp(0, i32::from(u16::MAX)) as u16,
     };
     match Receiver::start(opts, host) {
         Ok(r) => {
@@ -227,10 +234,11 @@ pub extern "system" fn Java_app_soundfield_spotify_SpotifyNative_start<'l>(
     _this: JObject<'l>,
     device_name: JString<'l>,
     cache_dir: JString<'l>,
+    initial_volume: jint,
     sink: JObject<'l>,
 ) -> jlong {
     catch_unwind(AssertUnwindSafe(|| {
-        do_start(&mut env, &device_name, &cache_dir, &sink)
+        do_start(&mut env, &device_name, &cache_dir, initial_volume, &sink)
     }))
     .unwrap_or(0)
 }
@@ -273,6 +281,24 @@ pub extern "system" fn Java_app_soundfield_spotify_SpotifyNative_command<'l>(
             if let Some((h, r)) = g.as_ref() {
                 if *h == handle {
                     r.command(command);
+                }
+            }
+        }
+    }));
+}
+
+#[no_mangle]
+pub extern "system" fn Java_app_soundfield_spotify_SpotifyNative_setVolume<'l>(
+    _env: JNIEnv<'l>,
+    _this: JObject<'l>,
+    handle: jlong,
+    volume: jint,
+) {
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        if let Ok(g) = ACTIVE.lock() {
+            if let Some((h, r)) = g.as_ref() {
+                if *h == handle {
+                    r.set_volume(volume.clamp(0, i32::from(u16::MAX)) as u16);
                 }
             }
         }

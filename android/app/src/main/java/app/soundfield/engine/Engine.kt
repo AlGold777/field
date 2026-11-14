@@ -51,6 +51,7 @@ import app.soundfield.audio.PreparedAudioFile
 import app.soundfield.core.*
 import app.soundfield.service.PlaybackService
 import app.soundfield.capture.CaptureService
+import app.soundfield.capture.CaptureVolumeGuard
 import app.soundfield.spotify.SpotifyEvent
 import app.soundfield.spotify.SpotifyReceiver
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -144,13 +145,8 @@ class Engine private constructor(private val app: Context) {
             (SF.LEAD_NS + SF.PAUSE_LEAD_NS + 100_000_000L) * SF.SAMPLE_RATE / 1_000_000_000L
         private val PROGRESSIVE_RESUME_BUFFER_FRAMES = SF.SAMPLE_RATE.toLong()
         private val PROGRESSIVE_FADE_FRAMES = SF.SAMPLE_RATE / 10L
-        // Живой поток. Запас = голова − позиция. Минимум: опережение отправки на Point (LEAD 400 мс) + упреждение
-        // сцены и предлимитера (~100 мс) + пакет.
-        private const val LIVE_TARGET_MARGIN_FRAMES = SF.SAMPLE_RATE * 1L
-        private const val LIVE_MIN_MARGIN_FRAMES = SF.SAMPLE_RATE * 6L / 10L
-        private const val LIVE_MAX_MARGIN_FRAMES = SF.SAMPLE_RATE * 18L / 10L
-        private const val LIVE_START_MARGIN_FRAMES = SF.SAMPLE_RATE * 9L / 10L
-        private const val LIVE_STALE_FRAMES = SF.SAMPLE_RATE * 6L
+        /** Столько отчётов LIVE_STATE подряд (по 5 с) «музыка играет, поток пуст» — и пользователь получает подсказку. */
+        private const val CAPTURE_SILENT_REPORTS = 3
         private const val SPOTIFY_DEVICE_NAME = "SoundField"
         private const val SPOTIFY_HINT = "В Spotify выберите устройство «SoundField»"
     }
@@ -504,7 +500,7 @@ class Engine private constructor(private val app: Context) {
 
     // ================================================================== запуск
     private fun boot() {
-        restoreCaptureVolumes()
+        CaptureVolumeGuard.restore(app, "launch")   // процесс погиб в режиме захвата YouTube
         AudioFileDecoder.clearCache(app)
         refreshPlaylists()
         // Стараемся занять тот же TCP-порт, что и в прошлый раз: второй телефон помнит его и подключается напрямую.
@@ -4321,6 +4317,7 @@ class Engine private constructor(private val app: Context) {
                 rebuildPlayState()
                 if (o.optBoolean("finished", true)) {
                     if (soloMode) prefs.edit().putFloat("soloMaster", master).apply() else saveServerParams()
+                    pushSpotifyVolume()
                 }
                 publishState()
             }
@@ -4970,7 +4967,9 @@ class Engine private constructor(private val app: Context) {
     /** Источник хочет играть: Spotify прислал PLAYING, захват YouTube активен. */
     @Volatile private var liveWantPlay = false
     /** Первый кадр текущего непрерывного участка потока: раньше него играть нечего (или уже неактуально). */
-    private var liveSegmentStart = 0L
+    @Volatile private var liveSegmentStart = 0L   // читает и поток приёмника Spotify (liveBufferedFrames)
+    private var captureSilentReports = 0
+    private var captureSilentHintShown = false
     private var playerResumeFrame = 0L
     private var liveStateLoggedNs = 0L
     @Volatile private var captureMusicActive = false
@@ -4990,8 +4989,7 @@ class Engine private constructor(private val app: Context) {
         if (calibRunning) { toast("Дождитесь конца калибровки"); return@post }
         when (kind) {
             InputSource.PLAYER -> switchInput(kind)
-            InputSource.SPOTIFY -> if (SpotifyReceiver.available) switchInput(kind)
-                else toast("Приёмник Spotify не входит в эту сборку")
+            InputSource.SPOTIFY -> SpotifyReceiver.unavailableReason?.let(::toast) ?: switchInput(kind)
             InputSource.YOUTUBE -> if (Build.VERSION.SDK_INT >= 29) ui { copy(captureRequest = captureRequest + 1) }
                 else toast("Звук других приложений доступен с Android 10")
         }
@@ -5059,6 +5057,7 @@ class Engine private constructor(private val app: Context) {
         input = kind
         mode = SourceMode.MUSIC
         liveWantPlay = false; liveSegmentStart = 0L; captureServo = null; captureMusicActive = false
+        captureSilentReports = 0; captureSilentHintShown = false
         if (kind == InputSource.PLAYER) {
             liveSource = null
             source = musicSource()
@@ -5071,9 +5070,11 @@ class Engine private constructor(private val app: Context) {
             liveSource = live
             source = live
             newEpoch(false, 0L, now)
-            if (kind == InputSource.SPOTIFY) spotify.start(SPOTIFY_DEVICE_NAME, live, ::liveBufferedFrames)
-            else {
-                captureServo = LiveClockServo(live, LIVE_TARGET_MARGIN_FRAMES.toInt())
+            if (kind == InputSource.SPOTIFY) {
+                telemetry.record("SPOTIFY_START", mapOf("native" to SpotifyReceiver.version()))
+                spotify.start(SPOTIFY_DEVICE_NAME, live, spotifyVolume(), ::liveBufferedFrames)
+            } else {
+                captureServo = LiveClockServo(live, LivePolicy.TARGET_MARGIN_FRAMES.toInt())
                 liveWantPlay = true
                 enterCaptureAudio()
             }
@@ -5086,6 +5087,7 @@ class Engine private constructor(private val app: Context) {
         if (input == InputSource.YOUTUBE) {
             val active = am.isMusicActive
             if (active != captureMusicActive) { captureMusicActive = active; publishState() }
+            CaptureVolumeGuard.keepAlive(app)
         }
         val timeline = serverPlay.timeline
         val head = live.readyFrames
@@ -5099,27 +5101,34 @@ class Engine private constructor(private val app: Context) {
                 "headFrame" to head, "marginMs" to if (timeline.running) (head - timeline.positionFrame(nowNs)) * 1000 / SF.SAMPLE_RATE else -1L,
                 "ratioPpm" to (captureServo?.ratioPpm ?: 0.0),
                 "peakDb" to if (peak > 0f) 20.0 * kotlin.math.log10(peak.toDouble()) else -200.0))
+            // Музыка на телефоне играет, а захваченный поток пуст: звук идёт не из приложения YouTube
+            // (браузер, другое приложение) или приложение запретило захват.
+            if (input == InputSource.YOUTUBE && captureMusicActive && peak == 0f) {
+                if (++captureSilentReports == CAPTURE_SILENT_REPORTS && !captureSilentHintShown) {
+                    captureSilentHintShown = true
+                    toast("Музыка играет, но её звук не приходит. SoundField берёт звук только из приложений YouTube и YouTube Music")
+                }
+            } else captureSilentReports = 0
         }
         if (timeline.playing) {
             if (!timeline.running || nowNs < timeline.anchorNs) return
             val position = timeline.positionFrame(nowNs)
             val margin = head - position
-            if (margin < -SF.SAMPLE_RATE && input == InputSource.YOUTUBE) {
-                // Позиция ушла далеко за голову (процесс стоял): тишиной не догоняем, привязываемся к голове заново.
-                telemetry.limited("LIVE_REANCHOR", "marginMs=${margin * 1000 / SF.SAMPLE_RATE}")
-                startLiveIfReady(live, nowNs)
-            } else if (margin < LIVE_MIN_MARGIN_FRAMES && input == InputSource.YOUTUBE) {
-                // Захват отдаёт звук только пока источник играет: на паузе и при подгрузке поток просто встаёт.
-                // Шкалу не останавливаем — разрыв закрывается тишиной до целевого запаса.
-                val pad = (LIVE_TARGET_MARGIN_FRAMES - margin).coerceIn(0L, SF.SAMPLE_RATE * 2L).toInt()
-                live.appendSilence(pad)
-                telemetry.limited("LIVE_PAD", "marginMs=${margin * 1000 / SF.SAMPLE_RATE} padMs=${pad * 1000L / SF.SAMPLE_RATE}")
-            } else if (margin < LIVE_MIN_MARGIN_FRAMES) {
-                telemetry.limited("LIVE_STARVED", "input=${input.wire} marginMs=${margin * 1000 / SF.SAMPLE_RATE} want=$liveWantPlay")
-                newEpoch(false, minOf(position, head).coerceAtLeast(liveSegmentStart), nowNs)
-            } else if (input == InputSource.YOUTUBE && margin > LIVE_MAX_MARGIN_FRAMES) {
-                telemetry.limited("LIVE_REANCHOR", "marginMs=${margin * 1000 / SF.SAMPLE_RATE}")
-                startLiveIfReady(live, nowNs)
+            when (LivePolicy.whileRunning(capture = input == InputSource.YOUTUBE, marginFrames = margin)) {
+                LivePolicy.Action.REANCHOR -> {
+                    telemetry.limited("LIVE_REANCHOR", "marginMs=${margin * 1000 / SF.SAMPLE_RATE}")
+                    startLiveIfReady(live, nowNs)
+                }
+                LivePolicy.Action.PAD -> {
+                    val pad = LivePolicy.padFrames(margin)
+                    live.appendSilence(pad)
+                    telemetry.limited("LIVE_PAD", "marginMs=${margin * 1000 / SF.SAMPLE_RATE} padMs=${pad * 1000L / SF.SAMPLE_RATE}")
+                }
+                LivePolicy.Action.STARVED -> {
+                    telemetry.limited("LIVE_STARVED", "input=${input.wire} marginMs=${margin * 1000 / SF.SAMPLE_RATE} want=$liveWantPlay")
+                    newEpoch(false, minOf(position, head).coerceAtLeast(liveSegmentStart), nowNs)
+                }
+                LivePolicy.Action.NONE -> {}
             }
         } else if (liveWantPlay) startLiveIfReady(live, nowNs)
     }
@@ -5129,14 +5138,12 @@ class Engine private constructor(private val app: Context) {
         val startDelayFrames = SF.START_DELAY_NS * SF.SAMPLE_RATE / 1_000_000_000L
         val frame: Long
         if (input == InputSource.YOUTUBE) {
-            // Поток идёт в реальном времени: к моменту старта голова уйдёт на START_DELAY, запас станет целевым.
-            frame = head + startDelayFrames - LIVE_TARGET_MARGIN_FRAMES
-            if (frame < liveSegmentStart) return
+            frame = LivePolicy.captureStartFrame(head, startDelayFrames, liveSegmentStart)
+            if (frame < 0L) return
         } else {
-            var paused = maxOf(serverPlay.timeline.anchorFrame, liveSegmentStart)
-            if (head - paused > LIVE_STALE_FRAMES) { paused = head; liveSegmentStart = head }   // позиция от другого источника
-            frame = paused
-            if (head - frame < LIVE_START_MARGIN_FRAMES) return
+            frame = LivePolicy.resumeFrame(head, serverPlay.timeline.anchorFrame, liveSegmentStart)
+            if (frame == head) liveSegmentStart = head   // место паузы устарело: продолжаем с головы
+            if (!LivePolicy.readyToStart(head, frame)) return
         }
         cancelScheduledPause()
         newEpoch(true, frame, nowNs + SF.START_DELAY_NS)
@@ -5148,7 +5155,9 @@ class Engine private constructor(private val app: Context) {
         when (kind) {
             SpotifyEvent.SESSION_CONNECTED -> {
                 live.describe("Spotify", "Подключено. Включите музыку в Spotify"); publishState()
+                pushSpotifyVolume()
             }
+            SpotifyEvent.VOLUME -> onSpotifyVolume(a)
             SpotifyEvent.PLAYING -> { liveWantPlay = true; publishState() }
             SpotifyEvent.PAUSED -> {
                 liveWantPlay = false
@@ -5158,8 +5167,9 @@ class Engine private constructor(private val app: Context) {
                 live.describe(text1?.takeIf { it.isNotBlank() } ?: "Spotify", text2.orEmpty()); publishState()
             }
             SpotifyEvent.FLUSH -> {
-                // Перемотка или смена трека: уже принятый, но ещё не сыгранный звук устарел. Продолжаем с головы.
-                liveSegmentStart = live.readyFrames
+                // Перемотка или смена трека: уже принятый, но ещё не сыгранный звук устарел. Продолжаем с кадра [a] —
+                // головы на момент события (её фиксирует приёмник до записи звука новой позиции).
+                liveSegmentStart = a.coerceIn(liveSegmentStart, live.readyFrames)
                 if (mode == SourceMode.MUSIC && source === live) {
                     cancelScheduledPause()
                     newEpoch(false, liveSegmentStart, System.nanoTime())
@@ -5176,6 +5186,27 @@ class Engine private constructor(private val app: Context) {
                 log("Spotify: ${text1 ?: "ошибка"}")
             }
         }
+    }
+
+    // Громкость в приложении Spotify и общая громкость SoundField — один регулятор. Приёмник отдаёт звук без
+    // ослабления; положение регулятора Spotify (0..65535) соответствует положению ползунка SoundField.
+    private fun spotifyVolume(): Int =
+        (AudioGain.masterToSlider(master) * SpotifyReceiver.VOLUME_MAX).roundToInt().coerceIn(0, SpotifyReceiver.VOLUME_MAX)
+
+    private fun pushSpotifyVolume() {
+        if (input == InputSource.SPOTIFY) spotify.setVolume(spotifyVolume())
+    }
+
+    private fun onSpotifyVolume(value: Long) {
+        val slider = value.coerceIn(0L, SpotifyReceiver.VOLUME_MAX.toLong()).toFloat() / SpotifyReceiver.VOLUME_MAX
+        // Эхо собственной команды и начальное значение: шаг регулятора Spotify — 1/64 шкалы.
+        if (kotlin.math.abs(slider - AudioGain.masterToSlider(master)) < 1f / 128f) return
+        if (mode == SourceMode.LEVEL_MEASURE || calibRunning) { pushSpotifyVolume(); return }   // громкость зафиксирована
+        master = AudioGain.sliderToMaster(slider)
+        rebuildPlayState()
+        if (soloMode) prefs.edit().putFloat("soloMaster", master).apply() else saveServerParams()
+        telemetry.limited("SPOTIFY_VOLUME", "slider=${"%.3f".format(slider)}")
+        publishState()
     }
 
     /** Кнопки плеера в режиме живого источника управляют приложением-источником. */
@@ -5234,8 +5265,7 @@ class Engine private constructor(private val app: Context) {
             val alarm = am.getStreamVolume(AudioManager.STREAM_ALARM)
             val alarmMax = am.getStreamMaxVolume(AudioManager.STREAM_ALARM)
             val mediaMax = am.getStreamMaxVolume(AudioManager.STREAM_MUSIC).coerceAtLeast(1)
-            if (!prefs.contains("captureSavedMedia"))
-                prefs.edit().putInt("captureSavedMedia", media).putInt("captureSavedAlarm", alarm).apply()
+            CaptureVolumeGuard.enter(app, media, alarm)
             val target = if (media <= 0) alarmMax / 2 else (media.toFloat() * alarmMax / mediaMax).roundToInt().coerceIn(1, alarmMax)
             am.setStreamVolume(AudioManager.STREAM_ALARM, target, 0)
             am.setStreamVolume(AudioManager.STREAM_MUSIC, 0, 0)
@@ -5258,17 +5288,7 @@ class Engine private constructor(private val app: Context) {
         }
         audio.usage = AudioAttributes.USAGE_MEDIA
         audio.restart()
-        restoreCaptureVolumes()
-    }
-
-    /** Возвращает громкости медиа и будильника, сохранённые при входе в захват (в том числе после аварийного завершения). */
-    private fun restoreCaptureVolumes() {
-        if (!prefs.contains("captureSavedMedia")) return
-        try {
-            am.setStreamVolume(AudioManager.STREAM_ALARM, prefs.getInt("captureSavedAlarm", am.getStreamVolume(AudioManager.STREAM_ALARM)), 0)
-            am.setStreamVolume(AudioManager.STREAM_MUSIC, prefs.getInt("captureSavedMedia", 0), 0)
-        } catch (e: Exception) { telemetry.event("CAPTURE_VOLUME_FAILED", error = e) }
-        prefs.edit().remove("captureSavedMedia").remove("captureSavedAlarm").apply()
+        CaptureVolumeGuard.leave(app)
     }
 
     // ================================================================== калибровка

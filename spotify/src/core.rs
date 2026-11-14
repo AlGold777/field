@@ -2,7 +2,7 @@
 //! JNI-слой (jni_glue.rs) и host-тест (examples/smoke.rs) используют только этот модуль.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{mpsc as std_mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -11,15 +11,18 @@ use librespot_connect::{ConnectConfig, Spirc};
 use librespot_core::authentication::Credentials;
 use librespot_core::cache::Cache;
 use librespot_core::config::DeviceType;
+use librespot_core::error::ErrorKind;
 use librespot_core::{Session, SessionConfig};
 use librespot_discovery::Discovery;
 use librespot_metadata::audio::UniqueFields;
 use librespot_playback::audio_backend::{Sink, SinkResult};
-use librespot_playback::config::{Bitrate, PlayerConfig};
+use librespot_playback::config::{
+    Bitrate, NormalisationMethod, NormalisationType, PlayerConfig, VolumeCtrl,
+};
 use librespot_playback::convert::Converter;
 use librespot_playback::decoder::AudioPacket;
 use librespot_playback::mixer::softmixer::SoftMixer;
-use librespot_playback::mixer::{Mixer, MixerConfig};
+use librespot_playback::mixer::{Mixer, MixerConfig, VolumeGetter};
 use librespot_playback::player::{Player, PlayerEvent, PlayerEventChannel};
 use tokio::sync::{mpsc, oneshot};
 
@@ -44,6 +47,8 @@ const SPIRC_START_TIMEOUT: Duration = Duration::from_secs(30);
 const BACKOFF_MIN: Duration = Duration::from_secs(2);
 const BACKOFF_MAX: Duration = Duration::from_secs(60);
 const STOP_TOTAL_TIMEOUT: Duration = Duration::from_secs(8);
+/// Громкость Spotify отсчитывается от −14 LUFS, файлы SoundField приводятся к −16 LUFS.
+const NORMALISATION_PREGAIN_DB: f64 = -2.0;
 
 /// Приёмник событий и звука. Все методы вызываются из нативных потоков.
 pub trait Host: Send + Sync + 'static {
@@ -57,35 +62,91 @@ pub struct Options {
     pub cache_dir: PathBuf,
     /// true: mDNS-ответчик внутри библиотеки (host); false: службу объявляет вызывающий.
     pub native_mdns: bool,
+    /// Положение регулятора громкости, которое устройство сообщает приложению Spotify (0..65535).
+    pub initial_volume: u16,
 }
 
 struct Shared {
     host: Arc<dyn Host>,
     /// После stop() приёмник больше не вызывает pcm().
     closed: AtomicBool,
+    /// Положение регулятора громкости (0..65535). Звук им не ослабляется: см. [UnityVolume].
+    volume: AtomicU32,
+}
+
+/// Звук уходит вызывающему с единичным усилением. Громкость из приложения Spotify приходит событием
+/// EV_VOLUME, и применяет её вызывающий своим регулятором: иначе сигнал ослаблялся бы до обработки.
+struct UnityVolume;
+
+impl VolumeGetter for UnityVolume {
+    fn attenuation_factor(&self) -> f64 {
+        1.0
+    }
+}
+
+enum Cmd {
+    Transport(i32),
+    Volume(u16),
 }
 
 // ---------------------------------------------------------------- FLUSH
+
+/// Событие плеера в той части, которая решает судьбу принятого, но не сыгранного звука.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FlushSignal {
+    EndOfTrack,
+    /// Загрузка трека: и пользовательская, и переход к следующему (`PlayRequestIdChanged`).
+    Load,
+    Seeked,
+    Stopped,
+    Paused,
+}
+
+/// Решает, устарел ли уже принятый звук. Естественный переход (EndOfTrack, затем загрузка или остановка)
+/// сбросом не считается: хвост трека должен доиграть.
+#[derive(Default)]
+pub struct FlushTracker {
+    /// Был EndOfTrack, и новая загрузка ещё не началась: следующий переход естественный.
+    ended: bool,
+}
+
+impl FlushTracker {
+    /// true: нужен FLUSH.
+    pub fn on(&mut self, signal: FlushSignal) -> bool {
+        match signal {
+            FlushSignal::EndOfTrack => {
+                self.ended = true;
+                false
+            }
+            FlushSignal::Load | FlushSignal::Stopped => !std::mem::take(&mut self.ended),
+            FlushSignal::Seeked => true,
+            FlushSignal::Paused => {
+                self.ended = false;
+                false
+            }
+        }
+    }
+}
 
 /// Синхронный разбор событий плеера для FLUSH.
 /// Плеер шлёт событие из своего потока до следующего `Sink::write`; sink перед каждой записью
 /// вычитывает собственный приёмник событий (`try_recv`) и шлёт FLUSH до первого PCM новой позиции.
 /// Если плеер не пишет (пауза, остановка), FLUSH шлёт асинхронная задача событий. Обе стороны
-/// работают под одним мьютексом.
+/// работают под одним мьютексом, и он удерживается на время вызова `Host::event`: пока вызывающий
+/// обрабатывает FLUSH, запись нового звука не начинается.
 struct FlushHub {
     inner: Mutex<FlushInner>,
 }
 
 struct FlushInner {
     rx: Option<PlayerEventChannel>,
-    /// Был EndOfTrack, и новая загрузка ещё не началась: следующий переход естественный.
-    ended: bool,
+    tracker: FlushTracker,
 }
 
 impl FlushHub {
     fn new() -> Self {
         Self {
-            inner: Mutex::new(FlushInner { rx: None, ended: false }),
+            inner: Mutex::new(FlushInner { rx: None, tracker: FlushTracker::default() }),
         }
     }
 
@@ -99,27 +160,16 @@ impl FlushHub {
         let Ok(mut g) = self.inner.lock() else { return };
         let mut need_flush = false;
         while let Some(ev) = g.rx.as_mut().and_then(|rx| rx.try_recv().ok()) {
-            match ev {
-                PlayerEvent::EndOfTrack { .. } => g.ended = true,
+            let signal = match ev {
+                PlayerEvent::EndOfTrack { .. } => FlushSignal::EndOfTrack,
                 // Каждая загрузка трека (и пользовательская, и gapless-переход) начинается с этого события.
-                PlayerEvent::PlayRequestIdChanged { .. } => {
-                    if g.ended {
-                        g.ended = false;
-                    } else {
-                        need_flush = true;
-                    }
-                }
-                PlayerEvent::Seeked { .. } => need_flush = true,
-                PlayerEvent::Stopped { .. } => {
-                    if g.ended {
-                        g.ended = false;
-                    } else {
-                        need_flush = true;
-                    }
-                }
-                PlayerEvent::Paused { .. } => g.ended = false,
-                _ => {}
-            }
+                PlayerEvent::PlayRequestIdChanged { .. } => FlushSignal::Load,
+                PlayerEvent::Seeked { .. } => FlushSignal::Seeked,
+                PlayerEvent::Stopped { .. } => FlushSignal::Stopped,
+                PlayerEvent::Paused { .. } => FlushSignal::Paused,
+                _ => continue,
+            };
+            need_flush |= g.tracker.on(signal);
         }
         if need_flush {
             host.event(EV_FLUSH, 0, 0, None, None);
@@ -164,7 +214,7 @@ pub struct Receiver {
     rt: Mutex<Option<tokio::runtime::Runtime>>,
     task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     shutdown_tx: Mutex<Option<oneshot::Sender<()>>>,
-    cmd_tx: mpsc::UnboundedSender<i32>,
+    cmd_tx: mpsc::UnboundedSender<Cmd>,
 }
 
 impl Receiver {
@@ -178,6 +228,7 @@ impl Receiver {
         let shared = Arc::new(Shared {
             host,
             closed: AtomicBool::new(false),
+            volume: AtomicU32::new(u32::from(opts.initial_volume)),
         });
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
@@ -192,7 +243,14 @@ impl Receiver {
     }
 
     pub fn command(&self, cmd: i32) {
-        let _ = self.cmd_tx.send(cmd);
+        let _ = self.cmd_tx.send(Cmd::Transport(cmd));
+    }
+
+    /// Положение регулятора громкости изменил вызывающий: сообщаем его приложению Spotify.
+    /// Без сеанса значение запоминается и уходит как начальное при подключении.
+    pub fn set_volume(&self, volume: u16) {
+        self.shared.volume.store(u32::from(volume), Ordering::Release);
+        let _ = self.cmd_tx.send(Cmd::Volume(volume));
     }
 
     /// Блокируется до полного завершения, но не дольше ~8 с: зависшие потоки отсоединяются.
@@ -249,6 +307,13 @@ fn open_cache(dir: &Path) -> Option<Cache> {
     }
 }
 
+/// Сохранённые учётные данные отвергнуты сервером: повторять их бессмысленно, ждём новый выбор устройства.
+fn forget_credentials(dir: &Path) {
+    if let Err(e) = std::fs::remove_file(dir.join("credentials.json")) {
+        log::warn!("cannot remove rejected credentials: {e}");
+    }
+}
+
 fn load_device_id(dir: &Path) -> String {
     let path = dir.join("device_id");
     if let Ok(s) = std::fs::read_to_string(&path) {
@@ -297,7 +362,6 @@ async fn event_task(
     mut rx: PlayerEventChannel,
     shared: Arc<Shared>,
     hub: Arc<FlushHub>,
-    cache_dir: PathBuf,
 ) {
     let host = shared.host.as_ref();
     while let Some(ev) = rx.recv().await {
@@ -322,10 +386,8 @@ async fn event_task(
                 );
             }
             PlayerEvent::VolumeChanged { volume } => {
+                shared.volume.store(u32::from(volume), Ordering::Release);
                 host.event(EV_VOLUME, volume as i64, 0, None, None);
-                if let Some(c) = open_cache(&cache_dir) {
-                    c.save_volume(volume);
-                }
             }
             PlayerEvent::Unavailable { .. } => {
                 host.event(EV_ERROR, 0, 0, Some("track unavailable"), None)
@@ -346,7 +408,7 @@ struct Active {
 async fn supervisor(
     opts: Options,
     shared: Arc<Shared>,
-    mut cmd_rx: mpsc::UnboundedReceiver<i32>,
+    mut cmd_rx: mpsc::UnboundedReceiver<Cmd>,
     mut shutdown_rx: oneshot::Receiver<()>,
 ) {
     let host = shared.host.clone();
@@ -384,7 +446,12 @@ async fn supervisor(
         }
     };
 
-    let mixer: Arc<dyn Mixer> = match SoftMixer::open(MixerConfig::default()) {
+    // Микшер хранит только положение регулятора для Connect (линейно, без пересчёта); звук он не трогает.
+    let mixer_config = MixerConfig {
+        volume_ctrl: VolumeCtrl::Linear,
+        ..MixerConfig::default()
+    };
+    let mixer: Arc<dyn Mixer> = match SoftMixer::open(mixer_config) {
         Ok(m) => Arc::new(m),
         Err(e) => {
             host.event(EV_ERROR, 0, 0, Some(&format!("mixer: {e}")), None);
@@ -418,12 +485,17 @@ async fn supervisor(
                     let cfg = PlayerConfig {
                         bitrate: Bitrate::Bitrate320,
                         gapless: true,
-                        normalisation: false,
+                        // Только ослабление громких треков по данным Spotify, без динамической обработки:
+                        // пики ограничивает предлимитер вызывающего.
+                        normalisation: true,
+                        normalisation_type: NormalisationType::Auto,
+                        normalisation_method: NormalisationMethod::Basic,
+                        normalisation_pregain_db: NORMALISATION_PREGAIN_DB,
                         position_update_interval: None,
                         ditherer: None,
                         ..PlayerConfig::default()
                     };
-                    Player::new(cfg, session.clone(), mixer.get_soft_volume(), move || {
+                    Player::new(cfg, session.clone(), Box::new(UnityVolume), move || {
                         Box::new(HostSink {
                             shared: shared2,
                             hub: hub2,
@@ -436,7 +508,6 @@ async fn supervisor(
                     p.get_player_event_channel(),
                     shared.clone(),
                     hub.clone(),
-                    cache_dir.clone(),
                 ));
                 player = Some(p);
             }
@@ -447,9 +518,7 @@ async fn supervisor(
         let connect_cfg = ConnectConfig {
             name: opts.device_name.clone(),
             device_type: DeviceType::Speaker,
-            initial_volume: open_cache(&cache_dir)
-                .and_then(|c| c.volume())
-                .unwrap_or(u16::MAX / 2),
+            initial_volume: shared.volume.load(Ordering::Acquire).min(u32::from(u16::MAX)) as u16,
             ..ConnectConfig::default()
         };
         let started = tokio::select! {
@@ -467,6 +536,9 @@ async fn supervisor(
             Some(Ok(Ok(v))) => v,
             Some(Ok(Err(e))) => {
                 session.shutdown();
+                if matches!(e.kind, ErrorKind::PermissionDenied | ErrorKind::Unauthenticated) {
+                    forget_credentials(&cache_dir);
+                }
                 host.event(EV_ERROR, 0, 0, Some(&format!("connect: {e}")), None);
                 if !retry_wait(
                     &mut backoff, &mut pending, &mut discovery, &mut shutdown_rx, host, &cache_dir,
@@ -517,17 +589,16 @@ async fn supervisor(
                 }
                 c = next_creds(&mut discovery, host) => break Why::NewAccount(c),
                 cmd = cmd_rx.recv() => {
-                    if let Some(cmd) = cmd {
-                        let r = match cmd {
-                            CMD_PLAY => active.spirc.play(),
-                            CMD_PAUSE => active.spirc.pause(),
-                            CMD_NEXT => active.spirc.next(),
-                            CMD_PREVIOUS => active.spirc.prev(),
-                            _ => Ok(()),
-                        };
-                        if let Err(e) = r {
-                            host.event(EV_ERROR, 0, 0, Some(&format!("command {cmd}: {e}")), None);
-                        }
+                    let r = match cmd {
+                        Some(Cmd::Transport(CMD_PLAY)) => active.spirc.play(),
+                        Some(Cmd::Transport(CMD_PAUSE)) => active.spirc.pause(),
+                        Some(Cmd::Transport(CMD_NEXT)) => active.spirc.next(),
+                        Some(Cmd::Transport(CMD_PREVIOUS)) => active.spirc.prev(),
+                        Some(Cmd::Volume(v)) => active.spirc.set_volume(v),
+                        _ => Ok(()),
+                    };
+                    if let Err(e) = r {
+                        host.event(EV_ERROR, 0, 0, Some(&format!("command: {e}")), None);
                     }
                 }
                 _ = &mut shutdown_rx => break Why::Shutdown,
@@ -614,5 +685,47 @@ async fn finish(player: Option<Arc<Player>>, discovery: Option<Discovery>) {
             tokio::task::spawn_blocking(move || drop(p)),
         )
         .await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FlushSignal::*, FlushTracker};
+
+    fn run(signals: &[super::FlushSignal]) -> Vec<bool> {
+        let mut t = FlushTracker::default();
+        signals.iter().map(|s| t.on(*s)).collect()
+    }
+
+    #[test]
+    fn natural_transition_keeps_the_tail() {
+        assert_eq!(run(&[EndOfTrack, Load]), [false, false]);
+    }
+
+    #[test]
+    fn end_of_queue_keeps_the_tail() {
+        assert_eq!(run(&[EndOfTrack, Stopped]), [false, false]);
+    }
+
+    #[test]
+    fn user_skip_seek_and_stop_flush() {
+        assert_eq!(run(&[Load]), [true]);
+        assert_eq!(run(&[Seeked]), [true]);
+        assert_eq!(run(&[Stopped]), [true]);
+    }
+
+    #[test]
+    fn natural_transition_does_not_hide_the_next_skip() {
+        assert_eq!(run(&[EndOfTrack, Load, Load]), [false, false, true]);
+    }
+
+    #[test]
+    fn seek_flushes_even_right_after_end_of_track() {
+        assert_eq!(run(&[EndOfTrack, Seeked]), [false, true]);
+    }
+
+    #[test]
+    fn pause_cancels_the_pending_natural_transition() {
+        assert_eq!(run(&[EndOfTrack, Paused, Load]), [false, false, true]);
     }
 }

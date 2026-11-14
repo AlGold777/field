@@ -40,7 +40,12 @@ class CaptureService : Service() {
     private var record: AudioRecord? = null
     @Volatile private var thread: Thread? = null
     private val projectionCallback = object : MediaProjection.Callback() {
-        override fun onStop() { finish("Захват звука остановлен") }
+        override fun onStop() {
+            // С Android 15 QPR1 система завершает захват при блокировке экрана.
+            val locked = (getSystemService(Context.KEYGUARD_SERVICE) as? android.app.KeyguardManager)?.isKeyguardLocked == true
+            Telemetry.get(this@CaptureService).record("CAPTURE_STOPPED", mapOf("locked" to locked))
+            finish(if (locked) "Система остановила захват звука при блокировке экрана" else "Захват звука остановлен")
+        }
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
