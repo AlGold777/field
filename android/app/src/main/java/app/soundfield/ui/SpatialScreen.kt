@@ -45,6 +45,10 @@ fun SpatialCompactBlock(ui: UiState, engine: Engine, openSpatial: () -> Unit) {
     val profile = if (ui.soloMode) "solo_stereo_speaker" else state.profile
     var width by remember(state.width) { mutableFloatStateOf(state.width.toFloat()) }
     var depth by remember(state.depth) { mutableFloatStateOf(state.depth.toFloat()) }
+    var height by remember(state.height) { mutableFloatStateOf(state.height.toFloat()) }
+    val apply = {
+        engine.setSpatial(state.withScene(width.toDouble(), depth.toDouble(), height.toDouble()).copy(profile = profile), finished = true)
+    }
     Column(Modifier.fillMaxWidth().padding(top = 14.dp)) {
         Row(
             Modifier.fillMaxWidth().pointerInput(Unit) { detectTapGestures(onLongPress = { openSpatial() }) },
@@ -55,12 +59,17 @@ fun SpatialCompactBlock(ui: UiState, engine: Engine, openSpatial: () -> Unit) {
         SceneSliderRow(
             label = "Ширина", value = width, description = "Ширина сцены",
             onChange = { width = it },
-            onFinished = { engine.setSpatial(state.withScene(width.toDouble(), depth.toDouble()).copy(profile = profile), finished = true) },
+            onFinished = apply,
         )
         SceneSliderRow(
             label = "Глубина", value = depth, description = "Глубина сцены",
             onChange = { depth = it },
-            onFinished = { engine.setSpatial(state.withScene(width.toDouble(), depth.toDouble()).copy(profile = profile), finished = true) },
+            onFinished = apply,
+        )
+        SceneSliderRow(
+            label = "Высота", value = height, description = "Высота сцены",
+            onChange = { height = it },
+            onFinished = apply,
         )
     }
 }
@@ -69,6 +78,7 @@ fun SpatialCompactBlock(ui: UiState, engine: Engine, openSpatial: () -> Unit) {
 fun SpatialScreen(ui: UiState, engine: Engine, onBack: () -> Unit) {
     var width by remember(ui.spatial.width) { mutableFloatStateOf(ui.spatial.width.toFloat()) }
     var depth by remember(ui.spatial.depth) { mutableFloatStateOf(ui.spatial.depth.toFloat()) }
+    var height by remember(ui.spatial.height) { mutableFloatStateOf(ui.spatial.height.toFloat()) }
     var near by remember(ui.spatial.profile) { mutableStateOf(ui.spatial.profile == "pair_near") }
     var preserveLoudness by remember(ui.spatial) { mutableStateOf(ui.spatial.preserveLoudness) }
     var meter by remember { mutableStateOf(0.0 to 0.0) }
@@ -82,7 +92,7 @@ fun SpatialScreen(ui: UiState, engine: Engine, onBack: () -> Unit) {
         near = placementNear
         preserveLoudness = preserve
         val profile = if (ui.soloMode) "solo_stereo_speaker" else if (placementNear) "pair_near" else "pair_wide"
-        engine.setSpatial(ui.spatial.withScene(width.toDouble(), depth.toDouble())
+        engine.setSpatial(ui.spatial.withScene(width.toDouble(), depth.toDouble(), height.toDouble())
             .copy(profile = profile, preserveLoudness = preserve), finished = true)
     }
 
@@ -102,6 +112,10 @@ fun SpatialScreen(ui: UiState, engine: Engine, onBack: () -> Unit) {
         SceneSliderRow(
             label = "Глубина", value = depth, description = "Глубина сцены",
             onChange = { depth = it }, onFinished = { apply() },
+        )
+        SceneSliderRow(
+            label = "Высота", value = height, description = "Высота сцены",
+            onChange = { height = it }, onFinished = { apply() },
         )
         Row(Modifier.fillMaxWidth().padding(top = 10.dp), verticalAlignment = Alignment.CenterVertically) {
             Text("Сохранять громкость", color = SFColors.Text, fontSize = 15.sp, modifier = Modifier.weight(1f))

@@ -21,6 +21,8 @@ data class SpatialDspConfig(
     val width: Double = 0.0,
     /** Положение ползунка «Глубина», 0…1. */
     val depth: Double = 0.0,
+    /** Положение ползунка «Высота», 0…1. */
+    val height: Double = 0.0,
     /** Масштаб геометрии колонок из профиля: больше — дальше за пределы базы. */
     val span: Double = 1.0,
     val preserveLoudness: Boolean = true,
@@ -31,7 +33,8 @@ data class SpatialDspConfig(
  * STFT-стадия сцены. Бин делится на первичный источник (главная ось ковариации L/R) и остаток (ambient).
  * Ширина: первичный источник переносится по панораме дальше (за колонки — через противофазу
  * противоположного канала), Side остатка усиливается. Глубина: остаток усиливается и вместе с первичным
- * уходит в посыл на комнату ([SceneRoom]). Ковариация двусторонняя: прошлое (80 мс) плюс опережающие кадры.
+ * уходит в посыл на комнату ([SceneRoom]). Высота: выход получает спектральную окраску направления «выше горизонта»
+ * (4–12 кГц), посыл в комнату — её же в [CEILING_RATIO] раз сильнее (отражения приходят сверху). Ковариация двусторонняя: прошлое (80 мс) плюс опережающие кадры.
  */
 class SpatialProcessor(
     private val config: SpatialDspConfig,
@@ -74,6 +77,7 @@ class SpatialProcessor(
     private val ambientLiftMid = DoubleArray(bins)
     private val ambientLiftSide = DoubleArray(bins)
     private val sendWeight = DoubleArray(bins)
+    private val elevationGain = DoubleArray(bins) { 1.0 }
     private val fluxHistory = DoubleArray(FLUX_WINDOW_FRAMES * BAND_COUNT)
     // Те же значения потока по возрастанию (по полосам): медиана и MAD без сортировки на каждом кадре.
     private val fluxSorted = DoubleArray(FLUX_WINDOW_FRAMES * BAND_COUNT)
@@ -89,6 +93,7 @@ class SpatialProcessor(
     private val attackRelease = 1.0 - exp(-(hopSize.toDouble() / sampleRate) / 0.150)
     private val width = config.width.coerceIn(0.0, 1.0)
     private val depth = config.depth.coerceIn(0.0, 1.0)
+    private val height = config.height.coerceIn(0.0, 1.0)
 
     init {
         require(sampleRate > 0 && fftSize >= 2 && fftSize.countOneBits() == 1 && hopSize in 1..fftSize)
@@ -114,6 +119,11 @@ class SpatialProcessor(
             ambientLiftMid[bin] = 10.0.pow(AMBIENT_DEPTH_DB * depth * f / 20.0) - 1.0
             ambientLiftSide[bin] = 10.0.pow((AMBIENT_WIDTH_DB * width + AMBIENT_DEPTH_DB * depth) * f / 20.0) - 1.0
             sendWeight[bin] = raisedCosineLog(hz, 150.0, 350.0) * (1.0 - 0.5 * raisedCosineLog(hz, 6_000.0, 12_000.0))
+            if (height > 0.0) {
+                val cueDb = elevationCueDb(hz) * height
+                elevationGain[bin] = 10.0.pow(cueDb / 20.0)
+                sendWeight[bin] *= 10.0.pow(cueDb * CEILING_RATIO / 20.0)
+            }
         }
     }
 
@@ -332,6 +342,8 @@ class SpatialProcessor(
                 val w = sendWeight[bin] * 0.5
                 sLr = w * lr; sLi = w * li; sRr = w * rr; sRi = w * ri
             }
+            val lift = elevationGain[bin]
+            yLr *= lift; yLi *= lift; yRr *= lift; yRi *= lift
             val pl = yLr * yLr + yLi * yLi; val pr = yRr * yRr + yRi * yRi
             val crossPower = yLr * yRr + yLi * yRi
             totalLeft += pl; totalRight += pr; totalCross += crossPower
@@ -360,6 +372,22 @@ class SpatialProcessor(
     private fun confidence(rho: Double): Double {
         val t = ((rho - RHO_LOW) / (RHO_HIGH - RHO_LOW)).coerceIn(0.0, 1.0)
         return t * t * (3.0 - 2.0 * t)
+    }
+
+    /**
+     * Окраска «выше горизонта» при высоте 1, дБ: подъём 6–8,5 кГц (полоса направления «сверху», заодно закрывает
+     * провал ушной раковины от источника ниже ушей), узкий провал у 11 кГц (первый провал раковины, сдвинутый вверх),
+     * небольшой спад у 4 кГц (полоса направления «спереди»). Ниже 2,5 кГц — ноль.
+     */
+    private fun elevationCueDb(hz: Double): Double {
+        if (hz <= ELEVATION_START_HZ) return 0.0
+        fun bell(centre: Double, octaves: Double): Double {
+            val x = log2(hz / centre) / octaves
+            return exp(-0.5 * x * x)
+        }
+        val cue = ELEVATION_PEAK_DB * bell(7_200.0, 0.28) + ELEVATION_NOTCH_DB * bell(11_000.0, 0.13) +
+            ELEVATION_FRONT_DB * bell(4_000.0, 0.30)
+        return cue * raisedCosineLog(hz, ELEVATION_START_HZ, 3_500.0)
     }
 
     private fun raisedCosineLog(hz: Double, from: Double, to: Double): Double {
@@ -437,5 +465,11 @@ class SpatialProcessor(
         private const val ETA = 0.02
         private const val RHO_LOW = 0.15
         private const val RHO_HIGH = 0.5
+        private const val ELEVATION_START_HZ = 2_500.0
+        private const val ELEVATION_PEAK_DB = 5.0
+        private const val ELEVATION_NOTCH_DB = -7.0
+        private const val ELEVATION_FRONT_DB = -1.5
+        /** Во сколько раз (в дБ) окраска отражений сильнее окраски прямого звука. */
+        private const val CEILING_RATIO = 1.6
     }
 }

@@ -34,8 +34,8 @@ class SpatialSceneTest {
             else if (ch == Ch.L) left[frame.toInt()] else right[frame.toInt()]
     }
 
-    private fun cfg(width: Double, depth: Double, loudness: Boolean = false, span: Double = 1.0) =
-        SpatialDspConfig(enabled = true, width = width, depth = depth, span = span, preserveLoudness = loudness)
+    private fun cfg(width: Double, depth: Double, loudness: Boolean = false, span: Double = 1.0, height: Double = 0.0) =
+        SpatialDspConfig(enabled = true, width = width, depth = depth, height = height, span = span, preserveLoudness = loudness)
 
     private fun render(l: FloatArray, r: FloatArray, config: SpatialDspConfig): Pair<FloatArray, FloatArray> {
         SpatialSource(Buffer(l, r), spatialConfig = config).use { spatial ->
@@ -124,7 +124,58 @@ class SpatialSceneTest {
         val l = white(1, sr * 2, 0.5f); val r = white(2, sr * 2, 0.5f)
         val (outL, outR) = render(l, r, SpatialDspConfig(enabled = false, width = 1.0, depth = 1.0))
         assertTrue(l.contentEquals(outL)); assertTrue(r.contentEquals(outR))
-        assertTrue(!SpatialSettings(level = SpatialLevel.STRONG, width = 0.0, depth = 0.0).sanitized().enabled)
+        assertTrue(!SpatialSettings(level = SpatialLevel.STRONG, width = 0.0, depth = 0.0, height = 0.0).sanitized().enabled)
+    }
+
+    /** Изменение уровня в третьоктавной полосе вокруг [hz], дБ (центральный розовый шум, только высота). */
+    private fun heightBandChange(height: Double, vararg hz: Double): List<Double> {
+        val n = sr * 4
+        val x = pink(21, n, 0.15f)
+        val (outL, outR) = render(x, x.copyOf(), cfg(0.0, 0.0, height = height))
+        val from = sr / 2; val to = n - sr / 2
+        assertTrue("centre L-R", dbE(energy(diff(outL, outR), from, to) / energy(outL, from, to)) < -90.0)
+        return hz.map { f ->
+            val lo = f / 1.06; val hi = f * 1.06
+            dbE(energy(band(outL, lo, hi), from, to) / energy(band(x, lo, hi), from, to))
+        }
+    }
+
+    @Test fun heightColoursOnlyTheUpperBandAndKeepsCentre() {
+        val full = heightBandChange(1.0, 500.0, 2_000.0, 4_000.0, 7_200.0, 11_000.0)
+        val half = heightBandChange(0.5, 7_200.0, 11_000.0)
+        println("MEASURED height 1: 500 Hz ${"%.2f".format(full[0])}, 2 kHz ${"%.2f".format(full[1])}, 4 kHz ${"%.2f".format(full[2])}, " +
+            "7.2 kHz ${"%.2f".format(full[3])}, 11 kHz ${"%.2f".format(full[4])} dB; height 0.5: 7.2 kHz ${"%.2f".format(half[0])}, 11 kHz ${"%.2f".format(half[1])} dB")
+        assertTrue("500 Hz ${full[0]}", abs(full[0]) < 0.05)
+        assertTrue("2 kHz ${full[1]}", abs(full[1]) < 0.05)
+        assertTrue("4 kHz ${full[2]}", full[2] in -2.0..-0.8)
+        assertTrue("7.2 kHz ${full[3]}", full[3] in 4.0..5.5)
+        assertTrue("11 kHz ${full[4]}", full[4] in -7.5..-4.5)
+        assertTrue("half peak ${half[0]}", half[0] in 2.0..2.8)
+        assertTrue("half notch ${half[1]}", half[1] in -3.8..-2.2)
+    }
+
+    @Test fun heightColoursTheRoomMoreThanTheDirectSound() {
+        val n = sr * 6
+        val x = pink(22, n, 0.15f)
+        val from = sr; val to = n - sr / 2
+        fun wetBand(height: Double): Double {
+            val (dryL, _) = render(x, x.copyOf(), cfg(0.0, 0.0, height = height.coerceAtLeast(1e-9)))
+            val (outL, _) = render(x, x.copyOf(), cfg(0.0, 1.0, height = height))
+            val wet = diff(outL, dryL)
+            return dbE(energy(band(wet, 6_500.0, 8_000.0), from, to) / energy(band(wet, 1_000.0, 2_000.0), from, to))
+        }
+        val flat = wetBand(0.0); val high = wetBand(1.0)
+        println("MEASURED room 6.5-8 kHz re 1-2 kHz: height 0 ${"%.2f".format(flat)} dB, height 1 ${"%.2f".format(high)} dB, tilt ${"%.2f".format(high - flat)} dB")
+        assertTrue("room tilt ${high - flat}", high - flat in 6.5..9.0)
+    }
+
+    @Test fun heightWithLoudnessCompensationStaysNearUnity() {
+        val n = sr * 8
+        val x = pink(23, n, 0.15f)
+        val (outL, _) = render(x, x.copyOf(), cfg(0.0, 0.0, loudness = true, height = 1.0))
+        val level = dbE(energy(outL, sr * 2, n) / energy(x, sr * 2, n))
+        println("MEASURED height 1 broadband level with compensation: ${"%.2f".format(level)} dB")
+        assertTrue("level $level", abs(level) < 1.0)
     }
 
     @Test fun tinyWidthIsContinuousWithBypass() {

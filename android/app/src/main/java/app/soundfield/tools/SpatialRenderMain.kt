@@ -26,9 +26,10 @@ object SpatialRenderMain {
         val output = File(options.getValue("out")).canonicalFile
         val width = options.getValue("width").toDouble()
         val depth = options.getValue("depth").toDouble()
+        val height = options["height"]?.toDouble() ?: 0.0
         val profile = options.getValue("profile")
         require(input.isFile) { "Input WAV does not exist: $input" }
-        require(width in 0.0..1.0 && depth in 0.0..1.0) { "--width and --depth must be in 0..1" }
+        require(width in 0.0..1.0 && depth in 0.0..1.0 && height in 0.0..1.0) { "--width, --depth and --height must be in 0..1" }
         require(profile in setOf("pair_wide", "pair_near", "solo_stereo_speaker", "off")) {
             "Unsupported profile: $profile"
         }
@@ -39,7 +40,7 @@ object SpatialRenderMain {
         ).firstOrNull { it.isFile }
         val profileData = profileFile?.readText()?.let { SpatialProfiles.parse(it)[profile] }
             ?: SpatialProfiles.fallback(profile)
-        val level = "w${width}_d${depth}"
+        val level = "w${width}_d${depth}_h${height}"
 
         val decoded = Wav.decode(input.readBytes())
         val source: AudioSource = PcmSource(decoded.pcm, input.nameWithoutExtension, "Local WAV")
@@ -51,7 +52,7 @@ object SpatialRenderMain {
         val reference = File(tracks, "$fragment-REF.wav")
         writeWav(reference, source) { frame, channel -> source.sample(frame, channel) }
         SpatialSource(source, spatialConfig = SpatialDspConfig(
-            enabled = profile != "off" && (width > 0.0 || depth > 0.0), width = width, depth = depth, span = profileData.span)).use { spatial ->
+            enabled = profile != "off" && (width > 0.0 || depth > 0.0 || height > 0.0), width = width, depth = depth, height = height, span = profileData.span)).use { spatial ->
             spatial.requestThrough(source.totalFrames)
             val deadline = System.nanoTime() + 30_000_000_000L
             while (!spatial.complete && spatial.processingError == null && System.nanoTime() < deadline) Thread.sleep(2)
@@ -167,7 +168,7 @@ object SpatialRenderMain {
             index += 2
         }
         for (required in listOf("in", "width", "depth", "profile", "out")) require(required in result) {
-            "Usage: --in track.wav --width 0..1 --depth 0..1 --profile pair_wide|pair_near|solo_stereo_speaker|off --out folder"
+            "Usage: --in track.wav --width 0..1 --depth 0..1 [--height 0..1] --profile pair_wide|pair_near|solo_stereo_speaker|off --out folder"
         }
         return result
     }

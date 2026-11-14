@@ -15,8 +15,17 @@ class SpatialSettingsTest {
 
     @Test fun loudnessPreferenceDefaultsToOn() = assertTrue(SpatialSettings().preserveLoudness)
 
+    @Test fun heightAloneKeepsSceneEnabled() {
+        val settings = SpatialSettings().withScene(0.0, 0.0, 0.6).sanitized()
+        assertTrue(settings.enabled)
+        assertEquals(0.6, settings.dspConfig(SpatialProfiles.fallback("pair_wide")).height, 0.0)
+    }
+
+    @Test fun levelPresetsCarryNoHeight() =
+        assertEquals(0.0, SpatialSettings().withLevel(SpatialLevel.STRONG).height, 0.0)
+
     @Test fun zeroWidthAndDepthSanitiseToDisabled() {
-        val settings = SpatialSettings().withScene(0.0, 0.0).sanitized()
+        val settings = SpatialSettings().withScene(0.0, 0.0, 0.0).sanitized()
         assertFalse(settings.enabled)
         assertFalse(settings.dspConfig(SpatialProfiles.fallback("pair_wide")).enabled)
     }

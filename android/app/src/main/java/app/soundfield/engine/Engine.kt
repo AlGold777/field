@@ -2314,7 +2314,7 @@ class Engine private constructor(private val app: Context) {
             if (soloMode) post { applySpatialSettings(clean, finished) }
             else cmd("spatial", telemetry = finished) {
                 put("enabled", clean.enabled); put("level", clean.level.wire); put("profile", clean.profile)
-                put("width", clean.width); put("depth", clean.depth)
+                put("width", clean.width); put("depth", clean.depth); put("height", clean.height)
                 put("preserveLoudness", clean.preserveLoudness)
                 put("abFixedCompensationDb", spatialAbFixedCompensationDb ?: JSONObject.NULL)
                 put("finished", finished)
@@ -3958,7 +3958,7 @@ class Engine private constructor(private val app: Context) {
             if (soloMode) prefs.edit().putString("soloSpatial:${audio.routeKey()}", clean.toJson().toString()).apply()
             else saveServerParams()
             telemetry.record("SPATIAL_CONFIG", mapOf("profile" to clean.profile, "level" to clean.level.wire,
-                "width" to clean.width, "depth" to clean.depth,
+                "width" to clean.width, "depth" to clean.depth, "height" to clean.height,
                 "preserveLoudness" to clean.preserveLoudness,
                 "dspVersion" to DSP_VERSION, "profilesVersion" to SpatialProfiles.VERSION,
                 "reason" to reason, "fFrame" to f))
