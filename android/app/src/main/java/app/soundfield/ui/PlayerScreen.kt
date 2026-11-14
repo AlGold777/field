@@ -235,14 +235,16 @@ fun PlayerScreen(ui: UiState, engine: Engine, openCalibration: () -> Unit, openD
         var seekHold by remember { mutableStateOf<Float?>(null) }
         LaunchedEffect(seekHold) { if (seekHold != null) { delay(300); seekHold = null } }
         LaunchedEffect(pos) { seekHold?.let { if (abs(pos - it * dur) < 500) seekHold = null } }
-        Slider(
+        // Живой источник (Spotify, YouTube) не перематывается отсюда; место сохраняем, чтобы экран не прыгал.
+        if (ui.input.live) Spacer(Modifier.height(64.dp))
+        else Slider(
             value = dragging ?: seekHold ?: (pos.toFloat() / dur).coerceIn(0f, 1f),
             onValueChange = { dragging = it },
             onValueChangeFinished = { dragging?.let { engine.seekMs((it * dur).toLong()); seekHold = it }; dragging = null },
             colors = SliderDefaults.colors(thumbColor = SFColors.Accent1, activeTrackColor = SFColors.Accent1,
                 inactiveTrackColor = Color(0x1AFFFFFF)),
         )
-        Row(Modifier.fillMaxWidth()) {
+        if (!ui.input.live) Row(Modifier.fillMaxWidth()) {
             Text(fmtTime((dragging ?: seekHold)?.let { (it * dur).toLong() } ?: pos), color = SFColors.TextDim, fontSize = 12.sp)
             Spacer(Modifier.weight(1f))
             Text(fmtTime(ui.durationMs), color = SFColors.TextDim, fontSize = 12.sp)

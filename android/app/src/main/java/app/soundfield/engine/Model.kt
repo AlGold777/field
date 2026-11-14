@@ -347,6 +347,10 @@ data class UiState(
     /** Воспроизведение автоматически ждёт, пока декодер подготовит следующий сегмент. */
     val audioBuffering: Boolean = false,
     val queueExpanded: Boolean = false,
+    /** Источник музыки на Server: своя очередь, Spotify или YouTube. */
+    val input: app.soundfield.core.InputSource = app.soundfield.core.InputSource.PLAYER,
+    /** Счётчик запросов системного разрешения на захват звука (обрабатывает активность). */
+    val captureRequest: Int = 0,
     val filePickerRequest: Int = 0,
     val mode: SourceMode = SourceMode.MUSIC,
     val volL: Float = 1f,

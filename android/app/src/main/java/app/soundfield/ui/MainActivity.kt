@@ -90,6 +90,41 @@ fun AppRoot(engine: Engine) {
             showAudioBrowser = true
         }
     }
+    // Источник YouTube: микрофонное разрешение (его требует AudioRecord захвата), затем системный запрос MediaProjection.
+    val captureLauncher = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+        engine.captureConsent(result.resultCode, result.data)
+    }
+    val launchCaptureConsent = {
+        val manager = ctx.getSystemService(Context.MEDIA_PROJECTION_SERVICE) as android.media.projection.MediaProjectionManager
+        // Android 14+: сразу запрос на весь экран, без выбора «одно приложение» — звук всё равно берётся только у YouTube.
+        val intent = if (Build.VERSION.SDK_INT >= 34)
+            manager.createScreenCaptureIntent(android.media.projection.MediaProjectionConfig.createConfigForDefaultDisplay())
+            else manager.createScreenCaptureIntent()
+        runCatching { captureLauncher.launch(intent) }
+            .onFailure { Toast.makeText(ctx, "Системный запрос захвата недоступен", Toast.LENGTH_LONG).show() }
+        Unit
+    }
+    val captureMicLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        if (granted) launchCaptureConsent()
+        else Toast.makeText(ctx, "Захват звука YouTube требует разрешения «Запись аудио»", Toast.LENGTH_LONG).show()
+    }
+    var handledCaptureRequest by rememberSaveable { mutableIntStateOf(ui.captureRequest) }
+    LaunchedEffect(ui.captureRequest) {
+        if (ui.captureRequest > handledCaptureRequest) {
+            handledCaptureRequest = ui.captureRequest
+            if (ContextCompat.checkSelfPermission(ctx, Manifest.permission.RECORD_AUDIO) == android.content.pm.PackageManager.PERMISSION_GRANTED)
+                launchCaptureConsent()
+            else captureMicLauncher.launch(Manifest.permission.RECORD_AUDIO)
+        }
+    }
+    // При захвате YouTube свой звук идёт через поток будильника: кнопки громкости должны менять его.
+    val captureOnThisPhone = ui.input == app.soundfield.core.InputSource.YOUTUBE && ui.role == app.soundfield.core.Role.SERVER
+    DisposableEffect(captureOnThisPhone) {
+        val activity = ctx as? Activity
+        activity?.volumeControlStream = if (captureOnThisPhone) android.media.AudioManager.STREAM_ALARM
+            else android.media.AudioManager.USE_DEFAULT_STREAM_TYPE
+        onDispose { activity?.volumeControlStream = android.media.AudioManager.USE_DEFAULT_STREAM_TYPE }
+    }
     var handledPickerRequest by rememberSaveable { mutableIntStateOf(ui.filePickerRequest) }
     LaunchedEffect(Unit) {
         if (Build.VERSION.SDK_INT >= 33) notifLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)

@@ -38,6 +38,10 @@ class AudioOutput(private val ctx: Context) {
     /** Стереопара выводит каналы через встроенный динамик; соло следует системному аудиомаршруту. */
     @Volatile var preferPhoneSpeaker: Boolean = true
     @Volatile var onRouteChanged: (() -> Unit)? = null
+    /** Поток громкости вывода. При захвате звука другого приложения медиапоток заглушён, вывод идёт через будильник. */
+    @Volatile var usage: Int = AudioAttributes.USAGE_MEDIA
+    /** Поток, которым система регулирует громкость этого вывода (для метрик «выход заглушён»). */
+    private val volumeStream: Int get() = if (usage == AudioAttributes.USAGE_ALARM) AudioManager.STREAM_ALARM else AudioManager.STREAM_MUSIC
     @Volatile var latencyMs = 0.0; private set
     @Volatile var underruns = 0L; private set
     @Volatile var timestampOk = false; private set
@@ -135,9 +139,9 @@ class AudioOutput(private val ctx: Context) {
         val device = if (Build.VERSION.SDK_INT >= 23) track?.routedDevice else null
         return Window(
             outputSignal.take(), fps, timestampOk,
-            am.getStreamVolume(AudioManager.STREAM_MUSIC),
-            if (Build.VERSION.SDK_INT >= 28) am.getStreamMinVolume(AudioManager.STREAM_MUSIC) else 0,
-            am.getStreamMaxVolume(AudioManager.STREAM_MUSIC), am.isStreamMute(AudioManager.STREAM_MUSIC),
+            am.getStreamVolume(volumeStream),
+            if (Build.VERSION.SDK_INT >= 28) am.getStreamMinVolume(volumeStream) else 0,
+            am.getStreamMaxVolume(volumeStream), am.isStreamMute(volumeStream),
             route(device), audioFocus, recoveryCount.getAndSet(0), recoveryError.getAndSet(null),
         )
     }
@@ -186,6 +190,12 @@ class AudioOutput(private val ctx: Context) {
             routeChangeTask = task
             routeHandler.postDelayed(task, 300)
         }
+    }
+
+    /** Пересоздаёт трек (смена [usage]); остановленный вывод не запускает. */
+    @Synchronized fun restart() {
+        if (thread == null) return
+        stop(); start()
     }
 
     @Synchronized fun stop() {
@@ -250,7 +260,7 @@ class AudioOutput(private val ctx: Context) {
         val minBuf = AudioTrack.getMinBufferSize(sr, channelMask, AudioFormat.ENCODING_PCM_FLOAT)
         val t = AudioTrack.Builder()
             .setAudioAttributes(AudioAttributes.Builder()
-                .setUsage(AudioAttributes.USAGE_MEDIA)
+                .setUsage(usage)
                 .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC).build())
             .setAudioFormat(AudioFormat.Builder()
                 .setSampleRate(sr).setEncoding(AudioFormat.ENCODING_PCM_FLOAT)

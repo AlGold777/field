@@ -11,6 +11,8 @@
     <!-- Работа в фоне и с выключенным экраном -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
+    <!-- Источник YouTube: захват звука другого приложения (AudioPlaybackCapture) после системного запроса -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <!-- Doze exemption: без неё Xiaomi/Samsung/Huawei замораживают сокеты через 1–5 мин экрана выключенного -->
@@ -19,6 +21,12 @@
     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="28" />
 
     <uses-feature android:name="android.hardware.microphone" android:required="false" />
+
+    <!-- UID приложений YouTube: захватывается только их звук -->
+    <queries>
+        <package android:name="com.google.android.youtube" />
+        <package android:name="com.google.android.apps.youtube.music" />
+    </queries>
     <uses-feature android:name="android.hardware.wifi" android:required="true" />
 
     <application
@@ -46,6 +54,11 @@
             android:name=".service.PlaybackService"
             android:exported="false"
             android:foregroundServiceType="mediaPlayback" />
+
+        <service
+            android:name=".capture.CaptureService"
+            android:exported="false"
+            android:foregroundServiceType="mediaProjection" />
 
         <provider
             android:name="androidx.core.content.FileProvider"

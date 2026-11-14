@@ -24,7 +24,9 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import app.soundfield.core.InputSource
 import app.soundfield.core.Role
+import androidx.compose.ui.semantics.stateDescription
 import app.soundfield.engine.Engine
 import app.soundfield.engine.PlaylistInfo
 import app.soundfield.engine.QueueTrackUi
@@ -43,8 +45,35 @@ private object QueueIcons {
         "M14,10H3v2h11V10zM14,6H3v2h11V6zM18,14v-4h-2v4h-4v2h4v4h2v-4h4v-2H18zM3,16h7v-2H3V16z")
     val Checklist = icon("Checklist",
         "M22,7h-9v2h9V7zM22,15h-9v2h9V15zM5.54,11L2,7.46l1.41,-1.41l2.12,2.12l4.24,-4.24l1.41,1.41L5.54,11zM5.54,19L2,15.46l1.41,-1.41l2.12,2.12l4.24,-4.24l1.41,1.41L5.54,19z")
+    val MusicNote = icon("MusicNote",
+        "M12,3v10.55c-0.59,-0.34 -1.27,-0.55 -2,-0.55c-2.21,0 -4,1.79 -4,4s1.79,4 4,4s4,-1.79 4,-4V7h4V3H12z")
+    /** Знаки сервисов (контуры Simple Icons, CC0): обозначают источник, с которого берётся звук. */
+    val Spotify = icon("Spotify",
+        "M12,0C5.4,0 0,5.4 0,12s5.4,12 12,12s12,-5.4 12,-12S18.66,0 12,0zM17.521,17.34c-0.24,0.359 -0.66,0.48 -1.021,0.24c-2.82,-1.74 -6.36,-2.101 -10.561,-1.141c-0.418,0.122 -0.779,-0.179 -0.899,-0.539c-0.12,-0.421 0.18,-0.78 0.54,-0.9c4.56,-1.021 8.52,-0.6 11.64,1.32c0.42,0.18 0.479,0.659 0.301,1.02zM18.961,14.04c-0.301,0.42 -0.841,0.6 -1.262,0.3c-3.239,-1.98 -8.159,-2.58 -11.939,-1.38c-0.479,0.12 -1.02,-0.12 -1.14,-0.6c-0.12,-0.48 0.12,-1.021 0.6,-1.141C9.6,9.9 15,10.561 18.72,12.84c0.361,0.181 0.54,0.78 0.241,1.2zM19.081,10.68C15.24,8.4 8.82,8.16 5.16,9.301c-0.6,0.179 -1.2,-0.181 -1.38,-0.721c-0.18,-0.601 0.18,-1.2 0.72,-1.381c4.26,-1.26 11.28,-1.02 15.721,1.621c0.539,0.3 0.719,1.02 0.419,1.56c-0.299,0.421 -1.02,0.599 -1.559,0.3z")
+    val YouTube = icon("YouTube",
+        "M23.498,6.186a3.016,3.016 0,0 0,-2.122 -2.136C19.505,3.545 12,3.545 12,3.545s-7.505,0 -9.377,0.505A3.017,3.017 0,0 0,0.502 6.186C0,8.07 0,12 0,12s0,3.93 0.502,5.814a3.016,3.016 0,0 0,2.122 2.136c1.871,0.505 9.376,0.505 9.376,0.505s7.505,0 9.377,-0.505a3.015,3.015 0,0 0,2.122 -2.136C24,15.93 24,12 24,12s0,-3.93 -0.502,-5.814zM9.545,15.568V8.432L15.818,12l-6.273,3.568z")
     val LibraryMusic = icon("LibraryMusic",
         "M20,2H8C6.9,2 6,2.9 6,4v12c0,1.1 0.9,2 2,2h12c1.1,0 2,-0.9 2,-2V4C22,2.9 21.1,2 20,2zM18,7h-3v5.5c0,1.38 -1.12,2.5 -2.5,2.5S10,13.88 10,12.5s1.12,-2.5 2.5,-2.5c0.57,0 1.08,0.19 1.5,0.51V5h4V7zM4,6H2v14c0,1.1 0.9,2 2,2h14v-2H4V6z")
+}
+
+private object SourceColors {
+    val Spotify = Color(0xFF1ED760)
+    val YouTube = Color(0xFFFF0000)
+}
+
+/** Переключатель источника: активный — в цвете сервиса на подложке, остальные — приглушённые. */
+@Composable
+private fun SourceButton(icon: ImageVector, label: String, active: Boolean, color: Color, enabled: Boolean, onClick: () -> Unit) {
+    Box(
+        Modifier.size(44.dp).clip(CircleShape)
+            .background(if (active) color.copy(alpha = 0.18f) else Color.Transparent)
+            .clickable(enabled = enabled, onClickLabel = label, onClick = onClick)
+            .semantics { stateDescription = if (active) "Включён" else "Выключен" },
+        contentAlignment = Alignment.Center,
+    ) {
+        Icon(icon, contentDescription = label, modifier = Modifier.size(26.dp),
+            tint = when { active -> color; !enabled -> SFColors.TextDim.copy(alpha = 0.35f); else -> SFColors.TextDim })
+    }
 }
 
 @Composable
@@ -61,7 +90,9 @@ private fun HeaderIcon(icon: ImageVector, label: String, active: Boolean = false
 }
 
 /**
- * Очередь: заголовок со значками «Добавить музыку», «Выбрать» (режим удаления), «Плейлисты»;
+ * Очередь: слева переключатель источника (Плеер, Spotify, YouTube); при источнике «Плеер» справа значки
+ * «Добавить музыку», «Выбрать» (режим удаления), «Плейлисты», ниже — список. У Spotify и YouTube их нет.
+ * Список:
  * список треков «Название - Исполнитель»; удаление свайпом влево с возможностью «Вернуть».
  */
 @OptIn(ExperimentalMaterial3Api::class)
@@ -79,29 +110,36 @@ fun QueueCard(ui: UiState, engine: Engine) {
         if (ids.isEmpty()) selecting = false
     }
 
+    val playerInput = ui.input == InputSource.PLAYER
+    val canSwitchInput = isServer && (ui.soloMode || ui.inPair)
     SFCard {
         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-            Row(
-                Modifier.weight(1f).clip(CircleShape).clickable { engine.setQueueExpanded(!ui.queueExpanded) }
-                    .padding(vertical = 8.dp, horizontal = 2.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Text("ОЧЕРЕДЬ · ${ui.queueTracks.size}", fontSize = 13.sp, letterSpacing = 1.sp,
-                    color = SFColors.TextDim, fontWeight = FontWeight.SemiBold, maxLines = 1)
-                Spacer(Modifier.width(6.dp))
-                Text(if (ui.queueExpanded) "⌃" else "⌄", color = SFColors.TextDim, fontSize = 18.sp)
+            // Источник музыки. Повторное нажатие на «Плеер» сворачивает и разворачивает список.
+            SourceButton(QueueIcons.MusicNote, "Плеер SoundField", playerInput, SFColors.Accent1, enabled = canSwitchInput || playerInput) {
+                if (playerInput) engine.setQueueExpanded(!ui.queueExpanded) else engine.requestInput(InputSource.PLAYER)
             }
-            HeaderIcon(QueueIcons.PlaylistAdd,
-                if (isServer) "Добавить музыку" else "Отправить файлы на Server",
-                enabled = canAddHere) { engine.requestTrackPicker() }
-            HeaderIcon(QueueIcons.Checklist, "Выбрать треки", active = selecting, enabled = ui.queueTracks.isNotEmpty()) {
-                selecting = !selecting; selected = emptySet()
-                if (selecting && !ui.queueExpanded) engine.setQueueExpanded(true)
+            Spacer(Modifier.width(8.dp))
+            SourceButton(QueueIcons.Spotify, "Spotify", ui.input == InputSource.SPOTIFY, SourceColors.Spotify, enabled = canSwitchInput) {
+                engine.requestInput(InputSource.SPOTIFY)
             }
-            HeaderIcon(QueueIcons.LibraryMusic, "Плейлисты", enabled = isServer) { showPlaylists = true }
+            Spacer(Modifier.width(8.dp))
+            SourceButton(QueueIcons.YouTube, "YouTube", ui.input == InputSource.YOUTUBE, SourceColors.YouTube, enabled = canSwitchInput) {
+                engine.requestInput(InputSource.YOUTUBE)
+            }
+            Spacer(Modifier.weight(1f))
+            if (playerInput) {
+                HeaderIcon(QueueIcons.PlaylistAdd,
+                    if (isServer) "Добавить музыку" else "Отправить файлы на Server",
+                    enabled = canAddHere) { engine.requestTrackPicker() }
+                HeaderIcon(QueueIcons.Checklist, "Выбрать треки", active = selecting, enabled = ui.queueTracks.isNotEmpty()) {
+                    selecting = !selecting; selected = emptySet()
+                    if (selecting && !ui.queueExpanded) engine.setQueueExpanded(true)
+                }
+                HeaderIcon(QueueIcons.LibraryMusic, "Плейлисты", enabled = isServer) { showPlaylists = true }
+            }
         }
 
-        if (ui.queueExpanded) {
+        if (playerInput && ui.queueExpanded) {
             if (ui.queueTracks.isEmpty()) {
                 Text(if (isServer) "Добавьте музыку значком «+» или откройте плейлист"
                      else if (ui.fileTransferAvailable) "Отправьте музыку на Server значком «+»"

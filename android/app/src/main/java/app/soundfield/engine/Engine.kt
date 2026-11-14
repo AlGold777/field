@@ -50,6 +50,9 @@ import app.soundfield.audio.MicRecorder
 import app.soundfield.audio.PreparedAudioFile
 import app.soundfield.core.*
 import app.soundfield.service.PlaybackService
+import app.soundfield.capture.CaptureService
+import app.soundfield.spotify.SpotifyEvent
+import app.soundfield.spotify.SpotifyReceiver
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.update
@@ -141,6 +144,15 @@ class Engine private constructor(private val app: Context) {
             (SF.LEAD_NS + SF.PAUSE_LEAD_NS + 100_000_000L) * SF.SAMPLE_RATE / 1_000_000_000L
         private val PROGRESSIVE_RESUME_BUFFER_FRAMES = SF.SAMPLE_RATE.toLong()
         private val PROGRESSIVE_FADE_FRAMES = SF.SAMPLE_RATE / 10L
+        // Живой поток. Запас = голова − позиция. Минимум: опережение отправки на Point (LEAD 400 мс) + упреждение
+        // сцены и предлимитера (~100 мс) + пакет.
+        private const val LIVE_TARGET_MARGIN_FRAMES = SF.SAMPLE_RATE * 1L
+        private const val LIVE_MIN_MARGIN_FRAMES = SF.SAMPLE_RATE * 6L / 10L
+        private const val LIVE_MAX_MARGIN_FRAMES = SF.SAMPLE_RATE * 18L / 10L
+        private const val LIVE_START_MARGIN_FRAMES = SF.SAMPLE_RATE * 9L / 10L
+        private const val LIVE_STALE_FRAMES = SF.SAMPLE_RATE * 6L
+        private const val SPOTIFY_DEVICE_NAME = "SoundField"
+        private const val SPOTIFY_HINT = "В Spotify выберите устройство «SoundField»"
     }
 
     private val telemetry = Telemetry.get(app)
@@ -492,6 +504,7 @@ class Engine private constructor(private val app: Context) {
 
     // ================================================================== запуск
     private fun boot() {
+        restoreCaptureVolumes()
         AudioFileDecoder.clearCache(app)
         refreshPlaylists()
         // Стараемся занять тот же TCP-порт, что и в прошлый раз: второй телефон помнит его и подключается напрямую.
@@ -532,7 +545,7 @@ class Engine private constructor(private val app: Context) {
         ex.scheduleAtFixedRate({ try { serverTick() } catch (t: Throwable) { Log.e(TAG, "tick", t); telemetry.limited("ENGINE_TICK_EXCEPTION", error = t) } }, 100, 100, TimeUnit.MILLISECONDS)
         ui { copy(myId = myId, myName = myName, remembered = record, durationMs = music.totalFrames * 1000 / SF.SAMPLE_RATE,
             freezeCount = processFreezeCount, freezeDurationMs = processFreezeTotalMs,
-            title = music.title, artist = music.artist, queueExpanded = prefs.getBoolean("queueExpanded", false),
+            title = music.title, artist = music.artist, queueExpanded = prefs.getBoolean("queueExpanded", true),
             eq = eqSettings, eqExpanded = prefs.getBoolean("eqExpanded", false), eqPreampDb = eqConfig.preampDb.toFloat(),
             eqRouteLabel = audio.routeLabel(), customEqPresets = readCustomEqPresets(), eqCurveDb = eqConfig.curveDb.map { it.toFloat() },
             spatial = spatialSettings, spatialAvailable = spatialAvailableNow()) }
@@ -1487,7 +1500,7 @@ class Engine private constructor(private val app: Context) {
         negotiatedCapabilities = emptySet()
         audio.preferPhoneSpeaker = false
         mode = SourceMode.MUSIC
-        source = if (queueIndex in queue.indices) currentQueueSource ?: music else music
+        source = musicSource()
         master = prefs.getFloat("soloMaster", master)
         balance = 0.5f
         activeSoloEqRouteKey = ""
@@ -1504,7 +1517,7 @@ class Engine private constructor(private val app: Context) {
         audio.playbackActive = false
         newEpoch(playing, frame.coerceIn(0L, source.totalFrames), System.nanoTime())
         audio.start()
-        if (playing) { requestFocus(); ensureSoloService() }
+        if (playing) { if (input != InputSource.YOUTUBE) requestFocus(); ensureSoloService() }
         ui { copy(soloMode = true, phase = Phase.IDLE, role = Role.SERVER, playing = playing,
             title = source.title, artist = source.artist, durationMs = source.totalFrames * 1000 / SF.SAMPLE_RATE,
             mode = SourceMode.MUSIC, eq = eqSettings, eqAvailable = true, eqRouteLabel = audio.routeLabel(),
@@ -3278,6 +3291,7 @@ class Engine private constructor(private val app: Context) {
 
     // ================================================================== пара
     private fun becomePaired(l: ControlLink, r: Role, pid: String, pname: String, pplat: String, key: String, resumed: Boolean) {
+        if (r == Role.POINT && input.live) switchInput(InputSource.PLAYER)
         if (soloMode) leaveSoloForPair(r)
         soloMode = false
         audio.preferPhoneSpeaker = true
@@ -3387,7 +3401,7 @@ class Engine private constructor(private val app: Context) {
             closeServerTcpAudio("control_pair_reset")
             if (!continuing) {
                 mode = SourceMode.MUSIC
-                source = if (queueIndex in queue.indices) currentQueueSource ?: music else music
+                source = musicSource()
                 // Соло → Server: та же музыка с той же позиции и в том же состоянии (играет/пауза), без сброса.
                 val handoff = soloHandoffFrame >= 0L
                 newEpoch(handoff && soloHandoffPlaying, if (handoff) soloHandoffFrame.coerceIn(0L, source.totalFrames) else 0L,
@@ -4073,7 +4087,8 @@ class Engine private constructor(private val app: Context) {
     }
 
     private fun newEpoch(playing: Boolean, frame: Long, anchorNs: Long) {
-        if (playing && mode != SourceMode.SYNC_PROBE && phase == Phase.PAIRED && role == Role.SERVER &&
+        // Живой поток опережает воспроизведение всего на секунду: ждать предзагрузку нечем, запас уйдёт.
+        if (playing && mode != SourceMode.SYNC_PROBE && phase == Phase.PAIRED && role == Role.SERVER && source !is LiveSource &&
             "tcpAudio" in negotiatedCapabilities && serverTcpAudioSocket?.let { it.isConnected && !it.isClosed } == true) {
             beginTcpAudioPreload(frame)
             return
@@ -4139,7 +4154,10 @@ class Engine private constructor(private val app: Context) {
 
     private fun stateJson(): JSONObject {
         val tl = serverPlay.timeline
-        return JSONObject().put("t", "state").put("playing", tl.running || ui.value.audioBuffering).put("durFrames", source.totalFrames)
+        val playingNow = if (mode == SourceMode.MUSIC && source is LiveSource)
+            (if (input == InputSource.YOUTUBE) captureMusicActive else liveWantPlay) else tl.running || ui.value.audioBuffering
+        return JSONObject().put("t", "state").put("playing", playingNow).put("durFrames", source.totalFrames)
+            .put("input", input.wire)
             .put("title", source.title).put("artist", source.artist).put("mode", mode.wire)
             .put("queueIndex", queueIndex).put("queueCount", queue.size).put("trackId", queue.getOrNull(queueIndex)?.id ?: "")
             .put("volL", volL.toDouble()).put("volR", volR.toDouble()).put("master", master.toDouble())
@@ -4199,7 +4217,7 @@ class Engine private constructor(private val app: Context) {
         val s = stateJson()
         applyState(s)
         link?.send(s)
-        if (soloMode) { if (serverPlay.timeline.playing) ensureSoloService() else scheduleSoloServiceStop() }
+        if (soloMode) { if (serverPlay.timeline.playing || input.live) ensureSoloService() else scheduleSoloServiceStop() }
     }
 
     /** Общий для обеих ролей разбор состояния плеера → UI (и параметры рендера на Point). */
@@ -4237,6 +4255,7 @@ class Engine private constructor(private val app: Context) {
         val progress = if (o.isNull("decodeProgress")) null else o.optDouble("decodeProgress").toFloat().coerceIn(0f, 1f)
         ui { copy(playing = playing, durationMs = dur * 1000 / SF.SAMPLE_RATE, title = o.optString("title"),
             artist = o.optString("artist"), mode = incomingMode, audioBuffering = o.optBoolean("audioBuffering"),
+            input = InputSource.fromWire(o.optString("input")),
             queueIndex = o.optInt("queueIndex", -1), undoText = o.optString("undo", ""),
             volL = vL, volR = vR, master = m, balance = b, pointChannel = pCh, trimMs = trim, decodingProgress = progress,
             levelTrimServerDb = o.optDouble("levelTrimServerDb", 0.0).toFloat(), levelTrimPointDb = o.optDouble("levelTrimPointDb", 0.0).toFloat(),
@@ -4250,7 +4269,8 @@ class Engine private constructor(private val app: Context) {
             eqPreampDb = o.optDouble("eqPreampDb", 0.0).toFloat(),
             eqRouteLabel = audio.routeLabel(), eqCurveDb = activeEqConfig().curveDb.map { it.toFloat() },
             gainLaw = if (role == Role.POINT) if (o.has("pointGain")) 2 else 1 else o.optInt("peerGainLaw", 1)) }
-        if (playing) requestFocus()
+        // При захвате YouTube фокус не берём: иначе YouTube встанет на паузу.
+        if (playing && !(role == Role.SERVER && input == InputSource.YOUTUBE)) requestFocus()
         PlaybackService.refresh(app)
     }
 
@@ -4266,6 +4286,10 @@ class Engine private constructor(private val app: Context) {
             "cmd" to o.optString("a"), "originRole" to o.optString("originRole", "unknown"),
             "appliedSrvNs" to now, "issuedSrvNs" to lastCommandIssuedSrvNs,
         ), op = op)
+        if (input.live && mode == SourceMode.MUSIC) when (o.optString("a")) {
+            "play", "pause", "toggle", "next", "previous" -> { liveTransport(o.optString("a")); return }
+            "seek", "skip", "select", "remove", "undoRemove" -> return
+        }
         when (o.optString("a")) {
             "play" -> cmdPlay()
             "pause" -> if (calibRunning) abortCalibration() else cmdPause()
@@ -4462,8 +4486,14 @@ class Engine private constructor(private val app: Context) {
         if (mode == SourceMode.SYNC_PROBE) cancelSyncProbe("playback_interrupted")
         clearProgressiveBufferState()
         mode = SourceMode.MUSIC
-        source = if (queueIndex in queue.indices) currentQueueSource ?: music else music
+        source = musicSource()
         val now = System.nanoTime()
+        liveSource?.let { live ->
+            // Живой поток за время служебного сигнала ушёл вперёд: продолжаем с головы, запуск — в liveTick.
+            liveSegmentStart = live.readyFrames
+            newEpoch(false, liveSegmentStart, now)
+            return
+        }
         newEpoch(resume, savedFrame, if (resume) now + SF.START_DELAY_NS else now)
     }
 
@@ -4476,7 +4506,7 @@ class Engine private constructor(private val app: Context) {
         if (currentAudioPath != syncProbePreviousAudioPath)
             setAudioPath(syncProbePreviousAudioPath, "sync_probe_cancel", notifyPeer = reason != "pair_disconnected")
         mode = SourceMode.MUSIC
-        source = if (queueIndex in queue.indices) currentQueueSource ?: music else music
+        source = musicSource()
         ui { copy(syncProbeRunning = false, syncProbeResult = "Замер отменён") }
         telemetry.record("SYNC_PROBE_RESULT", mapOf("valid" to false, "reason" to reason), op = op)
     }
@@ -4487,7 +4517,7 @@ class Engine private constructor(private val app: Context) {
     private fun navigationIndex(): Int = queue.indexOfFirst { it.id == pendingTrackId }.takeIf { it >= 0 } ?: queueIndex
 
     private fun selectTrack(index: Int, forcePaused: Boolean = false, startPlayback: Boolean = false, startFrame: Long = 0L) {
-        if (calibRunning || (!soloMode && phase !in setOf(Phase.PAIRED, Phase.RECONNECTING)) || index !in queue.indices) return
+        if (input.live || calibRunning || (!soloMode && phase !in setOf(Phase.PAIRED, Phase.RECONNECTING)) || index !in queue.indices) return
         val item = queue[index]
         if (queueIndex == index && pendingTrackId == null && currentQueueSource != null) {
             if (startPlayback) cmdPlay()
@@ -4552,7 +4582,7 @@ class Engine private constructor(private val app: Context) {
         // Rows can move while decoding (remove/Undo); the track identity does not.
         val index = queue.indexOfFirst { it.id == item.id }
         if (generation != trackLoadGeneration || pendingTrackId != item.id || index < 0 ||
-            role != Role.SERVER || calibRunning) return
+            role != Role.SERVER || calibRunning || input.live) return
         pendingTrackId = null
         clearProgressiveBufferState()
         queueIndex = index
@@ -4866,6 +4896,7 @@ class Engine private constructor(private val app: Context) {
         val tl = serverPlay.timeline
         val nowNs = System.nanoTime()
         val progressive = if (mode == SourceMode.MUSIC) source as? app.soundfield.core.SegmentedPcmSource else null
+        (source as? LiveSource)?.let { live -> if (mode == SourceMode.MUSIC) { liveTick(live, nowNs); return } }
 
         if (progressivePausedFrame >= 0) {
             val pausedAt = progressivePausedFrame
@@ -4929,6 +4960,315 @@ class Engine private constructor(private val app: Context) {
             SourceMode.CHANNEL_TEST, SourceMode.CENTER_CHECK -> restoreMusic(savedPlaying)
             else -> {}
         }
+    }
+
+
+    // ================================================================== живые источники: Spotify и YouTube
+    @Volatile private var input = InputSource.PLAYER
+    @Volatile private var liveSource: LiveSource? = null
+    @Volatile private var captureServo: LiveClockServo? = null
+    /** Источник хочет играть: Spotify прислал PLAYING, захват YouTube активен. */
+    @Volatile private var liveWantPlay = false
+    /** Первый кадр текущего непрерывного участка потока: раньше него играть нечего (или уже неактуально). */
+    private var liveSegmentStart = 0L
+    private var playerResumeFrame = 0L
+    private var liveStateLoggedNs = 0L
+    @Volatile private var captureMusicActive = false
+    private var captureVolumeReceiverRegistered = false
+    private val spotify by lazy {
+        SpotifyReceiver(app, ::onSpotifyEvent) { text -> telemetry.limited("SPOTIFY_LOG", text.take(300)) }
+    }
+
+    private fun musicSource(): AudioSource = liveSource ?: if (queueIndex in queue.indices) currentQueueSource ?: music else music
+
+    /** Кнопки источников под управлением плеера. Источник живёт на телефоне с музыкой (Server или Solo). */
+    fun requestInput(kind: InputSource) = post {
+        if (kind == input) return@post
+        if (role != Role.SERVER || (!soloMode && phase !in setOf(Phase.PAIRED, Phase.RECONNECTING))) {
+            toast("Источник выбирается на телефоне Server"); return@post
+        }
+        if (calibRunning) { toast("Дождитесь конца калибровки"); return@post }
+        when (kind) {
+            InputSource.PLAYER -> switchInput(kind)
+            InputSource.SPOTIFY -> if (SpotifyReceiver.available) switchInput(kind)
+                else toast("Приёмник Spotify не входит в эту сборку")
+            InputSource.YOUTUBE -> if (Build.VERSION.SDK_INT >= 29) ui { copy(captureRequest = captureRequest + 1) }
+                else toast("Звук других приложений доступен с Android 10")
+        }
+    }
+
+    /** Ответ на системный запрос захвата звука (MediaProjection). */
+    fun captureConsent(resultCode: Int, data: android.content.Intent?) = post {
+        if (Build.VERSION.SDK_INT < 29) return@post
+        if (data == null || resultCode != android.app.Activity.RESULT_OK) { toast("Без разрешения звук YouTube взять нельзя"); return@post }
+        if (role != Role.SERVER || (!soloMode && phase !in setOf(Phase.PAIRED, Phase.RECONNECTING)) || calibRunning) return@post
+        switchInput(InputSource.YOUTUBE)
+        try { CaptureService.start(app, resultCode, data) } catch (e: Exception) {
+            telemetry.event("CAPTURE_SERVICE_START_FAILED", error = e)
+            switchInput(InputSource.PLAYER); toast("Захват звука не запустился")
+        }
+    }
+
+    /** Поток захвата: PCM 48 кГц стерео. */
+    fun captureWrite(interleaved: FloatArray, frames: Int) {
+        captureServo?.write(interleaved, frames, liveMarginFrames())
+    }
+
+    /** Захват кончился сам: пользователь остановил трансляцию или система отозвала разрешение. */
+    fun captureEnded(reason: String?) = post {
+        if (input != InputSource.YOUTUBE) return@post
+        switchInput(InputSource.PLAYER)
+        reason?.let(::toast)
+    }
+
+    /** Запас живого потока перед позицией воспроизведения; null — воспроизведение не идёт. */
+    private fun liveMarginFrames(): Long? {
+        val live = liveSource ?: return null
+        val state = serverPlay
+        val timeline = state.timeline
+        val now = System.nanoTime()
+        if (!timeline.running || now < timeline.anchorNs || state.source.mode != SourceMode.MUSIC) return null
+        return live.readyFrames - timeline.positionFrame(now)
+    }
+
+    /** Сколько потока лежит впереди позиции (и на паузе тоже): по нему приёмник Spotify придерживает декодер. */
+    private fun liveBufferedFrames(): Long {
+        val live = liveSource ?: return 0L
+        val state = serverPlay
+        if (state.source.mode != SourceMode.MUSIC) return Long.MAX_VALUE
+        return live.readyFrames - maxOf(state.timeline.positionFrame(System.nanoTime()), liveSegmentStart)
+    }
+
+    private fun switchInput(kind: InputSource) {
+        if (kind == input) return
+        val now = System.nanoTime()
+        if (mode == SourceMode.SYNC_PROBE) cancelSyncProbe("input_switch")
+        val wasPlaying = mode == SourceMode.MUSIC && serverPlay.timeline.running
+        when (input) {
+            InputSource.PLAYER -> {
+                playerResumeFrame = if (mode == SourceMode.MUSIC) posFrame() else savedFrame
+                pendingTrackId = null; pendingShouldPlay = false; trackLoadGeneration++
+                decodeProgress = null; decodeProgressTrackId = null
+                ui { copy(loadingTracks = false, loadingTrackId = null, decodingProgress = null) }
+            }
+            InputSource.SPOTIFY -> spotify.stop()
+            InputSource.YOUTUBE -> leaveCaptureAudio()
+        }
+        clearProgressiveBufferState(); cancelScheduledPause(); cancelTcpAudioPreload()
+        telemetry.record("INPUT_SOURCE", mapOf("from" to input.wire, "to" to kind.wire, "wasPlaying" to wasPlaying))
+        input = kind
+        mode = SourceMode.MUSIC
+        liveWantPlay = false; liveSegmentStart = 0L; captureServo = null; captureMusicActive = false
+        if (kind == InputSource.PLAYER) {
+            liveSource = null
+            source = musicSource()
+            newEpoch(false, playerResumeFrame.coerceIn(0L, source.totalFrames), now)
+            ui { copy(queueExpanded = true) }
+            if (queueIndex in queue.indices && currentQueueSource == null) selectTrack(queueIndex, forcePaused = true)
+        } else {
+            val live = if (kind == InputSource.SPOTIFY) LiveSource("Spotify", SPOTIFY_HINT)
+                else LiveSource("YouTube", "Включите музыку в приложении YouTube")
+            liveSource = live
+            source = live
+            newEpoch(false, 0L, now)
+            if (kind == InputSource.SPOTIFY) spotify.start(SPOTIFY_DEVICE_NAME, live, ::liveBufferedFrames)
+            else {
+                captureServo = LiveClockServo(live, LIVE_TARGET_MARGIN_FRAMES.toInt())
+                liveWantPlay = true
+                enterCaptureAudio()
+            }
+        }
+        publishState()
+    }
+
+    /** Каждые 100 мс, пока источник живой: запуск, когда набран запас, и остановка, когда он иссяк. */
+    private fun liveTick(live: LiveSource, nowNs: Long) {
+        if (input == InputSource.YOUTUBE) {
+            val active = am.isMusicActive
+            if (active != captureMusicActive) { captureMusicActive = active; publishState() }
+        }
+        val timeline = serverPlay.timeline
+        val head = live.readyFrames
+        if (nowNs - liveStateLoggedNs >= 5_000_000_000L) {
+            liveStateLoggedNs = nowNs
+            // Пик последних 0,5 с принятого потока: отличает «источник молчит» от «звук не доходит».
+            var peak = 0f
+            for (frame in maxOf(0L, head - SF.SAMPLE_RATE / 2) until head)
+                peak = maxOf(peak, kotlin.math.abs(live.sample(frame, Ch.L)), kotlin.math.abs(live.sample(frame, Ch.R)))
+            telemetry.record("LIVE_STATE", mapOf("input" to input.wire, "playing" to timeline.running, "wantPlay" to liveWantPlay,
+                "headFrame" to head, "marginMs" to if (timeline.running) (head - timeline.positionFrame(nowNs)) * 1000 / SF.SAMPLE_RATE else -1L,
+                "ratioPpm" to (captureServo?.ratioPpm ?: 0.0),
+                "peakDb" to if (peak > 0f) 20.0 * kotlin.math.log10(peak.toDouble()) else -200.0))
+        }
+        if (timeline.playing) {
+            if (!timeline.running || nowNs < timeline.anchorNs) return
+            val position = timeline.positionFrame(nowNs)
+            val margin = head - position
+            if (margin < -SF.SAMPLE_RATE && input == InputSource.YOUTUBE) {
+                // Позиция ушла далеко за голову (процесс стоял): тишиной не догоняем, привязываемся к голове заново.
+                telemetry.limited("LIVE_REANCHOR", "marginMs=${margin * 1000 / SF.SAMPLE_RATE}")
+                startLiveIfReady(live, nowNs)
+            } else if (margin < LIVE_MIN_MARGIN_FRAMES && input == InputSource.YOUTUBE) {
+                // Захват отдаёт звук только пока источник играет: на паузе и при подгрузке поток просто встаёт.
+                // Шкалу не останавливаем — разрыв закрывается тишиной до целевого запаса.
+                val pad = (LIVE_TARGET_MARGIN_FRAMES - margin).coerceIn(0L, SF.SAMPLE_RATE * 2L).toInt()
+                live.appendSilence(pad)
+                telemetry.limited("LIVE_PAD", "marginMs=${margin * 1000 / SF.SAMPLE_RATE} padMs=${pad * 1000L / SF.SAMPLE_RATE}")
+            } else if (margin < LIVE_MIN_MARGIN_FRAMES) {
+                telemetry.limited("LIVE_STARVED", "input=${input.wire} marginMs=${margin * 1000 / SF.SAMPLE_RATE} want=$liveWantPlay")
+                newEpoch(false, minOf(position, head).coerceAtLeast(liveSegmentStart), nowNs)
+            } else if (input == InputSource.YOUTUBE && margin > LIVE_MAX_MARGIN_FRAMES) {
+                telemetry.limited("LIVE_REANCHOR", "marginMs=${margin * 1000 / SF.SAMPLE_RATE}")
+                startLiveIfReady(live, nowNs)
+            }
+        } else if (liveWantPlay) startLiveIfReady(live, nowNs)
+    }
+
+    private fun startLiveIfReady(live: LiveSource, nowNs: Long) {
+        val head = live.readyFrames
+        val startDelayFrames = SF.START_DELAY_NS * SF.SAMPLE_RATE / 1_000_000_000L
+        val frame: Long
+        if (input == InputSource.YOUTUBE) {
+            // Поток идёт в реальном времени: к моменту старта голова уйдёт на START_DELAY, запас станет целевым.
+            frame = head + startDelayFrames - LIVE_TARGET_MARGIN_FRAMES
+            if (frame < liveSegmentStart) return
+        } else {
+            var paused = maxOf(serverPlay.timeline.anchorFrame, liveSegmentStart)
+            if (head - paused > LIVE_STALE_FRAMES) { paused = head; liveSegmentStart = head }   // позиция от другого источника
+            frame = paused
+            if (head - frame < LIVE_START_MARGIN_FRAMES) return
+        }
+        cancelScheduledPause()
+        newEpoch(true, frame, nowNs + SF.START_DELAY_NS)
+    }
+
+    private fun onSpotifyEvent(kind: Int, a: Long, b: Long, text1: String?, text2: String?) = post {
+        val live = liveSource
+        if (input != InputSource.SPOTIFY || live == null) return@post
+        when (kind) {
+            SpotifyEvent.SESSION_CONNECTED -> {
+                live.describe("Spotify", "Подключено. Включите музыку в Spotify"); publishState()
+            }
+            SpotifyEvent.PLAYING -> { liveWantPlay = true; publishState() }
+            SpotifyEvent.PAUSED -> {
+                liveWantPlay = false
+                if (mode == SourceMode.MUSIC && serverPlay.timeline.running) cmdPause() else publishState()
+            }
+            SpotifyEvent.TRACK -> {
+                live.describe(text1?.takeIf { it.isNotBlank() } ?: "Spotify", text2.orEmpty()); publishState()
+            }
+            SpotifyEvent.FLUSH -> {
+                // Перемотка или смена трека: уже принятый, но ещё не сыгранный звук устарел. Продолжаем с головы.
+                liveSegmentStart = live.readyFrames
+                if (mode == SourceMode.MUSIC && source === live) {
+                    cancelScheduledPause()
+                    newEpoch(false, liveSegmentStart, System.nanoTime())
+                }
+            }
+            SpotifyEvent.STOPPED, SpotifyEvent.SESSION_DISCONNECTED -> {
+                liveWantPlay = false
+                live.appendSilence(SF.SAMPLE_RATE)   // хвост доигрывается, остановка наступит по исчерпанию запаса
+                if (kind == SpotifyEvent.SESSION_DISCONNECTED) live.describe("Spotify", SPOTIFY_HINT)
+                publishState()
+            }
+            SpotifyEvent.ERROR -> {
+                telemetry.limited("SPOTIFY_ERROR", (text1 ?: "unknown").take(300))
+                log("Spotify: ${text1 ?: "ошибка"}")
+            }
+        }
+    }
+
+    /** Кнопки плеера в режиме живого источника управляют приложением-источником. */
+    private fun liveTransport(action: String) {
+        when (input) {
+            InputSource.SPOTIFY -> {
+                if (!spotify.sessionActive) { toast(SPOTIFY_HINT); return }
+                spotify.command(when (action) {
+                    "play" -> 0; "pause" -> 1; "next" -> 2; "previous" -> 3
+                    else -> if (liveWantPlay) 1 else 0
+                })
+            }
+            InputSource.YOUTUBE -> mediaKey(when (action) {
+                "play" -> android.view.KeyEvent.KEYCODE_MEDIA_PLAY
+                "pause" -> android.view.KeyEvent.KEYCODE_MEDIA_PAUSE
+                "next" -> android.view.KeyEvent.KEYCODE_MEDIA_NEXT
+                "previous" -> android.view.KeyEvent.KEYCODE_MEDIA_PREVIOUS
+                else -> android.view.KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE
+            })
+            InputSource.PLAYER -> {}
+        }
+    }
+
+    private fun mediaKey(code: Int) {
+        try {
+            am.dispatchMediaKeyEvent(android.view.KeyEvent(android.view.KeyEvent.ACTION_DOWN, code))
+            am.dispatchMediaKeyEvent(android.view.KeyEvent(android.view.KeyEvent.ACTION_UP, code))
+        } catch (e: Exception) { telemetry.event("MEDIA_KEY_FAILED", error = e) }
+    }
+
+    // ---- захват YouTube: оригинал глушится нулевой громкостью медиа, свой вывод идёт через поток будильника
+    private val captureVolumeReceiver = object : android.content.BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: android.content.Intent) {
+            if (intent.getIntExtra("android.media.EXTRA_VOLUME_STREAM_TYPE", -1) != AudioManager.STREAM_MUSIC) return
+            val value = intent.getIntExtra("android.media.EXTRA_VOLUME_STREAM_VALUE", 0)
+            if (value > 0) post { transferMediaVolume(value) }
+        }
+    }
+
+    /** Кнопка громкости подняла медиапоток (SoundField не на экране): переносим шаги на свой поток, оригинал снова в ноль. */
+    private fun transferMediaVolume(mediaSteps: Int) {
+        if (input != InputSource.YOUTUBE) return
+        try {
+            val alarmMax = am.getStreamMaxVolume(AudioManager.STREAM_ALARM)
+            val mediaMax = am.getStreamMaxVolume(AudioManager.STREAM_MUSIC).coerceAtLeast(1)
+            val add = (mediaSteps.toFloat() * alarmMax / mediaMax).roundToInt().coerceAtLeast(1)
+            am.setStreamVolume(AudioManager.STREAM_ALARM, (am.getStreamVolume(AudioManager.STREAM_ALARM) + add).coerceAtMost(alarmMax), 0)
+            am.setStreamVolume(AudioManager.STREAM_MUSIC, 0, 0)
+        } catch (e: Exception) { telemetry.event("CAPTURE_VOLUME_FAILED", error = e) }
+    }
+
+    private fun enterCaptureAudio() {
+        abandonFocus()
+        try {
+            val media = am.getStreamVolume(AudioManager.STREAM_MUSIC)
+            val alarm = am.getStreamVolume(AudioManager.STREAM_ALARM)
+            val alarmMax = am.getStreamMaxVolume(AudioManager.STREAM_ALARM)
+            val mediaMax = am.getStreamMaxVolume(AudioManager.STREAM_MUSIC).coerceAtLeast(1)
+            if (!prefs.contains("captureSavedMedia"))
+                prefs.edit().putInt("captureSavedMedia", media).putInt("captureSavedAlarm", alarm).apply()
+            val target = if (media <= 0) alarmMax / 2 else (media.toFloat() * alarmMax / mediaMax).roundToInt().coerceIn(1, alarmMax)
+            am.setStreamVolume(AudioManager.STREAM_ALARM, target, 0)
+            am.setStreamVolume(AudioManager.STREAM_MUSIC, 0, 0)
+        } catch (e: Exception) { telemetry.event("CAPTURE_VOLUME_FAILED", error = e) }
+        if (!captureVolumeReceiverRegistered) {
+            ContextCompat.registerReceiver(app, captureVolumeReceiver,
+                android.content.IntentFilter("android.media.VOLUME_CHANGED_ACTION"), ContextCompat.RECEIVER_NOT_EXPORTED)
+            captureVolumeReceiverRegistered = true
+        }
+        audio.usage = AudioAttributes.USAGE_ALARM
+        audio.restart()
+    }
+
+    private fun leaveCaptureAudio() {
+        mediaKey(android.view.KeyEvent.KEYCODE_MEDIA_PAUSE)   // иначе YouTube зазвучит сам, когда вернётся громкость
+        if (Build.VERSION.SDK_INT >= 29) try { CaptureService.stop(app) } catch (_: Exception) {}
+        if (captureVolumeReceiverRegistered) {
+            try { app.unregisterReceiver(captureVolumeReceiver) } catch (_: Exception) {}
+            captureVolumeReceiverRegistered = false
+        }
+        audio.usage = AudioAttributes.USAGE_MEDIA
+        audio.restart()
+        restoreCaptureVolumes()
+    }
+
+    /** Возвращает громкости медиа и будильника, сохранённые при входе в захват (в том числе после аварийного завершения). */
+    private fun restoreCaptureVolumes() {
+        if (!prefs.contains("captureSavedMedia")) return
+        try {
+            am.setStreamVolume(AudioManager.STREAM_ALARM, prefs.getInt("captureSavedAlarm", am.getStreamVolume(AudioManager.STREAM_ALARM)), 0)
+            am.setStreamVolume(AudioManager.STREAM_MUSIC, prefs.getInt("captureSavedMedia", 0), 0)
+        } catch (e: Exception) { telemetry.event("CAPTURE_VOLUME_FAILED", error = e) }
+        prefs.edit().remove("captureSavedMedia").remove("captureSavedAlarm").apply()
     }
 
     // ================================================================== калибровка
@@ -5049,7 +5389,7 @@ class Engine private constructor(private val app: Context) {
         pointChannel = syncProbeSavedPointChannel
         if (syncProbePreviousAudioPath != currentAudioPath) setAudioPath(syncProbePreviousAudioPath, "sync_probe_complete")
         mode = SourceMode.MUSIC
-        source = if (queueIndex in queue.indices) currentQueueSource ?: music else music
+        source = musicSource()
         restoreMusic(savedPlaying)
         val text = if (!result.valid) {
             if (result.reason == "recording_clipped") "Запись перегружена — уменьшите громкость и повторите замер"
@@ -5812,7 +6152,8 @@ class Engine private constructor(private val app: Context) {
     private fun onInterrupted(reason: String) {
         abandonFocus()
         if (!ui.value.inPair) return
-        if (role == Role.SERVER) { abortCalibration(); cmdPause() } else link?.send(JSONObject().put("t", "cmd").put("a", "pause"))
+        if (role == Role.SERVER) { abortCalibration(); if (input.live && mode == SourceMode.MUSIC) liveTransport("pause") else cmdPause() }
+        else link?.send(JSONObject().put("t", "cmd").put("a", "pause"))
         toast(reason)
     }
 }

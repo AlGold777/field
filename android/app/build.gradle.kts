@@ -13,8 +13,8 @@ android {
         applicationId = "app.soundfield"
         minSdk = 26
         targetSdk = 35
-        versionCode = 75
-        versionName = "1.10.37"
+        versionCode = 76
+        versionName = "1.11.0"
         ndk { abiFilters += "arm64-v8a" }
     }
     externalNativeBuild {
@@ -55,6 +55,17 @@ val buildHostDsp = tasks.register<Exec>("buildHostDsp") {
     outputs.dir(File(repo, "dsp/build/host"))
     isIgnoreExitValue = true  // нет clang++/JDK-заголовков — тесты ядра пропускаются (Assume)
 }
+
+// Приёмник Spotify Connect (Rust, librespot): libsfspotify.so в jniLibs. Нет cargo или NDK — скрипт выходит с 0,
+// приложение собирается без источника Spotify.
+val buildSpotifyBridge = tasks.register<Exec>("buildSpotifyBridge") {
+    group = "build"
+    description = "Builds libsfspotify.so (Spotify Connect receiver) for arm64-v8a with cargo."
+    workingDir = rootProject.projectDir.parentFile
+    commandLine("sh", "tools/build_spotify.sh")
+    isIgnoreExitValue = true
+}
+tasks.matching { it.name == "preBuild" }.configureEach { dependsOn(buildSpotifyBridge) }
 
 tasks.withType<Test>().configureEach {
     dependsOn(buildHostDsp)
