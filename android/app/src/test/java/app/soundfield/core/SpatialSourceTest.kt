@@ -63,53 +63,6 @@ class SpatialSourceTest {
         }
     }
 
-    @Test fun widthDoesNotSeparateACommonMonoSignalAndPreservesTheSum() {
-        val frames = SF.SAMPLE_RATE.toLong()
-        val mono = MonoSource(frames)
-        SpatialSource(mono, spatialConfig = SpatialDspConfig(
-            enabled = true, gMidDb = 5.0, gHighDb = 3.0, gAmbientDb = 3.0,
-        )).use { spatial ->
-            spatial.requestThrough(frames)
-            await("width processing") { spatial.complete || spatial.processingError != null }
-            spatial.processingError?.let { throw AssertionError("spatial worker failed", it) }
-            var maxChannelDifference = 0f
-            var maxSumDifference = 0f
-            for (frame in 0 until frames step 73) {
-                val left = spatial.sample(frame, Ch.L)
-                val right = spatial.sample(frame, Ch.R)
-                maxChannelDifference = maxOf(maxChannelDifference, kotlin.math.abs(left - right))
-                maxSumDifference = maxOf(maxSumDifference, kotlin.math.abs(left + right - 2f * mono.sample(frame, Ch.L)))
-            }
-            assertTrue("common center must remain centered", maxChannelDifference < 2e-6f)
-            assertTrue("width layer must preserve M", maxSumDifference < 2e-6f)
-        }
-    }
-
-    @Test fun earlyReflectionsStayInSideAndPreserveTheMonoSum() {
-        val input = AntiPhaseSource(2L * SF.SAMPLE_RATE)
-        val taps = listOf(app.soundfield.dsp.SpatialReflectionTap(4.0, 7.0, -17.0))
-        val baseConfig = SpatialDspConfig(enabled = true, preserveLoudness = false)
-        SpatialSource(input, spatialConfig = baseConfig).use { reference ->
-            SpatialSource(input, spatialConfig = baseConfig.copy(reflectionsEnabled = true, reflectionTaps = taps)).use { spatial ->
-                reference.requestThrough(input.totalFrames); spatial.requestThrough(input.totalFrames)
-                await("reference render") { reference.complete || reference.processingError != null }
-                await("reflection render") { spatial.complete || spatial.processingError != null }
-                reference.processingError?.let { throw AssertionError("reference worker failed", it) }
-                spatial.processingError?.let { throw AssertionError("spatial worker failed", it) }
-                var addedSideEnergy = 0.0; var sumError = 0.0
-                for (frame in SF.SAMPLE_RATE.toLong() until input.totalFrames step 29) {
-                    val outL = spatial.sample(frame, 0); val outR = spatial.sample(frame, 1)
-                    val refL = reference.sample(frame, 0); val refR = reference.sample(frame, 1)
-                    val sideDelta = ((outL - outR) - (refL - refR)) * 0.5
-                    addedSideEnergy += sideDelta * sideDelta
-                    sumError = maxOf(sumError, kotlin.math.abs(outL + outR - refL - refR).toDouble())
-                }
-                assertTrue("reflections should add delayed Side energy", addedSideEnergy > 0.01)
-                assertTrue("Side reflections must preserve the mono sum", sumError < 2e-6)
-            }
-        }
-    }
-
     private fun await(label: String, condition: () -> Boolean) {
         val deadline = System.nanoTime() + 5_000_000_000L
         while (!condition() && System.nanoTime() < deadline) Thread.sleep(2)
@@ -145,16 +98,5 @@ class SpatialSourceTest {
 
     private class MonoSource(total: Long) : ProceduralSource(total) {
         override fun sample(frame: Long, ch: Int): Float = super.sample(frame, Ch.L)
-    }
-
-    private class AntiPhaseSource(override val totalFrames: Long) : AudioSource {
-        override val mode = SourceMode.MUSIC
-        override val title = "anti-phase tone"
-        override val artist = "test"
-        override fun sample(frame: Long, ch: Int): Float {
-            if (frame !in 0 until totalFrames) return 0f
-            val value = sin(2 * PI * 1_000.0 * frame / SF.SAMPLE_RATE) * 0.3
-            return (if (ch == 0) value else -value).toFloat()
-        }
     }
 }

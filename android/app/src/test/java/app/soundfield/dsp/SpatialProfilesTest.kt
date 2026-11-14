@@ -1,25 +1,34 @@
 package app.soundfield.dsp
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class SpatialProfilesTest {
-    @Test fun parsesProfileFieldsBeforeNestedReflectionData() {
+    @Test fun parsesSpanAndXtcBeta() {
         val profiles = SpatialProfiles.parse("""
-            {"version":1,"profiles":{"pair_wide":{"gMidDb":3.0,"gHighDb":2.0,
-            "gAmbientDb":2.0,"depthDb":-2.0,"reflectionsEnabled":true,"reflectionTaps":[
-            {"leftMs":7.2,"rightMs":10.5,"gainDb":-17.0},
-            {"leftMs":13.4,"rightMs":18.1,"gainDb":-16.0},
-            {"leftMs":21.0,"rightMs":15.7,"gainDb":-18.0}]},
-            "pair_near":{"gMidDb":5.0,"gHighDb":3.0,"gAmbientDb":3.0,"depthDb":-1.5}}}
+            {"version":3,"profiles":{"pair_wide":{"span":1.0,"xtcBeta":null},
+            "solo_stereo_speaker":{"span":1.5,"xtcBeta":0.06}}}
         """.trimIndent())
-        assertEquals(3.0, profiles.getValue("pair_wide").gMidDb, 0.0)
-        assertEquals(-2.0, profiles.getValue("pair_wide").depthDb, 0.0)
-        assertEquals(5.0, profiles.getValue("pair_near").gMidDb, 0.0)
-        assertTrue(profiles.getValue("pair_wide").reflectionsEnabled)
-        assertEquals(3, profiles.getValue("pair_wide").reflectionTaps.size)
-        assertEquals(7.2, profiles.getValue("pair_wide").reflectionTaps.first().leftMs, 0.0)
-        assertTrue(SpatialProfiles.fallback("pair_near").gMidDb > SpatialProfiles.fallback("pair_wide").gMidDb)
+        assertEquals(1.0, profiles.getValue("pair_wide").span, 0.0)
+        assertNull(profiles.getValue("pair_wide").xtcBeta)
+        assertEquals(1.5, profiles.getValue("solo_stereo_speaker").span, 0.0)
+        assertEquals(0.06, profiles.getValue("solo_stereo_speaker").xtcBeta!!, 0.0)
+    }
+
+    @Test fun fallbackSpansGrowForNearerAndSoloPlacement() {
+        assertEquals(3, SpatialProfiles.VERSION)
+        assertTrue(SpatialProfiles.fallback("pair_near").span > SpatialProfiles.fallback("pair_wide").span)
+        assertTrue(SpatialProfiles.fallback("solo_stereo_speaker").span > SpatialProfiles.fallback("pair_near").span)
+        assertEquals(1.0, SpatialProfiles.fallback("off").span, 0.0)
+    }
+
+    @Test fun bundledProfilesMatchFallback() {
+        val file = listOf(java.io.File("src/main/assets/spatial_profiles.json"), java.io.File("app/src/main/assets/spatial_profiles.json"))
+            .first { it.isFile }
+        val parsed = SpatialProfiles.parse(file.readText())
+        for (id in listOf("pair_wide", "pair_near", "solo_stereo_speaker", "off"))
+            assertEquals(id, SpatialProfiles.fallback(id), parsed.getValue(id))
     }
 }

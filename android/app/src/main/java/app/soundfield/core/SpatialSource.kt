@@ -3,7 +3,7 @@ package app.soundfield.core
 import app.soundfield.dsp.Radix2Fft
 import app.soundfield.dsp.SpatialDspConfig
 import app.soundfield.dsp.SpatialLoudnessCompensator
-import app.soundfield.dsp.SpatialReflectionProcessor
+import app.soundfield.dsp.SceneRoom
 import app.soundfield.dsp.SpatialProcessor
 import app.soundfield.dsp.XtcFilterDesigner
 import app.soundfield.dsp.XtcFilterSet
@@ -14,7 +14,7 @@ import kotlin.math.sqrt
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.TimeUnit
 
-/** Streaming STFT→ISTFT source. S2 deliberately applies the identity transform. */
+/** Потоковый STFT→ISTFT-источник сцены: ширина и глубина (STFT-стадия + комната), затем компенсатор громкости и XTC. */
 class SpatialSource(
     private val inner: AudioSource,
     private val startAtFrame: Long = 0L,
@@ -24,8 +24,7 @@ class SpatialSource(
 ) : AudioSource, AutoCloseable, PrefetchableAudioSource, TrackMeters {
     override val truePeakDbtp: Double get() = (inner as? TrackMeters)?.truePeakDbtp ?: Double.NaN
     override val loudnessLufs: Double get() = (inner as? TrackMeters)?.loudnessLufs ?: Double.NaN
-    private val bypass = !spatialConfig.enabled &&
-        !(spatialConfig.reflectionsEnabled && spatialConfig.reflectionTaps.isNotEmpty())
+    private val bypass = !spatialConfig.enabled
     override val mode get() = inner.mode
     override val title get() = inner.title
     override val artist get() = inner.artist
@@ -38,8 +37,9 @@ class SpatialSource(
     private val cache = FloatArray(cacheCapacityFrames * 2)
     private val fft = Radix2Fft(FFT_SIZE)
     private val spatialProcessor = SpatialProcessor(spatialConfig)
-    private val reflectionProcessor = if (spatialConfig.reflectionsEnabled && spatialConfig.reflectionTaps.isNotEmpty())
-        SpatialReflectionProcessor(spatialConfig.reflectionTaps, strength = spatialConfig.strength) else null
+    /** Комната работает только при глубине > 0: иначе посыла нет вовсе (ни обратных БПФ, ни аккумуляторов). */
+    private val roomEnabled = spatialConfig.enabled && spatialConfig.depth > 0.0
+    private val room = if (roomEnabled) SceneRoom(spatialConfig.depth) else null
     @Volatile private var xtcProcessor: XtcProcessor? = null
     @Volatile var xtcApplied: Boolean = false
         private set
@@ -50,6 +50,9 @@ class SpatialSource(
         fixedCompensationDb = spatialConfig.fixedLoudnessCompensationDb,
     )
     private val window = DoubleArray(FFT_SIZE) { i -> sqrt(0.5 - 0.5 * cos(2.0 * PI * i / FFT_SIZE)) }
+    // L и R идут одним комплексным БПФ (L + jR): 3 БПФ на шаг вместо 6.
+    private val packRe = DoubleArray(FFT_SIZE)
+    private val packIm = DoubleArray(FFT_SIZE)
     private val realL = DoubleArray(FFT_SIZE)
     private val imagL = DoubleArray(FFT_SIZE)
     private val realR = DoubleArray(FFT_SIZE)
@@ -59,6 +62,12 @@ class SpatialSource(
     private val accumulationL = DoubleArray(accumulationCapacity)
     private val accumulationR = DoubleArray(accumulationCapacity)
     private val accumulationWeight = DoubleArray(accumulationCapacity)
+    private val sendRealL = DoubleArray(if (roomEnabled) FFT_SIZE else 0)
+    private val sendImagL = DoubleArray(if (roomEnabled) FFT_SIZE else 0)
+    private val sendRealR = DoubleArray(if (roomEnabled) FFT_SIZE else 0)
+    private val sendImagR = DoubleArray(if (roomEnabled) FFT_SIZE else 0)
+    private val sendAccumulationL = DoubleArray(if (roomEnabled) accumulationCapacity else 0)
+    private val sendAccumulationR = DoubleArray(if (roomEnabled) accumulationCapacity else 0)
     private val workerRunning = java.util.concurrent.atomic.AtomicBoolean(true)
     private val requestedHead = java.util.concurrent.atomic.AtomicLong(
         minOf(inner.totalFrames, startAtFrame + cacheCapacityFrames).coerceAtLeast(startAtFrame),
@@ -198,7 +207,9 @@ class SpatialSource(
         java.util.Arrays.fill(accumulationR, 0.0)
         java.util.Arrays.fill(accumulationWeight, 0.0)
         spatialProcessor.reset()
-        reflectionProcessor?.reset()
+        room?.reset()
+        java.util.Arrays.fill(sendAccumulationL, 0.0)
+        java.util.Arrays.fill(sendAccumulationR, 0.0)
         xtcProcessor?.reset()
         loudnessCompensator.reset()
         processedHead = warmupStart
@@ -215,16 +226,24 @@ class SpatialSource(
             val frame = frameStart + i
             val left = if (frame < 0L || frame >= inner.totalFrames) 0f else inner.sample(frame, 0)
             val right = if (frame < 0L || frame >= inner.totalFrames) 0f else inner.sample(frame, 1)
-            realL[i] = (if (left.isNaN()) 0f else left) * window[i]
-            imagL[i] = 0.0
-            realR[i] = (if (right.isNaN()) 0f else right) * window[i]
-            imagR[i] = 0.0
+            packRe[i] = (if (left.isNaN()) 0f else left) * window[i]
+            packIm[i] = (if (right.isNaN()) 0f else right) * window[i]
         }
-        fft.transform(realL, imagL)
-        fft.transform(realR, imagR)
-        if (!spatialProcessor.process(realL, imagL, realR, imagR)) return null
-        fft.transform(realL, imagL, inverse = true)
-        fft.transform(realR, imagR, inverse = true)
+        fft.transform(packRe, packIm)
+        for (k in 0 until FFT_SIZE) {
+            val m = (FFT_SIZE - k) and (FFT_SIZE - 1)
+            realL[k] = 0.5 * (packRe[k] + packRe[m]); imagL[k] = 0.5 * (packIm[k] - packIm[m])
+            realR[k] = 0.5 * (packIm[k] + packIm[m]); imagR[k] = 0.5 * (packRe[m] - packRe[k])
+        }
+        val produced = if (roomEnabled) spatialProcessor.process(realL, imagL, realR, imagR, sendRealL, sendImagL, sendRealR, sendImagR)
+            else spatialProcessor.process(realL, imagL, realR, imagR)
+        if (!produced) return null
+        packSpectra(realL, imagL, realR, imagR)
+        fft.transform(realL, imagL, inverse = true) // после обратного БПФ: realL — L, imagL — R
+        if (roomEnabled) {
+            packSpectra(sendRealL, sendImagL, sendRealR, sendImagR)
+            fft.transform(sendRealL, sendImagL, inverse = true)
+        }
         val outputStart = frameStart - spatialProcessor.lookaheadHops * HOP_SIZE
         for (i in 0 until FFT_SIZE) {
             val frame = outputStart + i
@@ -232,10 +251,23 @@ class SpatialSource(
             val index = (frame.toInt() and accumulationMask)
             val w = window[i]
             accumulationL[index] += realL[i] * w
-            accumulationR[index] += realR[i] * w
+            accumulationR[index] += imagL[i] * w
             accumulationWeight[index] += w * w
+            if (roomEnabled) {
+                sendAccumulationL[index] += sendRealL[i] * w
+                sendAccumulationR[index] += sendImagL[i] * w
+            }
         }
         return outputStart
+    }
+
+    /** Спектры двух вещественных сигналов → спектр L + jR (на месте, поэлементно). */
+    private fun packSpectra(reL: DoubleArray, imL: DoubleArray, reR: DoubleArray, imR: DoubleArray) {
+        for (k in 0 until FFT_SIZE) {
+            val zr = reL[k] - imR[k]
+            val zi = imL[k] + reR[k]
+            reL[k] = zr; imL[k] = zi
+        }
     }
 
     private fun publishHop(frameStart: Long) {
@@ -246,11 +278,21 @@ class SpatialSource(
         for (frame in blockStart until blockEnd) {
             val rawLeft: Float
             val rawRight: Float
+            var sendLeft = 0f
+            var sendRight = 0f
             if (frame < inner.totalFrames) {
                 val accumulationIndex = frame.toInt() and accumulationMask
                 val weight = accumulationWeight[accumulationIndex]
                 rawLeft = if (weight > 1e-12) (accumulationL[accumulationIndex] / weight).toFloat() else 0f
                 rawRight = if (weight > 1e-12) (accumulationR[accumulationIndex] / weight).toFloat() else 0f
+                if (roomEnabled) {
+                    if (weight > 1e-12) {
+                        sendLeft = (sendAccumulationL[accumulationIndex] / weight).toFloat()
+                        sendRight = (sendAccumulationR[accumulationIndex] / weight).toFloat()
+                    }
+                    sendAccumulationL[accumulationIndex] = 0.0
+                    sendAccumulationR[accumulationIndex] = 0.0
+                }
                 accumulationL[accumulationIndex] = 0.0
                 accumulationR[accumulationIndex] = 0.0
                 accumulationWeight[accumulationIndex] = 0.0
@@ -259,9 +301,13 @@ class SpatialSource(
             }
             val inputLeft = if (frame in 0 until inner.totalFrames) inner.sample(frame, 0).takeUnless { it.isNaN() } ?: 0f else 0f
             val inputRight = if (frame in 0 until inner.totalFrames) inner.sample(frame, 1).takeUnless { it.isNaN() } ?: 0f else 0f
-            val reflected = reflectionProcessor?.process(inputLeft, inputRight) ?: 0f
-            val processedLeft = rawLeft + reflected
-            val processedRight = rawRight - reflected
+            var processedLeft = rawLeft
+            var processedRight = rawRight
+            if (room != null) {
+                room.process(sendLeft, sendRight)
+                processedLeft += room.wetL.toFloat()
+                processedRight += room.wetR.toFloat()
+            }
             loudnessCompensator.observe(inputLeft, inputRight, processedLeft, processedRight)
             val compensation = loudnessCompensator.gain()
             val compensatedLeft = (processedLeft * compensation).toFloat()

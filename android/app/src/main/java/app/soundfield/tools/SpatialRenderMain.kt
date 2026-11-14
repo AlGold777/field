@@ -8,6 +8,7 @@ import app.soundfield.core.SpatialSource
 import app.soundfield.core.SourceMode
 import app.soundfield.core.Wav
 import app.soundfield.dsp.DSP_VERSION
+import app.soundfield.dsp.SpatialDspConfig
 import app.soundfield.dsp.SpatialProfiles
 import java.io.BufferedOutputStream
 import java.io.DataOutputStream
@@ -23,10 +24,11 @@ object SpatialRenderMain {
         val options = parseArgs(args)
         val input = File(options.getValue("in")).canonicalFile
         val output = File(options.getValue("out")).canonicalFile
-        val level = options.getValue("level")
+        val width = options.getValue("width").toDouble()
+        val depth = options.getValue("depth").toDouble()
         val profile = options.getValue("profile")
         require(input.isFile) { "Input WAV does not exist: $input" }
-        require(level in setOf("soft", "strong")) { "--level must be soft or strong" }
+        require(width in 0.0..1.0 && depth in 0.0..1.0) { "--width and --depth must be in 0..1" }
         require(profile in setOf("pair_wide", "pair_near", "solo_stereo_speaker", "off")) {
             "Unsupported profile: $profile"
         }
@@ -37,7 +39,7 @@ object SpatialRenderMain {
         ).firstOrNull { it.isFile }
         val profileData = profileFile?.readText()?.let { SpatialProfiles.parse(it)[profile] }
             ?: SpatialProfiles.fallback(profile)
-        val strength = if (level == "soft") 0.6 else 1.4
+        val level = "w${width}_d${depth}"
 
         val decoded = Wav.decode(input.readBytes())
         val source: AudioSource = PcmSource(decoded.pcm, input.nameWithoutExtension, "Local WAV")
@@ -48,7 +50,8 @@ object SpatialRenderMain {
         val processed = File(tracks, "$fragment-SPATIAL.wav")
         val reference = File(tracks, "$fragment-REF.wav")
         writeWav(reference, source) { frame, channel -> source.sample(frame, channel) }
-        SpatialSource(source, spatialConfig = profileData.dspConfig(enabled = profile != "off", strength = strength)).use { spatial ->
+        SpatialSource(source, spatialConfig = SpatialDspConfig(
+            enabled = profile != "off" && (width > 0.0 || depth > 0.0), width = width, depth = depth, span = profileData.span)).use { spatial ->
             spatial.requestThrough(source.totalFrames)
             val deadline = System.nanoTime() + 30_000_000_000L
             while (!spatial.complete && spatial.processingError == null && System.nanoTime() < deadline) Thread.sleep(2)
@@ -163,8 +166,8 @@ object SpatialRenderMain {
             result[key] = args[index + 1]
             index += 2
         }
-        for (required in listOf("in", "level", "profile", "out")) require(required in result) {
-            "Usage: --in track.wav --level soft|strong --profile pair_wide|pair_natural|phone_speaker|custom --out folder"
+        for (required in listOf("in", "width", "depth", "profile", "out")) require(required in result) {
+            "Usage: --in track.wav --width 0..1 --depth 0..1 --profile pair_wide|pair_near|solo_stereo_speaker|off --out folder"
         }
         return result
     }

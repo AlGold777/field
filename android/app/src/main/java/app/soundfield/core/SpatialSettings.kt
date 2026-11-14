@@ -58,8 +58,9 @@ data class SpatialSettings(
 
     fun dspConfig(profileData: SpatialProfile): app.soundfield.dsp.SpatialDspConfig {
         val clean = sanitized()
-        return profileData.dspConfig(clean.enabled, clean.level.multiplier).copy(
-            width = clean.width, depth = clean.depth, preserveLoudness = clean.preserveLoudness)
+        return app.soundfield.dsp.SpatialDspConfig(
+            enabled = clean.enabled, width = clean.width, depth = clean.depth,
+            span = profileData.span, preserveLoudness = clean.preserveLoudness)
     }
 
     companion object {
