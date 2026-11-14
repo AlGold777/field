@@ -57,13 +57,12 @@ val buildHostDsp = tasks.register<Exec>("buildHostDsp") {
 }
 
 // Приёмник Spotify Connect (Rust, librespot): libsfspotify.so в jniLibs. Нет cargo или NDK — скрипт выходит с 0,
-// приложение собирается без источника Spotify.
+// приложение собирается без источника Spotify. Ошибка компиляции приёмника останавливает сборку приложения.
 val buildSpotifyBridge = tasks.register<Exec>("buildSpotifyBridge") {
     group = "build"
     description = "Builds libsfspotify.so (Spotify Connect receiver) for arm64-v8a with cargo."
     workingDir = rootProject.projectDir.parentFile
     commandLine("sh", "tools/build_spotify.sh")
-    isIgnoreExitValue = true
 }
 tasks.matching { it.name == "preBuild" }.configureEach { dependsOn(buildSpotifyBridge) }
 
