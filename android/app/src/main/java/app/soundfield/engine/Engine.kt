@@ -2314,9 +2314,7 @@ class Engine private constructor(private val app: Context) {
             if (soloMode) post { applySpatialSettings(clean, finished) }
             else cmd("spatial", telemetry = finished) {
                 put("enabled", clean.enabled); put("level", clean.level.wire); put("profile", clean.profile)
-                clean.custom?.let { custom -> put("custom", JSONObject()
-                    .put("gMidDb", custom.gMidDb).put("gHighDb", custom.gHighDb).put("gAmbientDb", custom.gAmbientDb)
-                    .put("depthDb", custom.depthDb).put("reflectionDb", custom.reflectionDb)) }
+                put("width", clean.width); put("depth", clean.depth)
                 put("preserveLoudness", clean.preserveLoudness)
                 put("abFixedCompensationDb", spatialAbFixedCompensationDb ?: JSONObject.NULL)
                 put("finished", finished)
@@ -2328,8 +2326,7 @@ class Engine private constructor(private val app: Context) {
 
     fun spatialAbAudition(level: SpatialLevel, session: SpatialAbSession) {
         spatialAbFixedCompensationDb = session.fixedCompensationDb
-        val settings = session.originalSettings.copy(enabled = level != SpatialLevel.OFF, level = level,
-            custom = null, preserveLoudness = true)
+        val settings = session.originalSettings.withLevel(level).copy(preserveLoudness = true)
         pause()
         seekMs(session.anchorMs)
         setSpatial(settings, finished = false)
@@ -3961,8 +3958,7 @@ class Engine private constructor(private val app: Context) {
             if (soloMode) prefs.edit().putString("soloSpatial:${audio.routeKey()}", clean.toJson().toString()).apply()
             else saveServerParams()
             telemetry.record("SPATIAL_CONFIG", mapOf("profile" to clean.profile, "level" to clean.level.wire,
-                "params" to clean.custom?.let { mapOf("gMidDb" to it.gMidDb, "gHighDb" to it.gHighDb,
-                    "gAmbientDb" to it.gAmbientDb, "depthDb" to it.depthDb, "reflectionDb" to it.reflectionDb) },
+                "width" to clean.width, "depth" to clean.depth,
                 "preserveLoudness" to clean.preserveLoudness,
                 "dspVersion" to DSP_VERSION, "profilesVersion" to SpatialProfiles.VERSION,
                 "reason" to reason, "fFrame" to f))
@@ -4331,13 +4327,7 @@ class Engine private constructor(private val app: Context) {
             }
             "spatial" -> {
                 if (!spatialAvailableNow()) return
-                val customJson = o.optJSONObject("custom")
-                val custom = customJson?.let { c -> SpatialCustom(
-                    c.optDouble("gMidDb", 3.0), c.optDouble("gHighDb", 2.0), c.optDouble("gAmbientDb", 2.0),
-                    c.optDouble("depthDb", -2.0), c.optDouble("reflectionDb", -17.0)) }
-                val settings = SpatialSettings(o.optBoolean("enabled", false), SpatialLevel.parse(o.optString("level")),
-                    o.optString("profile", if (soloMode) "solo_stereo_speaker" else "pair_wide"), custom,
-                    o.optBoolean("preserveLoudness", true)).sanitized()
+                val settings = SpatialSettings.fromJson(o, if (soloMode) "solo_stereo_speaker" else "pair_wide")
                 spatialAbFixedCompensationDb = if (o.has("abFixedCompensationDb") && !o.isNull("abFixedCompensationDb"))
                     o.optDouble("abFixedCompensationDb").coerceIn(-3.0, 3.0) else null
                 applySpatialSettings(settings, o.optBoolean("finished", true),

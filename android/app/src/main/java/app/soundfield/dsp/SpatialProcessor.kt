@@ -26,6 +26,10 @@ data class SpatialDspConfig(
     val fixedLoudnessCompensationDb: Double? = null,
     /** Side после усиления не превышает kappa·Mid в каждом бине: корреляция L/R не уходит в минус (фазовость). */
     val phaseLimitKappa: Double = 1.0,
+    /** Положение ползунка «Ширина», 0…1. */
+    val width: Double = 0.0,
+    /** Положение ползунка «Глубина», 0…1. */
+    val depth: Double = 0.0,
 )
 
 data class SpatialReflectionTap(val leftMs: Double, val rightMs: Double, val gainDb: Double)
