@@ -234,6 +234,20 @@ class SpatialSceneTest {
         assertTrue("ILD $ild", ild >= 12.0)
     }
 
+    /** Профиль наушников (span 0): образ не выносится за базу, но растяжение внутри базы остаётся. */
+    @Test fun headphoneProfileStretchesInsideTheBaseWithoutAntiPhase() {
+        val n = sr * 4
+        val x = white(11, n, 0.3f)
+        val from = sr / 2; val to = n - sr / 2
+        val (hardL, hardR) = render(x, FloatArray(n), cfg(1.0, 0.0, span = 0.0))
+        val leak = dbE(energy(band(hardR, 300.0, 1_200.0), from, to) / energy(band(hardL, 300.0, 1_200.0), from, to))
+        val (partL, partR) = render(x, FloatArray(n) { x[it] * 0.5f }, cfg(1.0, 0.0, span = 0.0))
+        val ild = dbE(energy(band(partL, 300.0, 5_000.0), from, to) / energy(band(partR, 300.0, 5_000.0), from, to))
+        println("MEASURED headphones (span 0): hard-left R re L ${"%.1f".format(leak)} dB, 6 dB source -> ILD ${"%.1f".format(ild)} dB")
+        assertTrue("leak $leak dB", leak < -50.0)
+        assertTrue("ILD $ild", ild >= 12.0)
+    }
+
     @Test fun diffuseFieldGetsWiderMonotonically() {
         val n = sr * 4
         val l = white(8, n, 0.3f); val r = white(9, n, 0.3f)

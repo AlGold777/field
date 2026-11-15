@@ -30,7 +30,7 @@ object SpatialRenderMain {
         val profile = options.getValue("profile")
         require(input.isFile) { "Input WAV does not exist: $input" }
         require(width in 0.0..1.0 && depth in 0.0..1.0 && height in 0.0..1.0) { "--width, --depth and --height must be in 0..1" }
-        require(profile in setOf("pair_wide", "pair_near", "solo_stereo_speaker", "off")) {
+        require(profile in setOf("pair_wide", "pair_near", "solo_stereo_speaker", "solo_headphones", "off")) {
             "Unsupported profile: $profile"
         }
 
@@ -168,7 +168,7 @@ object SpatialRenderMain {
             index += 2
         }
         for (required in listOf("in", "width", "depth", "profile", "out")) require(required in result) {
-            "Usage: --in track.wav --width 0..1 --depth 0..1 [--height 0..1] --profile pair_wide|pair_near|solo_stereo_speaker|off --out folder"
+            "Usage: --in track.wav --width 0..1 --depth 0..1 [--height 0..1] --profile pair_wide|pair_near|solo_stereo_speaker|solo_headphones|off --out folder"
         }
         return result
     }

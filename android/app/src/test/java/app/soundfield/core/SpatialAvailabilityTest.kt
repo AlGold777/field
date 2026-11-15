@@ -7,8 +7,8 @@ import org.junit.Test
 
 class SpatialAvailabilityTest {
     private fun eval(solo: Boolean = false, music: Boolean = true, paired: Boolean = true, peer: Boolean = true,
-        speaker: Boolean = true, stereo: Boolean = false) =
-        SpatialAvailability.evaluate(solo, music, paired, peer, speaker, stereo)
+        speaker: Boolean = true, stereo: Boolean = false, external: Boolean = false) =
+        SpatialAvailability.evaluate(solo, music, paired, peer, speaker, stereo, external)
 
     @Test fun pairWithCapablePeerOnSpeakerIsAvailable() = assertTrue(eval().available)
 
@@ -19,8 +19,13 @@ class SpatialAvailabilityTest {
         assertFalse(r.available); assertEquals("", r.hint)
     }
 
-    @Test fun soloOnHeadphonesIsHiddenWithoutHint() {
-        val r = eval(solo = true, paired = false, speaker = false, stereo = true)
+    @Test fun soloOnHeadphonesIsAvailableOnAnyPhone() {
+        assertTrue(eval(solo = true, paired = false, speaker = false, stereo = false, external = true).available)
+        assertTrue(eval(solo = true, paired = false, speaker = false, stereo = true, external = true).available)
+    }
+
+    @Test fun soloWithUnknownRouteIsHidden() {
+        val r = eval(solo = true, paired = false, speaker = false, stereo = true, external = false)
         assertFalse(r.available); assertEquals("", r.hint)
     }
 

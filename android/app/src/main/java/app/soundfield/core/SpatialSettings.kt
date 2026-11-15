@@ -31,7 +31,7 @@ data class SpatialSettings(
         return copy(
             enabled = on,
             level = if (on) level else SpatialLevel.OFF,
-            profile = profile.takeIf { it in setOf("pair_wide", "pair_near", "solo_stereo_speaker", "off") } ?: "pair_wide",
+            profile = profile.takeIf { it in setOf("pair_wide", "pair_near", "solo_stereo_speaker", "solo_headphones", "off") } ?: "pair_wide",
             width = w, depth = d, height = h,
         )
     }

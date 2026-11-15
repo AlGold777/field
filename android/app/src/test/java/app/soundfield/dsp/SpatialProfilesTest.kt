@@ -24,11 +24,18 @@ class SpatialProfilesTest {
         assertEquals(1.0, SpatialProfiles.fallback("off").span, 0.0)
     }
 
+    @Test fun headphonesProfileHasNoBeyondBaseExtensionAndNoXtc() {
+        val profile = SpatialProfiles.fallback("solo_headphones")
+        assertEquals("solo_headphones", profile.id)
+        assertEquals(0.0, profile.span, 0.0)
+        assertNull(profile.xtcBeta)
+    }
+
     @Test fun bundledProfilesMatchFallback() {
         val file = listOf(java.io.File("src/main/assets/spatial_profiles.json"), java.io.File("app/src/main/assets/spatial_profiles.json"))
             .first { it.isFile }
         val parsed = SpatialProfiles.parse(file.readText())
-        for (id in listOf("pair_wide", "pair_near", "solo_stereo_speaker", "off"))
+        for (id in listOf("pair_wide", "pair_near", "solo_stereo_speaker", "solo_headphones", "off"))
             assertEquals(id, SpatialProfiles.fallback(id), parsed.getValue(id))
     }
 }

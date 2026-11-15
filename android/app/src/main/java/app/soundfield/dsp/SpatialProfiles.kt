@@ -9,7 +9,7 @@ data class SpatialProfile(
 
 object SpatialProfiles {
     const val VERSION = 3
-    private val knownIds = listOf("pair_wide", "pair_near", "solo_stereo_speaker", "off")
+    private val knownIds = listOf("pair_wide", "pair_near", "solo_stereo_speaker", "solo_headphones", "off")
 
     fun parse(json: String): Map<String, SpatialProfile> = knownIds.mapNotNull { id ->
         val start = Regex("\\\"${Regex.escape(id)}\\\"\\s*:\\s*\\{").find(json)?.range?.last?.plus(1)
@@ -31,6 +31,8 @@ object SpatialProfiles {
     fun fallback(id: String): SpatialProfile = when (id) {
         "pair_near" -> SpatialProfile(id, 1.25)
         "solo_stereo_speaker" -> SpatialProfile(id, 1.5, xtcBeta = 0.06)
+        // Наушники: между ушами нет акустической перекрёстной связи, противофаза за базу не расширяет образ — вынос за базу выключен.
+        "solo_headphones" -> SpatialProfile(id, 0.0)
         "off" -> SpatialProfile(id, 1.0)
         else -> SpatialProfile("pair_wide", 1.0)
     }
