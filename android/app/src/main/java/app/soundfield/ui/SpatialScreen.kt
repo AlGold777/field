@@ -40,7 +40,13 @@ import kotlin.math.roundToInt
 
 @Composable
 fun SpatialCompactBlock(ui: UiState, engine: Engine, openSpatial: () -> Unit) {
-    if (!ui.spatialAvailable) return
+    if (!ui.spatialAvailable) {
+        if (ui.spatialHint.isNotBlank()) Column(Modifier.fillMaxWidth().padding(top = 14.dp)) {
+            Text("Сцена", color = SFColors.Text, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
+            Text(ui.spatialHint, color = SFColors.TextDim, fontSize = 13.sp, modifier = Modifier.padding(top = 4.dp))
+        }
+        return
+    }
     val state = ui.spatial
     val profile = if (ui.soloMode) "solo_stereo_speaker" else state.profile
     var width by remember(state.width) { mutableFloatStateOf(state.width.toFloat()) }

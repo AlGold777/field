@@ -544,7 +544,7 @@ class Engine private constructor(private val app: Context) {
             title = music.title, artist = music.artist, queueExpanded = prefs.getBoolean("queueExpanded", true),
             eq = eqSettings, eqExpanded = prefs.getBoolean("eqExpanded", false), eqPreampDb = eqConfig.preampDb.toFloat(),
             eqRouteLabel = audio.routeLabel(), customEqPresets = readCustomEqPresets(), eqCurveDb = eqConfig.curveDb.map { it.toFloat() },
-            spatial = spatialSettings, spatialAvailable = spatialAvailableNow()) }
+            spatial = spatialSettings, spatialAvailable = spatialAvailableNow(), spatialHint = spatialEvaluation().hint) }
         watchNetwork()
         log("Запуск: TCP ${tcp.localPort}, UDP ${udp.localPort}")
         // Главная страница — плеер: соло стартует сразу, без пары. Пара — надстройка (см. becomePaired / goIdle).
@@ -1519,7 +1519,7 @@ class Engine private constructor(private val app: Context) {
             mode = SourceMode.MUSIC, eq = eqSettings, eqAvailable = true, eqRouteLabel = audio.routeLabel(),
             eqPreampDb = eqConfig.preampDb.toFloat(), eqCurveDb = eqConfig.curveDb.map { it.toFloat() },
             queueTracks = queue.map { QueueTrackUi(it.id, it.title, it.artist) }, queueIndex = queueIndex,
-            spatial = spatialSettings, spatialAvailable = spatialAvailableNow()) }
+            spatial = spatialSettings, spatialAvailable = spatialAvailableNow(), spatialHint = spatialEvaluation().hint) }
         telemetry.record("EQ_ROUTE_PROFILE", mapOf("route" to audio.routeLabel(), "applied" to true))
         later(350) { if (soloMode) applySoloEqRoute(audio.routeKey(), savePrevious = true) }
         PlaybackService.refresh(app)
@@ -3707,9 +3707,6 @@ class Engine private constructor(private val app: Context) {
     private fun eqAvailableInPair() = soloMode ||
         (phase in setOf(Phase.PAIRED, Phase.RECONNECTING) && "eq" in negotiatedCapabilities)
 
-    private fun spatialAvailableInPair() = mode == SourceMode.MUSIC && phase in setOf(Phase.PAIRED, Phase.RECONNECTING) &&
-        "spatialV1" in negotiatedCapabilities && audio.isBuiltInSpeakerRoute()
-
     private fun deviceSpeakerRecord(): JSONObject? = spatialDeviceTable?.optJSONObject(Build.MODEL)
 
     private fun deviceHasStereoSpeakers(): Boolean = deviceSpeakerRecord()?.optBoolean("stereoSpeakers")
@@ -3780,17 +3777,18 @@ class Engine private constructor(private val app: Context) {
         ))
     }
 
-    private fun spatialAvailableNow(): Boolean = when {
-        soloMode -> mode == SourceMode.MUSIC && audio.isBuiltInSpeakerRoute() && deviceHasStereoSpeakers()
-            && app.resources.configuration.orientation == android.content.res.Configuration.ORIENTATION_LANDSCAPE
-        else -> spatialAvailableInPair()
-    }
+    private fun spatialEvaluation() = SpatialAvailability.evaluate(
+        solo = soloMode, music = mode == SourceMode.MUSIC, paired = phase in setOf(Phase.PAIRED, Phase.RECONNECTING),
+        peerSupportsSpatial = "spatialV1" in negotiatedCapabilities, builtInSpeaker = audio.isBuiltInSpeakerRoute(),
+        stereoSpeakers = deviceHasStereoSpeakers())
+
+    private fun spatialAvailableNow(): Boolean = spatialEvaluation().available
 
     private fun refreshSpatialAvailability() {
         prewarmXtc()
-        val available = spatialAvailableNow()
-        if (ui.value.spatialAvailable != available || ui.value.spatial != spatialSettings)
-            ui { copy(spatialAvailable = available, spatial = spatialSettings) }
+        val state = spatialEvaluation()
+        if (ui.value.spatialAvailable != state.available || ui.value.spatialHint != state.hint || ui.value.spatial != spatialSettings)
+            ui { copy(spatialAvailable = state.available, spatialHint = state.hint, spatial = spatialSettings) }
     }
 
     private fun spatialProfile(id: String): SpatialProfile = spatialProfiles[id] ?: SpatialProfiles.fallback(id)
@@ -3973,7 +3971,7 @@ class Engine private constructor(private val app: Context) {
                 "dspVersion" to DSP_VERSION, "profilesVersion" to SpatialProfiles.VERSION,
                 "reason" to reason, "fFrame" to f))
         }
-        ui { copy(spatial = clean, spatialAvailable = spatialAvailableNow()) }
+        ui { copy(spatial = clean, spatialAvailable = spatialAvailableNow(), spatialHint = spatialEvaluation().hint) }
         telemetry.record("SPATIAL_REPROCESS", mapOf("reason" to reason, "fFrame" to f,
             "delayMs" to if (isPlaying) (f - posFrame()).coerceAtLeast(0) * 1000.0 / SF.SAMPLE_RATE else 0,
             "tcpResendFrames" to if (currentAudioPath == "tcp" && isPlaying) (source.totalFrames - f).coerceAtLeast(0) else 0))
@@ -4261,7 +4259,7 @@ class Engine private constructor(private val app: Context) {
             eq = if (role == Role.SERVER) eqSettingsForWire() else incomingEq,
             eqAvailable = eqAvailableInPair(),
             spatial = if (role == Role.SERVER) spatialSettingsForWire() else incomingSpatial,
-            spatialAvailable = spatialAvailableNow(),
+            spatialAvailable = spatialAvailableNow(), spatialHint = spatialEvaluation().hint,
             eqPreampDb = o.optDouble("eqPreampDb", 0.0).toFloat(),
             eqRouteLabel = audio.routeLabel(), eqCurveDb = activeEqConfig().curveDb.map { it.toFloat() },
             gainLaw = if (role == Role.POINT) if (o.has("pointGain")) 2 else 1 else o.optInt("peerGainLaw", 1)) }
