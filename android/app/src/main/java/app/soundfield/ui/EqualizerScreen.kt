@@ -58,42 +58,23 @@ import kotlin.math.max
 import kotlin.math.roundToInt
 import kotlin.math.pow
 
+/** Свёрнутый эквалайзер: заголовок, состояние и мини-кривая. Нажатие сразу открывает полный экран настройки. */
 @Composable
-fun EqualizerCompactBlock(ui: UiState, engine: Engine, openEqualizer: () -> Unit) {
+fun EqualizerCompactBlock(ui: UiState, openEqualizer: () -> Unit) {
     val state = ui.eq
     Column(Modifier.fillMaxWidth().padding(top = 14.dp)) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Column(Modifier.weight(1f).clickable(enabled = ui.eqAvailable, onClick = openEqualizer)) {
+        Row(Modifier.fillMaxWidth().clickable(enabled = ui.eqAvailable, onClick = openEqualizer),
+            verticalAlignment = Alignment.CenterVertically) {
+            Column(Modifier.weight(1f)) {
                 Text("Эквалайзер", color = SFColors.Text, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
                 Text(eqStatus(state), color = SFColors.TextDim, fontSize = 12.sp)
             }
-            MiniEqCurve(state, ui.eqCurveDb, Modifier.width(82.dp).height(34.dp).clickable(enabled = ui.eqAvailable, onClick = openEqualizer))
-            Text(if (ui.eqExpanded) "⌃" else "⌄", color = SFColors.Accent1, fontSize = 24.sp,
-                modifier = Modifier.padding(start = 12.dp).clickable { engine.setEqExpanded(!ui.eqExpanded) })
+            MiniEqCurve(state, ui.eqCurveDb, Modifier.width(82.dp).height(34.dp))
+            Text("›", color = SFColors.Accent1, fontSize = 24.sp, modifier = Modifier.padding(start = 12.dp))
         }
         if (!ui.eqAvailable) {
             Text("Эквалайзер в паре требует SoundField 1.8.0 на обоих телефонах",
                 color = SFColors.Warn, fontSize = 11.sp, lineHeight = 15.sp, modifier = Modifier.padding(top = 6.dp))
-        }
-        if (ui.eqExpanded) {
-            Spacer(Modifier.height(10.dp))
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Text("Включить", color = SFColors.TextDim, fontSize = 14.sp, modifier = Modifier.weight(1f))
-                Switch(checked = state.enabled, enabled = ui.eqAvailable, onCheckedChange = {
-                    engine.setEq(state.copy(enabled = it, bypass = false), finished = true)
-                })
-            }
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Text("Для: ${ui.eqRouteLabel}", color = SFColors.TextDim, fontSize = 12.sp, modifier = Modifier.weight(1f))
-                Text("Запас ${formatDb(ui.eqPreampDb)}", color = SFColors.Accent1, fontSize = 12.sp)
-            }
-            TextButton(enabled = ui.eqAvailable, onClick = openEqualizer, modifier = Modifier.align(Alignment.End)) {
-                Text("Настроить эквалайзер", color = SFColors.Accent1)
-            }
-            if (!ui.eqAvailable) {
-                Text("Эквалайзер в паре требует SoundField 1.8.0 на обоих телефонах",
-                    color = SFColors.Warn, fontSize = 12.sp, lineHeight = 16.sp)
-            }
         }
     }
 }
@@ -127,10 +108,8 @@ fun EqualizerScreen(ui: UiState, engine: Engine, onBack: () -> Unit) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Text("‹", color = SFColors.Accent1, fontSize = 32.sp,
                 modifier = Modifier.clickable(onClick = onBack).padding(end = 12.dp))
-            Column(Modifier.weight(1f)) {
-                Text("Эквалайзер", color = SFColors.Text, fontSize = 22.sp, fontWeight = FontWeight.Bold)
-                Text("Для: ${ui.eqRouteLabel}", color = SFColors.TextDim, fontSize = 12.sp)
-            }
+            Text("Эквалайзер", color = SFColors.Text, fontSize = 22.sp, fontWeight = FontWeight.Bold,
+                modifier = Modifier.weight(1f))
             Text(if (ui.eq.enabled) "Вкл" else "Выкл", color = if (ui.eq.enabled) SFColors.Good else SFColors.TextDim, fontSize = 13.sp)
         }
         Spacer(Modifier.height(14.dp))

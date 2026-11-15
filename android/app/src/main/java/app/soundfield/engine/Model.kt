@@ -387,7 +387,6 @@ data class UiState(
     val clockPath: String = "udp",
     val eq: EqSettings = EqSettings(),
     val eqAvailable: Boolean = false,
-    val eqExpanded: Boolean = false,
     val eqPreampDb: Float = 0f,
     val eqRouteLabel: String = "Динамик телефона",
     val eqSpectrumDb: List<Float> = emptyList(),

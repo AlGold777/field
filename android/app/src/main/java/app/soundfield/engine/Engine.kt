@@ -542,7 +542,7 @@ class Engine private constructor(private val app: Context) {
         ui { copy(myId = myId, myName = myName, remembered = record, durationMs = music.totalFrames * 1000 / SF.SAMPLE_RATE,
             freezeCount = processFreezeCount, freezeDurationMs = processFreezeTotalMs,
             title = music.title, artist = music.artist, queueExpanded = prefs.getBoolean("queueExpanded", true),
-            eq = eqSettings, eqExpanded = prefs.getBoolean("eqExpanded", false), eqPreampDb = eqConfig.preampDb.toFloat(),
+            eq = eqSettings, eqPreampDb = eqConfig.preampDb.toFloat(),
             eqRouteLabel = audio.routeLabel(), customEqPresets = readCustomEqPresets(), eqCurveDb = eqConfig.curveDb.map { it.toFloat() },
             spatial = spatialSettings, spatialAvailable = spatialAvailableNow()) }
         watchNetwork()
@@ -2431,10 +2431,6 @@ class Engine private constructor(private val app: Context) {
         }
     }
 
-    fun setEqExpanded(expanded: Boolean) = post {
-        prefs.edit().putBoolean("eqExpanded", expanded).apply()
-        ui { copy(eqExpanded = expanded) }
-    }
 
     fun setEqAnalyzer(enabled: Boolean) = post {
         eqSettings = eqSettings.copy(analyzerEnabled = enabled)
