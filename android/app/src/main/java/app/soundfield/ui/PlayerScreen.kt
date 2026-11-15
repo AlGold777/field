@@ -315,8 +315,8 @@ fun PlayerScreen(ui: UiState, engine: Engine, openCalibration: () -> Unit, openD
                 Text("R", color = SFColors.RightText, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
             }
             if (!ui.soloMode) LaunchedEffect(balance) { if (!balanceDragging) wasInCenter = abs(balance - 0.5f) < 0.015f }
-            EqualizerCompactBlock(ui, engine, openEqualizer)
             SpatialCompactBlock(ui, engine, openSpatial)
+            EqualizerCompactBlock(ui, engine, openEqualizer)
         }
 
         Row(Modifier.fillMaxWidth().padding(bottom = 12.dp).height(48.dp), horizontalArrangement = Arrangement.spacedBy(8.dp),

@@ -395,8 +395,6 @@ data class UiState(
     val eqCurveDb: List<Float> = List(256) { 0f },
     val spatial: SpatialSettings = SpatialSettings(),
     val spatialAvailable: Boolean = false,
-    /** Одна строка вместо ползунков сцены, если причину может устранить пользователь; пусто — блок скрыт. */
-    val spatialHint: String = "",
     val freezeCount: Int = 0,
     val freezeDurationMs: Long = 0,
     val showStabilitySettings: Boolean = false,

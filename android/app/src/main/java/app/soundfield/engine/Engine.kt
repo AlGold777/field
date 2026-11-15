@@ -544,7 +544,7 @@ class Engine private constructor(private val app: Context) {
             title = music.title, artist = music.artist, queueExpanded = prefs.getBoolean("queueExpanded", true),
             eq = eqSettings, eqExpanded = prefs.getBoolean("eqExpanded", false), eqPreampDb = eqConfig.preampDb.toFloat(),
             eqRouteLabel = audio.routeLabel(), customEqPresets = readCustomEqPresets(), eqCurveDb = eqConfig.curveDb.map { it.toFloat() },
-            spatial = spatialSettings, spatialAvailable = spatialAvailableNow(), spatialHint = spatialEvaluation().hint) }
+            spatial = spatialSettings, spatialAvailable = spatialAvailableNow()) }
         watchNetwork()
         log("Запуск: TCP ${tcp.localPort}, UDP ${udp.localPort}")
         // Главная страница — плеер: соло стартует сразу, без пары. Пара — надстройка (см. becomePaired / goIdle).
@@ -1519,7 +1519,7 @@ class Engine private constructor(private val app: Context) {
             mode = SourceMode.MUSIC, eq = eqSettings, eqAvailable = true, eqRouteLabel = audio.routeLabel(),
             eqPreampDb = eqConfig.preampDb.toFloat(), eqCurveDb = eqConfig.curveDb.map { it.toFloat() },
             queueTracks = queue.map { QueueTrackUi(it.id, it.title, it.artist) }, queueIndex = queueIndex,
-            spatial = spatialSettings, spatialAvailable = spatialAvailableNow(), spatialHint = spatialEvaluation().hint) }
+            spatial = spatialSettings, spatialAvailable = spatialAvailableNow()) }
         telemetry.record("EQ_ROUTE_PROFILE", mapOf("route" to audio.routeLabel(), "applied" to true))
         later(350) { if (soloMode) applySoloEqRoute(audio.routeKey(), savePrevious = true) }
         PlaybackService.refresh(app)
@@ -3735,7 +3735,7 @@ class Engine private constructor(private val app: Context) {
 
     /** Расчёт фильтра занимает сотни миллисекунд: делаем его заранее, до первого воспроизведения. */
     private fun prewarmXtc() {
-        if (!soloMode || externalOutputNow() || !deviceXtcVerified() || !deviceHasStereoSpeakers()) return
+        if (!soloMode || !soloStereoSpeakersNow() || !deviceXtcVerified()) return
         val beta = spatialProfile("solo_stereo_speaker").xtcBeta ?: return
         listOf(SpatialLevel.SOFT, SpatialLevel.STRONG).forEach {
             XtcFilterDesigner.request(Build.MODEL, deviceSpeakerSpacingM(), xtcBeta(it, beta))
@@ -3777,24 +3777,20 @@ class Engine private constructor(private val app: Context) {
         ))
     }
 
-    private fun spatialEvaluation() = SpatialAvailability.evaluate(
-        solo = soloMode, music = mode == SourceMode.MUSIC, paired = phase in setOf(Phase.PAIRED, Phase.RECONNECTING),
-        peerSupportsSpatial = "spatialV1" in negotiatedCapabilities, builtInSpeaker = audio.isBuiltInSpeakerRoute(),
-        stereoSpeakers = deviceHasStereoSpeakers(), externalOutput = externalOutputNow())
+    /** Сцена доступна всегда, когда играет музыка: в паре и в Solo, на любом выходе. Что делать с каналами, решает система вывода. */
+    private fun spatialAvailableNow(): Boolean =
+        mode == SourceMode.MUSIC && (soloMode || phase in setOf(Phase.PAIRED, Phase.RECONNECTING))
 
-    /** Звук идёт не на встроенный динамик (наушники, Bluetooth, USB): маршрут известен. */
-    private fun externalOutputNow(): Boolean = audio.routeKey().let { it != "speaker" && it != "unknown" }
+    /** Встроенные стереодинамики из таблицы моделей: только для них вынос образа за базу и XTC. Наушники, Bluetooth и моно-динамик — без них. */
+    private fun soloStereoSpeakersNow(): Boolean = audio.isBuiltInSpeakerRoute() && deviceHasStereoSpeakers()
 
-    /** Профиль Solo по маршруту: наушники без выноса за базу и без XTC, динамики — с ними. */
-    private fun soloProfileId() = if (externalOutputNow()) "solo_headphones" else "solo_stereo_speaker"
-
-    private fun spatialAvailableNow(): Boolean = spatialEvaluation().available
+    private fun soloProfileId() = if (soloStereoSpeakersNow()) "solo_stereo_speaker" else "solo_headphones"
 
     private fun refreshSpatialAvailability() {
         prewarmXtc()
-        val state = spatialEvaluation()
-        if (ui.value.spatialAvailable != state.available || ui.value.spatialHint != state.hint || ui.value.spatial != spatialSettings)
-            ui { copy(spatialAvailable = state.available, spatialHint = state.hint, spatial = spatialSettings) }
+        val available = spatialAvailableNow()
+        if (ui.value.spatialAvailable != available || ui.value.spatial != spatialSettings)
+            ui { copy(spatialAvailable = available, spatial = spatialSettings) }
     }
 
     private fun spatialProfile(id: String): SpatialProfile = spatialProfiles[id] ?: SpatialProfiles.fallback(id)
@@ -3805,13 +3801,12 @@ class Engine private constructor(private val app: Context) {
 
     private fun spatialEnabledFor(input: AudioSource): Boolean = input.mode == SourceMode.MUSIC &&
         spatialSettings.enabled && spatialSettings.level != SpatialLevel.OFF && spatialAvailableNow() &&
-        !spatialBypassLocked && spatialBypassedInput !== input &&
-        (!soloMode || externalOutputNow() || deviceHasStereoSpeakers())
+        !spatialBypassLocked && spatialBypassedInput !== input
 
     private fun spatialSignature(input: AudioSource): String {
         val profileId = if (soloMode) soloProfileId() else spatialSettings.profile
         return "${System.identityHashCode(input)}:$profileId:${spatialSettings.toJson()}:$spatialAbFixedCompensationDb:" +
-            "xtc=${soloMode && deviceXtcVerified() && !externalOutputNow()}"
+            "xtc=${soloMode && soloStereoSpeakersNow() && deviceXtcVerified()}"
     }
 
     /** Источник для рендера Server: spatial (если включён) под сцепленным предлимитером −1,5 dBTP (A1.4); служебные сигналы не ограничиваются. */
@@ -3846,7 +3841,7 @@ class Engine private constructor(private val app: Context) {
         val old = activeSpatialSource
         val profileId = if (soloMode) soloProfileId() else spatialSettings.profile
         val profileData = spatialProfile(profileId)
-        val xtcDesign = if (soloMode && deviceXtcVerified() && !externalOutputNow() && spatialSettings.enabled && profileData.xtcBeta != null) {
+        val xtcDesign = if (soloMode && soloStereoSpeakersNow() && deviceXtcVerified() && spatialSettings.enabled && profileData.xtcBeta != null) {
             XtcFilterDesigner.request(Build.MODEL, deviceSpeakerSpacingM(), xtcBeta(spatialSettings.level, profileData.xtcBeta))
         } else null
         xtcDesign?.thenAccept { recordXtcDesign(it, "verified_playback") }
@@ -3977,7 +3972,7 @@ class Engine private constructor(private val app: Context) {
                 "dspVersion" to DSP_VERSION, "profilesVersion" to SpatialProfiles.VERSION,
                 "reason" to reason, "fFrame" to f))
         }
-        ui { copy(spatial = clean, spatialAvailable = spatialAvailableNow(), spatialHint = spatialEvaluation().hint) }
+        ui { copy(spatial = clean, spatialAvailable = spatialAvailableNow()) }
         telemetry.record("SPATIAL_REPROCESS", mapOf("reason" to reason, "fFrame" to f,
             "delayMs" to if (isPlaying) (f - posFrame()).coerceAtLeast(0) * 1000.0 / SF.SAMPLE_RATE else 0,
             "tcpResendFrames" to if (currentAudioPath == "tcp" && isPlaying) (source.totalFrames - f).coerceAtLeast(0) else 0))
@@ -4265,7 +4260,7 @@ class Engine private constructor(private val app: Context) {
             eq = if (role == Role.SERVER) eqSettingsForWire() else incomingEq,
             eqAvailable = eqAvailableInPair(),
             spatial = if (role == Role.SERVER) spatialSettingsForWire() else incomingSpatial,
-            spatialAvailable = spatialAvailableNow(), spatialHint = spatialEvaluation().hint,
+            spatialAvailable = spatialAvailableNow(),
             eqPreampDb = o.optDouble("eqPreampDb", 0.0).toFloat(),
             eqRouteLabel = audio.routeLabel(), eqCurveDb = activeEqConfig().curveDb.map { it.toFloat() },
             gainLaw = if (role == Role.POINT) if (o.has("pointGain")) 2 else 1 else o.optInt("peerGainLaw", 1)) }
