@@ -102,10 +102,14 @@ class SpatialSource(
     /** Ask the processor to make this exclusive frame position available. Safe from consumer threads. */
     override fun requestThrough(frameExclusive: Long) {
         val target = frameExclusive.coerceIn(startAtFrame, inner.totalFrames)
+        // sample() зовёт это на каждый отвод интерполятора из аудиопотока: вниз по цепочке — только когда голова ушла вперёд.
+        var advanced = false
         while (true) {
             val previous = requestedHead.get()
-            if (target <= previous || requestedHead.compareAndSet(previous, target)) break
+            if (target <= previous) break
+            if (requestedHead.compareAndSet(previous, target)) { advanced = true; break }
         }
+        if (!advanced) return
         val inputTarget = (target + if (xtcDesign != null) XTC_INPUT_AHEAD_FRAMES else 0L)
             .coerceAtMost(inner.totalFrames)
         (inner as? PrefetchableAudioSource)?.requestThrough(inputTarget)

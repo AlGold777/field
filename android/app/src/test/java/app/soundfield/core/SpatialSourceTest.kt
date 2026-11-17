@@ -31,6 +31,29 @@ class SpatialSourceTest {
         }
     }
 
+    @Test fun repeatedRequestsDoNotWalkTheSourceChain() {
+        val inner = CountingPrefetchSource(SF.SAMPLE_RATE * 2L)
+        PreLimitedSource(inner).use { limited ->
+            limited.requestThrough(SF.SAMPLE_RATE.toLong() * 2)
+            val afterFirst = inner.requests.get()
+            repeat(10_000) { limited.requestThrough(SF.SAMPLE_RATE.toLong()) }
+            assertEquals(afterFirst, inner.requests.get())
+        }
+    }
+
+    private class CountingPrefetchSource(frames: Long) : AudioSource, PrefetchableAudioSource {
+        private val base = ProceduralSource(frames)
+        val requests = java.util.concurrent.atomic.AtomicLong()
+        override val mode get() = base.mode
+        override val title get() = base.title
+        override val artist get() = base.artist
+        override val totalFrames get() = base.totalFrames
+        override val readyFrames get() = base.readyFrames
+        override val complete get() = base.complete
+        override fun sample(frame: Long, ch: Int) = base.sample(frame, ch)
+        override fun requestThrough(frameExclusive: Long) { requests.incrementAndGet() }
+    }
+
     @Test fun progressiveInputNeverPublishesFramesAheadOfDecoder() {
         val input = ProgressiveSource(SF.SAMPLE_RATE * 2L)
         SpatialSource(input).use { spatial ->

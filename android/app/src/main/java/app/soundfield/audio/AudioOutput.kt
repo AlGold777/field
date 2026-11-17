@@ -62,6 +62,8 @@ class AudioOutput(private val ctx: Context) {
     private var retiring: Thread? = null
     private companion object {
         const val MAX_RECOVERY_ATTEMPTS = 5
+        /** Запас буфера AudioTrack: 64 мс переживают кратковременные задержки потока (раньше 42 мс). Задержка учитывается по timestamp. */
+        const val OUTPUT_BUFFER_FRAMES = 3072
         /** Внешние выходы в порядке, в котором Android выбирает их для медиа (до API 33 точного запроса нет). */
         val EXTERNAL_OUTPUT_TYPES = intArrayOf(
             AudioDeviceInfo.TYPE_BLUETOOTH_A2DP, AudioDeviceInfo.TYPE_BLE_HEADSET, AudioDeviceInfo.TYPE_BLE_SPEAKER,
@@ -286,7 +288,7 @@ class AudioOutput(private val ctx: Context) {
             .setAudioFormat(AudioFormat.Builder()
                 .setSampleRate(sr).setEncoding(AudioFormat.ENCODING_PCM_FLOAT)
                 .setChannelMask(channelMask).build())
-            .setBufferSizeInBytes(maxOf(minBuf, 2048 * channels * 4))
+            .setBufferSizeInBytes(maxOf(minBuf, OUTPUT_BUFFER_FRAMES * channels * 4))
             .setTransferMode(AudioTrack.MODE_STREAM)
             .setPerformanceMode(AudioTrack.PERFORMANCE_MODE_LOW_LATENCY)
             .build()
@@ -337,7 +339,9 @@ class AudioOutput(private val ctx: Context) {
                         timing.timestamp(ts.framePosition, ts.nanoTime)
                         timestampFrames.set(ts.framePosition)
                     }
-                    else timing.invalidateTimestamp()
+                    // Единичный отказ getTimestamp не сбрасывает метку: запасная оценка (+20 мс) даёт скачок позиции.
+                    // Устаревшая метка отбрасывается сама по возрасту (AudioPlayoutClock.presentation, 500 мс).
+                    else if (timing.timestampOk.not()) timing.invalidateTimestamp()
                 }
                 val head = t.playbackHeadPosition.toLong() and 0xFFFFFFFFL
                 if (head != lastHead) { lastHead = head; lastProgress = now }

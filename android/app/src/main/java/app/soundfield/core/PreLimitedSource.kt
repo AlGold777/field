@@ -81,11 +81,14 @@ class PreLimitedSource(
 
     override fun requestThrough(frameExclusive: Long) {
         val target = frameExclusive.coerceIn(startAtFrame, inner.totalFrames)
+        // sample() зовёт это на каждый отвод интерполятора из аудиопотока: вниз по цепочке — только когда голова ушла вперёд.
+        var advanced = false
         while (true) {
             val previous = requestedHead.get()
-            if (target <= previous || requestedHead.compareAndSet(previous, target)) break
+            if (target <= previous) break
+            if (requestedHead.compareAndSet(previous, target)) { advanced = true; break }
         }
-        (inner as? PrefetchableAudioSource)?.requestThrough((target + latency + CHUNK_FRAMES).coerceAtMost(inner.totalFrames))
+        if (advanced) (inner as? PrefetchableAudioSource)?.requestThrough((target + latency + CHUNK_FRAMES).coerceAtMost(inner.totalFrames))
     }
 
     override fun sample(frame: Long, ch: Int): Float {
