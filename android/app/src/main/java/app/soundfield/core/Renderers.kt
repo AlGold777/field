@@ -83,6 +83,7 @@ class ServerRenderer(
         }
         corrector.plan(tl.frameAt(presentLocalNs) - WindowedSinc.GROUP_DELAY_FRAMES + limiterLatencyFrames, n)
         val src = st.source
+        requestAudioAhead(src, tl, n)
         var sourceMissing = 0L
         val readyFrames = src.readyFrames
         for (i in 0 until n) {
@@ -91,9 +92,9 @@ class ServerRenderer(
             val g = tl.envelope(f)
             if (g == 0f) out[i] = 0f else {
                 val sample = if (st.channel == Ch.BOTH) {
-                    (WindowedSinc.interpolate(position) { src.sample(it, Ch.L) } +
-                        WindowedSinc.interpolate(position) { src.sample(it, Ch.R) }) * 0.5f
-                } else WindowedSinc.interpolate(position) { src.sample(it, st.channel) }
+                    (WindowedSinc.interpolate(position) { src.readPrepared(it, Ch.L) } +
+                        WindowedSinc.interpolate(position) { src.readPrepared(it, Ch.R) }) * 0.5f
+                } else WindowedSinc.interpolate(position) { src.readPrepared(it, st.channel) }
                 if (sample.isNaN()) {
                     out[i] = 0f
                 } else out[i] = sample * g
@@ -124,6 +125,7 @@ class ServerRenderer(
         }
         corrector.plan(tl.frameAt(presentLocalNs) - WindowedSinc.GROUP_DELAY_FRAMES + limiterLatencyFrames, n)
         val src = st.source
+        requestAudioAhead(src, tl, n)
         var sourceMissing = 0L
         val readyFrames = src.readyFrames
         for (i in 0 until n) {
@@ -135,8 +137,8 @@ class ServerRenderer(
             } else {
                 val leftChannel = if (st.channel == Ch.BOTH) Ch.L else st.channel
                 val rightChannel = if (st.channel == Ch.BOTH) Ch.R else st.channel
-                val left = WindowedSinc.interpolate(position) { src.sample(it, leftChannel) }
-                val right = WindowedSinc.interpolate(position) { src.sample(it, rightChannel) }
+                val left = WindowedSinc.interpolate(position) { src.readPrepared(it, leftChannel) }
+                val right = WindowedSinc.interpolate(position) { src.readPrepared(it, rightChannel) }
                 if (left.isNaN() || right.isNaN()) {
                     interleaved[i * 2] = 0f; interleaved[i * 2 + 1] = 0f
                 } else {
@@ -155,6 +157,15 @@ class ServerRenderer(
         } else inSourceUnderrun = false
         positionFrame = corrector.frame(n - 1, n)
         finishStereo(interleaved, n, st.gain, st.equalizer, playing = true)
+    }
+
+    private fun requestAudioAhead(source: AudioSource, timeline: Timeline, frames: Int) {
+        val worker = source as? PrefetchableAudioSource ?: return
+        if (frames <= 0) return
+        val blockEnd = maxOf(timeline.anchorFrame, corrector.position(frames - 1).toLong()) + WindowedSinc.HALF + 1
+        val end = if (timeline.stopFrame >= 0) minOf(source.totalFrames, timeline.stopFrame + WindowedSinc.HALF)
+            else source.totalFrames
+        worker.requestThrough(minOf(blockEnd + SF.SAMPLE_RATE / 2, end))
     }
 
     private fun finishStereo(samples: FloatArray, n: Int, gain: Float, config: EqConfig, playing: Boolean) {
@@ -229,6 +240,7 @@ class PointRenderer(
         }
         val serverNs = clock.toServer(presentLocalNs) - p.trimNs
         corrector.plan(tl.frameAt(serverNs) - WindowedSinc.GROUP_DELAY_FRAMES + limiterLatencyFrames, n)
+        val useTcp = audioPath() == "tcp"
         var missing = 0
         for (i in 0 until n) {
             val position = corrector.position(i)
@@ -236,7 +248,8 @@ class PointRenderer(
             val g = tl.envelope(f)
             if (g == 0f) { out[i] = 0f; continue }
             val s = WindowedSinc.interpolate(position) { frame ->
-                if (audioPath() == "tcp") tcpAudio.read(tl.epoch, frame) else rx.read(frame)
+                if (frame < tl.anchorFrame || (p.totalFrames > 0 && frame >= p.totalFrames)) 0f
+                else if (useTcp) tcpAudio.read(tl.epoch, frame) else rx.read(frame)
             }
             if (s.isNaN()) {
                 out[i] = 0f

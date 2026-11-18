@@ -51,6 +51,9 @@ class AudioOutput(private val ctx: Context) {
     private val outputSignal = AtomicSignalMeter()
     private val timestampFrames = AtomicLong()
     private val timestampGeneration = AtomicLong()
+    private val hardwareUnderrunDelta = AtomicLong()
+    private val timestampTransitions = AtomicLong()
+    private val maxRenderNs = AtomicLong()
     private val recoveryCount = AtomicLong()
     private val recoveryError = AtomicReference<Throwable?>(null)
     private var lastMetricsAtMs = 0L
@@ -130,6 +133,9 @@ class AudioOutput(private val ctx: Context) {
         val audioFocus: Boolean,
         val recoveryCount: Long,
         val recoveryError: Throwable?,
+        val hardwareUnderrunDelta: Long,
+        val timestampTransitions: Long,
+        val maxRenderNs: Long,
     )
 
     /** Called by heartbeat only. Audio processing updates the raw signal and timestamp counters atomically. */
@@ -151,6 +157,7 @@ class AudioOutput(private val ctx: Context) {
             if (Build.VERSION.SDK_INT >= 28) am.getStreamMinVolume(volumeStream) else 0,
             am.getStreamMaxVolume(volumeStream), am.isStreamMute(volumeStream),
             route(device), audioFocus, recoveryCount.getAndSet(0), recoveryError.getAndSet(null),
+            hardwareUnderrunDelta.getAndSet(0), timestampTransitions.getAndSet(0), maxRenderNs.getAndSet(0),
         )
     }
 
@@ -308,6 +315,8 @@ class AudioOutput(private val ctx: Context) {
             var lastProgress = System.nanoTime()
             var pausedAtMs = 0L
             var pausedByEngine = false
+            var lastUnderruns = 0L
+            underruns = 0L
             t.play()
             while (active()) {
                 val now = System.nanoTime()
@@ -347,9 +356,11 @@ class AudioOutput(private val ctx: Context) {
                 if (head != lastHead) { lastHead = head; lastProgress = now }
                 check(now - lastProgress < 2_000_000_000L) { "AudioTrack playback stalled" }
                 val present = timing.presentation(now, head)
+                if (playbackActive && timestampOk != timing.timestampOk) timestampTransitions.incrementAndGet()
                 timestampOk = timing.timestampOk
                 latencyMs = (present - now) / 1e6
                 val src = source
+                val renderStart = System.nanoTime()
                 if (src == null) java.util.Arrays.fill(buf, 0f)
                 else if (channels == 1) src.render(buf, n, present)
                 else if (src is StereoRenderSource) src.renderStereo(buf, n, present)
@@ -357,6 +368,7 @@ class AudioOutput(private val ctx: Context) {
                     src.render(mono, n, present)
                     for (i in 0 until n) { buf[i * 2] = mono[i]; buf[i * 2 + 1] = mono[i] }
                 }
+                if (playbackActive) maxRenderNs.accumulateAndGet(System.nanoTime() - renderStart, ::maxOf)
                 var off = 0
                 val writeCount = n * channels
                 var lastWrite = now
@@ -375,7 +387,10 @@ class AudioOutput(private val ctx: Context) {
                         failedAttempts = 0
                     }
                 }
-                underruns = t.underrunCount.toLong()
+                val totalUnderruns = t.underrunCount.toLong()
+                if (playbackActive && totalUnderruns > lastUnderruns) hardwareUnderrunDelta.addAndGet(totalUnderruns - lastUnderruns)
+                lastUnderruns = totalUnderruns
+                underruns = totalUnderruns
             }
         } finally {
             timestampOk = false

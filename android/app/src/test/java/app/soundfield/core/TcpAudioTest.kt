@@ -10,6 +10,9 @@ import java.io.DataInputStream
 import java.io.DataOutputStream
 
 class TcpAudioTest {
+    private fun udp(epoch: Int, seq: Int, start: Long, count: Int): UdpMsg.Audio =
+        UdpMsg.Audio(epoch, epoch, seq, start, 0L, 0L, 0, IntArray(count), count)
+
     @Test fun wireRoundTripsHelloAndPcmFrames() {
         val bytes = ByteArrayOutputStream()
         val out = DataOutputStream(bytes)
@@ -75,5 +78,40 @@ class TcpAudioTest {
     @Test fun startPolicyRequiresHalfSecondOfContiguousAudio() {
         assertFalse(TcpAudioStartPolicy.ready(23_999, 24_000))
         assertTrue(TcpAudioStartPolicy.ready(24_000, 24_000))
+    }
+
+    @Test fun distantUdpPacketDoesNotIncreaseContiguousFramesAcrossGap() {
+        val receiver = PointReceiver(ClockSync(), capacityPow2 = 8)
+        receiver.onTimeline(Timeline(1, true, 0L, 0L))
+        // Deliver out of order, including a far packet and a nearer packet after a gap.
+        receiver.onAudio(udp(epoch = 1, seq = 2, start = 100, count = 4), 0L)
+        receiver.onAudio(udp(epoch = 1, seq = 1, start = 4, count = 2), 0L)
+        receiver.onAudio(udp(epoch = 1, seq = 0, start = 0, count = 2), 0L)
+
+        assertEquals(2, receiver.contiguousFramesFrom(startFrame = 0, limit = 128))
+        assertEquals(4, receiver.contiguousFramesFrom(startFrame = 100, limit = 128))
+    }
+
+    @Test fun epochResetDropsOldUdpFramesAndRejectsLateOldEpochPacket() {
+        val receiver = PointReceiver(ClockSync(), capacityPow2 = 8)
+        receiver.onTimeline(Timeline(4, true, 0L, 0L))
+        receiver.onAudio(udp(epoch = 4, seq = 0, start = 0, count = 8), 0L)
+        assertEquals(8, receiver.contiguousFramesFrom(startFrame = 0, limit = 16))
+
+        receiver.onTimeline(Timeline(5, true, 40L, 1_000_000L))
+        assertEquals(0, receiver.contiguousFramesFrom(startFrame = 40, limit = 16))
+        receiver.onAudio(udp(epoch = 4, seq = 1, start = 40, count = 8), 0L)
+        assertEquals(0, receiver.contiguousFramesFrom(startFrame = 40, limit = 16))
+        receiver.onAudio(udp(epoch = 5, seq = 0, start = 40, count = 3), 0L)
+        assertEquals(3, receiver.contiguousFramesFrom(startFrame = 40, limit = 16))
+    }
+
+    @Test fun contiguousUdpCountDoesNotOverflowAcrossLongFrameBoundary() {
+        val receiver = PointReceiver(ClockSync(), capacityPow2 = 4)
+        receiver.onTimeline(Timeline(8, true, 0L, 0L))
+        receiver.onAudio(udp(epoch = 8, seq = 0, start = Long.MAX_VALUE, count = 1), 0L)
+
+        assertEquals(0, receiver.contiguousFramesFrom(startFrame = 0, limit = 8))
+        assertEquals(1, receiver.contiguousFramesFrom(startFrame = Long.MAX_VALUE, limit = 8))
     }
 }

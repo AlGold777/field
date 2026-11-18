@@ -42,6 +42,7 @@ import app.soundfield.dsp.DeviceProfiles
 import app.soundfield.dsp.ProfileTable
 import app.soundfield.dsp.SpatialProfile
 import app.soundfield.dsp.SpatialProfiles
+import app.soundfield.dsp.WindowedSinc
 import app.soundfield.dsp.XtcFilterDesigner
 import app.soundfield.dsp.XtcFilterSet
 import app.soundfield.audio.AudioOutput
@@ -121,7 +122,7 @@ class Engine private constructor(private val app: Context) {
         Exception("All ${outcomes.size} connection candidates failed", cause)
     private data class AudioPreload(
         val epoch: Int, val startFrame: Long, val source: AudioSource, val channel: Int,
-        val trackId: String, val startedAtMs: Long,
+        val trackId: String, val startedAtMs: Long, val minimumFrames: Int,
     )
 
     companion object {
@@ -136,7 +137,10 @@ class Engine private constructor(private val app: Context) {
         private const val TRANSFER_CHUNK_BYTES = 48 * 1024
         private const val TELEMETRY_MAX_BYTES = 8L * 1024 * 1024
         private const val CONNECT_STAGGER_MS = 200L
-        private const val TCP_AUDIO_TARGET_FRAMES = 30L * SF.SAMPLE_RATE
+        // Server and the TCP sender share a 20 s PCM ring. Keep 5 s for the local reader,
+        // DSP warm-up and short stalls even if the Point can buffer more.
+        private const val TCP_AUDIO_TARGET_FRAMES = 15L * SF.SAMPLE_RATE
+        private const val TCP_AUDIO_PRELOAD_FRAMES = SF.SAMPLE_RATE.toLong()
         private const val TCP_AUDIO_MIN_START_FRAMES = SF.SAMPLE_RATE / 2
         private const val TCP_AUDIO_MAX_WAIT_MS = 2_000L
         private const val MAX_TRANSFER_FILE_BYTES = 512L * 1024 * 1024
@@ -264,6 +268,7 @@ class Engine private constructor(private val app: Context) {
     private val tcpAudioBuffer = TcpAudioBuffer()
     private val pointAudioConnecting = AtomicBoolean(false)
     @Volatile private var currentAudioPath = "udp"
+    @Volatile private var pointUdpFallbackPending = false
     @Volatile private var currentClockPath = "udp"
     @Volatile private var serverTcpAudioSocket: Socket? = null
     @Volatile private var pointTcpAudioSocket: Socket? = null
@@ -272,6 +277,7 @@ class Engine private constructor(private val app: Context) {
     private var tcpAudioPreloadTask: ScheduledFuture<*>? = null
     @Volatile private var pointAudioPreloadEpoch = Int.MIN_VALUE
     @Volatile private var pointAudioPreloadFrame = 0L
+    @Volatile private var pointAudioPreloadMinimum = TCP_AUDIO_MIN_START_FRAMES
     private val pointAudioReadyEpoch = AtomicLong(Int.MIN_VALUE.toLong())
     private val tcpAudioFramesSent = AtomicLong()
     private val tcpAudioFramesReceived = AtomicLong()
@@ -442,7 +448,10 @@ class Engine private constructor(private val app: Context) {
     private val cacheSeq = IntArray(1024) { -1 }
     private val cacheEpoch = IntArray(1024)
     private val cacheStart = LongArray(1024)
-    private val cacheCount = IntArray(1024)
+    private val cacheSamples = arrayOfNulls<IntArray>(1024)
+    private val udpReadBuffer = FloatArray(SF.PACKET_FRAMES)
+    private val udpSourceSkipped = AtomicLong()
+    private val tcpSourceSkipped = AtomicLong()
 
     // ------------------------------------------------------------------ Point
     private val clock = ClockSync()
@@ -1000,15 +1009,17 @@ class Engine private constructor(private val app: Context) {
         var trackOnWire = ""
         var cursor = 0L
         var observedSpatialReprocess = spatialReprocessToken
+        val readBuffer = FloatArray(TcpAudioWire.CHUNK_FRAMES)
         try {
             val out = DataOutputStream(BufferedOutputStream(socket.getOutputStream(), 64 * 1024))
             while (!socket.isClosed && serverTcpAudioSocket === socket && phase == Phase.PAIRED) {
                 val preload = tcpAudioPreload
-                val timeline = serverPlay.timeline
+                val playingState = serverPlay
+                val timeline = playingState.timeline
                 val isPreload = preload != null
                 val activeEpoch = preload?.epoch ?: timeline.epoch
-                val audioSource = preload?.source ?: serverPlay.source
-                val channel = preload?.channel ?: pointChannel
+                val audioSource = preload?.source ?: playingState.source
+                val channel = preload?.channel ?: Ch.other(playingState.channel)
                 val trackId = preload?.trackId ?: queue.getOrNull(queueIndex)?.id.orEmpty()
                 val start = preload?.startFrame ?: timeline.anchorFrame
                 if (activeEpoch != epochOnWire || (isPreload &&
@@ -1021,7 +1032,7 @@ class Engine private constructor(private val app: Context) {
                 }
                 val currentReprocess = spatialReprocessToken
                 if (!isPreload && currentReprocess != observedSpatialReprocess) {
-                    cursor = spatialReprocessFrame.coerceIn(start, audioSource.totalFrames)
+                    cursor = minOf(cursor, spatialReprocessFrame.coerceIn(start, audioSource.totalFrames))
                     observedSpatialReprocess = currentReprocess
                 }
                 if (!isPreload && !timeline.playing) {
@@ -1031,7 +1042,9 @@ class Engine private constructor(private val app: Context) {
                 val now = System.nanoTime()
                 val playback = if (timeline.playing && timeline.epoch == activeEpoch)
                     timeline.positionFrame(now).toLong().coerceAtLeast(start) else start
-                val target = minOf(audioSource.totalFrames, (if (isPreload) start else playback) + TCP_AUDIO_TARGET_FRAMES)
+                if (!isPreload) cursor = advanceAudioCursor(audioSource, timeline, now, cursor, tcpSourceSkipped)
+                val target = minOf(audioSource.totalFrames, if (isPreload) start + TCP_AUDIO_PRELOAD_FRAMES
+                    else playback + TCP_AUDIO_TARGET_FRAMES)
                 (audioSource as? PrefetchableAudioSource)?.requestThrough(target)
                 val ready = audioSource.readyFrames
                 val limit = minOf(target, ready, audioSource.totalFrames)
@@ -1040,11 +1053,11 @@ class Engine private constructor(private val app: Context) {
                     continue
                 }
                 val count = minOf(TcpAudioWire.CHUNK_FRAMES.toLong(), limit - cursor).toInt()
-                if (count <= 0) { Thread.sleep(20); continue }
-                val samples = quantizeChannel(audioSource, cursor, channel, count)
+                val samples = quantizeChannel(audioSource, cursor, channel, count, readBuffer)
+                if (samples.isEmpty()) { Thread.sleep(5); continue }
                 TcpAudioWire.writeChunk(out, TcpAudioChunk(activeEpoch, trackId, cursor, samples))
-                cursor += count
-                tcpAudioFramesSent.addAndGet(count.toLong())
+                cursor += samples.size
+                tcpAudioFramesSent.addAndGet(samples.size.toLong())
                 // Fill at up to 4× real time, leaving capacity for control and other network traffic.
                 Thread.sleep(25)
             }
@@ -1101,7 +1114,7 @@ class Engine private constructor(private val app: Context) {
                 val input = DataInputStream(BufferedInputStream(socket.getInputStream(), 64 * 1024))
                 while (phase == Phase.PAIRED && pointTcpAudioSocket === socket && !socket.isClosed) {
                     val chunk = TcpAudioWire.readChunk(input)
-                    tcpAudioBuffer.write(chunk)
+                    if (!tcpAudioBuffer.write(chunk)) continue
                     tcpAudioFramesReceived.addAndGet(chunk.samples.size.toLong())
                     tcpAudioFramesSinceMetric.addAndGet(chunk.samples.size.toLong())
                     val nowMs = SystemClock.elapsedRealtime()
@@ -1122,8 +1135,10 @@ class Engine private constructor(private val app: Context) {
                     try { socket.close() } catch (_: Exception) {}
                 }
                 if (!existingSocket && phase == Phase.PAIRED && role == Role.POINT) {
-                    if (currentAudioPath == "tcp")
+                    if (currentAudioPath == "tcp") {
+                        pointUdpFallbackPending = true
                         link?.send(JSONObject().put("t", "audio-path").put("path", "udp").put("reason", "tcp_audio_disconnected"))
+                    }
                     later(3_000) { if (phase == Phase.PAIRED && role == Role.POINT) startPointTcpAudioConnection(pointAudioPort) }
                 }
                 pointAudioConnecting.set(false)
@@ -1133,8 +1148,9 @@ class Engine private constructor(private val app: Context) {
 
     private fun maybeSendAudioReady(epoch: Int) {
         if (pointAudioPreloadEpoch != epoch || pointAudioReadyEpoch.get() == epoch.toLong()) return
-        val contiguous = tcpAudioBuffer.contiguousFrames(epoch, pointAudioPreloadFrame, TCP_AUDIO_MIN_START_FRAMES)
-        if (!TcpAudioStartPolicy.ready(contiguous, TCP_AUDIO_MIN_START_FRAMES)) return
+        val minimum = pointAudioPreloadMinimum
+        val contiguous = tcpAudioBuffer.contiguousFrames(epoch, pointAudioPreloadFrame, minimum)
+        if (!TcpAudioStartPolicy.ready(contiguous, minimum)) return
         if (!pointAudioReadyEpoch.compareAndSet(Int.MIN_VALUE.toLong(), epoch.toLong())) return
         telemetry.record("START_WAIT", mapOf("epoch" to epoch, "ready" to true, "bufferedFrames" to contiguous,
             "audioPath" to "tcp", "state" to "ready"))
@@ -1142,12 +1158,44 @@ class Engine private constructor(private val app: Context) {
     }
 
     private fun maybeActivateTcpAudio(epoch: Int) {
-        if (currentAudioPath == "tcp" || rx.timeline.epoch != epoch || !rx.timeline.playing) return
-        val position = if (clock.ready) rx.timeline.positionFrame(clock.toServer(System.nanoTime()) - pointParams.trimNs)
-            .toLong().coerceAtLeast(0) else rx.timeline.anchorFrame
-        val readyFrames = tcpAudioBuffer.contiguousFrames(epoch, position, TCP_AUDIO_MIN_START_FRAMES)
-        if (TcpAudioStartPolicy.ready(readyFrames, TCP_AUDIO_MIN_START_FRAMES))
+        val tl = rx.timeline
+        if (currentAudioPath == "tcp" || pointTcpAudioSocket == null || tl.epoch != epoch || !tl.playing) return
+        val position = pointBufferStart(tl)
+        val minimum = pointBufferMinimum(position, TCP_AUDIO_MIN_START_FRAMES)
+        if (TcpAudioStartPolicy.ready(tcpAudioBuffer.contiguousFrames(epoch, position, minimum), minimum))
             setAudioPath("tcp", "tcp_audio_buffered")
+    }
+
+    private fun pointBufferStart(timeline: Timeline): Long {
+        if (!clock.ready) return timeline.anchorFrame
+        val outputNs = System.nanoTime() + (audio.latencyMs.coerceAtLeast(0.0) * 1e6).toLong()
+        val predicted = timeline.positionFrame(clock.toServer(outputNs) - pointParams.trimNs)
+        val rendered = rx.lastRenderedFrame
+        val frame = if (rendered in maxOf(timeline.anchorFrame, predicted - SF.SAMPLE_RATE / 20)..predicted) rendered else predicted
+        return maxOf(timeline.anchorFrame, frame - 2 * WindowedSinc.HALF)
+    }
+
+    private fun pointBufferMinimum(start: Long, target: Int): Int {
+        val total = pointParams.totalFrames
+        return if (total <= 0) target else (total - start).coerceIn(0L, target.toLong()).toInt()
+    }
+
+    private fun maybeActivateUdpAudio(epoch: Int) {
+        val tl = rx.timeline
+        if (!pointUdpFallbackPending || currentAudioPath != "tcp" || tl.epoch != epoch || !tl.playing) return
+        val start = pointBufferStart(tl)
+        val minimum = pointBufferMinimum(start, SF.SAMPLE_RATE / 10)
+        if (TcpAudioStartPolicy.ready(rx.contiguousFramesFrom(start, minimum, epoch), minimum)) {
+            pointUdpFallbackPending = false
+            setAudioPath("udp", "udp_audio_buffered")
+        }
+    }
+
+    private fun requestUdpFallback(reason: String) {
+        if (currentAudioPath != "tcp" || pointUdpFallbackPending) return
+        val activeLink = link ?: return
+        pointUdpFallbackPending = true
+        activeLink.send(JSONObject().put("t", "audio-path").put("path", "udp").put("reason", reason))
     }
 
     private fun setAudioPath(path: String, reason: String, notifyPeer: Boolean = true) {
@@ -3528,6 +3576,7 @@ class Engine private constructor(private val app: Context) {
         closeServerTcpAudio("pair_disconnected")
         pointTcpAudioSocket?.let { try { it.close() } catch (_: Exception) {} }
         pointTcpAudioSocket = null
+        pointUdpFallbackPending = false
         tcpAudioBuffer.clear(); cancelTcpAudioPreload()
         setAudioPath("udp", "pair_disconnected", notifyPeer = false)
         setClockPath("udp", "pair_disconnected")
@@ -3595,10 +3644,11 @@ class Engine private constructor(private val app: Context) {
             }
             "audio-preload" -> if (role == Role.POINT && "tcpAudio" in negotiatedCapabilities) {
                 val preloadEpoch = o.optInt("epoch", Int.MIN_VALUE)
-                pointAudioPreloadEpoch = preloadEpoch
                 pointAudioPreloadFrame = o.optString("startFrame", "0").toLongOrNull() ?: 0L
+                pointAudioPreloadMinimum = o.optInt("minFrames", TCP_AUDIO_MIN_START_FRAMES).coerceIn(1, TCP_AUDIO_MIN_START_FRAMES)
                 pointAudioReadyEpoch.set(Int.MIN_VALUE.toLong())
                 tcpAudioBuffer.prepare(preloadEpoch)
+                pointAudioPreloadEpoch = preloadEpoch
                 telemetry.record("START_WAIT", mapOf("epoch" to preloadEpoch, "startFrame" to pointAudioPreloadFrame,
                     "targetBufferFrames" to TCP_AUDIO_MIN_START_FRAMES, "audioPath" to "tcp", "state" to "waiting"))
                 maybeSendAudioReady(preloadEpoch)
@@ -3609,8 +3659,12 @@ class Engine private constructor(private val app: Context) {
                 val path = o.optString("path", "udp")
                 val reason = o.optString("reason", "peer_update")
                 if (role == Role.POINT && path == "udp" && currentAudioPath == "tcp") {
+                    pointUdpFallbackPending = true
                     telemetry.record("AUDIO_PATH_FALLBACK_WAIT", mapOf("path" to "udp", "reason" to reason,
                         "tcpBufferSeconds" to tcpAudioBuffer.bufferedSeconds(rx.timeline.epoch, positionFrameSnapshot())))
+                    maybeActivateUdpAudio(rx.timeline.epoch)
+                } else if (role == Role.POINT && path == "tcp") {
+                    maybeActivateTcpAudio(rx.timeline.epoch)
                 } else setAudioPath(path, reason, notifyPeer = role == Role.POINT)
             }
             "clock-ping" -> if (role == Role.SERVER && "tcpClock" in negotiatedCapabilities) {
@@ -3657,7 +3711,10 @@ class Engine private constructor(private val app: Context) {
                     o.optString("stopFrame", "-1").toLongOrNull() ?: -1L)
                 rx.onTimeline(timeline)
                 audio.playbackActive = timeline.playing
-                if (currentAudioPath == "tcp") tcpAudioBuffer.activate(timeline.epoch)
+                if (currentAudioPath == "tcp" || pointAudioReadyEpoch.get() == timeline.epoch.toLong()) {
+                    tcpAudioBuffer.activate(timeline.epoch)
+                    if (pointAudioReadyEpoch.get() == timeline.epoch.toLong()) maybeActivateTcpAudio(timeline.epoch)
+                }
             }
             "sdiag" -> if (role == Role.POINT) ui { copy(serverDiag = Diag.fromJson(o)) }
             "calib" -> if (role == Role.POINT) applyCalib(o)
@@ -3806,25 +3863,32 @@ class Engine private constructor(private val app: Context) {
     }
 
     /** Источник для рендера Server: spatial (если включён) под сцепленным предлимитером −1,5 dBTP (A1.4); служебные сигналы не ограничиваются. */
-    private fun renderSourceFor(input: AudioSource, startAtFrame: Long = 0L): AudioSource =
-        limitedFor(spatialSourceFor(input, startAtFrame), startAtFrame)
+    private fun renderSourceFor(input: AudioSource, startAtFrame: Long = 0L, fresh: Boolean = false): AudioSource =
+        limitedFor(spatialSourceFor(input, startAtFrame, fresh), startAtFrame, fresh)
+
+    private fun renderSourceForEpoch(frame: Long): AudioSource {
+        val previous = serverPlay.source
+        val backwards = frame < serverPlay.timeline.positionFrame(System.nanoTime()) - SF.SAMPLE_RATE
+        val fresh = backwards || frame < previous.firstReadyFrame || frame > previous.readyFrames + SF.SAMPLE_RATE / 2
+        return renderSourceFor(source, frame, fresh)
+    }
 
     @Volatile private var currentPreLimited: PreLimitedSource? = null
 
-    private fun limitedFor(rendered: AudioSource, startAtFrame: Long): AudioSource {
+    private fun limitedFor(rendered: AudioSource, startAtFrame: Long, fresh: Boolean = false): AudioSource {
         val current = currentPreLimited
         if (rendered.mode != SourceMode.MUSIC) {
             if (current != null) { currentPreLimited = null; closeSpatialLater(current) }
             return rendered
         }
-        if (current != null && current.innerSource === rendered) return current
+        if (!fresh && current != null && current.innerSource === rendered) return current
         val created = PreLimitedSource(rendered, startAtFrame.coerceIn(0L, rendered.totalFrames))
         currentPreLimited = created
         if (current != null) closeSpatialLater(current)
         return created
     }
 
-    private fun spatialSourceFor(input: AudioSource, startAtFrame: Long = 0L): AudioSource {
+    private fun spatialSourceFor(input: AudioSource, startAtFrame: Long = 0L, fresh: Boolean = false): AudioSource {
         if (!spatialEnabledFor(input)) {
             val old = activeSpatialSource
             activeSpatialSource = null; activeSpatialInput = null; activeSpatialSignature = ""
@@ -3832,7 +3896,7 @@ class Engine private constructor(private val app: Context) {
             return input
         }
         val signature = spatialSignature(input)
-        if (activeSpatialInput === input && activeSpatialSignature == signature)
+        if (!fresh && activeSpatialInput === input && activeSpatialSignature == signature)
             return activeSpatialSource ?: input
         val old = activeSpatialSource
         val profileId = if (soloMode) soloProfileId() else spatialSettings.profile
@@ -3857,21 +3921,40 @@ class Engine private constructor(private val app: Context) {
 
     private fun currentRenderedSource(): AudioSource {
         val current = serverPlay.source
-        if (current is CrossfadeAudioSource) return current
-        return renderSourceFor(source)
+        if (current is CrossfadeAudioSource || tcpAudioPreload != null) return current
+        return renderSourceFor(source, posFrame())
     }
 
     private fun closeSpatialLater(source: AudioSource) {
-        later(5_000) { io.execute { closeSpatialTree(source) } }
+        later(5_000) { closeSpatialTree(source) }
     }
 
     private fun closeSpatialTree(source: AudioSource) {
         when (source) {
-            is SpatialSource -> source.close()
-            is PreLimitedSource -> source.close()
             is CrossfadeAudioSource -> { closeSpatialTree(source.previous); closeSpatialTree(source.next) }
+            is SpatialSource, is PreLimitedSource -> {
+                val oldest = posFrame() - SF.MAX_TRIM_MS.toLong() * SF.SAMPLE_RATE / 1000
+                if (usesRenderSource(serverPlay.source, source, oldest) ||
+                    tcpAudioPreload?.let { usesRenderSource(it.source, source, it.startFrame) } == true) {
+                    closeSpatialLater(source)
+                } else {
+                    if (currentPreLimited === source) currentPreLimited = null
+                    if (activeSpatialSource === source) {
+                        activeSpatialSource = null; activeSpatialInput = null; activeSpatialSignature = ""
+                    }
+                    io.execute { (source as AutoCloseable).close() }
+                }
+            }
         }
     }
+
+    private fun usesRenderSource(root: AudioSource, expected: AudioSource, oldest: Long): Boolean =
+        root === expected || when (root) {
+            is PreLimitedSource -> usesRenderSource(root.innerSource, expected, oldest)
+            is CrossfadeAudioSource -> usesRenderSource(root.next, expected, oldest) ||
+                (oldest < root.fadeEndFrame && usesRenderSource(root.previous, expected, oldest))
+            else -> false
+        }
 
     @Volatile private var activeSpatialSignature = ""
     @Volatile private var spatialAbFixedCompensationDb: Double? = null
@@ -3956,9 +4039,9 @@ class Engine private constructor(private val app: Context) {
         val renderStart = if (isPlaying) (f - fadeFrames).coerceAtLeast(0L) else 0L
         val updated = renderSourceFor(source, renderStart)
         val appliedSource = if (isPlaying) CrossfadeAudioSource(previousSource, updated, f, fadeFrames) else updated
+        serverPlay = ServerPlayState(timeline, appliedSource, renderChannel(), serverGain(), activeEqConfig())
         spatialReprocessFrame = f
         spatialReprocessToken++
-        serverPlay = ServerPlayState(timeline, appliedSource, renderChannel(), serverGain(), activeEqConfig())
         if (finished) {
             if (soloMode) prefs.edit().putString("soloSpatial:${audio.routeKey()}", clean.toJson().toString()).apply()
             else saveServerParams()
@@ -4088,10 +4171,11 @@ class Engine private constructor(private val app: Context) {
         commitEpoch(playing, frame, anchorNs, epoch + 1)
     }
 
-    private fun commitEpoch(playing: Boolean, frame: Long, anchorNs: Long, newEpoch: Int) {
+    private fun commitEpoch(playing: Boolean, frame: Long, anchorNs: Long, newEpoch: Int,
+        rendered: AudioSource = renderSourceForEpoch(frame.coerceAtLeast(0L))) {
         epoch = newEpoch
         preloadEpochCounter = maxOf(preloadEpochCounter, newEpoch)
-        val rendered = renderSourceFor(source, frame.coerceAtLeast(0L))
+        if (playing) (rendered as? PrefetchableAudioSource)?.requestThrough(minOf(rendered.totalFrames, frame + SF.SAMPLE_RATE / 2))
         serverPlay = ServerPlayState(Timeline(epoch, playing, frame, anchorNs), rendered, renderChannel(), serverGain(), activeEqConfig())
         audio.playbackActive = playing
         if (role == Role.POINT) tcpAudioBuffer.activate(epoch)
@@ -4103,16 +4187,18 @@ class Engine private constructor(private val app: Context) {
         tcpAudioPreloadTask?.cancel(false)
         val targetEpoch = maxOf(epoch + 1, preloadEpochCounter + 1).also { preloadEpochCounter = it }
         val itemId = queue.getOrNull(queueIndex)?.id.orEmpty()
-        val preload = AudioPreload(targetEpoch, frame.coerceAtLeast(0), renderSourceFor(source, frame.coerceAtLeast(0)), pointChannel, itemId,
-            SystemClock.elapsedRealtime())
+        val start = frame.coerceAtLeast(0)
+        val minimum = (source.totalFrames - start).coerceIn(1L, TCP_AUDIO_MIN_START_FRAMES.toLong()).toInt()
+        val preload = AudioPreload(targetEpoch, start, renderSourceForEpoch(start), pointChannel, itemId,
+            SystemClock.elapsedRealtime(), minimum)
         tcpAudioPreload = preload
         telemetry.record("START_WAIT", mapOf("epoch" to targetEpoch, "startFrame" to preload.startFrame,
             "track" to itemId.takeIf { it.isNotBlank() }?.let(TelemetryIdentifiers::hash),
-            "targetBufferFrames" to TCP_AUDIO_MIN_START_FRAMES, "timeoutMs" to TCP_AUDIO_MAX_WAIT_MS,
+            "targetBufferFrames" to minimum, "timeoutMs" to TCP_AUDIO_MAX_WAIT_MS,
             "audioPath" to "tcp", "state" to "waiting"))
         link?.send(JSONObject().put("t", "audio-preload").put("epoch", targetEpoch)
             .put("startFrame", preload.startFrame.toString()).put("trackId", itemId)
-            .put("minFrames", TCP_AUDIO_MIN_START_FRAMES))
+            .put("minFrames", minimum))
         tcpAudioPreloadTask = later(TCP_AUDIO_MAX_WAIT_MS) {
             if (tcpAudioPreload?.epoch == targetEpoch) finishTcpAudioPreload(targetEpoch, false, 0)
         }
@@ -4120,14 +4206,16 @@ class Engine private constructor(private val app: Context) {
 
     private fun finishTcpAudioPreload(targetEpoch: Int, ready: Boolean, bufferedFrames: Int) {
         val preload = tcpAudioPreload?.takeIf { it.epoch == targetEpoch } ?: return
+        if (ready && bufferedFrames < preload.minimumFrames) return
         tcpAudioPreload = null
         tcpAudioPreloadTask?.cancel(false); tcpAudioPreloadTask = null
         val waited = SystemClock.elapsedRealtime() - preload.startedAtMs
         telemetry.record("START_WAIT", mapOf("epoch" to targetEpoch, "startFrame" to preload.startFrame,
             "durationMs" to waited, "ready" to ready, "bufferedFrames" to bufferedFrames,
             "audioPath" to currentAudioPath, "state" to if (ready) "ready" else "timeout"))
+        if (!ready) setAudioPath("udp", "preload_timeout")
+        commitEpoch(true, preload.startFrame, System.nanoTime() + SF.START_DELAY_NS, targetEpoch, preload.source)
         if (ready) setAudioPath("tcp", "preload_ready")
-        commitEpoch(true, preload.startFrame, System.nanoTime() + SF.START_DELAY_NS, targetEpoch)
     }
 
     private fun cancelTcpAudioPreload() {
@@ -5761,6 +5849,14 @@ class Engine private constructor(private val app: Context) {
         } else {
             val audioMissing = rx.timeline.playing && nowMs - pairedAtMs > 5_000 &&
                 (localDiag.audioAgeMs < 0 || localDiag.audioAgeMs >= 5_000)
+            val tl = rx.timeline
+            val lastTcp = lastTcpAudioRxAt.get()
+            if (currentAudioPath == "tcp" && !pointUdpFallbackPending && clock.ready && tl.running &&
+                lastTcp > 0 && nowMs - lastTcp >= 1_000) {
+                val minimum = pointBufferMinimum(pointBufferStart(tl), SF.SAMPLE_RATE / 10)
+                if (minimum > 0 && tcpAudioBuffer.contiguousFrames(tl.epoch, pointBufferStart(tl), minimum) < minimum)
+                    requestUdpFallback("tcp_audio_stalled")
+            }
             ui { copy(audioMissing = audioMissing) }
             activeLink.send(localDiag.toJson("diag"))
         }
@@ -5792,6 +5888,13 @@ class Engine private constructor(private val app: Context) {
         val state = ui.value
         val track = if (role == Role.SERVER) queue.getOrNull(queueIndex)?.id
             else state.queueTracks.getOrNull(state.queueIndex)?.id
+        val pcm = serverPlay.source.takeIf { role == Role.SERVER }
+        val pointTimeline = rx.timeline
+        val pointStart = if (role == Role.POINT && pointTimeline.playing) pointBufferStart(pointTimeline) else null
+        val contiguous = pointStart?.let {
+            if (currentAudioPath == "tcp") tcpAudioBuffer.contiguousFrames(pointTimeline.epoch, it, SF.SAMPLE_RATE)
+            else rx.contiguousFramesFrom(it, SF.SAMPLE_RATE, pointTimeline.epoch)
+        }
         return linkedMapOf(
             "mono" to nowMs, "srvNs" to if (role == Role.SERVER) System.nanoTime()
                 else if (clock.ready) clock.toServer(System.nanoTime()) else null,
@@ -5825,12 +5928,17 @@ class Engine private constructor(private val app: Context) {
                 "jitterBufferMs" to pointDiag.bufferMs, "decodeLeadFrames" to serverDiag.decodeLeadFrames,
                 "decodeReadyFrames" to serverDiag.decodeReadyFrames, "decodePositionFrame" to serverDiag.decodePositionFrame,
                 "pointAudioBufferSeconds" to pointDiag.audioBufferSeconds,
+                "localPointContiguousFramesUpTo1s" to contiguous,
+                "pcmFirstReadyFrame" to pcm?.firstReadyFrame, "pcmEndFrameExclusive" to pcm?.readyFrames,
+                "udpSourceSkippedFrames" to udpSourceSkipped.getAndSet(0), "tcpSourceSkippedFrames" to tcpSourceSkipped.getAndSet(0),
                 "audioFillFramesPerSec" to pointDiag.audioFillFramesPerSec,
                 "pointUnderrunFrames" to pointDiag.outputSilentFrames, "serverUnderrunFrames" to serverDiag.outputSilentFrames,
             ),
             "sound" to mapOf(
                 "outputRmsDbfs" to output.signal.rmsDbfs, "outputPeakDbfs" to output.signal.peakDbfs,
                 "outputFramesPerSec" to output.framesPerSecond, "outputTimestampValid" to output.timestampValid,
+                "hardwareUnderrunDelta" to output.hardwareUnderrunDelta,
+                "timestampTransitions" to output.timestampTransitions, "renderMaxUs" to output.maxRenderNs / 1000,
                 "serverChannelRmsDbfs" to (channelSignal?.rmsDbfs ?: serverDiag.serverChannelRmsDbfs),
                 "musicVolume" to output.streamVolume, "musicVolumeMin" to output.streamMinVolume,
                 "musicVolumeMax" to output.streamMaxVolume, "musicMuted" to output.streamMuted,
@@ -5989,8 +6097,7 @@ class Engine private constructor(private val app: Context) {
                     is UdpMsg.Audio -> if (role == Role.POINT && phase == Phase.PAIRED) {
                         lastAudioRxAt.set(SystemClock.elapsedRealtime())
                         rx.onAudio(m, now)
-                        if (currentAudioPath == "tcp" && rx.bufferMs >= 100.0)
-                            setAudioPath("udp", "udp_audio_buffered")
+                        maybeActivateUdpAudio(m.epoch)
                     }
                 }
             } catch (e: Exception) {
@@ -6023,35 +6130,32 @@ class Engine private constructor(private val app: Context) {
         val st = serverPlay
         val tl = st.timeline
         if (!tl.playing) return
-        val start = tl.frameAt(System.nanoTime() + SF.LEAD_NS).toLong().coerceAtLeast(0)
+        val start = maxOf(tl.anchorFrame, st.source.firstReadyFrame, tl.frameAt(System.nanoTime() + SF.LEAD_NS).toLong())
         if (start >= st.source.totalFrames) return
         val count = minOf((SF.SAMPLE_RATE / 10).toLong(), st.source.totalFrames - start,
             st.source.readyFrames - start).coerceAtLeast(0L).toInt()
         if (count <= 0) return
         val channel = Ch.other(st.channel)
-        val samples = FloatArray(count) { index ->
-            val frame = start + index
-            st.source.sample(frame, channel) * tl.envelope(frame)
-        }
-        pointChannelSignal.add(samples, 0, samples.size)
+        val samples = FloatArray(count)
+        val available = Packetizing.readAvailable(st.source, start, channel, samples, count)
+        for (i in 0 until available) samples[i] *= tl.envelope(start + i)
+        if (available > 0) pointChannelSignal.add(samples, 0, available)
     }
 
-    /** [count] кадров канала [channel] от [start] → знаковые 24 бит с TPDF-дизерингом; seed зависит от кадра и канала — перепосылка идентична. */
-    private fun quantizeChannel(source: AudioSource, start: Long, channel: Int, count: Int): IntArray {
-        val f = FloatArray(count) { i -> source.sample(start + i, channel).let { if (it.isNaN()) 0f else it } }
-        val q = IntArray(count)
-        Pcm24.quantize(f, count, start * 2 + channel + 1, q)
-        return q
+    private fun quantizeChannel(source: AudioSource, start: Long, channel: Int, count: Int, buffer: FloatArray): IntArray {
+        val available = Packetizing.readAvailable(source, start, channel, buffer, count)
+        return IntArray(available).also { if (available > 0) Pcm24.quantize(buffer, available, start * 2 + channel + 1, it) }
     }
 
-    /** Число кадров в пакете, начинающемся с [start]: не больше PACKET_FRAMES и только из готовой части источника. */
-    private fun packetFrameCount(source: AudioSource, start: Long): Int = Packetizing.frameCount(source, start)
+    private fun packet(tl: Timeline, seq: Int, start: Long, flags: Int, samples: IntArray): ByteArray =
+        Wire.audio(sessionId, tl.epoch, seq, start, tl.timeOf(start), System.nanoTime(), flags, samples, samples.size, udpKey ?: ByteArray(32))
 
-    private fun packet(st: ServerPlayState, tl: Timeline, seq: Int, start: Long, flags: Int,
-        count: Int = packetFrameCount(st.source, start)): ByteArray {
-        val pCh = Ch.other(st.channel)
-        val s = quantizeChannel(st.source, start, pCh, count)
-        return Wire.audio(sessionId, tl.epoch, seq, start, tl.timeOf(start), System.nanoTime(), flags, s, count, udpKey ?: ByteArray(32))
+    /** A lagging sender must never restart the shared DSP by sampling evicted or expired PCM. */
+    private fun advanceAudioCursor(source: AudioSource, tl: Timeline, now: Long, cursor: Long, skipped: AtomicLong): Long {
+        val stillUseful = tl.positionFrame(now - SF.MAX_TRIM_MS * 1_000_000L)
+        val next = minOf(source.totalFrames, maxOf(cursor, stillUseful, source.firstReadyFrame))
+        if (next > cursor) skipped.addAndGet(next - cursor)
+        return next
     }
 
     private fun serverSend() { synchronized(sendLock) {
@@ -6061,22 +6165,24 @@ class Engine private constructor(private val app: Context) {
         val tl = st.timeline
         if (!tl.playing) return
         if (tl.epoch != sentEpoch) { sentEpoch = tl.epoch; nextFrame = tl.anchorFrame }
-        val requestedTarget = minOf(tl.frameAt(System.nanoTime() + SF.LEAD_NS).toLong(), st.source.totalFrames)
+        val now = System.nanoTime()
+        nextFrame = advanceAudioCursor(st.source, tl, now, nextFrame, udpSourceSkipped)
+        val requestedTarget = minOf(tl.frameAt(now + SF.LEAD_NS).toLong(), st.source.totalFrames)
         (st.source as? PrefetchableAudioSource)?.requestThrough(requestedTarget)
         val target = minOf(requestedTarget, st.source.readyFrames)
         var k = 0
         while (nextFrame < target && k < 40) {
             // Пакет может оказаться короче PACKET_FRAMES, если источник (обработка, декодер) ещё не готов дальше.
             // Курсор двигаем на фактически отправленное число кадров: иначе хвост пакета терялся бы дырой до 10 мс.
-            val count = packetFrameCount(st.source, nextFrame)
-            if (count <= 0) break
+            val samples = quantizeChannel(st.source, nextFrame, Ch.other(st.channel), SF.PACKET_FRAMES, udpReadBuffer)
+            if (samples.isEmpty()) break
             val seq = sendSeq++
-            val b = packet(st, tl, seq, nextFrame, 0, count)
+            val b = packet(tl, seq, nextFrame, 0, samples)
             val i = seq and 1023
-            cacheSeq[i] = seq; cacheEpoch[i] = tl.epoch; cacheStart[i] = nextFrame; cacheCount[i] = count
+            cacheSeq[i] = seq; cacheEpoch[i] = tl.epoch; cacheStart[i] = nextFrame; cacheSamples[i] = samples
             udp.send(DatagramPacket(b, b.size, addr))
             sentAudioPackets.incrementAndGet()
-            nextFrame += count; k++
+            nextFrame += samples.size; k++
         }
     } }
 
@@ -6088,8 +6194,9 @@ class Engine private constructor(private val app: Context) {
         for (seq in n.seqs) {
             val i = seq and 1023
             if (cacheSeq[i] != seq || cacheEpoch[i] != tl.epoch) continue
-            if (tl.timeOf(cacheStart[i] + cacheCount[i]) < now) continue   // уже поздно
-            val b = packet(st, tl, seq, cacheStart[i], UdpMsg.FLAG_RETRANSMIT, cacheCount[i])
+            val samples = cacheSamples[i] ?: continue
+            if (tl.timeOf(cacheStart[i] + samples.size) < now) continue   // уже поздно
+            val b = packet(tl, seq, cacheStart[i], UdpMsg.FLAG_RETRANSMIT, samples)
             udp.send(DatagramPacket(b, b.size, addr)); resent.incrementAndGet()
         }
     } }

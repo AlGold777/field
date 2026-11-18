@@ -29,6 +29,7 @@ class PreLimitedSource(
     override val totalFrames get() = inner.totalFrames
     /** Источник под предлимитером (Engine сравнивает по ссылке, чтобы не создавать второй экземпляр). */
     val innerSource: AudioSource get() = inner
+    override val firstReadyFrame: Long get() = retainedFrom
     override val readyFrames: Long get() = minOf(inner.readyFrames, processedHead)
     override val complete: Boolean get() = inner.complete && processedHead >= inner.totalFrames
 
@@ -37,9 +38,11 @@ class PreLimitedSource(
     private val limiter = PeakLimiter(SF.SAMPLE_RATE, 2, ceilingDbtp)
     private val latency = limiter.latencyFrames
     private val running = AtomicBoolean(true)
-    private val requestedHead = AtomicLong(minOf(inner.totalFrames, startAtFrame + capacity).coerceAtLeast(startAtFrame))
+    private val requestedHead = AtomicLong(minOf(inner.totalFrames, startAtFrame + SF.SAMPLE_RATE).coerceAtLeast(startAtFrame))
     private val restartAt = AtomicLong(NO_RESTART)
     @Volatile private var processedHead = maxOf(0L, startAtFrame - WARMUP_FRAMES)
+    @Volatile private var retainedFrom = startAtFrame
+    @Volatile private var generation = 0L
     private var nextInput = processedHead
     private val buffer = FloatArray(CHUNK_FRAMES * 2)
     /**
@@ -94,14 +97,20 @@ class PreLimitedSource(
     override fun sample(frame: Long, ch: Int): Float {
         if (ch !in 0..1 || frame < startAtFrame || frame >= inner.totalFrames) return 0f
         requestThrough(frame + 1)
-        val head = processedHead
-        val firstCached = maxOf(0L, head - capacity)
-        if (frame < firstCached || frame >= head) {
+        val value = readPrepared(frame, ch)
+        if (value.isNaN()) {
             missCount.incrementAndGet()
-            if (frame < firstCached || frame - head >= capacity) restartAt.set(frame)
-            return Float.NaN
+            if (frame < retainedFrom || frame - processedHead >= capacity) restartAt.set(frame)
         }
-        return cache[((frame % capacity) * 2L + ch).toInt()]
+        return value
+    }
+
+    override fun readPrepared(frame: Long, ch: Int): Float {
+        if (ch !in 0..1 || frame < startAtFrame || frame >= inner.totalFrames) return 0f
+        val revision = generation
+        if (frame >= processedHead || frame < retainedFrom) return Float.NaN
+        val value = cache[((frame % capacity) * 2L + ch).toInt()]
+        return if (revision == generation && frame >= retainedFrom) value else Float.NaN
     }
 
     private fun processLoop() {
@@ -118,24 +127,31 @@ class PreLimitedSource(
                 while (running.get() && nextInput < inputLimit && restartAt.get() == NO_RESTART) {
                     val end = minOf(nextInput + CHUNK_FRAMES, inputLimit)
                     val n = (end - nextInput).toInt()
-                    for (i in 0 until n) {
+                    var available = 0
+                    while (available < n) {
+                        val i = available
                         val f = nextInput + i
                         if (f < total && f < ready) {
-                            val l = inner.sample(f, 0); val r = inner.sample(f, 1)
-                            buffer[i * 2] = if (l.isNaN()) 0f else l; buffer[i * 2 + 1] = if (r.isNaN()) 0f else r
+                            val l = inner.readPrepared(f, 0); val r = inner.readPrepared(f, 1)
+                            if (!l.isFinite() || !r.isFinite()) break
+                            buffer[i * 2] = l; buffer[i * 2 + 1] = r
                         } else { buffer[i * 2] = 0f; buffer[i * 2 + 1] = 0f }
+                        available++
                     }
-                    applyStaticGain(n)
-                    limiter.process(buffer, 0, n)
+                    if (available == 0) break
+                    applyStaticGain(available)
+                    limiter.process(buffer, 0, available)
+                    // Invalidate overwritten slots before exposing new PCM in them.
+                    retainedFrom = maxOf(retainedFrom, minOf(total, nextInput + available - latency) - capacity)
                     var written = processedHead
-                    for (i in 0 until n) {
+                    for (i in 0 until available) {
                         val o = nextInput + i - latency
                         if (o < processedHead || o >= total) continue
                         val index = ((o % capacity) * 2L).toInt()
                         cache[index] = buffer[i * 2]; cache[index + 1] = buffer[i * 2 + 1]
                         written = o + 1
                     }
-                    nextInput = end
+                    nextInput += available
                     if (written > processedHead) processedHead = written
                     collectStats()
                     progressed = true
@@ -190,8 +206,9 @@ class PreLimitedSource(
         currentDb = initialGainDb()   // после перемотки без «подъезда»
         currentGain = Math.pow(10.0, currentDb / 20.0)
         nextInput = from
+        generation++
+        retainedFrom = maxOf(startAtFrame, from)
         processedHead = from
-        requestedHead.set(minOf(inner.totalFrames, maxOf(requestedHead.get(), target + 1)))
     }
 
     override fun close() {

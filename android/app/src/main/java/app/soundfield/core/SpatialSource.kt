@@ -29,6 +29,7 @@ class SpatialSource(
     override val title get() = inner.title
     override val artist get() = inner.artist
     override val totalFrames get() = inner.totalFrames
+    override val firstReadyFrame: Long get() = maxOf(startAtFrame, retainedFrom)
     override val readyFrames: Long get() = minOf(inner.readyFrames, processedHead)
     override val complete: Boolean get() = inner.complete && processedHead >= inner.totalFrames
     val decodedReadyFrames: Long get() = inner.readyFrames
@@ -70,10 +71,12 @@ class SpatialSource(
     private val sendAccumulationR = DoubleArray(if (roomEnabled) accumulationCapacity else 0)
     private val workerRunning = java.util.concurrent.atomic.AtomicBoolean(true)
     private val requestedHead = java.util.concurrent.atomic.AtomicLong(
-        minOf(inner.totalFrames, startAtFrame + cacheCapacityFrames).coerceAtLeast(startAtFrame),
+        minOf(inner.totalFrames, startAtFrame + minOf(SF.SAMPLE_RATE, cacheCapacityFrames - HOP_SIZE)).coerceAtLeast(startAtFrame),
     )
 
     @Volatile private var processedHead = initialProcessingHead()
+    @Volatile private var retainedFrom = startAtFrame
+    @Volatile private var generation = 0L
     @Volatile var processingError: Throwable? = null
         private set
     @Volatile var realtimeFactor = 0.0
@@ -118,15 +121,21 @@ class SpatialSource(
     override fun sample(frame: Long, ch: Int): Float {
         if (ch !in 0..1 || frame < startAtFrame || frame >= inner.totalFrames) return 0f
         requestThrough(frame + 1)
-        var head = processedHead
-        val firstCached = maxOf(startAtFrame, head - cacheCapacityFrames)
-        if (frame < firstCached || frame >= head) {
+        val value = readPrepared(frame, ch)
+        if (value.isNaN()) {
             missCount.incrementAndGet()
-            if (frame < firstCached || frame - head >= cacheCapacityFrames) scheduleRestart(frame)
-            return Float.NaN
+            if (frame < firstReadyFrame || frame - processedHead >= cacheCapacityFrames) scheduleRestart(frame)
         }
+        return value
+    }
+
+    override fun readPrepared(frame: Long, ch: Int): Float {
+        if (ch !in 0..1 || frame < startAtFrame || frame >= inner.totalFrames) return 0f
+        val revision = generation
+        if (frame >= processedHead || frame < firstReadyFrame) return Float.NaN
         val index = ((frame % cacheCapacityFrames) * 2L + ch).toInt()
-        return cache[index]
+        val value = cache[index]
+        return if (revision == generation && frame >= firstReadyFrame) value else Float.NaN
     }
 
     private fun processLoop() {
@@ -157,6 +166,7 @@ class SpatialSource(
                     val end = minOf(wanted, ready, inner.totalFrames)
                     val processingStartedAt = System.nanoTime()
                     var frame = processedHead
+                    retainedFrom = maxOf(retainedFrom, end - cacheCapacityFrames)
                     while (workerRunning.get() && frame < end) {
                         val cacheIndex = ((frame % cacheCapacityFrames) * 2L).toInt()
                         cache[cacheIndex] = inner.sample(frame, 0).takeUnless { it.isNaN() } ?: 0f
@@ -216,6 +226,8 @@ class SpatialSource(
         java.util.Arrays.fill(sendAccumulationR, 0.0)
         xtcProcessor?.reset()
         loudnessCompensator.reset()
+        generation++
+        retainedFrom = warmupStart
         processedHead = warmupStart
         realtimeFactor = 0.0
         restartCount.incrementAndGet()
@@ -326,6 +338,8 @@ class SpatialSource(
     /** Пиковое ограничение — не здесь: выход Spatial проходит сцепленный предлимитер Server ([PreLimitedSource], A1.4). */
     private fun publishFrame(frame: Long, left: Float, right: Float) {
         if (frame in startAtFrame until inner.totalFrames) {
+            val oldest = frame + 1 - cacheCapacityFrames
+            if (oldest > retainedFrom) retainedFrom = oldest
             val cacheIndex = ((frame % cacheCapacityFrames) * 2L).toInt()
             cache[cacheIndex] = left
             cache[cacheIndex + 1] = right
@@ -372,21 +386,38 @@ class CrossfadeAudioSource(
     override val title get() = next.title
     override val artist get() = next.artist
     override val totalFrames get() = next.totalFrames
-    override val readyFrames get() = if (next.readyFrames >= startFrame + fadeLength)
-        next.readyFrames else minOf(previous.readyFrames, next.readyFrames)
+    val fadeEndFrame = startFrame + fadeLength
+    override val firstReadyFrame: Long get() {
+        val nextFirst = next.firstReadyFrame
+        val previousFirst = previous.firstReadyFrame
+        return if (previousFirst >= fadeEndFrame || nextFirst > startFrame) maxOf(fadeEndFrame, nextFirst)
+            else previousFirst
+    }
+    override val readyFrames: Long get() {
+        val oldEnd = previous.readyFrames
+        val newEnd = next.readyFrames
+        if (next.firstReadyFrame > startFrame || previous.firstReadyFrame >= fadeEndFrame) return newEnd
+        if (oldEnd < startFrame || newEnd < startFrame) return minOf(oldEnd, startFrame)
+        return if (oldEnd >= fadeEndFrame) newEnd else minOf(oldEnd, newEnd)
+    }
     override val complete get() = next.complete && readyFrames >= totalFrames
 
     override fun requestThrough(frameExclusive: Long) {
-        (previous as? PrefetchableAudioSource)?.requestThrough(frameExclusive)
+        (previous as? PrefetchableAudioSource)?.requestThrough(minOf(frameExclusive, fadeEndFrame))
         (next as? PrefetchableAudioSource)?.requestThrough(frameExclusive)
     }
 
     override fun sample(frame: Long, ch: Int): Float {
-        if (frame < startFrame) return previous.sample(frame, ch)
+        requestThrough(frame + 1)
+        return readPrepared(frame, ch)
+    }
+
+    override fun readPrepared(frame: Long, ch: Int): Float {
+        if (frame < startFrame) return previous.readPrepared(frame, ch)
         val mix = ((frame - startFrame).toDouble() / fadeLength).coerceIn(0.0, 1.0).toFloat()
-        if (mix >= 1f) return next.sample(frame, ch)
-        val old = previous.sample(frame, ch)
-        val fresh = next.sample(frame, ch)
+        if (mix >= 1f) return next.readPrepared(frame, ch)
+        val old = previous.readPrepared(frame, ch)
+        val fresh = next.readPrepared(frame, ch)
         if (old.isNaN() || fresh.isNaN()) return Float.NaN
         return old * (1f - mix) + fresh * mix
     }

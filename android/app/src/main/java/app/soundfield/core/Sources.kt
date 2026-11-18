@@ -13,10 +13,14 @@ interface AudioSource {
     val title: String
     val artist: String
     val totalFrames: Long
-    /** Absolute frame count available without blocking. Progressive sources may be shorter than totalFrames. */
+    /** Oldest retained frame. A ring may evict frames below this position. */
+    val firstReadyFrame: Long get() = 0L
+    /** Exclusive upper bound of available frames. */
     val readyFrames: Long get() = totalFrames
     val complete: Boolean get() = true
     fun sample(frame: Long, ch: Int): Float
+    /** Read without advancing or restarting a worker. Callers prepare demand separately. */
+    fun readPrepared(frame: Long, ch: Int): Float = sample(frame, ch)
 }
 
 /** Источник знает true-peak трека (анализ при импорте); NaN — неизвестно или анализ ещё идёт (значение — максимум по уже декодированному). */

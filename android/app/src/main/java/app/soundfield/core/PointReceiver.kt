@@ -42,6 +42,19 @@ class PointReceiver(private val clock: ClockSync, capacityPow2: Int = 17) {
         return maxOf(0L, maxFrame - cur) * 1000.0 / SF.SAMPLE_RATE
     }
 
+    /** Count a continuous prefix in the current epoch. Called off the audio thread. */
+    fun contiguousFramesFrom(startFrame: Long, limit: Int, epoch: Int = timeline.epoch): Int = synchronized(lock) {
+        if (!timeline.playing || timeline.epoch != epoch || startFrame < 0 || startFrame > maxFrame || limit <= 0) {
+            return@synchronized 0
+        }
+        val count = (minOf(maxFrame - startFrame, limit.toLong() - 1, cap.toLong() - 1) + 1).toInt()
+        for (i in 0 until count) {
+            val frame = startFrame + i
+            if (tags[(frame and mask).toInt()] != frame) return@synchronized i
+        }
+        count
+    }
+
     fun reset() = synchronized(lock) {
         timeline = Timeline.NONE
         clearBuffer()

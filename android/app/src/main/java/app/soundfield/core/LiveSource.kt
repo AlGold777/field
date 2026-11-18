@@ -29,6 +29,7 @@ class LiveSource(title: String, artist: String, capacitySeconds: Int = 30) : Aud
     private val ring = FloatArray(capacity * 2)
     @Volatile private var head = 0L
     override val readyFrames: Long get() = head
+    override val firstReadyFrame: Long get() = (head - capacity).coerceAtLeast(0)
 
     fun describe(title: String, artist: String) { this.title = title; this.artist = artist }
 
