@@ -185,7 +185,7 @@ class SpotifyReceiver(
         const val MAX_AHEAD_FRAMES = SF.SAMPLE_RATE * 3L / 2L
         const val VOLUME_MAX = 65_535
         /** Версия крейта `spotify/`, с которой согласован этот JNI-контракт. */
-        const val NATIVE_VERSION = "0.1.1"
+        const val NATIVE_VERSION = "0.1.2"
         /** Дольше держать поток плеера нельзя: на нём же librespot исполняет паузу, перемотку и смену трека. */
         private const val MAX_BLOCK_MS = 400
 

@@ -155,7 +155,8 @@ impl RequestHandler {
         let shared_key = self.keys.shared_secret(&client_key);
 
         let encrypted_blob_len = encrypted_blob.len();
-        if encrypted_blob_len < 16 {
+        // SoundField: 16 байт IV + 20 байт контрольной суммы; короче 36 срез ниже паниковал на данных из сети.
+        if encrypted_blob_len < 36 {
             return Err(DiscoveryError::HmacError(encrypted_blob.to_vec()).into());
         }
 

@@ -298,6 +298,8 @@ impl Drop for Receiver {
 // ---------------------------------------------------------------- supervisor
 
 fn open_cache(dir: &Path) -> Option<Cache> {
+    // Cache::new(credentials, volume, audio, size_limit): учётные данные и громкость — в каталоге приёмника;
+    // аудио-кэш выключен намеренно — PCM сразу уходит в SoundField, хранить его на диске незачем.
     match Cache::new(Some(dir), Some(dir), None, None) {
         Ok(c) => Some(c),
         Err(e) => {
