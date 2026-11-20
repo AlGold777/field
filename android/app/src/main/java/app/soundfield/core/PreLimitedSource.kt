@@ -44,6 +44,9 @@ class PreLimitedSource(
     @Volatile private var retainedFrom = startAtFrame
     @Volatile private var generation = 0L
     private var nextInput = processedHead
+    private var stallSinceMs = 0L
+    /** Сколько раз цепочка выходила из застревания на вытесненном входном кадре (телеметрия). */
+    val stallRecoveries = AtomicLong(0)
     private val buffer = FloatArray(CHUNK_FRAMES * 2)
     /**
      * Текущее статическое усиление. Цель — нормализация громкости (A3.1, [TruePeakMeter.normalizationGainDb]); пока громкость
@@ -108,7 +111,12 @@ class PreLimitedSource(
     override fun readPrepared(frame: Long, ch: Int): Float {
         if (ch !in 0..1 || frame < startAtFrame || frame >= inner.totalFrames) return 0f
         val revision = generation
-        if (frame >= processedHead || frame < retainedFrom) return Float.NaN
+        if (frame >= processedHead || frame < retainedFrom) {
+            // Читатель ушёл вперёд дальше окна кэша: перезапуск с его кадра (иначе NaN навсегда).
+            // Отстающих читателей (frame < retainedFrom) не трогаем — их догоняет сам отправитель.
+            if (frame - processedHead >= capacity) restartAt.set(frame)
+            return Float.NaN
+        }
         val value = cache[((frame % capacity) * 2L + ch).toInt()]
         return if (revision == generation && frame >= retainedFrom) value else Float.NaN
     }
@@ -138,7 +146,21 @@ class PreLimitedSource(
                         } else { buffer[i * 2] = 0f; buffer[i * 2 + 1] = 0f }
                         available++
                     }
-                    if (available == 0) break
+                    if (available == 0) {
+                        // Кадр входа готов, но внутренний кэш его уже не отдаёт (вытеснен или перезапуск):
+                        // через STALL_RECOVERY_MS просим внутренний источник начать с него и подаём тишину,
+                        // чтобы цепочка не замолчала навсегда (до 1.11.7 это делал sample()).
+                        val f = nextInput
+                        if (f >= total || f >= ready) { stallSinceMs = 0L; break }
+                        val now = System.nanoTime() / 1_000_000L
+                        if (stallSinceMs == 0L) stallSinceMs = now
+                        if (now - stallSinceMs < STALL_RECOVERY_MS) break
+                        stallSinceMs = 0L
+                        stallRecoveries.incrementAndGet()
+                        inner.sample(f, 0)
+                        java.util.Arrays.fill(buffer, 0, n * 2, 0f)
+                        available = n
+                    } else stallSinceMs = 0L
                     applyStaticGain(available)
                     limiter.process(buffer, 0, available)
                     // Invalidate overwritten slots before exposing new PCM in them.
@@ -222,6 +244,7 @@ class PreLimitedSource(
         const val WARMUP_FRAMES = SF.SAMPLE_RATE
         private const val CHUNK_FRAMES = 1_024
         private const val NO_RESTART = Long.MIN_VALUE
+        private const val STALL_RECOVERY_MS = 200L
         /** Максимальная скорость подъёма усиления нормализации, dB в секунду. */
         const val MAX_RISE_DB_PER_S = 3.0
     }

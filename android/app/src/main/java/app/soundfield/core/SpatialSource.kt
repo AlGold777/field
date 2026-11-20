@@ -132,7 +132,11 @@ class SpatialSource(
     override fun readPrepared(frame: Long, ch: Int): Float {
         if (ch !in 0..1 || frame < startAtFrame || frame >= inner.totalFrames) return 0f
         val revision = generation
-        if (frame >= processedHead || frame < firstReadyFrame) return Float.NaN
+        if (frame >= processedHead || frame < firstReadyFrame) {
+            // Читатель ушёл вперёд дальше окна кэша: перезапуск с его кадра (иначе NaN навсегда).
+            if (frame - processedHead >= cacheCapacityFrames) scheduleRestart(frame)
+            return Float.NaN
+        }
         val index = ((frame % cacheCapacityFrames) * 2L + ch).toInt()
         val value = cache[index]
         return if (revision == generation && frame >= firstReadyFrame) value else Float.NaN
