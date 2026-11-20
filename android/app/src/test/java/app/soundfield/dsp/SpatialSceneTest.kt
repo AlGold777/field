@@ -405,8 +405,10 @@ class SpatialSceneTest {
             SpatialSource(Buffer(l, r), spatialConfig = config, cacheSeconds = 40).use { spatial ->
                 val start = System.nanoTime()
                 spatial.requestThrough(n.toLong())
-                while (!spatial.complete && spatial.processingError == null) Thread.sleep(1)
+                val deadline = System.nanoTime() + 60_000_000_000L   // без дедлайна зависший воркер вешал прогон тестов
+                while (!spatial.complete && spatial.processingError == null && System.nanoTime() < deadline) Thread.sleep(1)
                 spatial.processingError?.let { throw AssertionError("spatial worker failed", it) }
+                assertTrue("render timed out", spatial.complete)
                 return 30.0 / ((System.nanoTime() - start) / 1e9)
             }
         }

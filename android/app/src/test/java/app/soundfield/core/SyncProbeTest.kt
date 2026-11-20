@@ -33,4 +33,17 @@ class SyncProbeTest {
         assertFalse(result.valid)
         assertEquals("recording_clipped", result.reason)
     }
+
+    @Test fun silentRecordingHasNoChirps() {
+        val result = SyncProbeAnalyzer.analyze(FloatArray(48_000 * 12), 48_000, 0L, 500_000_000L, 10)
+        assertFalse(result.valid)
+        assertEquals("insufficient_chirps", result.reason)
+        assertEquals(0, result.trials)
+    }
+
+    @Test fun zeroTrialsIsInvalid() {
+        val result = SyncProbeAnalyzer.analyze(FloatArray(48_000), 48_000, 0L, 0L, 0)
+        assertFalse(result.valid)
+        assertEquals("insufficient_chirps", result.reason)
+    }
 }

@@ -114,4 +114,33 @@ class TcpAudioTest {
         assertEquals(0, receiver.contiguousFramesFrom(startFrame = 0, limit = 8))
         assertEquals(1, receiver.contiguousFramesFrom(startFrame = Long.MAX_VALUE, limit = 8))
     }
+
+    @Test fun truncatedHelloAndChunkAreRejected() {
+        val bytes = ByteArrayOutputStream()
+        TcpAudioWire.writeHello(DataOutputStream(bytes), "point-id", 42, ByteArray(32) { 3 })
+        val hello = bytes.toByteArray()
+        val cut = DataInputStream(ByteArrayInputStream(hello.copyOf(hello.size - 3)))
+        assertTrue(runCatching { TcpAudioWire.readHello(cut, ByteArray(32) { 3 }) }.exceptionOrNull() is java.io.EOFException)
+
+        val chunkBytes = ByteArrayOutputStream()
+        TcpAudioWire.writeChunk(DataOutputStream(chunkBytes), TcpAudioChunk(1, "t", 0L, IntArray(100)))
+        val chunk = chunkBytes.toByteArray()
+        val midChunk = DataInputStream(ByteArrayInputStream(chunk.copyOf(chunk.size / 2)))
+        assertTrue(runCatching { TcpAudioWire.readChunk(midChunk) }.exceptionOrNull() is java.io.EOFException)
+    }
+
+    @Test fun oversizedHelloIdAndFrameSizeAreRejectedBeforeAllocation() {
+        val hello = ByteArrayOutputStream().also { DataOutputStream(it).apply { writeInt(TcpAudioWire.HELLO_MAGIC); writeShort(60_000) } }
+        assertTrue(runCatching { TcpAudioWire.readHello(DataInputStream(ByteArrayInputStream(hello.toByteArray())), ByteArray(32)) }
+            .exceptionOrNull() is IllegalArgumentException)
+        val frame = ByteArrayOutputStream().also { DataOutputStream(it).writeInt(1_000_000) }
+        assertTrue(runCatching { TcpAudioWire.readChunk(DataInputStream(ByteArrayInputStream(frame.toByteArray()))) }
+            .exceptionOrNull() is IllegalArgumentException)
+    }
+
+    @Test fun helloWithWrongKeyIsRejected() {
+        val bytes = ByteArrayOutputStream()
+        TcpAudioWire.writeHello(DataOutputStream(bytes), "point-id", 42, ByteArray(32) { 3 })
+        assertFalse(runCatching { TcpAudioWire.readHello(DataInputStream(ByteArrayInputStream(bytes.toByteArray())), ByteArray(32) { 4 }) }.isSuccess)
+    }
 }
