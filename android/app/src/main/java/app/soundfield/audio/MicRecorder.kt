@@ -50,7 +50,8 @@ class MicRecorder(private val ctx: Context) {
                     pos += r
                 }
             } finally {
-                rec.stop()
+                // stop() может бросить сам — тогда исходная ошибка чтения потерялась бы.
+                try { rec.stop() } catch (_: Exception) {}
             }
             check(pos == total) { "Запись микрофона неполная: получено $pos из $total кадров" }
             return Recording(out, sr, startNs)

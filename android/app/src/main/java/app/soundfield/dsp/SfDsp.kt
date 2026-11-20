@@ -11,9 +11,9 @@ object SfDsp {
     /** Загружает libsfdsp из APK. На JVM-тестах — [loadFrom]. */
     @Synchronized fun load(): Boolean {
         loaded?.let { return it }
-        val ok = runCatching { System.loadLibrary("sfdsp"); nativeInit() }.isSuccess ||
+        val ok = runCatching { System.loadLibrary("sfdsp"); nativeInit(); checkAbi() }.isSuccess ||
             // JVM-тесты и лабораторные утилиты: хост-сборка по системному свойству (задаёт Gradle)
-            System.getProperty("sfdsp.host.lib")?.let { path -> runCatching { System.load(path); nativeInit() }.isSuccess } == true
+            System.getProperty("sfdsp.host.lib")?.let { path -> runCatching { System.load(path); nativeInit(); checkAbi() }.isSuccess } == true
         loaded = ok
         return ok
     }
@@ -21,8 +21,11 @@ object SfDsp {
     /** Хост-сборка для JUnit (абсолютный путь к libsfdsp.dylib). */
     @Synchronized fun loadFrom(path: String): Boolean {
         loaded?.let { return it }
-        return runCatching { System.load(path); nativeInit() }.isSuccess.also { loaded = it }
+        return runCatching { System.load(path); nativeInit(); checkAbi() }.isSuccess.also { loaded = it }
     }
+
+    /** Библиотека с другой ABI испортила бы память: считаем её незагруженной — работают Kotlin-запасные пути. */
+    private fun checkAbi() = check(nativeAbiVersion() == EXPECTED_ABI) { "sfdsp ABI ${nativeAbiVersion()} != $EXPECTED_ABI" }
 
     val isLoaded: Boolean get() = loaded == true
     const val EXPECTED_ABI = 1

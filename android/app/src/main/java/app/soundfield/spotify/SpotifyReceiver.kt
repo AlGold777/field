@@ -64,7 +64,7 @@ class SpotifyReceiver(
     private inner class Session(val name: String, val live: LiveSource, val bufferedFrames: () -> Long) : SpotifySink {
         @Volatile var handle = 0L
         @Volatile var released = false
-        var registration: NsdManager.RegistrationListener? = null
+        @Volatile var registration: NsdManager.RegistrationListener? = null
         private val converter = SampleRateConverter(SOURCE_RATE, SF.SAMPLE_RATE)
         private var converted = FloatArray(0)
 
@@ -170,6 +170,9 @@ class SpotifyReceiver(
         try {
             nsd.registerService(info, NsdManager.PROTOCOL_DNS_SD, listener)
             target.registration = listener
+            // stopNow мог пройти между проверкой released и регистрацией: тогда объявление снимаем сами,
+            // иначе устройство оставалось бы видно в Spotify до смерти процесса.
+            if (target.released) { runCatching { nsd.unregisterService(listener) }; target.registration = null }
         } catch (e: Exception) {
             onEvent(SpotifyEvent.ERROR, 0, 0, "Не удалось объявить устройство в сети", null)
         }
