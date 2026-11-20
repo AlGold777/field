@@ -26,6 +26,8 @@ final class AudioOutput {
     private let sourceBox = Locked<RenderSource?>(nil)
     private let outLatencyNs = Locked<Int64>(0)
     private(set) var running = false
+    /// start() вызван, но движок не запустился (сессию держит звонок или Siri): повторить при возврате/конце прерывания.
+    private var startPending = false
     var onInterruption: ((Bool) -> Void)?     // true = началось
     var onRouteWarning: ((String) -> Void)?
     var onRouteChanged: (() -> Void)?
@@ -162,7 +164,8 @@ final class AudioOutput {
         }
         engine.mainMixerNode.outputVolume = 1
         engine.prepare()
-        do { try engine.start(); running = true } catch { NSLog("SoundField engine: \(error)") }
+        do { try engine.start(); running = true; startPending = false }
+        catch { startPending = true; NSLog("SoundField engine: \(error)") }
     }
 
     /// Main-thread graph parameters; the unit owns its render state.
@@ -182,6 +185,7 @@ final class AudioOutput {
     }
 
     func stop() {
+        startPending = false
         guard running else { return }
         running = false
         engine.stop()
@@ -190,11 +194,12 @@ final class AudioOutput {
 
     /// Возврат в приложение / конец прерывания: если движок должен играть, но остановлен — запускаем снова.
     func ensureRunning() {
-        guard running, !engine.isRunning else { return }
+        guard running || startPending, !engine.isRunning else { return }
         Self.configurePlaybackSession()
         updateLatency()
         engine.prepare()
-        do { try engine.start() } catch { NSLog("SoundField engine restart: \(error)") }
+        do { try engine.start(); running = true; startPending = false }
+        catch { NSLog("SoundField engine restart: \(error)") }
     }
 
     /// Перезапуск после смены категории сессии (калибровка).
@@ -236,7 +241,10 @@ final class AudioOutput {
             // Флаг .shouldResume здесь не проверяется намеренно: движок запускается при любом окончании прерывания,
             // если выход должен быть активен. Воспроизведение после прерывания само не возобновляется (пара на паузе),
             // а остановленный движок дал бы тишину при следующем «Играть».
-            if running { try? AVAudioSession.sharedInstance().setActive(true); try? engine.start() }
+            if running || startPending {
+                try? AVAudioSession.sharedInstance().setActive(true)
+                if (try? engine.start()) != nil { running = true; startPending = false }
+            }
             onInterruption?(false)
         @unknown default: break
         }
