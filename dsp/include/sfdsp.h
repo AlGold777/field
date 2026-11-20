@@ -105,6 +105,7 @@ SFDSP_API sf_limiter* sf_limiter_create(int sample_rate, int channels, double ce
 SFDSP_API void sf_limiter_destroy(sf_limiter* l);
 SFDSP_API void sf_limiter_reset(sf_limiter* l);
 SFDSP_API int sf_limiter_latency_frames(const sf_limiter* l);
+SFDSP_API int sf_limiter_channels(const sf_limiter* l);
 /* На месте, интерлив. Выход задержан на latency кадров (первые latency кадров потока — тишина). Без аллокаций. */
 SFDSP_API void sf_limiter_process(sf_limiter* l, float* io, int frames);
 /* Забирает и обнуляет: число вызовов process, из них с ослаблением > 0,5 dB, максимальное ослабление (dB). */
@@ -148,6 +149,7 @@ typedef struct sf_speaker sf_speaker;
 SFDSP_API sf_speaker* sf_speaker_create(int sample_rate, int channels);
 SFDSP_API void sf_speaker_destroy(sf_speaker* s);
 SFDSP_API void sf_speaker_reset(sf_speaker* s);
+SFDSP_API int sf_speaker_channels(const sf_speaker* s);
 /*
  * Публикует новую цепочку из любого одного потока (управляющего); аудиопоток подхватит её на границе блока.
  * Секции — как в профиле: n ≤ SF_SPEAKER_MAX_SECTIONS, preamp_db ≤ 0. Возвращает 0, при неверных параметрах — -1 (цепочка не меняется).

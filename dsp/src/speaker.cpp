@@ -35,7 +35,7 @@ struct Params {
 };
 
 bool design(const sf_speaker_section& s, double fs, Biquad* out) {
-    if (!(s.f0_hz > 0) || !(s.f0_hz < fs * 0.5) || !(s.q > 0)) return false;
+    if (!(s.f0_hz > 0) || !(s.f0_hz < fs * 0.5) || !(s.q > 0) || !std::isfinite(s.gain_db)) return false;
     const double w0 = 2 * kPi * s.f0_hz / fs, cw = std::cos(w0), sw = std::sin(w0), alpha = sw / (2 * s.q);
     const double A = std::pow(10.0, s.gain_db / 40.0);
     double b0, b1, b2, a0, a1, a2;
@@ -70,7 +70,9 @@ bool design(const sf_speaker_section& s, double fs, Biquad* out) {
             return false;
     }
     out->b0 = b0 / a0; out->b1 = b1 / a0; out->b2 = b2 / a0; out->a1 = a1 / a0; out->a2 = a2 / a0;
-    return true;
+    // NaN/Inf-коэффициенты навсегда «запирают» состояние фильтра — такую цепочку отвергаем.
+    return std::isfinite(out->b0) && std::isfinite(out->b1) && std::isfinite(out->b2) &&
+           std::isfinite(out->a1) && std::isfinite(out->a2);
 }
 
 bool build(const Params& p, double fs, Chain* c) {
@@ -121,6 +123,8 @@ sf_speaker* sf_speaker_create(int sample_rate, int channels) {
 }
 
 void sf_speaker_destroy(sf_speaker* s) { delete s; }
+
+int sf_speaker_channels(const sf_speaker* s) { return s->channels; }
 
 void sf_speaker_reset(sf_speaker* s) {
     s->cur.clearState();

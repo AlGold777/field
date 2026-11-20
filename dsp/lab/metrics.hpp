@@ -19,6 +19,7 @@ struct ToneResult {
 
 inline ToneResult analyzeTone(const std::vector<float>& x, int sr, double expectedAmp, size_t skip = 8192, size_t n = 65536) {
     ToneResult r;
+    if (x.size() <= skip) return r;   // короткий вход: иначе x.size() − skip переполнялось (size_t)
     if (x.size() < skip + n) { n = nextPow2(x.size() - skip) / 2; }
     const auto w = kaiser(n, 26.0);
     double sw2 = 0;

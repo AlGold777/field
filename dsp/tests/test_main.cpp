@@ -425,13 +425,8 @@ TEST(limiter_release_two_speeds_and_stats) {
         for (size_t i = 24000; i < x.size(); i += (size_t)period) x[i] = 1.6f;
         return x;
     };
-    auto recovery = [&](const std::vector<float>& x) {   // доля восстановления уровня синуса через 80 мс после одиночного пика
-        auto y = limRun(x, 1, -1.0, 480);
-        return std::fabs((double)y[24000 + 3840 + 100]) / std::fabs((double)x[24000 + 3840 + 100]);
-    };
     auto sparse = make(1000000);
     auto dense = make(2400);
-    (void)recovery;
     int64_t a1 = 0, a2 = 0;
     limRun(sparse, 1, -1.0, 480, &a1);
     limRun(dense, 1, -1.0, 480, &a2);
@@ -441,6 +436,29 @@ TEST(limiter_release_two_speeds_and_stats) {
     double g = 0, n = 0;
     for (size_t i = 24000 + 19200; i < 24000 + 19200 + 4800; i++) if (std::fabs(sparse[i]) > 0.05f) { g += std::fabs((double)y[i] / sparse[i]); n++; }
     CHECK(g / n > 0.99);
+}
+
+TEST(limiter_nan_input_is_silence_not_full_scale) {
+    // NaN на входе — тишина (как в pcm24), а не −1,0 после финального ограничения.
+    sf_limiter* l = sf_limiter_create(48000, 1, -1.0);
+    const int lat = sf_limiter_latency_frames(l);
+    std::vector<float> x((size_t)(lat + 256), 0.25f);
+    x[10] = NAN;
+    sf_limiter_process(l, x.data(), (int)x.size());
+    bool finite = true; double peak = 0;
+    for (float v : x) { finite = finite && std::isfinite(v); peak = std::max(peak, (double)std::fabs(v)); }
+    CHECK(finite);
+    CHECK(peak <= 0.26);
+    sf_limiter_destroy(l);
+}
+
+TEST(src_short_output_capacity_does_not_overrun) {
+    sf_src* s = sf_src_create(2, 44100, 48000);
+    std::vector<float> in(2 * 4410, 0.1f), out(2 * 64 + 2, 7.0f);
+    const int64_t got = sf_src_process(s, in.data(), 4410, out.data(), 64);
+    CHECK(got <= 64);                       // −1 или частичный результат, но не запись за ёмкость
+    CHECK(out[2 * 64] == 7.0f && out[2 * 64 + 1] == 7.0f);
+    sf_src_destroy(s);
 }
 
 TEST(limiter_reset_is_deterministic) {
@@ -599,6 +617,8 @@ TEST(speaker_chain_change_crossfades_and_rejects_invalid) {
     CHECK(sf_speaker_set_chain(sp, &hp, 1, 1.0) == -1);                       // preamp > 0
     sf_speaker_section bad = {SF_SECTION_PEAK, 30000, 1.0, 3.0};
     CHECK(sf_speaker_set_chain(sp, &bad, 1, 0.0) == -1);                      // f0 ≥ fs/2
+    sf_speaker_section nanGain = {SF_SECTION_PEAK, 1000, 1.0, NAN};
+    CHECK(sf_speaker_set_chain(sp, &nanGain, 1, 0.0) == -1);                  // NaN-усиление запирало бы фильтр
     CHECK(sf_speaker_set_chain(sp, &hp, SF_SPEAKER_MAX_SECTIONS + 1, 0.0) == -1);
     std::vector<float> x(48000, 0.5f);                                        // постоянная составляющая: ФВЧ гасит её
     sf_speaker_process(sp, x.data(), 100);                                    // пустая цепочка — без изменений

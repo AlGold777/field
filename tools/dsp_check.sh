@@ -11,6 +11,10 @@ for a in "$@"; do case "$a" in --android) ANDROID=1 ;; --update) UPDATE=1 ;; --n
 B=dsp/build/host
 sh tools/build_dsp.sh "$B"
 "$B/dsp_tests"
+# Тесты ядра ещё раз под AddressSanitizer и UBSan: выход за буфер и неопределённое поведение — ошибка проверки.
+${CXX:-clang++} -std=c++20 -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer \
+    -ffp-contract=off -Idsp/include -Idsp/lab dsp/src/*.cpp dsp/tests/test_main.cpp -o "$B/dsp_tests_asan"
+"$B/dsp_tests_asan"
 
 CORPUS=tools/audio-corpus/wav
 ARGS=""

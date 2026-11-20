@@ -1,16 +1,34 @@
 // JNI-обёртка ядра для app.soundfield.dsp.SfDsp. Один вызов на блок.
 #include <jni.h>
 
+#include <cmath>
+#include <cstdint>
+
 #include "sfdsp.h"
 
 #define JFN(name) Java_app_soundfield_dsp_SfDsp_##name
 
 namespace {
+// readOnly: вход не копируется обратно (JNI_ABORT), если ART выдал копию массива.
 struct Critical {
-    JNIEnv* env; jarray arr; void* p;
-    Critical(JNIEnv* e, jarray a) : env(e), arr(a), p(e->GetPrimitiveArrayCritical(a, nullptr)) {}
-    ~Critical() { if (p) env->ReleasePrimitiveArrayCritical(arr, p, 0); }
+    JNIEnv* env; jarray arr; void* p; jint mode;
+    Critical(JNIEnv* e, jarray a, bool readOnly = false)
+        : env(e), arr(a), p(a ? e->GetPrimitiveArrayCritical(a, nullptr) : nullptr), mode(readOnly ? JNI_ABORT : 0) {}
+    ~Critical() { if (p) env->ReleasePrimitiveArrayCritical(arr, p, mode); }
 };
+
+// Проверка диапазона [off, off + count) внутри массива — до входа в критическую секцию.
+// Ошибка на стороне Kotlin даёт отказ, а не порчу памяти.
+bool fits(JNIEnv* env, jarray a, int64_t off, int64_t count) {
+    if (!a || off < 0 || count < 0) return false;
+    return off + count <= (int64_t)env->GetArrayLength(a);
+}
+// Последний элемент с шагом stride и шириной width: off + (n − 1)·stride + width.
+bool fitsStrided(JNIEnv* env, jarray a, int64_t off, int64_t stride, int64_t n, int64_t width) {
+    if (n <= 0) return n == 0 && a != nullptr;
+    if (stride < width) return false;
+    return fits(env, a, off, (n - 1) * stride + width);
+}
 }  // namespace
 
 extern "C" {
@@ -24,8 +42,9 @@ JNIEXPORT jfloat JNICALL JFN(nativeCoefficient)(JNIEnv*, jclass, jint phase, jin
 }
 
 JNIEXPORT jfloat JNICALL JFN(nativeInterpolate)(JNIEnv* env, jclass, jfloatArray src, jlong base, jint len, jdouble position) {
-    Critical c(env, src);
-    if (!c.p) return 0.0f / 0.0f;
+    if (!fits(env, src, 0, len)) return NAN;
+    Critical c(env, src, true);
+    if (!c.p) return NAN;
     return sf_sinc_interpolate((const float*)c.p, base, len, position);
 }
 
@@ -51,7 +70,8 @@ JNIEXPORT jlong JNICALL JFN(nativePlayoutSlewEvents)(JNIEnv*, jclass, jlong h) {
 }
 JNIEXPORT void JNICALL JFN(nativePlayoutRender)(JNIEnv* env, jclass, jlong h, jfloatArray src, jlong base, jint len,
                                                 jdouble ideal, jint n, jfloatArray out) {
-    Critical s(env, src);
+    if (!h || !fits(env, src, 0, len) || !fits(env, out, 0, n)) return;
+    Critical s(env, src, true);
     if (!s.p) return;
     Critical o(env, out);
     if (!o.p) return;
@@ -66,7 +86,8 @@ JNIEXPORT void JNICALL JFN(nativeDitherDestroy)(JNIEnv*, jclass, jlong h) { sf_d
 // handle == 0 — без дизера. in: FloatArray с шагом inStride (float), out: ByteArray с шагом outStride (байт).
 JNIEXPORT void JNICALL JFN(nativePcm24Encode)(JNIEnv* env, jclass, jlong h, jfloatArray in, jint inOff, jint inStride, jint n,
                                               jbyteArray out, jint outOff, jint outStride, jboolean bigEndian) {
-    Critical a(env, in);
+    if (!fitsStrided(env, in, inOff, inStride, n, 1) || !fitsStrided(env, out, outOff, outStride, n, 3)) return;
+    Critical a(env, in, true);
     if (!a.p) return;
     Critical b(env, out);
     if (!b.p) return;
@@ -75,7 +96,8 @@ JNIEXPORT void JNICALL JFN(nativePcm24Encode)(JNIEnv* env, jclass, jlong h, jflo
 
 JNIEXPORT void JNICALL JFN(nativePcm24Decode)(JNIEnv* env, jclass, jbyteArray in, jint inOff, jint inStride, jint n, jboolean bigEndian,
                                               jfloatArray out, jint outOff, jint outStride) {
-    Critical a(env, in);
+    if (!fitsStrided(env, in, inOff, inStride, n, 3) || !fitsStrided(env, out, outOff, outStride, n, 1)) return;
+    Critical a(env, in, true);
     if (!a.p) return;
     Critical b(env, out);
     if (!b.p) return;
@@ -93,7 +115,11 @@ JNIEXPORT jlong JNICALL JFN(nativeSrcMaxOutput)(JNIEnv*, jclass, jlong h, jlong 
 JNIEXPORT jlong JNICALL JFN(nativeSrcProcess)(JNIEnv* env, jclass, jlong h, jfloatArray in, jint inOffFrames, jint nIn,
                                               jfloatArray out, jint outOffFrames, jint outCapFrames) {
     sf_src* s = (sf_src*)(intptr_t)h;
-    Critical a(env, in);
+    if (!s) return -1;
+    const int64_t ch = sf_src_channels(s);
+    if (!fits(env, in, (int64_t)inOffFrames * ch, (int64_t)nIn * ch) ||
+        !fits(env, out, (int64_t)outOffFrames * ch, (int64_t)outCapFrames * ch)) return -1;
+    Critical a(env, in, true);
     if (!a.p) return -1;
     Critical b(env, out);
     if (!b.p) return -1;
@@ -102,6 +128,7 @@ JNIEXPORT jlong JNICALL JFN(nativeSrcProcess)(JNIEnv* env, jclass, jlong h, jflo
 }
 JNIEXPORT jlong JNICALL JFN(nativeSrcFlush)(JNIEnv* env, jclass, jlong h, jfloatArray out, jint outOffFrames, jint outCapFrames) {
     sf_src* s = (sf_src*)(intptr_t)h;
+    if (!s || !fits(env, out, (int64_t)outOffFrames * sf_src_channels(s), (int64_t)outCapFrames * sf_src_channels(s))) return -1;
     Critical b(env, out);
     if (!b.p) return -1;
     return sf_src_flush(s, (float*)b.p + (int64_t)outOffFrames * sf_src_channels(s), outCapFrames);
@@ -115,6 +142,8 @@ JNIEXPORT void JNICALL JFN(nativeLimiterReset)(JNIEnv*, jclass, jlong h) { sf_li
 JNIEXPORT jint JNICALL JFN(nativeLimiterLatency)(JNIEnv*, jclass, jlong h) { return sf_limiter_latency_frames((const sf_limiter*)(intptr_t)h); }
 // io — интерлив; смещение в float'ах.
 JNIEXPORT void JNICALL JFN(nativeLimiterProcess)(JNIEnv* env, jclass, jlong h, jfloatArray io, jint offFloats, jint frames) {
+    sf_limiter* l = (sf_limiter*)(intptr_t)h;
+    if (!l || !fits(env, io, offFloats, (int64_t)frames * sf_limiter_channels(l))) return;
     Critical a(env, io);
     if (!a.p) return;
     sf_limiter_process((sf_limiter*)(intptr_t)h, (float*)a.p + offFloats, frames);
@@ -130,7 +159,8 @@ JNIEXPORT void JNICALL JFN(nativeLimiterTakeStats)(JNIEnv* env, jclass, jlong h,
 JNIEXPORT jlong JNICALL JFN(nativeMeterCreate)(JNIEnv*, jclass, jint channels) { return (jlong)(intptr_t)sf_meter_create(channels); }
 JNIEXPORT void JNICALL JFN(nativeMeterDestroy)(JNIEnv*, jclass, jlong h) { sf_meter_destroy((sf_meter*)(intptr_t)h); }
 JNIEXPORT void JNICALL JFN(nativeMeterProcess)(JNIEnv* env, jclass, jlong h, jfloatArray in, jint offFrames, jint frames) {
-    Critical a(env, in);
+    if (!h || !fits(env, in, (int64_t)offFrames * 2, (int64_t)frames * 2)) return;
+    Critical a(env, in, true);
     if (!a.p) return;
     sf_meter_process((sf_meter*)(intptr_t)h, (const float*)a.p + (int64_t)offFrames * 2, frames);   // стерео интерлив
 }
@@ -155,7 +185,7 @@ JNIEXPORT jint JNICALL JFN(nativeSpeakerSetChain)(JNIEnv* env, jclass, jlong h, 
     if (n == 0) return sf_speaker_set_chain(s, nullptr, 0, preampDb);
     sf_speaker_section sec[SF_SPEAKER_MAX_SECTIONS];
     {
-        Critical t(env, types), a(env, f0), b(env, q), g(env, gainDb);
+        Critical t(env, types, true), a(env, f0, true), b(env, q, true), g(env, gainDb, true);
         if (!t.p || !a.p || !b.p || !g.p) return -1;
         for (jsize i = 0; i < n; i++) {
             sec[i].type = ((const jint*)t.p)[i];
@@ -168,6 +198,8 @@ JNIEXPORT jint JNICALL JFN(nativeSpeakerSetChain)(JNIEnv* env, jclass, jlong h, 
 }
 // io — интерлив; смещение в float'ах.
 JNIEXPORT void JNICALL JFN(nativeSpeakerProcess)(JNIEnv* env, jclass, jlong h, jfloatArray io, jint offFloats, jint frames) {
+    sf_speaker* sp = (sf_speaker*)(intptr_t)h;
+    if (!sp || !fits(env, io, offFloats, (int64_t)frames * sf_speaker_channels(sp))) return;
     Critical a(env, io);
     if (!a.p) return;
     sf_speaker_process((sf_speaker*)(intptr_t)h, (float*)a.p + offFloats, frames);

@@ -51,6 +51,7 @@ extern "C" {
 
 sf_limiter* sf_limiter_create(int sample_rate, int channels, double ceiling_dbtp) {
     if (channels < 1 || channels > 2 || sample_rate < 8000) return nullptr;
+    (void)tpTable();   // таблица строится здесь, а не лениво в первом process на аудиопотоке
     sf_limiter* l = new (std::nothrow) sf_limiter;
     if (!l) return nullptr;
     l->channels = channels;
@@ -84,6 +85,7 @@ void sf_limiter_reset(sf_limiter* l) {
 }
 
 int sf_limiter_latency_frames(const sf_limiter* l) { return l->latency; }
+int sf_limiter_channels(const sf_limiter* l) { return l->channels; }
 
 void sf_limiter_process(sf_limiter* l, float* io, int frames) {
     sf::FtzGuard ftz;
@@ -92,7 +94,11 @@ void sf_limiter_process(sf_limiter* l, float* io, int frames) {
     double blockMinGain = 1.0;
     for (int f = 0; f < frames; f++) {
         const int64_t n = l->n++;
-        for (int c = 0; c < ch; c++) l->xring[(size_t)c * rs + (size_t)(n & mask)] = io[f * ch + c];
+        // NaN на входе → 0 (как pcm24): иначе финальный clamp превращал его в −1,0 — полный щелчок.
+        for (int c = 0; c < ch; c++) {
+            const float v = io[f * ch + c];
+            l->xring[(size_t)c * rs + (size_t)(n & mask)] = std::isnan(v) ? 0.0f : v;
+        }
         // детектор: пик кадра k = n − 16 (нужны x[k−15 .. k+16] = x[n−31 .. n]); до начала потока отсчёты — нули
         const int64_t k = n - kTpHalf;
         double peak = 0;
