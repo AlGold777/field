@@ -30,9 +30,9 @@ final class LevelMeasureSource: AudioSource {
         let gap = Int64(Double(SF.sampleRate) * Self.gapSeconds)
         let relative = frame - initial
         let pos = relative % cycle
-        let repetition = relative / cycle
         if pos < active && ch == serverChannel {
-            return noise[Int((repetition * cycle + pos) % Int64(noise.count))]
+            // Индекс от начала свипа, как у Point: смещение повтора рвало свип щелчком.
+            return noise[Int(pos % Int64(noise.count))]
         }
         if pos >= active + gap && pos < active * 2 + gap && ch == pointChannel {
             return noise[Int((pos - active - gap) % Int64(noise.count))]

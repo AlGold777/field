@@ -132,7 +132,7 @@ class ClockSync {
             rtts.addLast(rtt / 1e6); while (rtts.size > 100) rtts.removeFirst()
             rttMinMs = rtts.min(); rttAvgMs = rtts.average()
             rttJitterMs = sqrt(rtts.sumOf { (it - rttAvgMs) * (it - rttAvgMs) } / rtts.size)
-            recompute()
+            recompute(t4)
         }
     }
 
@@ -144,11 +144,12 @@ class ClockSync {
             val b = bucketFor(arrivalLocal)
             val d = arrivalLocal - sendServerNs
             b.nBwd++
-            if (d < b.minBwd) { b.minBwd = d; recompute() }
+            if (d < b.minBwd) { b.minBwd = d; recompute(arrivalLocal) }
         }
     }
 
-    private fun recompute() {
+    /** [nowNs] — локальное время замера: симуляция и тесты с виртуальным временем не зависят от System.nanoTime. */
+    private fun recompute(nowNs: Long) {
         val ok = buckets.filter { it.usable }
         if (ok.isEmpty()) return
         val qMin = ok.minOf { it.quality }
@@ -187,7 +188,7 @@ class ClockSync {
         uncertaintyMs = maxOf(uncertaintyMs, qMin / 1e6 * 0.5)
         driftPpm = b * 1e6
         val next = Model(ref, a, b, true)
-        val now = System.nanoTime()
+        val now = nowNs
         val deltaNs = smoothed.deltaTo(next, now)
         lastModelStepUs = abs(deltaNs) / 1_000.0
         modelStepsUs.addLast(lastModelStepUs)

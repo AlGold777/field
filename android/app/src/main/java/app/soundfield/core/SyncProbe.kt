@@ -34,12 +34,14 @@ object SyncProbeAnalyzer {
         val searchRadius = (sampleRate * 0.040).toInt()
         val deltas = ArrayList<Double>(trialLimit)
         val localPositions = ArrayList<Double>(trialLimit)
+        val trialIndexes = ArrayList<Int>(trialLimit)   // номер пробы: пропуски не сдвигают шаг регрессии
         for (trial in 0 until trialLimit) {
             val base = expectedStart + trial.toDouble() * sampleRate
             val left = peak(samples, template, base.toInt(), searchRadius)
             val right = peak(samples, template, (base + SyncProbeSource.SECOND_CHIRP_OFFSET_FRAMES).toInt(), searchRadius)
             if (left == null || right == null || left.score < MIN_CORRELATION || right.score < MIN_CORRELATION) continue
             localPositions += left.position.toDouble()
+            trialIndexes += trial
             deltas += (right.position - left.position - SyncProbeSource.SECOND_CHIRP_OFFSET_FRAMES).toDouble()
         }
         if (deltas.size < 10) return SyncProbeResult(false, "insufficient_chirps", trials = deltas.size)
@@ -55,7 +57,7 @@ object SyncProbeAnalyzer {
             sigmaUs = sigma * 1e6 / sampleRate,
             p95Us = percentile(deviations, 0.95) * 1e6 / sampleRate,
             maxUs = deviations.last() * 1e6 / sampleRate,
-            ppm = driftPpm(localPositions, sampleRate),
+            ppm = driftPpm(trialIndexes, localPositions, sampleRate),
         )
     }
 
@@ -102,14 +104,15 @@ object SyncProbeAnalyzer {
     private fun percentile(sorted: List<Double>, fraction: Double): Double =
         sorted[((sorted.size - 1) * fraction).toInt().coerceIn(0, sorted.lastIndex)]
 
-    private fun driftPpm(positions: List<Double>, sampleRate: Int): Double {
+    /** Регрессия позиции чирпа по номеру пробы (а не по индексу в списке найденных). */
+    private fun driftPpm(trials: List<Int>, positions: List<Double>, sampleRate: Int): Double {
         if (positions.size < 3) return 0.0
-        val meanX = (positions.size - 1) / 2.0
+        val meanX = trials.average()
         val meanY = positions.average()
         var numerator = 0.0
         var denominator = 0.0
         for (i in positions.indices) {
-            val x = i - meanX
+            val x = trials[i] - meanX
             numerator += x * (positions[i] - meanY)
             denominator += x * x
         }

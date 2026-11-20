@@ -17,9 +17,9 @@ class LevelMeasureSource(private val serverChannel: Int, private val pointChanne
         if (frame < initialFrames || frame >= totalFrames) return 0f
         val relative = frame - initialFrames
         val pos = relative % cycleFrames
-        val repeat = relative / cycleFrames
         if (pos < activeFrames && ch == serverChannel) {
-            return noise[((repeat * cycleFrames + pos) % noise.size).toInt()]
+            // Индекс от начала свипа, как у Point: смещение повтора (7 с против 3 с шума) рвало свип щелчком.
+            return noise[(pos % noise.size).toInt()]
         }
         if (pos >= activeFrames + gapFrames && pos < activeFrames * 2 + gapFrames && ch == pointChannel) {
             return noise[((pos - activeFrames - gapFrames) % noise.size).toInt()]
