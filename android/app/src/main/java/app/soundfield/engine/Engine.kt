@@ -127,6 +127,8 @@ class Engine private constructor(private val app: Context) {
 
     companion object {
         const val TAG = "SoundField"
+        /** Возможности протокола этого приложения: объявляются пиру и пересекаются с его списком (один источник). */
+        val SUPPORTED_CAPABILITIES = linkedSetOf("addrs", "tcpClock", "tcpAudio", "eq", "spatialV1", "fileTransferV1")
         /** Меняется при каждом запуске процесса: сохранённые в UI счётчики запросов от прошлого процесса недействительны. */
         val PROCESS_TOKEN: String = java.util.UUID.randomUUID().toString()
         private const val SOLO_SERVICE_IDLE_MS = 5 * 60_000L
@@ -680,10 +682,7 @@ class Engine private constructor(private val app: Context) {
         return (0 until caps.length()).mapNotNull { caps.optString(it).takeIf(String::isNotBlank) }.toSet()
     }
 
-    private fun localCapabilitiesJson() = org.json.JSONArray().also { array ->
-        listOf("addrs", "tcpClock", "tcpAudio", "eq", "spatialV1").forEach(array::put)
-        array.put("fileTransferV1")
-    }
+    private fun localCapabilitiesJson() = org.json.JSONArray().also { array -> SUPPORTED_CAPABILITIES.forEach(array::put) }
 
     private fun updatePeerAddressBook(addresses: List<PeerAddress>) {
         if (addresses.isEmpty()) return
@@ -978,9 +977,17 @@ class Engine private constructor(private val app: Context) {
                 if (!tcpAudioServer.isClosed) telemetry.limited("TCP_AUDIO_ACCEPT_FAILED", error = e)
                 continue
             }
-            io.execute { acceptTcpAudioSocket(socket) }
+            // Не больше 4 одновременных hello: пул io не ограничен, а hello приходит до аутентификации.
+            if (pendingTcpAudioHellos.incrementAndGet() > 4) {
+                pendingTcpAudioHellos.decrementAndGet()
+                telemetry.limited("TCP_AUDIO_HELLO_LIMIT")
+                try { socket.close() } catch (_: Exception) {}
+                continue
+            }
+            io.execute { try { acceptTcpAudioSocket(socket) } finally { pendingTcpAudioHellos.decrementAndGet() } }
         }
     }
+    private val pendingTcpAudioHellos = java.util.concurrent.atomic.AtomicInteger()
 
     private fun closeServerTcpAudio(reason: String) {
         val socket = serverTcpAudioSocket
@@ -2558,11 +2565,15 @@ class Engine private constructor(private val app: Context) {
         } }.filter { it.name.isNotBlank() }
     } catch (_: Exception) { emptyList() }
 
+    private val eqSpectrumWindow = FloatArray(4096)
+
     fun eqSpectrumSnapshot(): List<Float> {
         val capture = if (role == Role.POINT) pointRenderer.spectrumCapture else serverRenderer.spectrumCapture
-        val window = FloatArray(4096)
-        return if (capture.copyLatest(window)) EqSpectrumCapture().spectrumDb(window).toList()
-        else List(30) { -100f }
+        // Буфер окна переиспользуется; спектр считает тот же объект захвата (без нового буфера 8192 на кадр).
+        val window = eqSpectrumWindow
+        return synchronized(window) {
+            if (capture.copyLatest(window)) capture.spectrumDb(window).toList() else List(30) { -100f }
+        }
     }
 
     private fun sendGainCommand(key: String, finished: Boolean, send: () -> Unit) {
@@ -3195,8 +3206,12 @@ class Engine private constructor(private val app: Context) {
                 l.send(JSONObject().put("t", "challenge").put("sn", PairCrypto.hex(sn)).put("proof", PairCrypto.hex(
                     HandshakeAuth.resumeServerProof(key, cn, sn, pid, myId))))
             }
-            else -> telemetry.record("TCP_UNKNOWN_MESSAGE_IGNORED", mapOf("type" to o.optString("t", ""),
-                "linkId" to l.id, "phase" to phase.name))
+            else -> {
+                telemetry.record("TCP_UNKNOWN_MESSAGE_IGNORED", mapOf("type" to o.optString("t", ""),
+                    "linkId" to l.id, "phase" to phase.name))
+                // Линк остаётся «new» до 5-секундного таймаута — и должен занимать слот лимита входящих.
+                if (l.tag == "new") incomingLinks.add(l)
+            }
         }
     }
 
@@ -3404,7 +3419,7 @@ class Engine private constructor(private val app: Context) {
         udpKey = l.udpKey
         pingGate.reset(); pongWindow.reset()
         role = r; peerId = pid; peerName = pname; peerPlatform = pplat
-        negotiatedCapabilities = peerCapabilities.intersect(setOf("addrs", "tcpClock", "tcpAudio", "eq", "spatialV1", "fileTransferV1"))
+        negotiatedCapabilities = peerCapabilities.intersect(SUPPORTED_CAPABILITIES)
         phase = Phase.PAIRED
         zeroSendRenewStreak = 0
         udpNetworkRebindAttempted = false
@@ -3668,7 +3683,7 @@ class Engine private constructor(private val app: Context) {
             // --- на Point ---
             "session" -> if (role == Role.POINT) {
                 peerCapabilities = parsePeerCaps(o)
-                negotiatedCapabilities = peerCapabilities.intersect(setOf("addrs", "tcpClock", "tcpAudio", "eq", "spatialV1", "fileTransferV1"))
+                negotiatedCapabilities = peerCapabilities.intersect(SUPPORTED_CAPABILITIES)
                 updatePeerAddressBook(parsePeerAddresses(o))
                 val newSession = o.getInt("session")
                 if (sessionId != newSession) {
@@ -3733,7 +3748,7 @@ class Engine private constructor(private val app: Context) {
             }
             "network-addresses" -> {
                 peerCapabilities = parsePeerCaps(o)
-                negotiatedCapabilities = peerCapabilities.intersect(setOf("addrs", "tcpClock", "tcpAudio", "eq", "spatialV1", "fileTransferV1"))
+                negotiatedCapabilities = peerCapabilities.intersect(SUPPORTED_CAPABILITIES)
                 updatePeerAddressBook(parsePeerAddresses(o))
                 telemetry.record("PEER_ADDRESSES_RECEIVED", mapOf("count" to parsePeerAddresses(o).size,
                     "networkIds" to parsePeerAddresses(o).map { it.networkId }.distinct()))

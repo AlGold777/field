@@ -312,14 +312,16 @@ class EqSpectrumCapture(private val capacity: Int = 8192) {
         return true
     }
 
+    @Volatile private var hannWindow: DoubleArray? = null
+
     fun spectrumDb(samples: FloatArray, bands: Int = 60): FloatArray {
         val n = samples.size
         require(n > 0 && (n and (n - 1)) == 0)
         val real = DoubleArray(n); val imag = DoubleArray(n)
-        for (i in 0 until n) {
-            val hann = 0.5 - 0.5 * cos(2.0 * PI * i / (n - 1))
-            real[i] = samples[i] * hann
-        }
+        // Окно Ханна считается один раз на размер, а не 4096 cos на каждый кадр анализатора (30 Гц).
+        val window = hannWindow?.takeIf { it.size == n } ?: DoubleArray(n) { i -> 0.5 - 0.5 * cos(2.0 * PI * i / (n - 1)) }
+            .also { hannWindow = it }
+        for (i in 0 until n) real[i] = samples[i] * window[i]
         var j = 0
         for (i in 1 until n) {
             var bit = n shr 1

@@ -89,28 +89,31 @@ data class PairRecord(
     companion object {
         fun fromJson(s: String?): PairRecord? = try {
             if (s == null) null else JSONObject(s).let {
+                // Именованные аргументы: новое поле в конструкторе не сдвинет разбор. Дефолты чтения
+                // master = 0.8, volTaper = 0 и levelTrimVersion = 0 отличаются от конструктора намеренно —
+                // это признаки записи до миграции громкости и уровней.
                 PairRecord(
-                    it.getString("key"), it.getString("peerId"), it.getString("peerName"),
-                    it.optString("peerPlatform", "android"), Role.fromWire(it.getString("myRole")),
-                    Ch.parse(it.optString("pointCh", "R")), it.optDouble("trimMs", 0.0),
-                    it.optDouble("volL", 1.0).toFloat(), it.optDouble("volR", 1.0).toFloat(),
-                    it.optDouble("master", 0.8).toFloat(),
-                    it.optString("lastHost", "").ifEmpty { null }, it.optInt("lastPort", 0),
-                    it.optJSONArray("peerAddresses")?.let { array ->
+                    key = it.getString("key"), peerId = it.getString("peerId"), peerName = it.getString("peerName"),
+                    peerPlatform = it.optString("peerPlatform", "android"), myRole = Role.fromWire(it.getString("myRole")),
+                    pointChannel = Ch.parse(it.optString("pointCh", "R")), trimMs = it.optDouble("trimMs", 0.0),
+                    volL = it.optDouble("volL", 1.0).toFloat(), volR = it.optDouble("volR", 1.0).toFloat(),
+                    master = it.optDouble("master", 0.8).toFloat(),
+                    lastHost = it.optString("lastHost", "").ifEmpty { null }, lastPort = it.optInt("lastPort", 0),
+                    peerAddresses = it.optJSONArray("peerAddresses")?.let { array ->
                         (0 until array.length()).mapNotNull { index ->
                             array.optJSONObject(index)?.let { address -> PeerAddress(address.optString("ip"),
                                 address.optString("iface"), address.optString("networkId")) }
                                 ?.takeIf { address -> address.ip.isNotBlank() }
                         }
-                    }.orEmpty(), it.optString("lastSuccessfulHost", "").ifEmpty { null },
-                    it.optDouble("balance", 0.5).toFloat(),
-                    it.optDouble("levelTrimServerDb", 0.0).toFloat(),
-                    it.optDouble("levelTrimPointDb", 0.0).toFloat(),
-                    it.optInt("volTaper", 0), it.optInt("levelTrimVersion", 0),
-                    it.optJSONObject("delayCalib")?.let { c -> DelayCalib(c.optString("state", "none"), c.optLong("atMs"), c.optDouble("spreadMs")) } ?: DelayCalib(),
-                    it.optJSONObject("levelCalib")?.let { c -> LevelCalib(c.optString("state", "none"), c.optLong("atMs"), c.optDouble("db")) } ?: LevelCalib(),
-                    it.optString("lastSuccessfulNetworkId", "").ifEmpty { null },
-                    it.optJSONObject("eq")?.let { eqObject ->
+                    }.orEmpty(), lastSuccessfulHost = it.optString("lastSuccessfulHost", "").ifEmpty { null },
+                    balance = it.optDouble("balance", 0.5).toFloat(),
+                    levelTrimServerDb = it.optDouble("levelTrimServerDb", 0.0).toFloat(),
+                    levelTrimPointDb = it.optDouble("levelTrimPointDb", 0.0).toFloat(),
+                    volTaper = it.optInt("volTaper", 0), levelTrimVersion = it.optInt("levelTrimVersion", 0),
+                    delayCalib = it.optJSONObject("delayCalib")?.let { c -> DelayCalib(c.optString("state", "none"), c.optLong("atMs"), c.optDouble("spreadMs")) } ?: DelayCalib(),
+                    levelCalib = it.optJSONObject("levelCalib")?.let { c -> LevelCalib(c.optString("state", "none"), c.optLong("atMs"), c.optDouble("db")) } ?: LevelCalib(),
+                    lastSuccessfulNetworkId = it.optString("lastSuccessfulNetworkId", "").ifEmpty { null },
+                    eq = it.optJSONObject("eq")?.let { eqObject ->
                         val gains = eqObject.optJSONArray("gains")
                         EqSettings(
                             enabled = eqObject.optBoolean("enabled", false),
@@ -121,7 +124,7 @@ data class PairRecord(
                             bypass = eqObject.optBoolean("bypass", false),
                         ).sanitized()
                     } ?: EqSettings(),
-                    SpatialSettings.fromJson(it.optJSONObject("spatial")),
+                    spatial = SpatialSettings.fromJson(it.optJSONObject("spatial")),
                 )
             }
         } catch (e: Exception) {

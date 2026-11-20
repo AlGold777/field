@@ -5,7 +5,6 @@ import java.io.ByteArrayOutputStream
 import java.io.Closeable
 import java.io.DataInputStream
 import java.io.DataOutputStream
-import java.io.EOFException
 
 object TcpAudioStartPolicy {
     fun ready(contiguousFrames: Int, minimumFrames: Int): Boolean =
@@ -20,6 +19,8 @@ object TcpAudioWire {
     const val HELLO_MAGIC = 0x53464132 // SFA2: версия 3 (PCM 24 бит); SFA1 (PCM16) отвергается
     private const val MAX_CHUNK_BYTES = 14_700
     const val CHUNK_FRAMES = 4_800 // 100 ms of mono 48 kHz PCM 24 bit
+    /** id пира — до 64 символов; в modified UTF-8 не больше 3 байт на символ. */
+    private const val MAX_HELLO_ID_BYTES = 64 * 3
 
     /** Подтверждение hello: усечённый HMAC от udpKey соединения (тот же ключ, что у UDP-контура). */
     fun helloTag(key: ByteArray, peerId: String, sessionId: Int): ByteArray =
@@ -36,7 +37,11 @@ object TcpAudioWire {
     /** Возвращает (peerId, session) только при верном теге, иначе бросает исключение. */
     fun readHello(input: DataInputStream, key: ByteArray): Pair<String, Int> {
         require(input.readInt() == HELLO_MAGIC) { "Invalid TCP audio hello" }
-        val id = input.readUTF().take(64); val session = input.readInt()
+        // Длину id читаем сами: readUTF выделял до 64 КБ до проверки тега для любого клиента в сети.
+        val idLength = input.readUnsignedShort()
+        require(idLength in 1..MAX_HELLO_ID_BYTES) { "Invalid TCP audio hello id length: $idLength" }
+        val idBytes = ByteArray(idLength); input.readFully(idBytes)
+        val id = String(idBytes, Charsets.UTF_8).take(64); val session = input.readInt()
         val tag = ByteArray(PairCrypto.TAG_BYTES); input.readFully(tag)
         require(PairCrypto.equal(tag, helloTag(key, id, session))) { "Invalid TCP audio hello tag" }
         return id to session
@@ -59,7 +64,7 @@ object TcpAudioWire {
     }
 
     fun readChunk(input: DataInputStream): TcpAudioChunk {
-        val size = try { input.readInt() } catch (e: EOFException) { throw e }
+        val size = input.readInt()
         require(size in 18..MAX_CHUNK_BYTES) { "Invalid TCP audio frame size: $size" }
         val bytes = ByteArray(size)
         input.readFully(bytes)

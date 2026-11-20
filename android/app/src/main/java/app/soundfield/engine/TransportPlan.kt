@@ -10,12 +10,11 @@ object TransportPlan {
         groups.flatMap { it }.forEach { next ->
             if (next.ip.isBlank()) return@forEach
             val current = merged[next.ip]
-            merged[next.ip] = when {
-                current == null -> next
-                current.iface.isBlank() && next.iface.isNotBlank() -> next
-                current.networkId.isBlank() && next.networkId.isNotBlank() -> next.copy(iface = current.iface.ifBlank { next.iface })
-                else -> current
-            }
+            // Поля объединяются: раньше замена записью с iface теряла networkId первой записи.
+            merged[next.ip] = if (current == null) next else current.copy(
+                iface = current.iface.ifBlank { next.iface },
+                networkId = current.networkId.ifBlank { next.networkId },
+            )
         }
         return merged.values.toList()
     }
