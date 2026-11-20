@@ -2,3 +2,6 @@
 dsp/build/
 spotify/target/
 android/app/src/main/jniLibs/
+
+# Артефакты сборки и выпуска: в репозиторий не попадают (APK лежат рядом с проектом).
+*.apk

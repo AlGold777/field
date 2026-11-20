@@ -5,3 +5,4 @@ local.properties
 *.iml
 coretest/out.jar
 .DS_Store
+.cxx/
