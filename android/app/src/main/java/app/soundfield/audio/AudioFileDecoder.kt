@@ -155,6 +155,7 @@ object AudioFileDecoder {
 
             val codec = MediaCodec.createDecoderByType(mime)
             val sink = PcmSegmentWriter(directory, source, onProgress, onReady)
+            var converter: SampleRateConverter? = null
             try {
                 codec.configure(inputFormat, null, null, 0)
                 codec.start()
@@ -164,7 +165,6 @@ object AudioFileDecoder {
                 var sampleRate = inputFormat.getInteger(MediaFormat.KEY_SAMPLE_RATE)
                 var channels = inputFormat.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
                 var encoding = AudioFormat.ENCODING_PCM_16BIT
-                var converter: SampleRateConverter? = null
                 var converterRate = -1
                 val inFrames = BLOCK_FRAMES
                 val inBlock = FloatArray(inFrames * 2)
@@ -229,9 +229,18 @@ object AudioFileDecoder {
                                 }
                                 val frames = info.size / (bps * channels)
                                 for (fr in 0 until frames) {
-                                    val l = readSample(buffer, encoding)
-                                    val r = if (channels >= 2) readSample(buffer, encoding) else l
-                                    for (c in 2 until channels) readSample(buffer, encoding)   // остальные каналы пропускаем
+                                    var l = readSample(buffer, encoding)
+                                    var r = if (channels >= 2) readSample(buffer, encoding) else l
+                                    if (channels == 6) {
+                                        // 5.1 (FL FR FC LFE SL SR): даунмикс ITU-R BS.775 без LFE, с нормировкой
+                                        // против клиппинга. Раньше центр (диалоги) и тылы терялись.
+                                        val c = readSample(buffer, encoding)
+                                        readSample(buffer, encoding)   // LFE
+                                        val sl = readSample(buffer, encoding)
+                                        val sr = readSample(buffer, encoding)
+                                        l = ((l + DOWNMIX_SIDE * (c + sl)) * DOWNMIX_NORM).toFloat()
+                                        r = ((r + DOWNMIX_SIDE * (c + sr)) * DOWNMIX_NORM).toFloat()
+                                    } else for (c in 2 until channels) readSample(buffer, encoding)   // прочие раскладки: L и R
                                     inBlock[inCount * 2] = l; inBlock[inCount * 2 + 1] = r
                                     if (++inCount == inFrames) flushInput(final = false)
                                 }
@@ -243,19 +252,25 @@ object AudioFileDecoder {
                     check(SystemClock.elapsedRealtime() - lastProgressAt < 30_000) { "Декодер аудио не отвечает" }
                 }
                 flushInput(final = true)
-                converter?.close(); converter = null
                 sink.finish()
                 sink.publishPeak()
                 require(sink.framesOut > 0) { "В файле нет аудиоданных" }
                 source.finish(sink.framesOut)
                 return source
             } finally {
+                // SRC закрываем и при отмене или ошибке кодека: иначе нативный хендл утекал.
+                try { converter?.close() } catch (_: Exception) {}
+                converter = null
                 try { sink.close() } catch (_: Exception) {}
                 try { codec.stop() } catch (_: Exception) {}
                 codec.release()
             }
         } finally { extractor.release() }
     }
+
+    /** Даунмикс 5.1: вес центра и тылов −3 дБ; нормировка 1/(1+2·0,7071) исключает клиппинг. */
+    private const val DOWNMIX_SIDE = 0.70710678
+    private const val DOWNMIX_NORM = 1.0 / (1.0 + 2.0 * DOWNMIX_SIDE)
 
     private fun readSample(b: java.nio.ByteBuffer, encoding: Int): Float = when (encoding) {
         AudioFormat.ENCODING_PCM_16BIT -> b.short / 32768f
