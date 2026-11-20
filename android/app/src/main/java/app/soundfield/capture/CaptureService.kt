@@ -74,7 +74,11 @@ class CaptureService : Service() {
             check(created.recordingState == AudioRecord.RECORDSTATE_RECORDING) { "recording did not start" }
             telemetry.record("CAPTURE_START", mapOf("encoding" to created.audioFormat, "sampleRate" to created.sampleRate,
                 "targets" to targetUids().size))
-            thread = Thread({ readLoop(created) }, "sf-capture").apply { start() }
+            // Сначала публикуем поток, потом запускаем: цикл чтения идёт, пока thread === currentThread,
+            // и при раннем старте мог сразу завершиться, оставив захват без чтения.
+            val worker = Thread({ readLoop(created) }, "sf-capture")
+            thread = worker
+            worker.start()
         } catch (e: Exception) {
             telemetry.event("CAPTURE_START_FAILED", error = e)
             finish("Захват звука не запустился")
