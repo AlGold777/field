@@ -35,7 +35,12 @@ enum PairCrypto {
     /// MAC над частями, каждая с префиксом длины u16 BE.
     static func mac(_ key: [UInt8], _ parts: [[UInt8]]) -> [UInt8] {
         var d: [UInt8] = []
-        for p in parts { d.append(UInt8(p.count >> 8)); d.append(UInt8(p.count & 0xFF)); d.append(contentsOf: p) }
+        // truncatingIfNeeded — как ByteArrayOutputStream.write на Android: часть ≥ 64 КБ из сети
+        // (длинный id в invite/accept) раньше роняла приложение на UInt8(...).
+        for p in parts {
+            d.append(UInt8(truncatingIfNeeded: p.count >> 8)); d.append(UInt8(truncatingIfNeeded: p.count))
+            d.append(contentsOf: p)
+        }
         return hmac(key, d[...])
     }
     static func mac(_ key: [UInt8], _ label: String, _ parts: [[UInt8]]) -> [UInt8] { mac(key, [Array(label.utf8)] + parts) }
