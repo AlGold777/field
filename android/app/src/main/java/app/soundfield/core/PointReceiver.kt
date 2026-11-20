@@ -97,8 +97,8 @@ class PointReceiver(private val clock: ClockSync, capacityPow2: Int = 17) {
             var duplicate = false
             if (diff >= 0) {
                 val gap = diff
-                if (gap > 256) {
-                    // Огромный провал в приёме (> 2.5 с звука) — не забиваем очередь безнадёжными NACK
+                if (gap > MAX_NACK_GAP_PACKETS) {
+                    // Огромный провал в приёме (> 256 пакетов × 8 мс ≈ 2,05 с звука) — не забиваем очередь безнадёжными NACK
                     lostFinal += gap
                 } else {
                     var s = expectedSeq
@@ -172,5 +172,10 @@ class PointReceiver(private val clock: ClockSync, capacityPow2: Int = 17) {
         if (tags.get(idx) != frame) return Float.NaN
         val s = samples[idx]
         return if (tags.get(idx) == frame) s else Float.NaN
+    }
+
+    private companion object {
+        /** Провал больше 256 пакетов (≈ 2,05 с при 384 кадрах на пакет) не перезапрашивается. */
+        const val MAX_NACK_GAP_PACKETS = 256
     }
 }

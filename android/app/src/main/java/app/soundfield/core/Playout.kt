@@ -104,7 +104,7 @@ class PlayoutCorrector {
     fun position(i: Int): Double = start + i * step
 
     /** Compatibility helper for position-only UI/telemetry call sites. */
-    fun frame(i: Int, @Suppress("UNUSED_PARAMETER") n: Int): Long = floor(position(i) + 0.5).toLong()
+    fun frame(i: Int): Long = floor(position(i) + 0.5).toLong()
 
     companion object {
         private const val KP_PER_SECOND = 2.0 / 3.0

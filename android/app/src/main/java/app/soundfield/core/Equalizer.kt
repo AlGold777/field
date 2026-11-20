@@ -62,7 +62,6 @@ object EqualizerMath {
     val frequencies = doubleArrayOf(31.5, 63.0, 125.0, 250.0, 500.0, 1_000.0, 2_000.0, 4_000.0, 8_000.0, 16_000.0)
     private const val SAMPLE_RATE = 48_000.0
     private const val Q = 1.4142135623730951
-    private val ln2 = ln(2.0)
 
     fun filterGains(targetDb: List<Float>): DoubleArray {
         val target = DoubleArray(BAND_COUNT) { targetDb.getOrNull(it)?.toDouble()?.coerceIn(-12.0, 12.0) ?: 0.0 }
@@ -229,6 +228,9 @@ class EqConfig internal constructor(
 }
 
 /** Per-output DSP state. There is one instance per local renderer/channel. */
+/** Длительность сглаживания смены настроек EQ: 1440 кадров = 30 мс при 48 кГц. */
+private const val EQ_SMOOTH_FRAMES = 1_440
+
 class EqualizerProcessor {
     @Volatile private var pending = EqConfig.neutral()
     private var applied: EqConfig? = null
@@ -258,7 +260,7 @@ class EqualizerProcessor {
             targetPreamp = if (active) next.outputGainDb else 0.0
             targetBypassMix = if (next.settings.enabled && next.settings.bypass) 1.0 else 0.0
             targetBypassComp = if (next.settings.enabled) next.bypassCompDb else 0.0
-            smoothRemaining = 1_440
+            smoothRemaining = EQ_SMOOTH_FRAMES   // 30 мс
         }
 
         var frame = 0
@@ -383,7 +385,7 @@ object EqMagnetMath {
         return result
     }
 
-    fun log2(value: Double) = ln(value) / ln2
+    fun log2(value: Double) = kotlin.math.log2(value)
 }
 
 /** Linear time-domain interpolation helper for UI slider updates. */

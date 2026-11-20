@@ -6,6 +6,10 @@ import kotlin.math.sqrt
 
 /** Детерминированный полосовой розовый шум с заданным RMS и ограниченным пиком. */
 object PinkNoise {
+    /** Средний уровень −20 дБFS (RMS 0,1) и пик не выше −8 дБFS (0,398): запас для калибровочных сигналов. */
+    private const val TARGET_RMS = 0.1
+    private const val PEAK_LIMIT = 0.39810717
+
     fun make(count: Int, lowHz: Double, highHz: Double, seed: Int = 0x13579BDF): FloatArray {
         var state = seed
         var b0 = 0f; var b1 = 0f; var b2 = 0f; var b3 = 0f; var b4 = 0f; var b5 = 0f; var b6 = 0f
@@ -35,7 +39,7 @@ object PinkNoise {
         }
         if (out.isEmpty()) return out
         val rms = sqrt(power / out.size).coerceAtLeast(1e-9)
-        val scale = minOf(0.1 / rms, 0.39810717 / maxOf(peak.toDouble(), 1e-9))
+        val scale = minOf(TARGET_RMS / rms, PEAK_LIMIT / maxOf(peak.toDouble(), 1e-9))
         for (i in out.indices) out[i] = (out[i] * scale).toFloat()
         return out
     }

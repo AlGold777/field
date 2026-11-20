@@ -82,8 +82,8 @@ object LevelAnalyzer {
             }
             fft(re, im)
             for (band in centersHz.indices) {
-                val low = centersHz[band] / 2.0.powThird()
-                val high = centersHz[band] * 2.0.powThird()
+                val low = centersHz[band] / THIRD_OCTAVE_HALF_STEP
+                val high = centersHz[band] * THIRD_OCTAVE_HALF_STEP
                 val loBin = max(1, kotlin.math.ceil(low * FFT_SIZE / sampleRate).toInt())
                 val hiBin = min(FFT_SIZE / 2, (high * FFT_SIZE / sampleRate).toInt())
                 var p = 0.0
@@ -134,5 +134,6 @@ object LevelAnalyzer {
         }
     }
 
-    private fun Double.powThird() = kotlin.math.exp(ln(2.0) / 6.0)
+    /** Половина третьоктавной полосы: 2^(1/6). */
+    private val THIRD_OCTAVE_HALF_STEP = kotlin.math.exp(ln(2.0) / 6.0)
 }

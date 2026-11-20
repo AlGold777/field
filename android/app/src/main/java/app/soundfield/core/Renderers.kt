@@ -110,7 +110,7 @@ class ServerRenderer(
             if (!inSourceUnderrun) underruns.incrementAndGet()
             inSourceUnderrun = true
         } else inSourceUnderrun = false
-        positionFrame = corrector.frame(n - 1, n)
+        positionFrame = corrector.frame(n - 1)
         finish(out, n, st.gain, st.equalizer, playing = true)
     }
 
@@ -155,7 +155,7 @@ class ServerRenderer(
             if (!inSourceUnderrun) underruns.incrementAndGet()
             inSourceUnderrun = true
         } else inSourceUnderrun = false
-        positionFrame = corrector.frame(n - 1, n)
+        positionFrame = corrector.frame(n - 1)
         finishStereo(interleaved, n, st.gain, st.equalizer, playing = true)
     }
 
@@ -261,7 +261,7 @@ class PointRenderer(
             windowUnderrunFrames.addAndGet(missing.toLong())
             if (!inUnderrun) { underrunEvents.incrementAndGet(); inUnderrun = true }
         } else inUnderrun = false
-        rx.lastRenderedFrame = corrector.frame(n - 1, n)
+        rx.lastRenderedFrame = corrector.frame(n - 1)
         finish(out, n, p, playing = true)
         if (debugSilence) java.util.Arrays.fill(out, 0, n, 0f)
     }

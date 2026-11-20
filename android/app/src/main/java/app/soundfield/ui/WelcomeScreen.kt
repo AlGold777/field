@@ -115,16 +115,3 @@ fun PairingDialogs(ui: UiState, engine: Engine) {
         )
     }
 }
-
-@Composable
-fun RenameDialog(current: String, onDismiss: () -> Unit, onSave: (String) -> Unit) {
-    var text by remember { mutableStateOf(current) }
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text("Имя телефона") },
-        text = { OutlinedTextField(value = text, onValueChange = { text = it.take(40) }, singleLine = true,
-            label = { Text("Видно второму телефону") }) },
-        confirmButton = { TextButton(enabled = text.trim().isNotEmpty(), onClick = { onSave(text.trim()) }) { Text("Сохранить") } },
-        dismissButton = { TextButton(onClick = onDismiss) { Text("Отмена") } },
-    )
-}

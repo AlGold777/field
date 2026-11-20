@@ -19,7 +19,6 @@ object SF {
     const val LINK_TIMEOUT_MS = 8_000L
     const val MAX_TRIM_MS = 250
     const val HARD_RESYNC_FRAMES = 960               // >20 мс рассогласования — жёсткий прыжок
-    const val SLEW_THRESHOLD_FRAMES = 6.0            // >0.125 мс — плавная подстройка по 1 сэмплу
 }
 
 enum class Role { SERVER, POINT;

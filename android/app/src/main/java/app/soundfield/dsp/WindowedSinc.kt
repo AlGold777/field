@@ -12,6 +12,10 @@ object WindowedSinc {
     const val TAPS = 32
     const val HALF = TAPS / 2
     const val PHASES = 256
+    /**
+     * Не задержка фильтра (sinc с нулевой фазой), а запас чтения назад: рендер берёт кадры до позиции − HALF,
+     * поэтому источник должен держать их готовыми. Имя совпадает с C ABI (SF_SINC_GROUP_DELAY_FRAMES).
+     */
     const val GROUP_DELAY_FRAMES = HALF
     private const val BETA = 8.6
     private val table = Array(PHASES) { phase ->

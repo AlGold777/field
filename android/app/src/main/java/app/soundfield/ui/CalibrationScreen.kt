@@ -102,7 +102,7 @@ fun CalibrationScreen(ui: UiState, engine: Engine, requestMic: () -> Unit, onBac
             }
             if (ui.mode == SourceMode.LEVEL_MATCH) {
                 Spacer(Modifier.height(8.dp))
-                Text(if (ui.mode == SourceMode.LEVEL_MATCH) "Сейчас звучит по очереди L, затем R" else "",
+                Text("Сейчас звучит по очереди L, затем R",
                     color = SFColors.Accent1, fontWeight = FontWeight.SemiBold)
                 var offset by remember { mutableFloatStateOf(offsetNow) }
                 var levelDragging by remember { mutableStateOf(false) }
