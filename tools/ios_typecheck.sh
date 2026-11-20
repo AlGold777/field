@@ -19,13 +19,21 @@ done
 
 # Swift-код приложения; bridging-header подключает C-ядро, поэтому sfdsp_* видны из Swift.
 # -continue-building-after-errors: известная ошибка Catalyst не должна скрывать остальные ошибки типов.
+command -v swiftc >/dev/null 2>&1 || { echo "swiftc не найден (нужны Command Line Tools)"; echo "IOS TYPECHECK FAILED"; exit 1; }
 OUT=$(find ios/SoundField -name "*.swift" -print0 | xargs -0 swiftc -typecheck -continue-building-after-errors \
     -target arm64-apple-ios16.0-macabi -sdk "$SDK" \
     -F "$SDK/System/iOSSupport/System/Library/Frameworks" -I "$SDK/System/iOSSupport/usr/lib/swift" \
-    -import-objc-header ios/SoundField/SoundField-Bridging-Header.h -Xcc -Idsp/include 2>&1)
+    -import-objc-header ios/SoundField/SoundField-Bridging-Header.h -Xcc -Idsp/include 2>&1; echo "__SWIFTC_RC=$?")
+RC=$(printf '%s\n' "$OUT" | sed -n 's/^__SWIFTC_RC=//p')
+OUT=$(printf '%s\n' "$OUT" | grep -v '^__SWIFTC_RC=')
 ERR=$(printf '%s\n' "$OUT" | grep "error:" | grep -v "UnsafeMutableAudioBufferListPointer")
 if [ -n "$ERR" ]; then
     printf '%s\n' "$ERR"
+    FAILED=1
+elif [ "$RC" != "0" ] && ! printf '%s\n' "$OUT" | grep -q "error:"; then
+    # Ненулевой код без единой строки error: — swiftc упал или не запустился; раньше это давало ложный OK.
+    printf '%s\n' "$OUT" | tail -n 20
+    echo "swiftc завершился с кодом $RC без сообщений об ошибках типов"
     FAILED=1
 fi
 

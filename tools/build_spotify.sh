@@ -21,6 +21,11 @@ fi
 
 # Собрать нечем: приложение идёт без Spotify, устаревшая библиотека в него не попадает.
 skip() {
+    # Строгий режим для выпуска: SF_REQUIRE_SPOTIFY=1 — без Spotify сборка не проходит, а не тихо собирается без него.
+    if [ "${SF_REQUIRE_SPOTIFY:-0}" = 1 ]; then
+        echo "build_spotify: $1 — SF_REQUIRE_SPOTIFY=1, сборка остановлена" >&2
+        exit 1
+    fi
     echo "build_spotify: $1, libsfspotify.so не собирается (приложение без Spotify)" >&2
     if [ -f "$OUT" ]; then
         rm -f "$OUT"
@@ -35,7 +40,10 @@ command -v cargo >/dev/null 2>&1 || skip "cargo не найден"
 SDK=${ANDROID_SDK_ROOT:-${ANDROID_HOME:-$HOME/Library/Android/sdk}}
 NDK=${ANDROID_NDK_HOME:-}
 if [ -z "$NDK" ] || [ ! -d "$NDK" ]; then
-    NDK=$(ls -d "$SDK"/ndk/*/ 2>/dev/null | sort -V | tail -n 1 | sed 's:/$::')
+    # Та же версия NDK, что закреплена в android/app/build.gradle.kts (ndkVersion); иначе — самая новая.
+    PINNED=$(sed -n 's/.*ndkVersion *= *"\([^"]*\)".*/\1/p' "$ROOT/android/app/build.gradle.kts" | head -n 1)
+    if [ -n "$PINNED" ] && [ -d "$SDK/ndk/$PINNED" ]; then NDK="$SDK/ndk/$PINNED"
+    else NDK=$(ls -d "$SDK"/ndk/*/ 2>/dev/null | sort -V | tail -n 1 | sed 's:/$::'); fi
 fi
 if [ -z "$NDK" ] || [ ! -d "$NDK" ]; then
     skip "Android NDK не найден ($SDK/ndk)"
