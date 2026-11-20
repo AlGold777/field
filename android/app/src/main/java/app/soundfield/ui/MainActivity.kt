@@ -126,6 +126,14 @@ fun AppRoot(engine: Engine) {
         onDispose { activity?.volumeControlStream = android.media.AudioManager.USE_DEFAULT_STREAM_TYPE }
     }
     var handledPickerRequest by rememberSaveable { mutableIntStateOf(ui.filePickerRequest) }
+    // После выгрузки процесса счётчики Engine начинаются с 0, а сохранённые «обработано» — нет:
+    // «+» и захват YouTube молчали, пока новый счётчик не догонял старый.
+    var handledProcess by rememberSaveable { mutableStateOf(Engine.PROCESS_TOKEN) }
+    if (handledProcess != Engine.PROCESS_TOKEN) {
+        handledProcess = Engine.PROCESS_TOKEN
+        handledCaptureRequest = ui.captureRequest
+        handledPickerRequest = ui.filePickerRequest
+    }
     LaunchedEffect(Unit) {
         if (Build.VERSION.SDK_INT >= 33) notifLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
     }

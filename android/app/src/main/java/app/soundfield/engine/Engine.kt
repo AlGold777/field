@@ -127,6 +127,8 @@ class Engine private constructor(private val app: Context) {
 
     companion object {
         const val TAG = "SoundField"
+        /** Меняется при каждом запуске процесса: сохранённые в UI счётчики запросов от прошлого процесса недействительны. */
+        val PROCESS_TOKEN: String = java.util.UUID.randomUUID().toString()
         private const val SOLO_SERVICE_IDLE_MS = 5 * 60_000L
         @Volatile private var inst: Engine? = null
         fun get(ctx: Context): Engine = inst ?: synchronized(this) {
@@ -2713,6 +2715,9 @@ class Engine private constructor(private val app: Context) {
         .put("platform", "android").put("role", r.wire).put("tcpPort", tcp.localPort)
         .put("caps", localCapabilitiesJson()).put("addrs", addressesJson())
 
+    /** Растёт при отмене приглашения; результаты старых подключений с другим поколением отбрасываются. */
+    private var connectGeneration = 0L
+
     private fun connectOutgoing(p: Peer, tag: String, first: JSONObject, timeoutMs: Long) {
         val routes = availableNetworkRoutes(wifiOnly = true)
         val networks = routes.map { it.networkId }.ifEmpty { listOf("process_default") }
@@ -2731,6 +2736,7 @@ class Engine private constructor(private val app: Context) {
         if (candidates.isEmpty()) return onConnectFailed(tag)
         val firstHost = candidates.first().host
         pendingPeer = p
+        val gen = connectGeneration
         val attemptOp = if (tag == "resume-out" && phase == Phase.RECONNECTING) java.util.UUID.randomUUID().toString() else null
         if (attemptOp != null) {
             reconnectAttemptOp = attemptOp
@@ -2773,7 +2779,7 @@ class Engine private constructor(private val app: Context) {
                         "resume-auto" -> phase == Phase.IDLE && autoResumeUntil != 0L
                         else -> phase == Phase.RECONNECTING || (phase == Phase.INVITING && manualResumeActive)
                     }
-                    if (!stillWanted || pending != null) { telemetry.event("TCP_CONNECT_DISCARDED", "tag=$tag phase=$phase"); try { connectedSocket.close() } catch (_: Exception) {}; return@post }
+                    if (gen != connectGeneration || !stillWanted || pending != null) { telemetry.event("TCP_CONNECT_DISCARDED", "tag=$tag phase=$phase"); try { connectedSocket.close() } catch (_: Exception) {}; return@post }
                     val l = newLink(connectedSocket, tag)
                     pending = l
                     l.hsCn = first.optString("cn").takeIf { it.isNotEmpty() }?.let { PairCrypto.unhex(it) }
@@ -2807,6 +2813,8 @@ class Engine private constructor(private val app: Context) {
                         "networkId" to it.networkId, "localIpv4" to it.localIpv4, "remoteAddress" to it.remoteHost,
                         "remotePort" to it.remotePort, "reason" to it.reason.name) }), error = e)
                 post {
+                    // Попытка от отменённого приглашения не должна сбрасывать новое приглашение.
+                    if (gen != connectGeneration) return@post
                     failure?.let { recordPeerPathRound(p, tag, it.candidates, routes) }
                     val failedAllByTimeout = failure?.candidates?.let {
                         PeerPathDiagnosis.classifyRound(it.map(PeerPathDiagnosis.Candidate::reason)) ==
@@ -3040,6 +3048,7 @@ class Engine private constructor(private val app: Context) {
 
     private fun doCancelPending() {
         telemetry.event("INVITE_CANCEL", "phase=$phase")
+        connectGeneration++   // незавершённые TCP-подключения больше не относятся к текущей попытке
         manualResumeActive = false
         val l = pending
         pending = null
@@ -3279,12 +3288,16 @@ class Engine private constructor(private val app: Context) {
                         })
                     }
                     phase == Phase.RECONNECTING -> {
-                        if (reason == "unknown") unknownRejects++ else unknownRejects = 0
+                        // "proto" считается так же, как "unknown" (как на iOS): несовместимую версию
+                        // раньше переподключали каждые 2 с бесконечно.
+                        if (reason == "unknown" || reason == "proto") unknownRejects++ else unknownRejects = 0
                         if (unknownRejects >= 5) {
-                            // пара забыта на стороне Server — повторы бессмысленны
+                            // пара забыта на стороне Server или версии несовместимы — повторы бессмысленны
                             unknownRejects = 0
                             setAutoResume(false)
-                            goIdle(sendBye = false, reason = "«$peerName» больше не считает этот телефон парой")
+                            goIdle(sendBye = false, reason = if (reason == "proto")
+                                "Версии SoundField на телефонах несовместимы — обновите приложение на обоих"
+                                else "«$peerName» больше не считает этот телефон парой")
                         } else scheduleReconnect(if (reason == "crossed") 1_500 else 2_000)
                     }
                 }
@@ -4687,6 +4700,14 @@ class Engine private constructor(private val app: Context) {
         decodeProgress = null; decodeProgressTrackId = null
         ui { copy(loadingTracks = false, loadingTrackId = null, decodingProgress = null) }
         toast("Не удалось загрузить «${item.title}»")
+        // Автопереход на нечитаемый трек: идём дальше по очереди, иначе serverTick каждые 100 мс
+        // снова выбирал тот же трек (бесконечные попытки декодирования и сообщения).
+        val tl = serverPlay.timeline
+        if (mode == SourceMode.MUSIC && tl.playing && tl.positionFrame(System.nanoTime()) >= source.totalFrames) {
+            val failed = queue.indexOfFirst { it.id == item.id }
+            if (failed >= 0 && failed + 1 < queue.size) selectTrack(failed + 1)
+            else newEpoch(false, source.totalFrames, System.nanoTime())
+        }
     }
 
     // ------------------------------------------------------------------ декодированные треки
@@ -4770,7 +4791,9 @@ class Engine private constructor(private val app: Context) {
         val next = queue.getOrNull(index + 1) ?: return
         if (decodedTracks.containsKey(next.id)) return
         val generation = trackLoadGeneration
-        queueIo.execute { loadTrack(next) { generation != trackLoadGeneration } }
+        // Именованный аргумент: завершающая лямбда попадала в onProgress, и предзагрузку нельзя было отменить —
+        // выбранный трек ждал в однопоточной queueIo, пока устаревший декодируется до конца.
+        queueIo.execute { loadTrack(next, cancelled = { generation != trackLoadGeneration }) }
     }
 
     // ------------------------------------------------------------------ удаление треков
@@ -5011,7 +5034,9 @@ class Engine private constructor(private val app: Context) {
             return
         }
 
-        if (!tl.playing || pendingTrackId != null) return
+        // Во время TCP-предзагрузки source уже новый, а шкала ещё старая: сравнивать их нельзя
+        // (новый трек пропускался или стартовал с позиции старого).
+        if (!tl.playing || pendingTrackId != null || tcpAudioPreload != null) return
         val position = tl.positionFrame(nowNs)
         if (progressive != null && !progressive.complete) {
             if (position >= source.totalFrames || progressive.readyFrames < position + PROGRESSIVE_LOOKAHEAD_FRAMES) {
@@ -6122,7 +6147,11 @@ class Engine private constructor(private val app: Context) {
                     // Не в паре — нет смысла крутиться каждые 5 мс, спим 200 мс.
                     SystemClock.sleep(200)
                 }
-            } catch (e: Exception) { udpSendFailures.incrementAndGet(); udpSendError.set(e) }
+            } catch (e: Exception) {
+                // Сон и при ошибке: иначе постоянный сбой отправки (Wi‑Fi пропал, фаза ещё PAIRED)
+                // превращал поток в холостой цикл на целое ядро.
+                udpSendFailures.incrementAndGet(); udpSendError.set(e); SystemClock.sleep(5)
+            }
         }
     }
 
@@ -6273,9 +6302,10 @@ class Engine private constructor(private val app: Context) {
     /** Прерывание на любом телефоне ставит на паузу всю пару — состояние остаётся согласованным. */
     private fun onInterrupted(reason: String) {
         abandonFocus()
-        if (!ui.value.inPair) return
+        // Solo тоже ставится на паузу: фокус в Solo запрашивается так же, как в паре.
+        if (!ui.value.inPair && !soloMode) return
         if (role == Role.SERVER) { abortCalibration(); if (input.live && mode == SourceMode.MUSIC) liveTransport("pause") else cmdPause() }
         else link?.send(JSONObject().put("t", "cmd").put("a", "pause"))
-        toast(reason)
+        toast(if (soloMode) reason.replace("пара на паузе", "на паузе") else reason)
     }
 }
