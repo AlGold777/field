@@ -59,6 +59,10 @@ import kotlin.math.roundToInt
 import kotlin.math.pow
 
 /** Свёрнутый эквалайзер: заголовок, состояние и мини-кривая. Нажатие сразу открывает полный экран настройки. */
+
+/** Одна кисть подписей графика на весь экран (рисование идёт на главном потоке), а не новая на каждый кадр. */
+private val eqLabelPaint = android.graphics.Paint().apply { color = android.graphics.Color.LTGRAY; isAntiAlias = true }
+
 @Composable
 fun EqualizerCompactBlock(ui: UiState, openEqualizer: () -> Unit) {
     val state = ui.eq
@@ -308,7 +312,7 @@ private fun EqualizerGraph(
             val shadeEnd = xForFrequency(200.0, w)
             drawRect(Color(0x334B5563), topLeft = Offset.Zero, size = Size(shadeEnd, h))
             drawContext.canvas.nativeCanvas.let { canvas ->
-                val paint = android.graphics.Paint().apply { color = android.graphics.Color.LTGRAY; textSize = 10.dp.toPx() }
+                val paint = eqLabelPaint.apply { textSize = 10.dp.toPx() }
                 canvas.save(); canvas.rotate(-90f, shadeEnd * 0.48f, h * 0.52f)
                 canvas.drawText("динамик телефона здесь почти не звучит", shadeEnd * 0.48f - h * 0.45f, h * 0.52f, paint)
                 canvas.restore()
@@ -360,7 +364,7 @@ private fun EqualizerGraph(
         }
         listOf("+12", "+6", "0", "−6", "−12").forEachIndexed { i, label ->
             drawContext.canvas.nativeCanvas.drawText(label, 5.dp.toPx(), y((12 - i * 6).toDouble()) - 3.dp.toPx(),
-                android.graphics.Paint().apply { color = android.graphics.Color.LTGRAY; textSize = 9.dp.toPx() })
+                eqLabelPaint.apply { textSize = 9.dp.toPx() })
         }
     }
 }

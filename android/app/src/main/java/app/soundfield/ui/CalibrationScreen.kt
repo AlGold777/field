@@ -21,6 +21,9 @@ import kotlin.math.roundToInt
 
 @Composable
 fun CalibrationScreen(ui: UiState, engine: Engine, requestMic: () -> Unit, onBack: () -> Unit, micDeniedForever: Boolean = false) {
+    // Экран калибровки не гаснет: погасший экран в фоне останавливает запись микрофона.
+    val view = androidx.compose.ui.platform.LocalView.current
+    DisposableEffect(view) { view.keepScreenOn = true; onDispose { view.keepScreenOn = false } }
     val c = ui.calib
     val pointCh = ui.pointChannel
     val serverCh = Ch.other(pointCh)

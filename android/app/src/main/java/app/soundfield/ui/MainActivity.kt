@@ -58,7 +58,8 @@ private enum class Sub { NONE, PAIRING, CALIBRATION, DIAGNOSTICS, EQUALIZER, SPA
 fun AppRoot(engine: Engine) {
     val ui by engine.ui.collectAsStateWithLifecycle()
     val ctx = LocalContext.current
-    var sub by remember { mutableStateOf(Sub.NONE) }
+    // rememberSaveable: смена темы, шрифта или языка пересоздаёт Activity — открытый экран сохраняется.
+    var sub by rememberSaveable { mutableStateOf(Sub.NONE) }
     var syncProbeAfterPermission by remember { mutableStateOf(false) }
 
     val notifLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) {}

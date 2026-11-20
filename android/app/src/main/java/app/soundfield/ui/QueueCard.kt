@@ -146,7 +146,12 @@ fun QueueCard(ui: UiState, engine: Engine) {
                      else "Обновите SoundField на Server для передачи файлов",
                     color = SFColors.TextDim, fontSize = 14.sp, modifier = Modifier.padding(vertical = 6.dp))
             } else {
-                LazyColumn(Modifier.fillMaxWidth().heightIn(max = 300.dp)) {
+                val queueListState = androidx.compose.foundation.lazy.rememberLazyListState()
+                // Текущий трек всегда виден: при смене трека список докручивается к нему.
+                LaunchedEffect(ui.queueIndex) {
+                    if (ui.queueIndex in ui.queueTracks.indices) queueListState.animateScrollToItem(ui.queueIndex)
+                }
+                LazyColumn(Modifier.fillMaxWidth().heightIn(max = 300.dp), state = queueListState) {
                     itemsIndexed(ui.queueTracks, key = { _, item -> item.id }) { index, item ->
                         val current = index == ui.queueIndex || item.id == ui.loadingTrackId
                         if (selecting) {
