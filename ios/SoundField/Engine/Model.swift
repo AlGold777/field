@@ -280,9 +280,20 @@ struct SpatialSettings: Codable, Equatable {
     var ambient = 2.0
     var depth = -2.0
     var reflection = -17.0
-    var json: [String: Any] { ["enabled":enabled, "level":level, "profile":profile,
-        "preserveLoudness":preserveLoudness, "custom":["gMidDb":width,"gHighDb":air,
-        "gAmbientDb":ambient,"depthDb":depth,"reflectionDb":reflection]] }
+    /// Ползунки сцены Android (ширина/глубина/высота, 0…1). iOS их не применяет, но хранит и возвращает:
+    /// иначе при iPhone-Server ползунки на Android откатывались к пресету уровня.
+    var sceneWidth: Double?
+    var sceneDepth: Double?
+    var sceneHeight: Double?
+    var json: [String: Any] {
+        var o: [String: Any] = ["enabled":enabled, "level":level, "profile":profile,
+            "preserveLoudness":preserveLoudness, "custom":["gMidDb":width,"gHighDb":air,
+            "gAmbientDb":ambient,"depthDb":depth,"reflectionDb":reflection]]
+        if let v = sceneWidth { o["width"] = v }
+        if let v = sceneDepth { o["depth"] = v }
+        if let v = sceneHeight { o["height"] = v }
+        return o
+    }
     static func read(_ o: [String: Any]) -> SpatialSettings {
         var s = SpatialSettings(); s.level = J.s(o,"level","off")
         if !["off","soft","strong"].contains(s.level) { s.level = "off" }
@@ -295,6 +306,8 @@ struct SpatialSettings: Codable, Equatable {
             s.ambient = min(6,max(0,J.d(c,"gAmbientDb",s.ambient))); s.depth = min(0,max(-6,J.d(c,"depthDb",s.depth)))
             s.reflection = min(-10,max(-30,J.d(c,"reflectionDb",s.reflection)))
         }
+        func unit(_ k: String) -> Double? { (o[k] as? NSNumber).map { min(1, max(0, $0.doubleValue)) } }
+        s.sceneWidth = unit("width"); s.sceneDepth = unit("depth"); s.sceneHeight = unit("height")
         return s
     }
 }
