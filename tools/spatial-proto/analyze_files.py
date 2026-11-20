@@ -74,6 +74,8 @@ def _click_width_ms(audio: np.ndarray, sample_rate: int) -> float:
         if not len(section):
             continue
         peak = int(np.argmax(section))
+        if section[peak] <= 0:
+            continue   # тишина: порог 0 растягивал «ширину щелчка» на всё окно
         threshold = section[peak] * 0.5
         left = peak
         right = peak

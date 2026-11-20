@@ -46,7 +46,8 @@ def _matched_start(audio: np.ndarray, template: np.ndarray, expected: float, rad
     return start + _fractional_peak(local, index), strength
 
 
-def _find_first_pair(audio: np.ndarray, template: np.ndarray, sample_rate: int) -> tuple[float, float, float, float]:
+def _find_first_pair(audio: np.ndarray, template: np.ndarray, sample_rate: int,
+                     lr_offset: float = 0.1) -> tuple[float, float, float, float]:
     # The user may start the recorder several seconds before pressing Play.
     scan = audio[: min(len(audio), sample_rate * 30)]
     corr = correlate(scan, template, mode="valid", method="fft")
@@ -57,7 +58,8 @@ def _find_first_pair(audio: np.ndarray, template: np.ndarray, sample_rate: int) 
     if not len(peaks):
         peaks = np.array([int(np.argmax(magnitude))])
     candidates: list[tuple[float, int, int]] = []
-    min_offset, max_offset = 0.065 * sample_rate, 0.14 * sample_rate
+    # Окно поиска пары L→R выводится из настроенного смещения (раньше 65–140 мс были зашиты при любом offset).
+    min_offset, max_offset = 0.65 * lr_offset * sample_rate, 1.4 * lr_offset * sample_rate
     for left_pos, peak in enumerate(peaks):
         deltas = peaks[left_pos + 1 :] - peak
         matches = np.flatnonzero((deltas >= min_offset) & (deltas <= max_offset))
@@ -87,8 +89,8 @@ def analyze_sync(recording_path: str | Path, output_dir: str | Path | None = Non
     mono = recording[:, int(np.argmax(np.std(recording, axis=0)))]
     probe = config["blind_test"]
     template = _sync_chirp(sample_rate, float(probe["sync_chirp_ms"]) / 1000.0)
-    left0, right0, left_strength, right_strength = _find_first_pair(mono, template, sample_rate)
     lr_offset = float(probe["sync_lr_offset_ms"]) / 1000.0
+    left0, right0, left_strength, right_strength = _find_first_pair(mono, template, sample_rate, lr_offset)
     nominal_interval = float(probe["sync_pair_interval_seconds"])
     radius = int(round(0.04 * sample_rate))
     estimated_ppm = 0.0
@@ -278,7 +280,8 @@ def analyze_measurement(recording_path: str | Path, measure_key_path: str | Path
         if len(section.shape) == 2 and section.shape[1] == 2:
             f, coh = result[2]
             coherence_values = [band_power(f, coh, float(center)) for center in centers]
-        recorded[track["signal"]][track["variant"]] = {
+        # Плейлист может содержать и другие сигналы (pan_hard): раньше это давало KeyError.
+        recorded.setdefault(track["signal"], {})[track["variant"]] = {
             "blind_code": track["blind_code"],
             "start_seconds": start / sample_rate,
             "end_seconds": end / sample_rate,

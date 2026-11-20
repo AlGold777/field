@@ -26,7 +26,7 @@ from dsp.xtc import apply_xtc
 from signals import generate_synthetic, write_sync_probe
 
 
-PROTO_VERSION = "0.1.3"
+PROTO_VERSION = "0.1.4"
 VARIANT_CODES = ("REF", "ANCHOR_MONO", "ANCHOR_OVER", "W2_LO", "W2_HI", "W2_W3", "W2_W3_W6")
 SUPPORTED_EXTENSIONS = {".wav", ".flac"}
 
@@ -61,6 +61,8 @@ def process(stereo: np.ndarray, variant_params: dict, settings: dict | None = No
     hop = int(config["stft"]["hop"])
     _, weight, _ = analyze_coherence(audio, sample_rate, config["stft"], n_fft, hop)
     profile_name = str(variant_params.get("profile", "lo"))
+    if profile_name not in ("lo", "hi", "W2_LO", "W2_HI"):
+        raise ValueError(f"Неизвестный профиль «{profile_name}»: ожидается lo, hi, W2_LO или W2_HI")   # опечатка раньше молча давала hi
     profile = "lo" if profile_name in ("lo", "W2_LO") else "hi"
     w2_settings = config["w2"]
     w2_params = {

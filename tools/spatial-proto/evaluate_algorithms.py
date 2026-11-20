@@ -184,7 +184,16 @@ def evaluate(run, output):
                     "median_crosstalk_improvement_db": float(np.median(np.array(before) - after)),
                     "worst_crosstalk_improvement_db": float(np.min(np.array(before) - after))})
 
-    (output / "evaluation.json").write_text(json.dumps(result, ensure_ascii=False, indent=2, allow_nan=False) + "\n")
+    def finite(value):
+        # LUFS = −inf у тишины и NaN-корреляции не должны ронять многочасовой прогон на записи результата.
+        if isinstance(value, float):
+            return value if np.isfinite(value) else None
+        if isinstance(value, dict):
+            return {k: finite(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [finite(v) for v in value]
+        return value
+    (output / "evaluation.json").write_text(json.dumps(finite(result), ensure_ascii=False, indent=2, allow_nan=False) + "\n")
     lines = ["# Диагностика алгоритмов", "", f"Анализатор {PROTO_VERSION}; исходный рендер {key['PROTO_VERSION']}.",
              "Это объективные измерения и явно синтетические пробы; слуховых оценок здесь нет.", "",
              "| Вариант | LUFS, min…max | Пик 4×, max dBTP | Моно ripple, max dB | S/M, среднее dB |",

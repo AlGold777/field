@@ -122,7 +122,7 @@ object SpatialRenderMain {
                 for (channel in Ch.L..Ch.R) {
                     val value = sample(frame, channel)
                     check(!value.isNaN()) { "Frame $frame is not ready in the spatial cache" }
-                    val pcm = (value.coerceIn(-1f, 32767f / 32768f) * 32768f).toInt().coerceIn(-32768, 32767)
+                    val pcm = kotlin.math.round(value.coerceIn(-1f, 32767f / 32768f) * 32768f).toInt().coerceIn(-32768, 32767)   // округление, не усечение: без смещения ~0,5 LSB
                     out.writeShortLE(pcm)
                 }
                 frame++

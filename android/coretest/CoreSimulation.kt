@@ -270,6 +270,8 @@ fun testLevelAnalyzer() {
 fun testWavAndSources() {
     println("[WAV/Sources]")
     val f = File("../../tools/test_track.wav")
+    // Без файла ветка не должна молча проходить: иначе «ALL PASSED» без проверки WAV.
+    check("test_track.wav present", f.exists(), f.absolutePath)
     if (f.exists()) {
         val d = Wav.decode(f.readBytes())
         check("wav decoded 40 s stereo", d.pcm.size == 48_000 * 40 * 2, "${d.pcm.size}")
