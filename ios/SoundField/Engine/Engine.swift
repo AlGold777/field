@@ -1617,7 +1617,10 @@ final class Engine {
         let sr = Int64(SF.sampleRate)
         switch J.s(o, "a") {
         case "play": cmdPlay()
-        case "pause": cmdPause()
+        case "pause":
+            // Пауза прерывает калибровку, как на Android: сигналы смолкают, результат не применяется.
+            if role == .server && calibRunning { calibAborted = true; newEpoch(false, 0, MonoClock.nowNs()) }
+            else { cmdPause() }
         case "toggle": if playBox.value.timeline.playing && mode != .calib { cmdPause() } else { cmdPlay() }
         // ограничение до умножения: иначе переполнение Int64 на некорректном вводе (трап = падение приложения)
         case "seek": seekFrame(min(max(0, J.i64(o, "ms")), 86_400_000) * sr / 1000)
@@ -1998,8 +2001,10 @@ final class Engine {
         while true {
             if phase == .paired {
                 if role == .server { serverSend() } else { pointNet() }
+                usleep(5_000)
+            } else {
+                usleep(200_000)   // вне пары отправлять нечего: не будим процессор 200 раз в секунду (как Android)
             }
-            usleep(5_000)
         }
     }
 

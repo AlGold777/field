@@ -171,7 +171,9 @@ final class PointReceiver {
         lock.lock(); defer { lock.unlock() }
         guard !pending.isEmpty else { return [] }
         var out: [Int32] = []
-        for (seq, var pd) in pending {
+        // Старейшие первыми, как на Android: порядок словаря произволен, и при потере > 64 пакетов
+        // старые seq истекали без перезапроса.
+        for (seq, var pd) in pending.sorted(by: { $0.value.firstSeen < $1.value.firstSeen }) {
             let age = nowLocal - pd.firstSeen
             if age > 350_000_000 { pending.removeValue(forKey: seq); lostFinal += 1; continue }
             if pd.tries < 4 && age >= 12_000_000 && nowLocal - pd.lastNack >= 40_000_000 {

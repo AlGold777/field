@@ -96,11 +96,13 @@ final class UdpSocket {
 
     func send(_ bytes: [UInt8], to a: Addr) {
         var st = a.storage
-        _ = bytes.withUnsafeBytes { b in
+        let sent = bytes.withUnsafeBytes { b in
             withUnsafePointer(to: &st) {
                 $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { sendto(fd, b.baseAddress, b.count, 0, $0, a.len) }
             }
         }
+        // Мёртвый дескриптор помечаем сломанным и при отправке: без входящего трафика его иначе не обнаружить.
+        if sent < 0 && (errno == EBADF || errno == ENOTSOCK) { brokenBox.value = true }
     }
 
     /// Адрес из NWEndpoint.Host + порт (IPv4 → IPv4-mapped IPv6 для dual-stack сокета).

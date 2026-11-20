@@ -60,7 +60,11 @@ final class ControlLink {
     }
 
     func send(_ o: [String: Any]) {
-        guard !closed, let body = try? JSONSerialization.data(withJSONObject: o) else { return }
+        guard !closed else { return }
+        // NaN/Inf в словаре: JSONSerialization бросает NSException мимо try? — это краш, проверяем заранее.
+        guard JSONSerialization.isValidJSONObject(o), let body = try? JSONSerialization.data(withJSONObject: o) else {
+            NSLog("SoundField link: сообщение «\(o["t"] ?? "?")» не сериализуется, не отправлено"); return
+        }
         var len = UInt32(body.count).bigEndian
         var frame = Data(bytes: &len, count: 4)
         frame.append(body)
