@@ -45,8 +45,12 @@ class Discovery(
     @Volatile private var wantBrowse = false
     @Volatile private var adPort = 0
     @Volatile private var adName = ""
-    private var regAttempts = 0
+    @Volatile private var regAttempts = 0
     private var lockHeld = false
+    /** Сервисы, потерянные после постановки в очередь резолва: их поздний результат не воскрешает пира. */
+    private val lostNames = HashSet<String>()
+    /** Повторы резолва при FAILURE_ALREADY_ACTIVE по имени сервиса — не бесконечно. */
+    private val alreadyActiveRetries = HashMap<String, Int>()
     private val retriedResolve = HashSet<String>()   // имена сервисов, резолв которых уже повторялся однажды
 
     /**
@@ -79,7 +83,11 @@ class Discovery(
                 if (regListener !== this) return
                 regListener = null
                 // без повтора телефон остаётся невидимым для второго до перезапуска приложения
-                if (wantAdvertise && regAttempts++ < 6) main.postDelayed({ if (wantAdvertise && regListener == null) register() }, 1_500)
+                // Без лимита попыток, с растущей паузой до 30 с: после 6 отказов телефон раньше оставался невидимым.
+                if (wantAdvertise) {
+                    val delay = minOf(30_000L, 1_500L shl minOf(regAttempts++, 5))
+                    main.postDelayed({ if (wantAdvertise && regListener == null) register() }, delay)
+                }
             }
             override fun onServiceUnregistered(i: NsdServiceInfo) { telemetry.event("NSD_UNREGISTERED", i.serviceName) }
             override fun onUnregistrationFailed(i: NsdServiceInfo, e: Int) { telemetry.event("NSD_UNREGISTER_FAILED", "code=$e") }
@@ -97,11 +105,11 @@ class Discovery(
     }
 
     /** Multicast lock нужен, пока активны публикация или поиск; refcount отключён, поэтому держим флаг. */
-    private fun acquireLock() {
+    @Synchronized private fun acquireLock() {
         if (!lockHeld) { multicastLock.acquire(); lockHeld = true }
     }
 
-    private fun releaseLockIfIdle() {
+    @Synchronized private fun releaseLockIfIdle() {
         if (lockHeld && !wantAdvertise && discListener == null) {
             lockHeld = false
             try { multicastLock.release() } catch (_: Exception) {}
@@ -113,7 +121,7 @@ class Discovery(
         if (discListener != null) return
         acquireLock()
         synchronized(lock) {
-            peers.clear(); resolvedAt.clear(); retriedResolve.clear()
+            peers.clear(); resolvedAt.clear(); retriedResolve.clear(); lostNames.clear(); alreadyActiveRetries.clear()
             if (!resolving) resolveQueue.clear()   // при активном резолве очередь не трогаем: иначе два резолва сразу
         }
         publish()
@@ -128,10 +136,11 @@ class Discovery(
             override fun onStopDiscoveryFailed(t: String, e: Int) { telemetry.event("NSD_STOP_FAILED", "code=$e") }
             override fun onServiceFound(info: NsdServiceInfo) {
                 if (!info.serviceName.startsWith(SF.SERVICE_PREFIX)) return
-                if (info.serviceName == SF.SERVICE_PREFIX + myId) return
+                if (serviceId(info.serviceName) == myId) return   // свой сервис, в том числе переименованный «(2)»
                 telemetry.event("NSD_FOUND", info.serviceName)
                 val now = SystemClock.elapsedRealtime()
                 synchronized(lock) {
+                    lostNames.remove(info.serviceName)
                     val last = resolvedAt[info.serviceName] ?: 0L
                     val alreadyKnown = peers.containsKey(info.serviceName)
                     // Не копим дубликаты. Если сервис уже известен, но прошло > 20 с, разрешаем повторный resolve для обновления IP/порта.
@@ -146,7 +155,9 @@ class Discovery(
                 val lostPeerId = synchronized(lock) {
                     val removed = peers.remove(info.serviceName)
                     resolvedAt.remove(info.serviceName)
-                    removed?.id ?: info.serviceName.removePrefix(SF.SERVICE_PREFIX)
+                    resolveQueue.removeAll { it.serviceName == info.serviceName }
+                    lostNames.add(info.serviceName)
+                    removed?.id ?: serviceId(info.serviceName)
                 }
                 onLost(lostPeerId)
                 publish()
@@ -168,6 +179,10 @@ class Discovery(
 
     /** Перезапуск поиска — обновляет адреса (после смены IP, выхода из сна и т. п.). */
     fun restartBrowse() { stopBrowse(); startBrowse() }
+
+    /** id из имени сервиса без суффикса « (2)», который NSD добавляет при коллизии имени после перезапуска. */
+    private fun serviceId(serviceName: String): String =
+        serviceName.removePrefix(SF.SERVICE_PREFIX).replace(Regex(" \\(\\d+\\)$"), "")
 
     fun peer(id: String): Peer? = synchronized(lock) { peers.values.firstOrNull { it.id == id } }
 
@@ -206,20 +221,30 @@ class Discovery(
                     telemetry.limited("NSD_RESOLVE_FAILED", "service=${i.serviceName} code=$e token=$token")
                     synchronized(lock) {
                         if (resolveToken == token) resolving = false
-                        if (e == NsdManager.FAILURE_ALREADY_ACTIVE) resolveQueue.addLast(i)
+                        if (e == NsdManager.FAILURE_ALREADY_ACTIVE) {
+                            val n = (alreadyActiveRetries[i.serviceName] ?: 0) + 1
+                            alreadyActiveRetries[i.serviceName] = n
+                            if (n <= 5) resolveQueue.addLast(i) else alreadyActiveRetries.remove(i.serviceName)
+                        }
                         else if (retriedResolve.add(i.serviceName)) {
                             // одна повторная попытка с паузой, иначе пир потеряется до следующего поиска
                             main.postDelayed({ synchronized(lock) { resolveQueue.addLast(i) }; resolveNext() }, 1_000)
                         } else retriedResolve.remove(i.serviceName)
                     }
-                    if (e == NsdManager.FAILURE_ALREADY_ACTIVE) main.postDelayed({ resolveNext() }, 300) else resolveNext()
+                    if (e == NsdManager.FAILURE_ALREADY_ACTIVE)
+                        main.postDelayed({ resolveNext() }, 300L * (synchronized(lock) { alreadyActiveRetries[i.serviceName] } ?: 1))
+                    else resolveNext()
                 }
                 override fun onServiceResolved(i: NsdServiceInfo) {
-                    synchronized(lock) { retriedResolve.remove(i.serviceName) }
+                    val wasLost = synchronized(lock) {
+                        retriedResolve.remove(i.serviceName); alreadyActiveRetries.remove(i.serviceName)
+                        lostNames.contains(i.serviceName).also { if (it && resolveToken == token) resolving = false }
+                    }
+                    if (wasLost) { telemetry.event("NSD_RESOLVED_AFTER_LOST", i.serviceName); resolveNext(); return }
                     val attrs = i.attributes
                     fun attr(k: String) = attrs[k]?.let { String(it, Charsets.UTF_8) }
                     // id берётся из имени сервиса; TXT-запись только для сверки (TXT может подменить отправитель)
-                    val id = i.serviceName.removePrefix(SF.SERVICE_PREFIX)
+                    val id = serviceId(i.serviceName)
                     val txtId = attr("id")
                     if (txtId != null && txtId != id) {
                         Log.w(TAG, "peer ${i.serviceName} ignored: TXT id does not match service name")
