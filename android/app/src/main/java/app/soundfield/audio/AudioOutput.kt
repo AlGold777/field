@@ -89,7 +89,7 @@ class AudioOutput(private val ctx: Context) {
     val isRunning get() = thread?.isAlive == true
 
     fun routeLabel(): String {
-        val device = if (Build.VERSION.SDK_INT >= 23) track?.routedDevice else null
+        val device = track?.routedDevice
         val name = device?.productName?.toString()?.takeIf { it.isNotBlank() }
         return when (device?.type) {
             AudioDeviceInfo.TYPE_BUILTIN_SPEAKER, AudioDeviceInfo.TYPE_BUILTIN_SPEAKER_SAFE -> "Динамик телефона"
@@ -103,7 +103,7 @@ class AudioOutput(private val ctx: Context) {
 
     /** Stable local profile key. Bluetooth devices use their address when available. */
     fun routeKey(): String {
-        val device = if (Build.VERSION.SDK_INT >= 23) track?.routedDevice else null
+        val device = track?.routedDevice
         return when (device?.type) {
             AudioDeviceInfo.TYPE_BUILTIN_SPEAKER, AudioDeviceInfo.TYPE_BUILTIN_SPEAKER_SAFE -> "speaker"
             AudioDeviceInfo.TYPE_WIRED_HEADSET, AudioDeviceInfo.TYPE_WIRED_HEADPHONES -> "wired"
@@ -150,7 +150,7 @@ class AudioOutput(private val ctx: Context) {
         lastMetricsAtMs = now
         lastMetricsFrames = frames
         lastMetricsGeneration = generation
-        val device = if (Build.VERSION.SDK_INT >= 23) track?.routedDevice else null
+        val device = track?.routedDevice
         return Window(
             outputSignal.take(), fps, timestampOk,
             am.getStreamVolume(volumeStream),
@@ -178,6 +178,7 @@ class AudioOutput(private val ctx: Context) {
         retiring?.join(500)
         retiring = null
         failed = false
+        failedAttempts = 0   // новый запуск — новый счёт попыток восстановления
         routeSignature = currentRouteSignature()
         am.registerAudioDeviceCallback(deviceCallback, Handler(Looper.getMainLooper()))
         thread = Thread({ loop() }, "sf-audio").apply { priority = Thread.MAX_PRIORITY }
@@ -185,8 +186,8 @@ class AudioOutput(private val ctx: Context) {
     }
 
     private fun currentRouteSignature(): String {
-        val selected = if (Build.VERSION.SDK_INT >= 23) track?.routedDevice
-            ?.let { "${it.type}:${it.address}:${it.productName}" } ?: "unknown" else "unknown"
+        val selected = track?.routedDevice
+            ?.let { "${it.type}:${it.address}:${it.productName}" } ?: "unknown"
         val available = am.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
             .filter { it.isSink }.sortedBy { it.id }.joinToString("|") { "${it.type}:${it.address}" }
         return "$selected#$available"
@@ -215,6 +216,7 @@ class AudioOutput(private val ctx: Context) {
 
     @Synchronized fun stop() {
         failed = false   // остановка намеренная: Engine не должен перезапускать вывод
+        routeChangeTask?.let(routeHandler::removeCallbacks); routeChangeTask = null
         val worker = thread ?: return
         thread = null
         try { am.unregisterAudioDeviceCallback(deviceCallback) } catch (_: Exception) {}
@@ -265,7 +267,9 @@ class AudioOutput(private val ctx: Context) {
                     playTrack()
                 } catch (_: InterruptedException) {
                     break
-                } catch (e: Exception) {
+                } catch (e: Throwable) {
+                    // Throwable, а не Exception: Error (например, из нативного DSP) раньше молча убивал поток
+                    // вывода с failed=false — тишина без перезапуска.
                     recoveryCount.incrementAndGet()
                     recoveryError.set(e)
                     if (!active()) break
@@ -302,7 +306,7 @@ class AudioOutput(private val ctx: Context) {
         try {
             check(t.state == AudioTrack.STATE_INITIALIZED) { "AudioTrack is not initialized" }
             track = t
-            if (Build.VERSION.SDK_INT >= 23) t.addOnRoutingChangedListener(routingListener, routeHandler)
+            t.addOnRoutingChangedListener(routingListener, routeHandler)
             timestampGeneration.incrementAndGet()
             pinSpeaker()
             val n = 240 // 5 мс на блок
@@ -396,7 +400,7 @@ class AudioOutput(private val ctx: Context) {
             timestampOk = false
             latencyMs = 0.0
             if (track === t) track = null
-            if (Build.VERSION.SDK_INT >= 23) try { t.removeOnRoutingChangedListener(routingListener) } catch (_: Exception) {}
+            try { t.removeOnRoutingChangedListener(routingListener) } catch (_: Exception) {}
             try { t.pause(); t.flush(); t.stop() } catch (_: Exception) {}
             t.release()
         }
