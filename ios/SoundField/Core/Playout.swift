@@ -6,6 +6,9 @@ struct Timeline {
     var playing: Bool
     var anchorFrame: Int64
     var anchorNs: Int64
+    /// Запланированная остановка в той же эпохе (пауза от Android Server): кадры ≥ stopFrame не звучат,
+    /// перед ней затухание 5 мс — оба телефона замолкают на одном кадре. −1 — остановки нет.
+    var stopFrame: Int64 = -1
 
     static let none = Timeline(epoch: -1, playing: false, anchorFrame: 0, anchorNs: 0)
 
@@ -16,8 +19,18 @@ struct Timeline {
         anchorNs + Int64(Double(frame - anchorFrame) * 1e9 / Double(SF.sampleRate))
     }
     func positionFrame(_ serverNs: Int64) -> Int64 {
-        playing ? max(anchorFrame, Int64(frameAt(serverNs))) : anchorFrame
+        guard playing else { return anchorFrame }
+        let f = max(anchorFrame, Int64(frameAt(serverNs)))
+        return stopFrame >= 0 ? min(f, stopFrame) : f
     }
+    /// Множитель затухания перед stopFrame (1 — без остановки), как Timeline.envelope на Android.
+    func stopGain(_ frame: Int64) -> Float {
+        guard stopFrame >= 0 else { return 1 }
+        let left = stopFrame - frame
+        if left <= 0 { return 0 }
+        return left < Timeline.stopFadeFrames ? Float(left) / Float(Timeline.stopFadeFrames) : 1
+    }
+    static let stopFadeFrames: Int64 = 240   // 5 мс
 }
 
 /// Держит позицию чтения рядом с «идеальной»: пропуск/повтор одного сэмпла при малой ошибке,

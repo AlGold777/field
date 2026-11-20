@@ -142,6 +142,7 @@ final class Engine {
     private let pointUdpBox = Locked<UdpSocket.Addr?>(nil)
     private var serverRenderer: ServerRenderer!
     private var calibRunning = false
+    private var calibStaleAfterIdle = false   // пара разорвана во время калибровки: результат записи отбросить
     private var calibAborted = false     // калибровка прервана (звонок и т.п.): результат не применять
     private var pointClockReady = false
     private var resent: Int64 = 0
@@ -1358,6 +1359,8 @@ final class Engine {
         pointUdpBox.value = nil; serverUdpBox.value = nil; sessionId = 0
         pairedAtNs = 0; lastAudioRxAtNs.value = 0
         rx.reset(); clock.reset()
+        // Запись микрофона ещё может завершиться: её результат не должен трогать шкалу Solo.
+        if calibRunning { calibStaleAfterIdle = true }
         calibRunning = false
         discovery.startBrowse()
         ui { s in
@@ -1432,7 +1435,8 @@ final class Engine {
         case "timeline":
             if role == .point {
                 rx.onTimeline(Timeline(epoch: Int32(truncatingIfNeeded: J.i64(o, "epoch")), playing: J.b(o, "playing"),
-                                       anchorFrame: J.i64(o, "anchorFrame"), anchorNs: J.i64(o, "anchorNs")))
+                                       anchorFrame: J.i64(o, "anchorFrame"), anchorNs: J.i64(o, "anchorNs"),
+                                       stopFrame: J.i64(o, "stopFrame", -1)))
             }
         case "sdiag": if role == .point { let d = Diag.from(o); ui { $0.serverDiag = d } }
         case "calib": if role == .point { applyCalib(o) }
@@ -1770,6 +1774,12 @@ final class Engine {
                 guard let loaded else {
                     self.ui { $0.loadingTracks = false; $0.loadingTrackId = nil }
                     self.toast("Не удалось загрузить «\(item.title)»")
+                    // Автопереход на нечитаемый трек: идём дальше, иначе serverTick снова выбирал его каждые 100 мс.
+                    let tl = self.playBox.value.timeline
+                    if self.mode == .music, tl.playing, tl.positionFrame(MonoClock.nowNs()) >= self.source.totalFrames {
+                        if index + 1 < self.queue.count { self.selectQueueTrack(at: index + 1) }
+                        else { self.newEpoch(false, self.source.totalFrames, MonoClock.nowNs()) }
+                    }
                     return
                 }
                 self.queueIndex = index; self.mode = .music; self.source = loaded; self.currentQueueSource = loaded; self.savedFrame = 0
@@ -1853,16 +1863,27 @@ final class Engine {
         }
     }
 
+    /// Калибровку прервал разрыв пары: запоздавший результат записи только сбрасывает флаги.
+    private func dropStaleCalibration() -> Bool {
+        guard calibStaleAfterIdle else { return false }
+        calibStaleAfterIdle = false; calibAborted = false; calibRunning = false
+        return true
+    }
+
     private func calibFailed(_ text: String) {
+        if dropStaleCalibration() { return }
         calibRunning = false
+        // После прерывания (звонок) музыка сама не возобновляется.
+        restoreMusic(savedPlaying && !calibAborted)
         calibAborted = false
-        restoreMusic(savedPlaying)
         broadcastCalib(false, "", text, false, nil)
     }
 
     private func finishCalibration(_ res: CalibrationAnalyzer.Result, apply: Bool, trimUsed: Int64) {
+        if dropStaleCalibration() { return }
         calibRunning = false
-        restoreMusic(savedPlaying)
+        // После прерывания (звонок, Siri) музыка сама не возобновляется — пара остаётся на паузе.
+        restoreMusic(savedPlaying && !calibAborted)
         if calibAborted {
             calibAborted = false
             broadcastCalib(false, "", "Калибровка прервана — результат не применён", false, nil); return

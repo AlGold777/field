@@ -103,7 +103,7 @@ final class PointRenderer: RenderSource {
         var missing = 0
         for i in 0..<n {
             let f = corrector.frame(i, n)
-            if let s = rx.read(f) { out[i] = s } else {
+            if let s = rx.read(f) { out[i] = s * tl.stopGain(f) } else {
                 out[i] = 0
                 if f >= tl.anchorFrame && (p.totalFrames <= 0 || f < p.totalFrames) { missing += 1 }
             }
