@@ -253,8 +253,8 @@ class Engine private constructor(private val app: Context) {
     private var focusRequest: AudioFocusRequest? = null
 
     // ------------------------------------------------------------------ сеть
-    private lateinit var tcp: ServerSocket
-    private lateinit var tcpAudioServer: ServerSocket
+    @Volatile private lateinit var tcp: ServerSocket
+    @Volatile private lateinit var tcpAudioServer: ServerSocket
     @Volatile private lateinit var udp: DatagramSocket
     private val udpRebindLock = Any()
     @Volatile private var udpBoundNetworkLabel: String = "unbound"
@@ -310,12 +310,12 @@ class Engine private constructor(private val app: Context) {
     /** Ключ UDP-контура текущей пары (выводится при рукопожатии, см. PairCrypto.udpKey). */
     @Volatile private var udpKey: ByteArray? = null
     private var pendingTimeout: ScheduledFuture<*>? = null
-    private var peerId = ""
+    @Volatile private var peerId = ""
     private var peerName = ""
     private var peerPlatform = ""
     private var peerAddressSnapshot: List<PeerAddress> = emptyList()
     @Volatile private var sessionId = 0
-    private var record: PairRecord? = PairRecord.fromJson(prefs.getString("pair", null))
+    @Volatile private var record: PairRecord? = PairRecord.fromJson(prefs.getString("pair", null))
     private var eqSettings = record?.eq ?: EqSettings()
     private var spatialSettings = record?.spatial ?: SpatialSettings()
     @Volatile private var eqConfig = EqualizerMath.config(eqSettings)
@@ -371,7 +371,8 @@ class Engine private constructor(private val app: Context) {
     private val udpReceiveError = AtomicReference<Throwable?>(null)
     private val udpSendError = AtomicReference<Throwable?>(null)
     private val connLog = ArrayDeque<String>()
-    private val logTime = java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.US)
+    // DateTimeFormatter потокобезопасен, в отличие от SimpleDateFormat: log() зовут из разных потоков.
+    private val logTime = java.time.format.DateTimeFormatter.ofPattern("HH:mm:ss", java.util.Locale.US)
 
     // ------------------------------------------------------------------ Server
     @Volatile private var serverPlay = ServerPlayState(Timeline.NONE, music, Ch.L, 0.8f, eqConfig)
@@ -514,6 +515,7 @@ class Engine private constructor(private val app: Context) {
         CaptureVolumeGuard.restore(app, "launch")   // процесс погиб в режиме захвата YouTube
         AudioFileDecoder.clearCache(app)
         refreshPlaylists()
+        queueIo.execute { cleanReceivedAudio() }
         // Стараемся занять тот же TCP-порт, что и в прошлый раз: второй телефон помнит его и подключается напрямую.
         tcp = try { ServerSocket(prefs.getInt("tcpPort", 0)) } catch (e: Exception) { telemetry.event("TCP_LISTEN_FALLBACK", error = e); ServerSocket(0) }
         prefs.edit().putInt("tcpPort", tcp.localPort).apply()
@@ -538,6 +540,9 @@ class Engine private constructor(private val app: Context) {
             if (manualLanBlockedPeerId == peerId) manualLanBlockedPeerId = null
             if (wasLanBlocked) ui { copy(showLanBlocked = false) }
         } })
+        // Выдернули наушники / отключился Bluetooth в Solo — пауза, а не музыка из динамика.
+        ContextCompat.registerReceiver(app, noisyReceiver,
+            android.content.IntentFilter(AudioManager.ACTION_AUDIO_BECOMING_NOISY), ContextCompat.RECEIVER_NOT_EXPORTED)
         Thread({ acceptLoop() }, "sf-accept").apply { isDaemon = true; start() }
         Thread({ tcpAudioAcceptLoop() }, "sf-tcp-audio-accept").apply { isDaemon = true; start() }
         Thread({ udpLoop() }, "sf-udp").apply { isDaemon = true; priority = Thread.MAX_PRIORITY - 1; start() }
@@ -548,8 +553,8 @@ class Engine private constructor(private val app: Context) {
         telemetry.record("SYSTEM_EFFECTS_SEEN", mapOf("model" to Build.MODEL, "effects" to systemEffects))
         discovery.advertise(tcp.localPort, myName)
         discovery.startBrowse()
-        ex.scheduleAtFixedRate({ try { heartbeat() } catch (t: Throwable) { Log.e(TAG, "hb", t); telemetry.event("HEARTBEAT_EXCEPTION", error = t) } }, 1, 1, TimeUnit.SECONDS)
-        ex.scheduleAtFixedRate({ try { serverTick() } catch (t: Throwable) { Log.e(TAG, "tick", t); telemetry.limited("ENGINE_TICK_EXCEPTION", error = t) } }, 100, 100, TimeUnit.MILLISECONDS)
+        ex.scheduleWithFixedDelay({ try { heartbeat() } catch (t: Throwable) { Log.e(TAG, "hb", t); telemetry.event("HEARTBEAT_EXCEPTION", error = t) } }, 1, 1, TimeUnit.SECONDS)
+        ex.scheduleWithFixedDelay({ try { serverTick() } catch (t: Throwable) { Log.e(TAG, "tick", t); telemetry.limited("ENGINE_TICK_EXCEPTION", error = t) } }, 100, 100, TimeUnit.MILLISECONDS)
         ui { copy(myId = myId, myName = myName, remembered = record, durationMs = music.totalFrames * 1000 / SF.SAMPLE_RATE,
             freezeCount = processFreezeCount, freezeDurationMs = processFreezeTotalMs,
             title = music.title, artist = music.artist, queueExpanded = prefs.getBoolean("queueExpanded", true),
@@ -690,15 +695,16 @@ class Engine private constructor(private val app: Context) {
         }
     }
 
-    private fun addressMessage(type: String = "network-addresses") = JSONObject()
-        .put("t", type).put("addrs", addressesJson()).put("caps", localCapabilitiesJson())
+    private fun addressMessage(type: String = "network-addresses", addresses: List<PeerAddress> = localWifiAddresses()) = JSONObject()
+        .put("t", type).put("addrs", addressesJson(addresses)).put("caps", localCapabilitiesJson())
 
     private fun sendLocalAddressesIfPaired(reason: String) {
         if (phase != Phase.PAIRED || link == null) return
         refreshMultiWifiWarning()
         if ("addrs" !in negotiatedCapabilities) return
-        link?.send(addressMessage())
-        telemetry.record("LOCAL_ADDRESSES_SENT", mapOf("reason" to reason, "count" to localWifiAddresses().size))
+        val addresses = localWifiAddresses()   // один опрос сети на отправку
+        link?.send(addressMessage(addresses = addresses))
+        telemetry.record("LOCAL_ADDRESSES_SENT", mapOf("reason" to reason, "count" to addresses.size))
     }
 
     private fun refreshMultiWifiWarning() {
@@ -788,10 +794,20 @@ class Engine private constructor(private val app: Context) {
                 if (l != null && l.isOpen) {
                     val activeRoute = routeForLocalAddress(l.localAddress)
                     if (l.localNetworkId != "unknown" && activeRoute?.networkId != l.localNetworkId) {
-                        telemetry.record("TCP_PATH_LOST", mapOf("localAddress" to l.localAddress.hostAddress,
-                            "oldNetworkId" to l.localNetworkId, "newNetworkId" to (activeRoute?.networkId ?: "unavailable"),
-                            "availableWifiNetworks" to availableNetworkRoutes(wifiOnly = true).map { it.label }))
-                        l.close("control network changed")
+                        val closeLostPath = { newRoute: NetworkRoute? ->
+                            telemetry.record("TCP_PATH_LOST", mapOf("localAddress" to l.localAddress.hostAddress,
+                                "oldNetworkId" to l.localNetworkId, "newNetworkId" to (newRoute?.networkId ?: "unavailable"),
+                                "availableWifiNetworks" to availableNetworkRoutes(wifiOnly = true).map { it.label }))
+                            l.close("control network changed")
+                        }
+                        if (activeRoute != null) { closeLostPath(activeRoute); return }
+                        // Маршрут мог пропасть на время переключения сети: живое соединение не рвём сразу,
+                        // а перепроверяем через 1,5 с.
+                        later(1_500) {
+                            if (link !== l || !l.isOpen) return@later
+                            val route = routeForLocalAddress(l.localAddress)
+                            if (route?.networkId != l.localNetworkId) closeLostPath(route)
+                        }
                         return
                     }
                     zeroSendRenewStreak = 0
@@ -819,9 +835,11 @@ class Engine private constructor(private val app: Context) {
     private fun log(text: String) {
         Log.i(TAG, text)
         telemetry.event("CONNECTION", "phase=$phase role=$role visible=$appVisible $text")
-        val line = "${logTime.format(java.util.Date())}  $text"
-        synchronized(connLog) { connLog.addLast(line); while (connLog.size > 60) connLog.removeFirst() }
-        val snapshot = synchronized(connLog) { connLog.toList() }
+        val line = "${logTime.format(java.time.LocalTime.now())}  $text"
+        val snapshot = synchronized(connLog) {
+            connLog.addLast(line); while (connLog.size > 60) connLog.removeFirst()
+            connLog.toList()
+        }
         ui { copy(connLog = snapshot) }
     }
 
@@ -933,9 +951,11 @@ class Engine private constructor(private val app: Context) {
                 if (tcp.isClosed) {
                     try {
                         val savedPort = prefs.getInt("tcpPort", 0)
-                        tcp = ServerSocket(savedPort)
+                        // Сохранённый порт может быть занят: тогда любой свободный и новый анонс в mDNS.
+                        tcp = try { ServerSocket(savedPort) } catch (_: Exception) { ServerSocket(0) }
                         prefs.edit().putInt("tcpPort", tcp.localPort).apply()
                         telemetry.event("TCP_SERVER_RECREATED", "port=${tcp.localPort}")
+                        if (tcp.localPort != savedPort) post { if (discovery.advertising || phase != Phase.IDLE) discovery.advertise(tcp.localPort, myName) }
                     } catch (ex: Exception) {
                         telemetry.limited("TCP_RECREATE_FAILED", error = ex)
                     }
@@ -1022,7 +1042,8 @@ class Engine private constructor(private val app: Context) {
                 val activeEpoch = preload?.epoch ?: timeline.epoch
                 val audioSource = preload?.source ?: playingState.source
                 val channel = preload?.channel ?: Ch.other(playingState.channel)
-                val trackId = preload?.trackId ?: queue.getOrNull(queueIndex)?.id.orEmpty()
+                // queue меняется на потоке движка: гонка не должна ронять TCP-путь в UDP.
+                val trackId = preload?.trackId ?: runCatching { queue.getOrNull(queueIndex)?.id }.getOrNull().orEmpty()
                 val start = preload?.startFrame ?: timeline.anchorFrame
                 if (activeEpoch != epochOnWire || (isPreload &&
                         (start != startFrameOnWire || trackId != trackOnWire))) {
@@ -1070,6 +1091,9 @@ class Engine private constructor(private val app: Context) {
                 try { socket.close() } catch (_: Exception) {}
                 setAudioPath("udp", "tcp_audio_send_failed")
             }
+        } finally {
+            // Обычный выход (фаза ушла из PAIRED, сокет заменён) тоже закрывает сокет.
+            try { socket.close() } catch (_: Exception) {}
         }
     }
 
@@ -2120,8 +2144,9 @@ class Engine private constructor(private val app: Context) {
                             transferLastProgressAtMs = SystemClock.elapsedRealtime()
                             telemetry.limited("FILE_TRANSFER_PROGRESS",
                                 "direction=send id=$id file=$currentFileIndex/$totalFiles fileBytes=$offset/${file.size} batchBytes=$batchSent/$totalBytes", op = op)
-                            post { if (fileTransferActive.get()) ui { copy(fileTransferText =
-                                "Отправка на Server · ${(batchSent * 100 / total).toInt()}%") } }
+                            // UI обновляем только при смене процента, а не на каждый блок 48 КиБ.
+                            val sendText = "Отправка на Server · ${(batchSent * 100 / total).toInt()}%"
+                            post { if (fileTransferActive.get() && ui.value.fileTransferText != sendText) ui { copy(fileTransferText = sendText) } }
                         }
                         check(offset == file.size) { "Размер «${file.name}» изменился во время передачи" }
                     }
@@ -2241,7 +2266,8 @@ class Engine private constructor(private val app: Context) {
             transferLastProgressAtMs = SystemClock.elapsedRealtime()
             telemetry.limited("FILE_TRANSFER_PROGRESS",
                 "direction=receive id=$id bytes=${transfer.received}/${transfer.size}", op = transfer.op)
-            ui { copy(fileTransferText = "Получение от Point · ${(transfer.received * 100 / transfer.size).toInt()}%") }
+            val receiveText = "Получение от Point · ${(transfer.received * 100 / transfer.size).toInt()}%"
+            if (ui.value.fileTransferText != receiveText) ui { copy(fileTransferText = receiveText) }
             link?.send(JSONObject().put("t", "file-ack").put("id", id).put("offset", transfer.received))
         } catch (e: Exception) {
             abortIncomingFileTransfer("${transfer.received}/${transfer.size}")
@@ -2812,10 +2838,12 @@ class Engine private constructor(private val app: Context) {
                     "candidateResults" to failure?.candidates.orEmpty().map { mapOf("network" to it.networkLabel,
                         "networkId" to it.networkId, "localIpv4" to it.localIpv4, "remoteAddress" to it.remoteHost,
                         "remotePort" to it.remotePort, "reason" to it.reason.name) }), error = e)
+                // Блокирующие пробы шлюзов (до 2 с на маршрут) — здесь, на потоке io, а не на потоке движка.
+                val gatewayProbe = if (failure != null) probeGateways(routes, SystemClock.elapsedRealtime()) else emptyMap()
                 post {
                     // Попытка от отменённого приглашения не должна сбрасывать новое приглашение.
                     if (gen != connectGeneration) return@post
-                    failure?.let { recordPeerPathRound(p, tag, it.candidates, routes) }
+                    failure?.let { recordPeerPathRound(p, tag, it.candidates, routes, gatewayProbe) }
                     val failedAllByTimeout = failure?.candidates?.let {
                         PeerPathDiagnosis.classifyRound(it.map(PeerPathDiagnosis.Candidate::reason)) ==
                             PeerPathDiagnosis.RoundVerdict.ALL_TIMEOUT
@@ -2918,9 +2946,9 @@ class Engine private constructor(private val app: Context) {
         return ConnectedSocket(race.connection, race.candidate.route, race.candidate.host)
     }
 
-    private fun recordPeerPathRound(peer: Peer, tag: String, candidates: List<PeerPathDiagnosis.Candidate>, routes: List<NetworkRoute>) {
+    private fun recordPeerPathRound(peer: Peer, tag: String, candidates: List<PeerPathDiagnosis.Candidate>,
+                                    routes: List<NetworkRoute>, gateways: Map<String, String>) {
         val now = SystemClock.elapsedRealtime()
-        val gateways = probeGateways(routes, now)
         val round = PeerPathDiagnosis.Round(candidates.firstOrNull()?.remoteHost.orEmpty(), peer.port, now, candidates)
         val diagnosis = peerPathDiagnoses.getOrPut(peer.id) { PeerPathDiagnosis() }
         val discoveredPeer = discovery.peer(peer.id)
@@ -4127,11 +4155,13 @@ class Engine private constructor(private val app: Context) {
             udpFailureNoticeShown = false
             audioRenewIntervalMs = 5_000L
         }
-        sessionId = rnd.nextInt().let { if (it == 0) 1 else it }
-        pointUdp = null
-        pointClockReady = false
-        fileTransferToken = hex(24)
-        abortIncomingFileTransfer("audio session changed")
+        // Под sendLock: цикл отправки не должен видеть новую сессию со старым адресом Point.
+        synchronized(sendLock) {
+            sessionId = rnd.nextInt().let { if (it == 0) 1 else it }
+            pointUdp = null
+            pointClockReady = false
+        }
+        // Токен передачи файлов не меняем: пересоздание UDP-сессии не должно обрывать импорт с Point.
         lastAudioSessionResetMs = now
         telemetry.record("AUDIO_SESSION_RENEW", mapOf("reason" to reason, "session" to sessionId,
             "sent" to sentTotal, "sentSincePreviousRenew" to sentSinceRenew,
@@ -4713,6 +4743,8 @@ class Engine private constructor(private val app: Context) {
     // ------------------------------------------------------------------ декодированные треки
     /** Готовые (декодированные в файл) треки: текущий, следующий и предыдущий. */
     private val decodedTracks = java.util.concurrent.ConcurrentHashMap<String, AudioSource>()
+    /** Трек, который сейчас предзагружается (поток движка); удаление его из очереди отменяет предзагрузку. */
+    private var prefetchTrackId: String? = null
 
     /** Декодирование в фоне (queueIo). Ловим Throwable: OutOfMemoryError раньше ронял приложение. */
     private fun loadTrack(
@@ -4793,7 +4825,16 @@ class Engine private constructor(private val app: Context) {
         val generation = trackLoadGeneration
         // Именованный аргумент: завершающая лямбда попадала в onProgress, и предзагрузку нельзя было отменить —
         // выбранный трек ждал в однопоточной queueIo, пока устаревший декодируется до конца.
-        queueIo.execute { loadTrack(next, cancelled = { generation != trackLoadGeneration }) }
+        prefetchTrackId = next.id
+        queueIo.execute {
+            val loaded = loadTrack(next, cancelled = { generation != trackLoadGeneration })
+            // Готовый трек кладём в decodedTracks: переход к нему не будет перечитывать кэш с диска.
+            post {
+                if (prefetchTrackId == next.id) prefetchTrackId = null
+                if (loaded != null && generation == trackLoadGeneration && queue.any { it.id == next.id })
+                    decodedTracks[next.id] = loaded
+            }
+        }
     }
 
     // ------------------------------------------------------------------ удаление треков
@@ -4811,8 +4852,8 @@ class Engine private constructor(private val app: Context) {
         queue.removeAll { it.id in ids }
         removedBackup = removed
 
-        if (pendingTrackId in ids || (current != null && current.id in ids)) {
-            // Also cancel an already activated progressive decoder before deleting its PCM cache.
+        if (pendingTrackId in ids || (current != null && current.id in ids) || prefetchTrackId in ids) {
+            // Also cancel an already activated progressive decoder (or the next-track prefetch) before deleting its PCM cache.
             pendingTrackId = null; trackLoadGeneration++
             ui { copy(loadingTracks = false, loadingTrackId = null) }
         }
@@ -4859,6 +4900,22 @@ class Engine private constructor(private val app: Context) {
 
     // ------------------------------------------------------------------ плейлисты (внутри приложения)
     private val playlistDir get() = File(app.filesDir, "playlists").apply { mkdirs() }
+
+    /**
+     * При запуске: недокачанные `.part` и принятые с Point файлы, на которые не ссылается ни один плейлист,
+     * удаляются — очередь после перезапуска пуста, иначе такие файлы копились бы без конца.
+     */
+    private fun cleanReceivedAudio() {
+        val dir = File(app.filesDir, "audio_received")
+        val files = dir.listFiles() ?: return
+        val playlistText = playlistDir.listFiles { f -> f.extension == "json" }.orEmpty()
+            .joinToString("\n") { runCatching { it.readText() }.getOrDefault("") }
+        var removed = 0
+        for (f in files) {
+            if (f.name.endsWith(".part") || !playlistText.contains(f.name)) { if (f.delete()) removed++ }
+        }
+        if (removed > 0) telemetry.event("RECEIVED_AUDIO_CLEANED", "removed=$removed")
+    }
 
     private fun readPlaylist(file: File): JSONObject? = try { JSONObject(file.readText()) } catch (_: Exception) { null }
 
@@ -5082,6 +5139,17 @@ class Engine private constructor(private val app: Context) {
     private var liveStateLoggedNs = 0L
     @Volatile private var captureMusicActive = false
     private var captureVolumeReceiverRegistered = false
+    private val noisyReceiver = object : android.content.BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: android.content.Intent) {
+            if (intent.action != AudioManager.ACTION_AUDIO_BECOMING_NOISY) return
+            post {
+                // В паре звук идёт из динамика телефона — маршрут наушников не важен.
+                if (!soloMode || role != Role.SERVER) return@post
+                telemetry.event("AUDIO_BECOMING_NOISY", "input=$input")
+                if (input.live && mode == SourceMode.MUSIC) liveTransport("pause") else cmdPause()
+            }
+        }
+    }
     private val spotify by lazy {
         SpotifyReceiver(app, ::onSpotifyEvent) { text -> telemetry.limited("SPOTIFY_LOG", text.take(300)) }
     }
@@ -6150,7 +6218,10 @@ class Engine private constructor(private val app: Context) {
             } catch (e: Exception) {
                 // Сон и при ошибке: иначе постоянный сбой отправки (Wi‑Fi пропал, фаза ещё PAIRED)
                 // превращал поток в холостой цикл на целое ядро.
-                udpSendFailures.incrementAndGet(); udpSendError.set(e); SystemClock.sleep(5)
+                // Сбоем UDP считаем только ошибки ввода-вывода; остальное — отдельное событие с причиной.
+                if (e is java.io.IOException) { udpSendFailures.incrementAndGet(); udpSendError.set(e) }
+                else telemetry.limited("TICK_EXCEPTION", "role=$role", e)
+                SystemClock.sleep(5)
             }
         }
     }
@@ -6176,8 +6247,8 @@ class Engine private constructor(private val app: Context) {
         return IntArray(available).also { if (available > 0) Pcm24.quantize(buffer, available, start * 2 + channel + 1, it) }
     }
 
-    private fun packet(tl: Timeline, seq: Int, start: Long, flags: Int, samples: IntArray): ByteArray =
-        Wire.audio(sessionId, tl.epoch, seq, start, tl.timeOf(start), System.nanoTime(), flags, samples, samples.size, udpKey ?: ByteArray(32))
+    private fun packet(tl: Timeline, seq: Int, start: Long, flags: Int, samples: IntArray, key: ByteArray): ByteArray =
+        Wire.audio(sessionId, tl.epoch, seq, start, tl.timeOf(start), System.nanoTime(), flags, samples, samples.size, key)
 
     /** A lagging sender must never restart the shared DSP by sampling evicted or expired PCM. */
     private fun advanceAudioCursor(source: AudioSource, tl: Timeline, now: Long, cursor: Long, skipped: AtomicLong): Long {
@@ -6190,6 +6261,8 @@ class Engine private constructor(private val app: Context) {
     private fun serverSend() { synchronized(sendLock) {
         if (debugStopUdpTraffic || currentAudioPath == "tcp") return
         val addr = pointUdp ?: return
+        // Без ключа пары не отправляем: раньше пакет подписывался нулевым ключом и ошибка маскировалась.
+        val key = udpKey ?: return
         val st = serverPlay
         val tl = st.timeline
         if (!tl.playing) return
@@ -6206,7 +6279,7 @@ class Engine private constructor(private val app: Context) {
             val samples = quantizeChannel(st.source, nextFrame, Ch.other(st.channel), SF.PACKET_FRAMES, udpReadBuffer)
             if (samples.isEmpty()) break
             val seq = sendSeq++
-            val b = packet(tl, seq, nextFrame, 0, samples)
+            val b = packet(tl, seq, nextFrame, 0, samples, key)
             val i = seq and 1023
             cacheSeq[i] = seq; cacheEpoch[i] = tl.epoch; cacheStart[i] = nextFrame; cacheSamples[i] = samples
             udp.send(DatagramPacket(b, b.size, addr))
@@ -6216,7 +6289,10 @@ class Engine private constructor(private val app: Context) {
     } }
 
     private fun resend(n: UdpMsg.Nack) { synchronized(sendLock) {
+        // Как serverSend: на TCP-пути и при отладочной остановке UDP повторы не нужны.
+        if (debugStopUdpTraffic || currentAudioPath == "tcp") return
         val addr = pointUdp ?: return
+        val key = udpKey ?: return
         val st = serverPlay; val tl = st.timeline
         if (!tl.playing || n.epoch != tl.epoch) return
         val now = System.nanoTime()
@@ -6225,7 +6301,7 @@ class Engine private constructor(private val app: Context) {
             if (cacheSeq[i] != seq || cacheEpoch[i] != tl.epoch) continue
             val samples = cacheSamples[i] ?: continue
             if (tl.timeOf(cacheStart[i] + samples.size) < now) continue   // уже поздно
-            val b = packet(tl, seq, cacheStart[i], UdpMsg.FLAG_RETRANSMIT, samples)
+            val b = packet(tl, seq, cacheStart[i], UdpMsg.FLAG_RETRANSMIT, samples, key)
             udp.send(DatagramPacket(b, b.size, addr)); resent.incrementAndGet()
         }
     } }
@@ -6252,9 +6328,15 @@ class Engine private constructor(private val app: Context) {
             }
             if (currentAudioPath != "tcp") {
                 val nacks = rx.collectNacks(now)
-                if (nacks.isNotEmpty() && addr != null) {
-                    val b = Wire.nack(sessionId, rx.timeline.epoch, nacks, udpKey ?: return)
-                    udp.send(DatagramPacket(b, b.size, addr))
+                val key = udpKey
+                if (nacks.isNotEmpty() && addr != null && key != null) {
+                    // Ошибка отправки NACK не должна обрывать тик и TCP-часы ниже.
+                    try {
+                        val b = Wire.nack(sessionId, rx.timeline.epoch, nacks, key)
+                        udp.send(DatagramPacket(b, b.size, addr))
+                    } catch (e: Exception) {
+                        telemetry.limited("UDP_NACK_SEND_FAILED", "target=${addr.address.hostAddress}:${addr.port}", e)
+                    }
                 }
             }
         }
