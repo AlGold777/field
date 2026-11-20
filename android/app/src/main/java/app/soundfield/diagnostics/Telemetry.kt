@@ -26,7 +26,6 @@ class Telemetry private constructor(private val app: Context) {
     private val limits = HashMap<String, Limit>()
 
     @Volatile private var contextProvider: () -> TelemetryContext = { TelemetryContext() }
-    @Volatile private var roleForExport: () -> String = { "server" }
     @Volatile private var crashSnapshotProvider: (() -> List<*>)? = null
     private val appMetadata: Map<String, Any?> by lazy {
         @Suppress("DEPRECATION")
@@ -39,9 +38,8 @@ class Telemetry private constructor(private val app: Context) {
 
     init { event("PROCESS_START", "") }
 
-    fun configure(context: () -> TelemetryContext, localRole: () -> String) {
+    fun configure(context: () -> TelemetryContext, @Suppress("UNUSED_PARAMETER") localRole: () -> String) {
         contextProvider = context
-        roleForExport = localRole
         record("DEVICE_INFO", mapOf("manufacturer" to Build.MANUFACTURER, "model" to Build.MODEL,
             "android" to Build.VERSION.RELEASE, "sdk" to Build.VERSION.SDK_INT))
     }
@@ -202,6 +200,10 @@ class Telemetry private constructor(private val app: Context) {
         val previous = Thread.getDefaultUncaughtExceptionHandler()
         Thread.setDefaultUncaughtExceptionHandler { thread, error ->
             try {
+                // Сначала события из очереди (до 512), иначе последние перед падением терялись или шли после UNCAUGHT.
+                val queued = ArrayList<Runnable>()
+                worker.queue.drainTo(queued)
+                queued.forEach { job -> runCatching { job.run() } }
                 journal.append(line("UNCAUGHT", "app", "error", emptyMap(), null, error, thread.name))
                 val samples = crashSnapshotProvider?.invoke().orEmpty()
                 if (samples.isNotEmpty()) {

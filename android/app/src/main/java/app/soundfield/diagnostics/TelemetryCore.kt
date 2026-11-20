@@ -272,12 +272,14 @@ internal object TelemetrySummary {
         return "$actualRole (${fields.joinToString(", ").ifEmpty { "device details unavailable" }})"
     }
 
-    private fun incidentSummary(lines: List<String>): List<String> = lines
-        .filter { event(it) == "INCIDENT_START" }
-        .map { start ->
+    private fun incidentSummary(lines: List<String>): List<String> {
+        // Один проход с группировкой по id инцидента вместо полного прохода журнала на каждый инцидент.
+        val byIncident = HashMap<String, MutableList<String>>()
+        for (line in lines) incidentId(line)?.let { byIncident.getOrPut(it) { ArrayList() }.add(line) }
+        return lines.filter { event(it) == "INCIDENT_START" }.map { start ->
             val id = incidentId(start)
             val rule = rulePattern.find(start)?.groupValues?.get(1) ?: "UNKNOWN"
-            val related = lines.filter { it !== start && id != null && incidentId(it) == id }
+            val related = id?.let { byIncident[it] }.orEmpty().filter { it !== start }
             val ended = related.lastOrNull { event(it) == "INCIDENT_END" }
             val latest = ended ?: related.lastOrNull { event(it) == "INCIDENT_ONGOING" }
             val durMs = latest?.let(::duration) ?: duration(start)
@@ -285,6 +287,7 @@ internal object TelemetrySummary {
             "- $rule: ${timestampPattern.find(start)?.groupValues?.get(1) ?: "unknown"}; " +
                 "${durMs?.let { String.format(Locale.US, if (ended == null) "≥ %.1f s" else "%.1f s", it / 1000.0) } ?: "duration unavailable"}; $state"
         }
+    }
 
     fun create(
         server: String,
