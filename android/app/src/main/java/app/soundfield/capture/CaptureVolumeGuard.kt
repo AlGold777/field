@@ -31,7 +31,7 @@ object CaptureVolumeGuard {
     /** Режим захвата включён в этом процессе. В заново поднятом процессе — false. */
     @Volatile var active = false
         private set
-    private var armedAtMs = 0L
+    @Volatile private var armedAtMs = 0L
 
     private fun prefs(ctx: Context) = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
 

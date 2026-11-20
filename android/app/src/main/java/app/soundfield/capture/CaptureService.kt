@@ -52,6 +52,12 @@ class CaptureService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val telemetry = Telemetry.get(this)
+        if (intent?.action == ACTION_STOP) {
+            // «Стоп» в уведомлении: выход из захвата без открытия приложения, движок возвращает плеер.
+            telemetry.event("CAPTURE_STOP_FROM_NOTIFICATION")
+            finish("Захват звука остановлен")
+            return START_NOT_STICKY
+        }
         try {
             startForeground(ID, notification(this), ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
         } catch (e: Exception) {
@@ -169,6 +175,7 @@ class CaptureService : Service() {
         private const val ID = 43
         private const val EXTRA_RESULT_CODE = "resultCode"
         private const val EXTRA_DATA = "data"
+        private const val ACTION_STOP = "app.soundfield.capture.STOP"
         val TARGET_PACKAGES = listOf("com.google.android.youtube", "com.google.android.apps.youtube.music")
 
         fun start(ctx: Context, resultCode: Int, data: Intent) {
@@ -186,11 +193,19 @@ class CaptureService : Service() {
             }
             val open = PendingIntent.getActivity(ctx, 2, Intent(ctx, MainActivity::class.java)
                 .addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP), PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
+            val stop = PendingIntent.getService(ctx, 3, Intent(ctx, CaptureService::class.java).setAction(ACTION_STOP),
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
+            // Без установленного YouTube захватывается звук всех медиаприложений — уведомление говорит об этом прямо.
+            val youtubeInstalled = TARGET_PACKAGES.any { name ->
+                runCatching { ctx.packageManager.getApplicationInfo(name, 0) }.isSuccess
+            }
             return NotificationCompat.Builder(ctx, CHANNEL)
                 .setSmallIcon(R.drawable.ic_stat_soundfield)
-                .setContentTitle("Источник: YouTube")
-                .setContentText("SoundField воспроизводит звук приложения YouTube")
+                .setContentTitle(if (youtubeInstalled) "Источник: YouTube" else "Источник: звук других приложений")
+                .setContentText(if (youtubeInstalled) "SoundField воспроизводит звук приложения YouTube"
+                    else "SoundField воспроизводит звук медиаприложений этого телефона")
                 .setContentIntent(open).setOngoing(true).setOnlyAlertOnce(true)
+                .addAction(0, "Стоп", stop)
                 .build()
         }
     }
