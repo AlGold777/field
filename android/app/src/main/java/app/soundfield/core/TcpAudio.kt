@@ -157,18 +157,19 @@ class TcpAudioBuffer(capacityPow2: Int = 21) {
         }
     }
 
-    fun write(chunk: TcpAudioChunk): Boolean {
+    /** Под [lock]: activate/prepare не сбросят слот посреди записи и не подменят его после выбора. */
+    fun write(chunk: TcpAudioChunk): Boolean = synchronized(lock) {
         val slot = when {
             active.epoch == chunk.epoch -> active
             staging.epoch == chunk.epoch -> staging
-            chunk.epoch > active.epoch -> synchronized(lock) {
+            chunk.epoch > active.epoch -> {
                 if (staging.epoch != chunk.epoch) staging.reset(chunk.epoch)
                 staging
             }
-            else -> return false
+            else -> return@synchronized false
         }
         slot.write(chunk.startFrame, chunk.samples)
-        return true
+        true
     }
 
     fun read(epoch: Int, frame: Long): Float = when {

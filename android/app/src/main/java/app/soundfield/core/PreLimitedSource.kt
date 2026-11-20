@@ -111,6 +111,7 @@ class PreLimitedSource(
     override fun readPrepared(frame: Long, ch: Int): Float {
         if (ch !in 0..1 || frame < startAtFrame || frame >= inner.totalFrames) return 0f
         val revision = generation
+        if ((revision and 1L) != 0L) return Float.NaN
         if (frame >= processedHead || frame < retainedFrom) {
             // Читатель ушёл вперёд дальше окна кэша: перезапуск с его кадра (иначе NaN навсегда).
             // Отстающих читателей (frame < retainedFrom) не трогаем — их догоняет сам отправитель.
@@ -228,9 +229,11 @@ class PreLimitedSource(
         currentDb = initialGainDb()   // после перемотки без «подъезда»
         currentGain = Math.pow(10.0, currentDb / 20.0)
         nextInput = from
+        // Нечётное поколение — границы кэша меняются: читатели отбрасывают значение (seqlock).
         generation++
         retainedFrom = maxOf(startAtFrame, from)
         processedHead = from
+        generation++
     }
 
     override fun close() {

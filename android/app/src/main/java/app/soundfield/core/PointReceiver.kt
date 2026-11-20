@@ -13,7 +13,9 @@ class PointReceiver(private val clock: ClockSync, capacityPow2: Int = 17) {
     private val cap = 1 shl capacityPow2
     private val mask = (cap - 1).toLong()
     private val samples = FloatArray(cap)
-    private val tags = LongArray(cap) { -1L }
+    // Теги — volatile-массив: запись «-1 → сэмпл → кадр», чтение «тег → сэмпл → тег» (seqlock),
+    // иначе на ARM аудиопоток мог взять сэмпл прошлого круга кольца под новым тегом.
+    private val tags = java.util.concurrent.atomic.AtomicLongArray(LongArray(cap) { -1L })
 
     @Volatile var timeline: Timeline = Timeline.NONE; private set
     @Volatile var lastRenderedFrame = Long.MIN_VALUE
@@ -50,7 +52,7 @@ class PointReceiver(private val clock: ClockSync, capacityPow2: Int = 17) {
         val count = (minOf(maxFrame - startFrame, limit.toLong() - 1, cap.toLong() - 1) + 1).toInt()
         for (i in 0 until count) {
             val frame = startFrame + i
-            if (tags[(frame and mask).toInt()] != frame) return@synchronized i
+            if (tags.get((frame and mask).toInt()) != frame) return@synchronized i
         }
         count
     }
@@ -62,7 +64,7 @@ class PointReceiver(private val clock: ClockSync, capacityPow2: Int = 17) {
     }
 
     private fun clearBuffer() {
-        java.util.Arrays.fill(tags, -1L)
+        for (i in 0 until cap) tags.set(i, -1L)
         maxFrame = -1L
         lastRenderedFrame = Long.MIN_VALUE
     }
@@ -138,8 +140,9 @@ class PointReceiver(private val clock: ClockSync, capacityPow2: Int = 17) {
         for (i in 0 until p.count) {
             val f = p.startFrame + i
             val idx = (f and mask).toInt()
+            tags.set(idx, -1L)
             samples[idx] = p.samples[i] / Pcm24.SCALE
-            tags[idx] = f
+            tags.set(idx, f)
         }
         val end = p.startFrame + p.count - 1
         if (end > maxFrame) maxFrame = end
@@ -166,7 +169,8 @@ class PointReceiver(private val clock: ClockSync, capacityPow2: Int = 17) {
     /** NaN — кадра нет в буфере. */
     fun read(frame: Long): Float {
         val idx = (frame and mask).toInt()
+        if (tags.get(idx) != frame) return Float.NaN
         val s = samples[idx]
-        return if (tags[idx] == frame) s else Float.NaN
+        return if (tags.get(idx) == frame) s else Float.NaN
     }
 }

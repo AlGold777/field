@@ -132,6 +132,7 @@ class SpatialSource(
     override fun readPrepared(frame: Long, ch: Int): Float {
         if (ch !in 0..1 || frame < startAtFrame || frame >= inner.totalFrames) return 0f
         val revision = generation
+        if ((revision and 1L) != 0L) return Float.NaN
         if (frame >= processedHead || frame < firstReadyFrame) {
             // Читатель ушёл вперёд дальше окна кэша: перезапуск с его кадра (иначе NaN навсегда).
             if (frame - processedHead >= cacheCapacityFrames) scheduleRestart(frame)
@@ -230,9 +231,11 @@ class SpatialSource(
         java.util.Arrays.fill(sendAccumulationR, 0.0)
         xtcProcessor?.reset()
         loudnessCompensator.reset()
+        // Нечётное поколение — границы кэша меняются: читатели отбрасывают значение (seqlock).
         generation++
         retainedFrom = warmupStart
         processedHead = warmupStart
+        generation++
         realtimeFactor = 0.0
         restartCount.incrementAndGet()
     }
