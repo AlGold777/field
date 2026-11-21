@@ -1,9 +1,7 @@
 package app.soundfield.core
 
-import kotlin.math.PI
+import app.soundfield.dsp.Radix2Fft
 import kotlin.math.abs
-import kotlin.math.cos
-import kotlin.math.sin
 
 /**
  * Акустическая калибровка. Server записывает микрофоном, как оба телефона проигрывают
@@ -101,63 +99,27 @@ object CalibrationAnalyzer {
 
     /** |взаимная корреляция| с двумя шаблонами: c[i] = Σ tpl[j]·x[i+j]. БПФ записи считается один раз. */
     fun xcorrAbsBoth(x: FloatArray, tplA: FloatArray, tplB: FloatArray): Pair<FloatArray, FloatArray> {
-        var n = 1
+        var n = 2 // Radix2Fft требует размер >= 2
         while (n < x.size + maxOf(tplA.size, tplB.size)) n = n shl 1
         val xr0 = DoubleArray(n); val xi0 = DoubleArray(n)
         for (i in x.indices) xr0[i] = x[i].toDouble()
-        Fft.transform(xr0, xi0, false)
-        return Pair(corrWith(xr0, xi0, tplA, x.size), corrWith(xr0, xi0, tplB, x.size))
+        val fft = Radix2Fft(n)
+        fft.transform(xr0, xi0, false)
+        return Pair(corrWith(fft, xr0, xi0, tplA, x.size), corrWith(fft, xr0, xi0, tplB, x.size))
     }
 
-    private fun corrWith(xr0: DoubleArray, xi0: DoubleArray, tpl: FloatArray, len: Int): FloatArray {
+    private fun corrWith(fft: Radix2Fft, xr0: DoubleArray, xi0: DoubleArray, tpl: FloatArray, len: Int): FloatArray {
         val n = xr0.size
         val xr = xr0.copyOf(); val xi = xi0.copyOf()
         val tr = DoubleArray(n); val ti = DoubleArray(n)
         for (i in tpl.indices) tr[i] = tpl[i].toDouble()
-        Fft.transform(tr, ti, false)
+        fft.transform(tr, ti, false)
         for (i in 0 until n) { // X · conj(T)
             val re = xr[i] * tr[i] + xi[i] * ti[i]
             val im = xi[i] * tr[i] - xr[i] * ti[i]
             xr[i] = re; xi[i] = im
         }
-        Fft.transform(xr, xi, true)
+        fft.transform(xr, xi, true)
         return FloatArray(len) { abs(xr[it]).toFloat() }
-    }
-}
-
-/** Итеративное БПФ radix-2 (in-place). inverse = true — с нормировкой 1/N. */
-object Fft {
-    fun transform(re: DoubleArray, im: DoubleArray, inverse: Boolean) {
-        val n = re.size
-        var j = 0
-        for (i in 1 until n) {
-            var bit = n shr 1
-            while (j and bit != 0) { j = j xor bit; bit = bit shr 1 }
-            j = j xor bit
-            if (i < j) {
-                var t = re[i]; re[i] = re[j]; re[j] = t
-                t = im[i]; im[i] = im[j]; im[j] = t
-            }
-        }
-        var len = 2
-        while (len <= n) {
-            val ang = 2 * PI / len * (if (inverse) 1 else -1)
-            val wr = cos(ang); val wi = sin(ang)
-            var i = 0
-            while (i < n) {
-                var cr = 1.0; var ci = 0.0
-                val half = len / 2
-                for (k in 0 until half) {
-                    val ar = re[i + k + half] * cr - im[i + k + half] * ci
-                    val ai = re[i + k + half] * ci + im[i + k + half] * cr
-                    re[i + k + half] = re[i + k] - ar; im[i + k + half] = im[i + k] - ai
-                    re[i + k] += ar; im[i + k] += ai
-                    val ncr = cr * wr - ci * wi; ci = cr * wi + ci * wr; cr = ncr
-                }
-                i += len
-            }
-            len = len shl 1
-        }
-        if (inverse) for (i in 0 until n) { re[i] /= n; im[i] /= n }
     }
 }

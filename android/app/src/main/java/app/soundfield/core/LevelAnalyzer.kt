@@ -1,5 +1,6 @@
 package app.soundfield.core
 
+import app.soundfield.dsp.Radix2Fft
 import kotlin.math.PI
 import kotlin.math.abs
 import kotlin.math.cos
@@ -69,6 +70,7 @@ object LevelAnalyzer {
         val first = min(until, from + edge)
         val last = max(first, until - edge)
         if (last - first < FFT_SIZE) return Spectrum(List(centersHz.size) { null }, peakDb)
+        val fft = fftCache ?: Radix2Fft(FFT_SIZE).also { fftCache = it }
         val accum = DoubleArray(centersHz.size)
         var windows = 0
         var offset = first
@@ -80,7 +82,7 @@ object LevelAnalyzer {
                 val w = 0.5 - 0.5 * cos(2 * PI * i / (FFT_SIZE - 1))
                 re[i] = samples[offset + i].toDouble() * w
             }
-            fft(re, im)
+            fft.transform(re, im)
             for (band in centersHz.indices) {
                 val low = centersHz[band] / THIRD_OCTAVE_HALF_STEP
                 val high = centersHz[band] * THIRD_OCTAVE_HALF_STEP
@@ -100,39 +102,7 @@ object LevelAnalyzer {
         return Spectrum(levels, peakDb)
     }
 
-    private fun fft(re: DoubleArray, im: DoubleArray) {
-        val n = re.size
-        var j = 0
-        for (i in 1 until n) {
-            var bit = n shr 1
-            while (j and bit != 0) { j = j xor bit; bit = bit shr 1 }
-            j = j xor bit
-            if (i < j) {
-                val tr = re[i]; re[i] = re[j]; re[j] = tr
-                val ti = im[i]; im[i] = im[j]; im[j] = ti
-            }
-        }
-        var len = 2
-        while (len <= n) {
-            val angle = -2 * PI / len
-            val wr0 = cos(angle); val wi0 = kotlin.math.sin(angle)
-            var start = 0
-            while (start < n) {
-                var wr = 1.0; var wi = 0.0
-                for (k in 0 until len / 2) {
-                    val even = start + k; val odd = even + len / 2
-                    val tr = wr * re[odd] - wi * im[odd]
-                    val ti = wr * im[odd] + wi * re[odd]
-                    re[odd] = re[even] - tr; im[odd] = im[even] - ti
-                    re[even] += tr; im[even] += ti
-                    val nextWr = wr * wr0 - wi * wi0
-                    wi = wr * wi0 + wi * wr0; wr = nextWr
-                }
-                start += len
-            }
-            len = len shl 1
-        }
-    }
+    @Volatile private var fftCache: Radix2Fft? = null
 
     /** Половина третьоктавной полосы: 2^(1/6). */
     private val THIRD_OCTAVE_HALF_STEP = kotlin.math.exp(ln(2.0) / 6.0)

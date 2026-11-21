@@ -1,5 +1,6 @@
 package app.soundfield.core
 
+import app.soundfield.dsp.Radix2Fft
 import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.PI
 import kotlin.math.abs
@@ -315,6 +316,7 @@ class EqSpectrumCapture(private val capacity: Int = 8192) {
     }
 
     @Volatile private var hannWindow: DoubleArray? = null
+    @Volatile private var fftCache: Radix2Fft? = null
 
     fun spectrumDb(samples: FloatArray, bands: Int = 60): FloatArray {
         val n = samples.size
@@ -324,30 +326,8 @@ class EqSpectrumCapture(private val capacity: Int = 8192) {
         val window = hannWindow?.takeIf { it.size == n } ?: DoubleArray(n) { i -> 0.5 - 0.5 * cos(2.0 * PI * i / (n - 1)) }
             .also { hannWindow = it }
         for (i in 0 until n) real[i] = samples[i] * window[i]
-        var j = 0
-        for (i in 1 until n) {
-            var bit = n shr 1
-            while ((j and bit) != 0) { j = j xor bit; bit = bit shr 1 }
-            j = j xor bit
-            if (i < j) { val tr = real[i]; real[i] = real[j]; real[j] = tr }
-        }
-        var len = 2
-        while (len <= n) {
-            val angle = -2.0 * PI / len
-            val wr0 = cos(angle); val wi0 = sin(angle)
-            for (start in 0 until n step len) {
-                var wr = 1.0; var wi = 0.0
-                for (k in 0 until len / 2) {
-                    val even = start + k; val odd = even + len / 2
-                    val tr = wr * real[odd] - wi * imag[odd]
-                    val ti = wr * imag[odd] + wi * real[odd]
-                    real[odd] = real[even] - tr; imag[odd] = imag[even] - ti
-                    real[even] += tr; imag[even] += ti
-                    val nextWr = wr * wr0 - wi * wi0; wi = wr * wi0 + wi * wr0; wr = nextWr
-                }
-            }
-            len *= 2
-        }
+        val fft = fftCache?.takeIf { it.size == n } ?: Radix2Fft(n).also { fftCache = it }
+        fft.transform(real, imag)
         val result = FloatArray(bands)
         for (band in 0 until bands) {
             val low = (20.0 * (20_000.0 / 20.0).pow(band.toDouble() / bands) * n / 48_000.0).toInt().coerceAtLeast(1)
