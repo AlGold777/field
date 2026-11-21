@@ -13,8 +13,8 @@ android {
         applicationId = "app.soundfield"
         minSdk = 26
         targetSdk = 35
-        versionCode = 85
-        versionName = "1.11.9"
+        versionCode = 86
+        versionName = "1.11.10"
         ndk { abiFilters += "arm64-v8a" }
     }
     externalNativeBuild {
@@ -69,6 +69,7 @@ tasks.matching { it.name == "preBuild" }.configureEach { dependsOn(buildSpotifyB
 tasks.withType<Test>().configureEach {
     dependsOn(buildHostDsp)
     systemProperty("sfdsp.host.lib", File(rootProject.projectDir.parentFile, "dsp/build/host/libsfdsp.dylib").absolutePath)
+    systemProperty("sf.protocol.vectors", File(rootProject.projectDir.parentFile, "tools/protocol_vectors.json").absolutePath)
 }
 
 tasks.register<JavaExec>("labRender") {
