@@ -55,7 +55,11 @@ for item in manifest:
         hi = array.array('b'); hi.frombytes(raw[2::3])
         item['start_s'] = loudest_start(hi, ch, rate)
     frame_bytes = 3 * ch
-    s0 = int(item['start_s'] * rate) * frame_bytes
+    start_frame = int(item['start_s'] * rate)
+    if start_frame + CLIP_S * rate > frames:  # иначе клип тихо получился бы короче 20 с
+        print('CLIP OUT OF RANGE', item['id'], 'start', item['start_s'], 's +', CLIP_S, 's >', frames / rate, 's'); failed += 1
+        os.remove(full); continue
+    s0 = start_frame * frame_bytes
     clip = raw[s0:s0 + CLIP_S * rate * frame_bytes]
     dst = os.path.join(OUT, item['id'] + '.wav')
     with wave.open(dst, 'wb') as w:

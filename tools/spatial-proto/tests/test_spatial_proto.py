@@ -14,7 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "tests"))
 
-from analyze_recording import analyze_sync
+from analyze_recording import analyze_measurement, analyze_sync
 from analyze_files import analyze_rendered_files
 from dsp.ambient import apply_w3
 from dsp.coherence import analyze_coherence
@@ -23,6 +23,7 @@ from dsp.limiter import limit, true_peak
 from dsp.msband import apply_w2
 from render import VARIANT_CODES, _loudness_match_and_limit, load_config, process, render_measurement, render_music
 from simulate_sync_recording import simulate
+from score import summarize
 from signals import _pink_noise, generate_synthetic
 
 
@@ -211,6 +212,72 @@ class IntegrationTests(unittest.TestCase):
                         1.0,
                         f"target ppm={drift}, report={report['estimated_recorder_clock_ppm']}",
                     )
+
+
+class MeasurementAndScoreTests(unittest.TestCase):
+    def test_analyze_measurement_accepts_pan_hard_signal(self) -> None:
+        # Плейлист с pan_hard раньше давал KeyError в recorded[signal].
+        rate = 48_000
+        rng = np.random.default_rng(5)
+        pause = np.zeros((int(1.5 * rate), 2))
+        parts = [pause]
+        for _ in range(3):
+            parts.append(rng.normal(0.0, 0.1, (int(2.6 * rate), 2)))
+            parts.append(pause)
+        recording = np.concatenate(parts) + rng.normal(0.0, 1e-4, (sum(len(p) for p in parts), 2))
+        tracks = [
+            {"signal": "pink_center", "variant": "REF", "blind_code": "A1"},
+            {"signal": "pan_hard", "variant": "REF", "blind_code": "B2"},
+            {"signal": "pan_hard", "variant": "W2_W3", "blind_code": "C3"},
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sf.write(root / "rec.wav", recording, rate, subtype="PCM_24")
+            (root / "measure.json").write_text(json.dumps({"sample_rate": rate, "tracks": tracks}), encoding="utf-8")
+            result = analyze_measurement(root / "rec.wav", root / "measure.json", root / "out")
+            self.assertEqual(result["matched_segments"], 3)
+            self.assertEqual(set(result["segments"]), {"pink_center", "pink_stereo", "pan_hard"})
+            self.assertEqual(set(result["segments"]["pan_hard"]), {"REF", "W2_W3"})
+            self.assertIn("pan_hard", result["response_deviation_db_vs_ref"])
+            self.assertTrue((root / "out" / "report_recording.json").exists())
+
+    def _write_score_inputs(self, root: Path, mono_deviation: float) -> tuple[Path, Path, Path]:
+        key = {"tracks": {
+            "R1": {"kind": "music", "fragment_id": "f1", "variant": "REF", "blind_code": "R1"},
+            "W1": {"kind": "music", "fragment_id": "f1", "variant": "W2_W3", "blind_code": "W1"},
+        }}
+        (root / "key.json").write_text(json.dumps(key), encoding="utf-8")
+        (root / "listener.csv").write_text(
+            "fragment,code,width,depth,center,coloration,naturalness,preference\n"
+            "f1,R1,50,50,80,80,80,50\n"
+            "f1,W1,70,70,80,80,80,60\n",
+            encoding="utf-8",
+        )
+        (root / "metrics.json").write_text(
+            json.dumps({"max_midband_mono_sum_shape_deviation_db": {"W2_W3": mono_deviation}}), encoding="utf-8"
+        )
+        return root / "key.json", root / "listener.csv", root / "metrics.json"
+
+    def test_score_success_when_width_gain_and_mono_sum_within_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            key, scores, metrics = self._write_score_inputs(root, 0.5)
+            result = summarize(key, [scores], metrics, root / "report.md")
+            verdict = result["verdicts"]["W2_W3"]
+            self.assertTrue(verdict["verdict"].startswith("УСПЕХ"))
+            self.assertEqual(verdict["successful_attributes"], ["ширина", "глубина"])
+            self.assertEqual(result["variants"]["REF"]["attributes"]["width"]["median"], 50.0)
+            self.assertTrue((root / "report.md").exists())
+
+    def test_score_fails_on_large_or_nan_mono_sum_deviation(self) -> None:
+        for deviation in (3.0, float("nan")):
+            with self.subTest(deviation=deviation), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                key, scores, metrics = self._write_score_inputs(root, deviation)
+                result = summarize(key, [scores], metrics, root / "report.md")
+                verdict = result["verdicts"]["W2_W3"]
+                self.assertEqual(verdict["verdict"], "ПРОВАЛ")
+                self.assertEqual(len(verdict["failures"]), 1)
 
 
 if __name__ == "__main__":

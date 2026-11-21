@@ -6,3 +6,4 @@ local.properties
 coretest/out.jar
 .DS_Store
 .cxx/
+android/.kotlin/

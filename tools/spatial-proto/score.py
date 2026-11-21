@@ -156,8 +156,12 @@ def summarize(key_path: str | Path, score_paths: list[str | Path], metrics_path:
         actual_variant = next(row["variant"] for row in included if row["condition"] == variant)
         is_music = all(row["kind"] == "music" for row in included if row["condition"] == variant)
         mono_deviation = technical.get(actual_variant) if is_music else None
-        if mono_deviation is not None and float(mono_deviation) > 2.0:
-            failures.append(f"форма моно-суммы отличается от REF на {float(mono_deviation):.2f} дБ")
+        # NaN (нет бинов в полосе) не должен проходить: сравнение «NaN > 2» ложно.
+        if mono_deviation is not None and not float(mono_deviation) <= 2.0:
+            if np.isfinite(float(mono_deviation)):
+                failures.append(f"форма моно-суммы отличается от REF на {float(mono_deviation):.2f} дБ")
+            else:
+                failures.append("форма моно-суммы не определена (NaN): в полосе нет данных")
         success_attributes = []
         for attribute, label in (("width", "ширина"), ("depth", "глубина")):
             if attribute in attrs and attribute in ref_attrs and attrs[attribute]["median"] >= ref_attrs[attribute]["median"] + 15:

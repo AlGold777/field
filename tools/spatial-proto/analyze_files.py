@@ -106,6 +106,13 @@ def _plot_lines(path: Path, centers: np.ndarray, series: dict[str, list[float]],
     plt.close(fig)
 
 
+def _max_keep_nan(current: float, value: float) -> float:
+    # Встроенный max(x, nan) молча отбрасывает NaN, и критерий «проходил» бы без данных.
+    if not np.isfinite(current) or not np.isfinite(value):
+        return float("nan")
+    return max(current, value)
+
+
 def analyze_rendered_files(run_dir: str | Path, config: dict | None = None) -> dict:
     run_dir = Path(run_dir)
     config = config or load_config()
@@ -154,11 +161,10 @@ def analyze_rendered_files(run_dir: str | Path, config: dict | None = None) -> d
                 "max_midband_shape_deviation_db": float(np.max(np.abs(shape_deviation[midband]))),
                 "high_res_mono_sum_ripple_pp_db": highres_ripple,
             }
-            max_midband_shape_deviation[variant] = max(
+            max_midband_shape_deviation[variant] = _max_keep_nan(
                 max_midband_shape_deviation[variant], fragment_result[variant]["max_midband_shape_deviation_db"]
             )
-            if np.isfinite(highres_ripple):
-                max_welch_ripple[variant] = max(max_welch_ripple[variant], highres_ripple)
+            max_welch_ripple[variant] = _max_keep_nan(max_welch_ripple[variant], highres_ripple)
             source_item = next(x for x in key["tracks"].values() if x["fragment_id"] == fragment_id and x["variant"] == variant)
             all_lufs_levels[variant].append(float(source_item["loudness"]["lufs_after_limiter"]))
         fragments[fragment_id] = fragment_result
