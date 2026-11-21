@@ -58,7 +58,7 @@ object CalibrationAnalyzer {
         val med = median(lates)
         val mad = median(lates.map { abs(it - med) })
         val snr = snrSum / snrN
-        val ok = mad < 3.0
+        val ok = mad < MAX_MAD_MS
         return Result(ok, med, mad, lates.size, snr,
             if (ok) "Измерено по ${lates.size} парам сигналов"
             else "Большой разброс измерений (±%.1f мс) — повторите в более тихом месте".format(mad))
@@ -66,25 +66,37 @@ object CalibrationAnalyzer {
 
     class Peak(val pos: Double, val snrDb: Double)
 
+    /** Приёмка: разброс (MAD) задержек по парам сигналов меньше 3 мс. */
+    private const val MAX_MAD_MS = 3.0
+    /** Окно поиска пика относительно ожидаемого момента: 0,3 с до и 0,45 с после. */
+    private const val SEARCH_BEFORE_S = 0.30
+    private const val SEARCH_AFTER_S = 0.45
+    /** Начало прямого пути — первый отсчёт выше половины максимума окна. */
+    private const val ONSET_FRACTION = 0.5f
+    /** Главный лепесток прямого пути: 1 мс от начала; позже — отражения. */
+    private const val MAIN_LOBE_S = 0.001
+    /** Пик должен превышать медиану окна в 8 раз (≈ 18 дБ), иначе сигнал не принят. */
+    private const val MIN_PEAK_TO_MEDIAN = 8.0
+
     /** Ищет пик корреляции в окне [e − 0.3 с, e + 0.45 с]; подтверждает превышение над медианой окна. */
     private fun findPeak(c: FloatArray, expected: Double, sr: Int): Peak? {
-        val from = maxOf(1, (expected - 0.30 * sr).toInt())
-        val to = minOf(c.size - 2, (expected + 0.45 * sr).toInt())
+        val from = maxOf(1, (expected - SEARCH_BEFORE_S * sr).toInt())
+        val to = minOf(c.size - 2, (expected + SEARCH_AFTER_S * sr).toInt())
         if (to - from < sr / 20) return null
         var argmax = from; var maxV = 0f
         for (i in from..to) if (c[i] > maxV) { maxV = c[i]; argmax = i }
         // первый индекс, где огибающая достигает 50% максимума окна; дальше — главный лепесток прямого пути
         // (до 1 мс от начала). Лепестки несущей чирпа (±5 сэмплов, 60–90% пика) и отражения позже 1 мс не выбираются.
         var i0 = argmax
-        for (i in from..to) if (c[i] >= 0.5f * maxV) { i0 = i; break }
-        val iEnd = minOf(to, i0 + (0.001 * sr + 0.5).toInt())
+        for (i in from..to) if (c[i] >= ONSET_FRACTION * maxV) { i0 = i; break }
+        val iEnd = minOf(to, i0 + (MAIN_LOBE_S * sr + 0.5).toInt())
         var best = i0
         for (i in i0..iEnd) if (c[i] > c[best]) best = i
         val window = FloatArray(to - from + 1) { c[from + it] }
         window.sort()
         val noise = window[window.size / 2].toDouble().coerceAtLeast(1e-9)
         val ratio = c[best] / noise
-        if (ratio < 8.0) return null
+        if (ratio < MIN_PEAK_TO_MEDIAN) return null
         // параболическая интерполяция
         val y0 = c[best - 1].toDouble(); val y1 = c[best].toDouble(); val y2 = c[best + 1].toDouble()
         val den = y0 - 2 * y1 + y2
