@@ -515,9 +515,10 @@ class Engine private constructor(private val app: Context) {
     // ================================================================== запуск
     private fun boot() {
         CaptureVolumeGuard.restore(app, "launch")   // процесс погиб в режиме захвата YouTube
-        AudioFileDecoder.clearCache(app)
+        // Очистка кэша — дисковая работа: не на главном потоке при открытии приложения. queueIo однопоточна,
+        // поэтому очистка гарантированно завершится раньше первого декодирования трека.
+        queueIo.execute { AudioFileDecoder.clearCache(app); cleanReceivedAudio() }
         refreshPlaylists()
-        queueIo.execute { cleanReceivedAudio() }
         // Стараемся занять тот же TCP-порт, что и в прошлый раз: второй телефон помнит его и подключается напрямую.
         tcp = try { ServerSocket(prefs.getInt("tcpPort", 0)) } catch (e: Exception) { telemetry.event("TCP_LISTEN_FALLBACK", error = e); ServerSocket(0) }
         prefs.edit().putInt("tcpPort", tcp.localPort).apply()
