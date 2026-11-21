@@ -104,6 +104,8 @@ class ClockSync {
         modelStepsUs.clear()
         pendingModelStepsUs.clear()
         lastModelStepUs = 0.0; modelStepP50Us = 0.0; modelStepP95Us = 0.0; modelStepMaxUs = 0.0
+        // Диагностика прошлого соединения не должна попадать в телеметрию нового до первого пересчёта.
+        rttMinMs = 0.0; rttAvgMs = 0.0; rttJitterMs = 0.0; driftPpm = 0.0; uncertaintyMs = 0.0
     }
 
     private fun bucketFor(local: Long): Bucket {
