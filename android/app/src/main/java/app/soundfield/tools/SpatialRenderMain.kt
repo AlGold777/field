@@ -54,7 +54,9 @@ object SpatialRenderMain {
         SpatialSource(source, spatialConfig = SpatialDspConfig(
             enabled = profile != "off" && (width > 0.0 || depth > 0.0 || height > 0.0), width = width, depth = depth, height = height, span = profileData.span)).use { spatial ->
             spatial.requestThrough(source.totalFrames)
-            val deadline = System.nanoTime() + 30_000_000_000L
+            // Дедлайн от длины входа: 30 с плюс время самого файла (рендер не медленнее реального времени).
+            val inputSeconds = source.totalFrames / SF.SAMPLE_RATE.toDouble()
+            val deadline = System.nanoTime() + ((30.0 + inputSeconds) * 1e9).toLong()
             while (!spatial.complete && spatial.processingError == null && System.nanoTime() < deadline) Thread.sleep(2)
             spatial.processingError?.let { throw IllegalStateException("Spatial render failed", it) }
             check(spatial.complete) { "Timed out rendering the input WAV" }

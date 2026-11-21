@@ -13,8 +13,8 @@ android {
         applicationId = "app.soundfield"
         minSdk = 26
         targetSdk = 35
-        versionCode = 86
-        versionName = "1.11.10"
+        versionCode = 87
+        versionName = "1.11.11"
         ndk { abiFilters += "arm64-v8a" }
     }
     externalNativeBuild {
