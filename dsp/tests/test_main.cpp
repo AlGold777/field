@@ -3,7 +3,9 @@
 #include <cstdio>
 #include <cstring>
 #include <functional>
+#include <atomic>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "sfdsp.h"
@@ -459,6 +461,43 @@ TEST(src_short_output_capacity_does_not_overrun) {
     CHECK(got <= 64);                       // −1 или частичный результат, но не запись за ёмкость
     CHECK(out[2 * 64] == 7.0f && out[2 * 64 + 1] == 7.0f);
     sf_src_destroy(s);
+}
+
+TEST(playout_marks_missing_frames_as_nan) {
+    // Хелпер render() подменяет NaN нулями — здесь проверяется сам контракт: кадры вне источника — NaN,
+    // внутри — конечные значения (рендерер отличает пропуск от тишины).
+    sf_playout* p = sf_playout_create(48000, 960);
+    std::vector<float> src(4800, 0.25f), out(256);
+    sf_playout_render(p, src.data(), 0, (int64_t)src.size(), 1000.0, 256, out.data());
+    bool finite = true; for (float v : out) finite = finite && std::isfinite(v);
+    CHECK(finite);
+    sf_playout_render(p, src.data(), 0, (int64_t)src.size(), 10000.0, 256, out.data());   // далеко за концом источника
+    bool allNan = true; for (float v : out) allNan = allNan && std::isnan(v);
+    CHECK(allNan);
+    sf_playout_destroy(p);
+}
+
+TEST(speaker_chain_publish_races_audio_thread_safely) {
+    // Тройной буфер: смена цепочки из другого потока во время обработки не даёт NaN и разрывов сверх кроссфейда.
+    sf_speaker* sp = sf_speaker_create(48000, 2);
+    sf_speaker_section hp = {SF_SECTION_HIGHPASS, 250, 0.7071, 0};
+    sf_speaker_section pk = {SF_SECTION_PEAK, 1000, 1.0, -6.0};
+    std::atomic<bool> stop{false};
+    std::thread writer([&] {
+        for (int i = 0; i < 2000 && !stop.load(); i++)
+            sf_speaker_set_chain(sp, (i % 3 == 0) ? nullptr : (i % 3 == 1 ? &hp : &pk), (i % 3 == 0) ? 0 : 1, 0.0);
+    });
+    std::vector<float> buf(2 * 64);
+    bool finite = true; double peak = 0;
+    for (int block = 0; block < 20000; block++) {
+        for (size_t i = 0; i < buf.size(); i++) buf[i] = 0.5f * (float)std::sin(0.05 * (double)(block * 64 + (int)i / 2));
+        sf_speaker_process(sp, buf.data(), 64);
+        for (float v : buf) { finite = finite && std::isfinite(v); peak = std::max(peak, (double)std::fabs(v)); }
+    }
+    stop = true; writer.join();
+    CHECK(finite);
+    CHECK(peak < 1.5);
+    sf_speaker_destroy(sp);
 }
 
 TEST(limiter_reset_is_deterministic) {

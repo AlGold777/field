@@ -15,6 +15,10 @@ sh tools/build_dsp.sh "$B"
 ${CXX:-clang++} -std=c++20 -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer \
     -ffp-contract=off -Idsp/include -Idsp/lab dsp/src/*.cpp dsp/tests/test_main.cpp -o "$B/dsp_tests_asan"
 "$B/dsp_tests_asan"
+# И под ThreadSanitizer: тест гонки публикации цепочки динамика (тройной буфер) должен проходить без предупреждений.
+${CXX:-clang++} -std=c++20 -O1 -g -fsanitize=thread -ffp-contract=off -Idsp/include -Idsp/lab \
+    dsp/src/*.cpp dsp/tests/test_main.cpp -o "$B/dsp_tests_tsan"
+TSAN_OPTIONS=halt_on_error=1 "$B/dsp_tests_tsan"
 
 CORPUS=tools/audio-corpus/wav
 ARGS=""
