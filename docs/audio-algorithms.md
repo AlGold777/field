@@ -5,7 +5,7 @@
 **Пересмотр:** 2026-10-07 — Solo стал независимым локальным плеером; короткое нажатие `Connect` восстанавливает последнюю пару, а удержание или свайп вниз открывает выбор телефонов. В Solo на экране остаются круги L/R с подписью `MyPhone`.
 **Область:** алгоритмы и потоки данных, которые можно проследить от текущего рабочего дерева приложения. Это описание исходников на дату аудита, а не план из ТЗ.
 
-> **Короткий итог по платформам.** Общие для Android/iOS части — модель 48 кГц, сетевое воспроизведение пары, баланс/громкость, калибровка задержки, генерация измерительных сигналов и спектральная оценка уровня. В Android дополнительно есть плеер на главной странице (соло без пары, переходящий в пару и обратно без остановки музыки), 32-отводный дробный ресемплер воспроизведения, графический EQ с анализатором и пространственная DSP-цепочка. В текущем iOS-коде EQ, пространственная обработка и соло-плеер не реализованы; декодирование и вывод там делегированы AVFoundation.
+> **Короткий итог по платформам.** Общие для Android/iOS части — модель 48 кГц, сетевое воспроизведение пары, баланс/громкость, калибровка задержки, генерация измерительных сигналов и спектральная оценка уровня. В Android дополнительно есть плеер на главной странице (соло без пары, переходящий в пару и обратно без остановки музыки), 32-отводный дробный ресемплер воспроизведения, графический EQ с анализатором и пространственная DSP-цепочка. На дату снимка в iOS не было EQ, пространственной обработки и соло-плеера; позже они появились (README: iOS 1.3.3 и далее) — актуальное состояние iOS описано в README.
 
 ## 1. Что именно описано
 
@@ -192,7 +192,7 @@ iOS передаёт renderer host time AVAudioSourceNode плюс `AVAudioSessi
 
 EQ реализован в `core/Equalizer.kt`, применяется в `ServerRenderer`/`PointRenderer` после выбора исходных кадров и до ramp/выходного ограничителя. Одинаковые аудиопараметры — enable, gains, magnet, preset, preserveLoudness и bypass — передаются Point по управляющему состоянию пары при согласованной возможности `eq`; DSP каждого телефона выполняет фильтрацию локально. Флажок показа анализатора `analyzerEnabled` остаётся локальной настройкой UI и по сети не передаётся. В solo настройки EQ сохраняются отдельно по ключу маршрута вывода; для Bluetooth маршрутный ключ использует адрес, если он доступен. В карточке Sound эквалайзер показан одной строкой (название, состояние, мини-кривая); нажатие сразу открывает полный экран настройки. Внутреннего разворачивания нет (убрано в 1.11.5, вместе с настройкой `eqExpanded`). Строка с названием аудиовыхода («Для: …») из интерфейса эквалайзера удалена.
 
-В iOS EQ-процессора и EQ-экрана в текущей реализации нет.
+На дату снимка в iOS не было EQ; с iOS 1.3.3 EQ есть (`AVAudioUnitEQ`, `ios/SoundField/Audio/AudioOutput.swift`).
 
 ### 6.1 Частоты, параметры и пресеты
 
@@ -246,9 +246,9 @@ EQ реализован в `core/Equalizer.kt`, применяется в `Serve
 
 **С A1 (Android 1.10.32) описанный ниже sample-peak limiter заменён** финальным true-peak лимитером ядра −1,0 dBTP (§13.7): после GainRamp стоит `PeakLimiter` (упреждение 1,5 мс + 16 кадров детектора = 87 кадров), его задержка вычитается корректором из позиции чтения. Дальнейший абзац описывает поведение до A1.
 
-Это sample-peak ограничитель: в 49-точечном окне задержки ищется наибольшая абсолютная амплитуда, атака gain вниз мгновенная, возврат к unity экспоненциальный с константой 50 мс. Отсчёт задерживается на 48 кадров, а gain умножает его и зажимает результат в [−1,1]. В стереорендере у левого и правого каналов свои экземпляры и свои peak/gain состояния. Он **не делает oversampling**, поэтому не является true-peak лимитером и не оценивает межсэмпловый пик.
+**До A1 (Android 1.10.32).** Это sample-peak ограничитель: в 49-точечном окне задержки ищется наибольшая абсолютная амплитуда, атака gain вниз мгновенная, возврат к unity экспоненциальный с константой 50 мс. Отсчёт задерживается на 48 кадров, а gain умножает его и зажимает результат в [−1,1]. В стереорендере у левого и правого каналов свои экземпляры и свои peak/gain состояния. Он **не делает oversampling**, поэтому не является true-peak лимитером и не оценивает межсэмпловый пик.
 
-iOS не выполняет EQ и в своём рендере не добавляет этот 1-мс limiter.
+iOS (с 1.3.3) выполняет EQ на `AVAudioUnitEQ` и этот 1-мс limiter не добавляет.
 
 ### 6.6 Анализатор спектра EQ
 
@@ -367,7 +367,7 @@ SpatialProcessor использует пять будущих hops = 2560 кад
 
 После spatial-обработки и loudness compensation два канала проходят общий limiter с задержкой 5 мс (240 кадров). Он отслеживает максимум абсолютной sample amplitude L/R в окне lookahead монотонной очередью, мгновенно уменьшает gain до порога −0,3 dBFS и возвращает gain за 80 мс. Gain общий для обоих каналов, что сохраняет их относительный уровень во время ограничения; дополнительная проверка задержанного стереокадра не позволяет превысить порог.
 
-Несмотря на имя/комментарий «true-peak» в исходнике, в коде нет oversampling для оценки межсэмпловых true peaks. Точное описание реализации — linked stereo **sample-peak** limiter.
+**До A1.** Несмотря на имя/комментарий «true-peak» в исходнике, в коде нет oversampling для оценки межсэмпловых true peaks. Точное описание реализации — linked stereo **sample-peak** limiter.
 
 ### 7.9 Автоматическое отключение при нехватке CPU
 
@@ -492,8 +492,8 @@ FFT является вычислительным инструментом дл�
 | Android importer/output/microphone | `android/app/src/main/java/app/soundfield/audio/AudioFileDecoder.kt`, `AudioOutput.kt`, `MicRecorder.kt` |
 | Android sample sources/levels/timing | `android/app/src/main/java/app/soundfield/core/Sources.kt`, `NoiseSources.kt`, `LevelMeasureSource.kt`, `Renderers.kt`, `Playout.kt`, `Packetizing.kt`, `ClockSync.kt`, `AudioPlayoutClock.kt`, `AudioGain.kt`, `LevelAnalyzer.kt`, `Calibration.kt`, `SyncProbe.kt`, `PointReceiver.kt`, `TcpAudio.kt`, `Wire.kt`, `Resampler.kt` |
 | Android EQ | `android/app/src/main/java/app/soundfield/core/Equalizer.kt`, `android/app/src/main/java/app/soundfield/ui/EqualizerScreen.kt`, `android/app/src/main/java/app/soundfield/engine/Engine.kt` |
-| Android spatial DSP | `android/app/src/main/java/app/soundfield/core/SpatialSource.kt`, `SpatialSettings.kt`, `android/app/src/main/java/app/soundfield/dsp/SpatialProcessor.kt`, `SpatialReflectionProcessor.kt`, `SpatialLoudnessCompensator.kt`, `SpatialPeakLimiter.kt`, `Xtc.kt`, `Radix2Fft.kt`, `WindowedSinc.kt` |
-| Android тесты аудио | `android/app/src/test/java/app/soundfield/core/AudioGainTest.kt`, `PacketizingTest.kt`, `SpatialSourceTest.kt`, `EqualizerTest.kt`, `PlayoutCorrectorTest.kt`; `.../dsp/SpatialInvariantsTest.kt`, `SpatialProcessorTest.kt`, `XtcTest.kt` |
+| Android spatial DSP | `android/app/src/main/java/app/soundfield/core/SpatialSource.kt`, `SpatialSettings.kt`, `android/app/src/main/java/app/soundfield/dsp/SpatialProcessor.kt`, `SceneRoom.kt`, `SpatialLoudnessCompensator.kt`, `PeakLimiter.kt`, `Xtc.kt`, `Radix2Fft.kt`, `WindowedSinc.kt` |
+| Android тесты аудио | `android/app/src/test/java/app/soundfield/core/AudioGainTest.kt`, `PacketizingTest.kt`, `SpatialSourceTest.kt`, `EqualizerTest.kt`, `PlayoutCorrectorTest.kt`; `.../dsp/SpatialSceneTest.kt`, `SpatialProcessorTest.kt`, `XtcTest.kt` |
 | Android data/configuration | `android/app/src/main/assets/spatial_profiles.json`, `device_speakers.json`; DSP version — `android/app/src/main/java/app/soundfield/dsp/DspVersion.kt` |
 | iOS decoder/output | `ios/SoundField/Core/Sources.swift`, `ios/SoundField/Core/Renderers.swift`, `ios/SoundField/Core/Playout.swift`, `ios/SoundField/Core/AudioGain.swift`, `ios/SoundField/Audio/AudioOutput.swift`, `ios/SoundField/Audio/MicRecorder.swift` |
 | DSP-ядро и лаборатория (A0) | `dsp/include/sfdsp.h`, `dsp/src/*`, `dsp/jni/sfdsp_jni.cpp`, `dsp/lab/*`, `dsp/tests/test_main.cpp`, `dsp/lab/baseline.json`; `tools/build_dsp.sh`, `tools/dsp_check.sh`; Android `dsp/SfDsp.kt`, `tools/LabRenderMain.kt`; iOS `Core/SfDsp.swift`, `SoundField-Bridging-Header.h` |
@@ -503,7 +503,7 @@ FFT является вычислительным инструментом дл�
 
 1. Расчётная EQ/spatial АЧХ — модель цифровых коэффициентов. Она не измеряет акустику корпуса, громкость устройства, позицию на столе, систему Android EQ/Dolby или комнату.
 2. Приложение использует аппаратный аудиостек и может получить от системы маршрутизацию/латентность, но не отменяет все неизвестные OEM-фильтры. В частности, XTC не включается только из-за наличия его реализации.
-3. Лимитер EQ — sample-peak; spatial limiter также работает по входным сэмплам с lookahead, но в исходнике назван true-peak. Oversampling в обоих случаях не обнаружен.
+3. (до A1; сейчас оба лимитера — true-peak 4× ядра sfdsp) Лимитер EQ — sample-peak; spatial limiter также работает по входным сэмплам с lookahead, но в исходнике назван true-peak. Oversampling в обоих случаях не обнаружен.
 4. EQ и spatial algorithms в данном снимке находятся на Android. Наличие UI/алгоритма на Android не означает, что такая же обработка включена на iPhone или в смешанной паре Android↔iOS.
 5. Числа `LevelAnalyzer` и синхронизационных проб являются диагностическими оценками, зависят от микрофона/его системной обработки и не равны калиброванному SPL или лабораторной проверке.
 6. Этот файл фиксирует работу исходников версии, указанной в заголовке. При изменении кода связанных модулей документ нужно пересмотреть вместе с функциональной документацией.
@@ -514,7 +514,7 @@ FFT является вычислительным инструментом дл�
 
 ### 13.1 Ядро `dsp/`
 
-C++20, C ABI (`dsp/include/sfdsp.h`, версия `SFDSP_VERSION` в `sfdsp_version.h`, сейчас 0.2.1 (A1), ABI 1). Правила аудиопотока: без аллокаций и блокировок в `render`, FTZ/DAZ на время вызова (`dsp/src/rt.hpp`), арифметика без FMA-слияния.
+C++20, C ABI (`dsp/include/sfdsp.h`, версия `SFDSP_VERSION` в `sfdsp_version.h`, сейчас 0.4.1, ABI 1). Правила аудиопотока: без аллокаций и блокировок в `render`, FTZ/DAZ на время вызова (`dsp/src/rt.hpp`), арифметика без FMA-слияния.
 
 Перенесено из Kotlin без изменения арифметики:
 
@@ -554,7 +554,7 @@ Kotlin пока использует собственные реализации
 1. Float-тракт Android прозрачен (null −200 dB, побитово совпадает с ядром). Узкое место точности звука — **кэш PCM16** (THD+N −96 / −81 / −42 dB на −1 / −20 / −60 dBFS при цели ≤ −110) — устраняется в A1.1.
 2. **Дробный корректор при дрейфе**: THD+N −77 dB на 1 кГц и −53 dB на 20 кГц (цель A4.1 ≤ −110): причина — округление фазы до 1/256 кадра (скачки времени ≈ 2 мкс). Постоянное смещение безвредно (−140 dB); шум создаёт именно движущаяся фаза. Решение A4.1 — интерполяция между соседними фазами или поли-фазная таблица с 2-й разностью.
 3. Задержка Android-цепочки 64 кадра = 16 (sinc) + 48 (lookahead лимитера EQ, 1 мс): это единственная компенсируемая в A1.4 величина.
-4. Лимитер EQ — sample-peak; корпус содержит клипованные мастеринги (true-peak до +0,6 dBTP, сэмпл-пик 0 dBFS, до −2,6 LUFS у `dense_rock`) — материал для A1.4/A3.1.
+4. (до A1; сейчас true-peak 4× ядра sfdsp) Лимитер EQ — sample-peak; корпус содержит клипованные мастеринги (true-peak до +0,6 dBTP, сэмпл-пик 0 dBFS, до −2,6 LUFS у `dense_rock`) — материал для A1.4/A3.1.
 5. Синхронизация L/R в цифровом домене (корректор, ±100 ppm): p95 / макс., мкс — шум оценки σ = 20 мкс: 3,4 / 5,8; σ = 100 мкс: 17,1 / 29,0; σ = 50 мкс без дрейфа: 8,6 / 14,5; σ = 50 мкс + 1% выбросов 3 мс: 40,9 / 64,6; скачок модели 100 мкс: 13,1 / 102. Цифровой бюджет A4 (p95 ≤ 10 мкс) достижим только если ошибка оценки момента вывода σ ≲ 40 мкс.
 
 Не измерено в A0 (нет телефона/микрофона): расход JNI на блок (бюджет ≤ 2%), CPU на Redmi 14C, акустические метрики — выполняются на этапах A2/A4.
