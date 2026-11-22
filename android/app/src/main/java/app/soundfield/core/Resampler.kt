@@ -6,6 +6,7 @@ import java.nio.ByteOrder
 import java.nio.MappedByteBuffer
 import java.nio.channels.FileChannel
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.PI
 import kotlin.math.cos
 import kotlin.math.min
@@ -101,6 +102,10 @@ class StreamResampler(private val inRate: Int, private val outRate: Int, private
  * PCM-файл, публикуемый декодером частями. Реалтайм-чтение никогда не ждёт декодер:
  * ещё не готовый сегмент возвращает тишину. Server отправляет эту же тишину в UDP,
  * поэтому обе стороны сохраняют одну временную шкалу. Размер трека не ограничен Int.MAX_VALUE.
+ *
+ * Сегменты могут появляться не по порядку: при перемотке за готовую часть [focus] просит декодер
+ * перейти к новому месту, а пропущенные участки он дозаполняет позже. [readyFrames] — конец
+ * непрерывного готового участка от точки [focus] (от начала трека, пока перемотки не было).
  */
 class SegmentedPcmSource(
     private val directory: File,
@@ -115,11 +120,13 @@ class SegmentedPcmSource(
     @Volatile override var loudnessLufs: Double = Double.NaN
     @Volatile override var totalFrames: Long = estimatedFrames.coerceAtLeast(0)
         private set
-    @Volatile override var readyFrames: Long = 0
-        private set
+    @Volatile private var runEnd: Long = 0
+    @Volatile private var focusFrame: Long = 0
+    override val readyFrames: Long get() = if (complete) totalFrames else runEnd
     @Volatile override var complete: Boolean = false
         private set
     private val segments = ConcurrentHashMap<Long, MappedByteBuffer>()
+    private val requestedSegment = AtomicLong(NO_REQUEST)
 
     fun publish(index: Long, file: File, frames: Int) {
         require(frames in 1..SEGMENT_FRAMES)
@@ -130,20 +137,64 @@ class SegmentedPcmSource(
             segments[index] = mapped
         }
         val ready = index * SEGMENT_FRAMES + frames
-        readyFrames = maxOf(readyFrames, ready)
-        // Некоторые контейнеры/потоки не сообщают длительность заранее. До конца декодирования
-        // показываем уже доступную длину; finish() заменит её точным числом кадров.
-        if (!complete) totalFrames = maxOf(totalFrames, ready)
+        synchronized(this) {
+            // Некоторые контейнеры/потоки не сообщают длительность заранее. До конца декодирования
+            // показываем уже доступную длину; finish() заменит её точным числом кадров.
+            if (!complete) totalFrames = maxOf(totalFrames, ready)
+            recomputeRun()
+        }
     }
 
     fun finish(actualFrames: Long) {
-        totalFrames = actualFrames
-        readyFrames = actualFrames
-        complete = true
+        synchronized(this) {
+            totalFrames = actualFrames
+            complete = true
+            runEnd = actualFrames
+        }
     }
 
-    fun progress(): Float = if (complete) 1f else if (totalFrames <= 0) 0f
-        else (readyFrames.toDouble() / totalFrames).toFloat().coerceIn(0f, 1f)
+    /** Воспроизведение переходит к [frame]: готовый участок считается от него, декодер переходит сюда, если здесь пусто. */
+    fun focus(frame: Long) {
+        synchronized(this) {
+            focusFrame = frame.coerceAtLeast(0)
+            recomputeRun()
+        }
+        if (!complete) requestedSegment.set(focusFrame / SEGMENT_FRAMES)
+    }
+
+    /** Сегмент, к которому просили перейти после последнего вызова, или null. Для потока декодера. */
+    fun takeRequestedSegment(): Long? = requestedSegment.getAndSet(NO_REQUEST).takeIf { it != NO_REQUEST }
+
+    fun hasSegment(index: Long): Boolean = segments.containsKey(index)
+
+    /** Первый недекодированный сегмент в [from, untilExclusive) или null. */
+    fun firstMissingSegment(from: Long, untilExclusive: Long): Long? {
+        var i = from.coerceAtLeast(0)
+        while (i < untilExclusive) { if (!segments.containsKey(i)) return i; i++ }
+        return null
+    }
+
+    /** Конец последнего опубликованного сегмента (кадр, исключительно). */
+    fun publishedEndFrame(): Long = segments.entries.maxOfOrNull { it.key * SEGMENT_FRAMES + segmentFrames(it.value) } ?: 0L
+
+    private fun segmentFrames(mapped: MappedByteBuffer): Long = mapped.limit() / BYTES_PER_FRAME
+
+    private fun recomputeRun() {
+        if (complete) { runEnd = totalFrames; return }
+        var i = focusFrame / SEGMENT_FRAMES
+        var mapped = segments[i] ?: run { runEnd = i * SEGMENT_FRAMES; return }
+        while (segmentFrames(mapped) == SEGMENT_FRAMES.toLong()) {
+            mapped = segments[i + 1] ?: break
+            i++
+        }
+        runEnd = i * SEGMENT_FRAMES + segmentFrames(mapped)
+    }
+
+    fun progress(): Float {
+        if (complete) return 1f
+        val expected = (totalFrames + SEGMENT_FRAMES - 1) / SEGMENT_FRAMES
+        return if (expected <= 0) 0f else (segments.size.toDouble() / expected).toFloat().coerceIn(0f, 1f)
+    }
 
     override fun sample(frame: Long, ch: Int): Float {
         if (frame < 0 || frame >= totalFrames || ch !in 0..1) return 0f
@@ -156,6 +207,7 @@ class SegmentedPcmSource(
     }
 
     companion object {
+        private const val NO_REQUEST = -1L
         const val SEGMENT_FRAMES = 5 * SF.SAMPLE_RATE
         const val BYTES_PER_FRAME = 6L          // стерео, 24 бит little-endian, интерлив
     }

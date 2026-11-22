@@ -102,6 +102,37 @@ class A1PathTest {
         } finally { dir.deleteRecursively() }
     }
 
+    @Test fun segmentedSourceTracksReadyRunFromSeekFocus() {
+        val dir = java.nio.file.Files.createTempDirectory("sfseek").toFile()
+        try {
+            val seg = SegmentedPcmSource.SEGMENT_FRAMES
+            fun segment(i: Long, frames: Int = seg) = File(dir, "$i.pcm24").also { it.writeBytes(ByteArray(frames * 6)) }
+            val source = SegmentedPcmSource(dir, "t", "a", 10L * seg)
+            source.publish(0, segment(0), seg)
+            source.publish(1, segment(1), seg)
+            assertEquals(2L * seg, source.readyFrames)
+            assertNull(source.takeRequestedSegment())
+            // Перемотка в недекодированный сегмент 6: готового участка там нет, декодер получает запрос.
+            source.focus(6L * seg + 100)
+            assertEquals(6L * seg, source.readyFrames)
+            assertEquals(6L, source.takeRequestedSegment())
+            assertNull(source.takeRequestedSegment())
+            source.publish(6, segment(6), seg)
+            source.publish(7, segment(7), seg)
+            assertEquals(8L * seg, source.readyFrames)
+            assertEquals(2L, source.firstMissingSegment(0, 10))
+            assertEquals(8L, source.firstMissingSegment(6, 10))
+            // Назад в начало: готовый участок снова от нуля, до первого пропуска.
+            source.focus(10)
+            assertEquals(2L * seg, source.readyFrames)
+            source.publish(9, segment(9, 100), 100)
+            assertEquals(9L * seg + 100, source.publishedEndFrame())
+            assertFalse(source.complete)
+            source.finish(9L * seg + 100)
+            assertEquals(9L * seg + 100, source.readyFrames)
+        } finally { dir.deleteRecursively() }
+    }
+
     @Test fun legacyPcm16CacheMarkerIsRecognisedAndRejected() {
         val dir = java.nio.file.Files.createTempDirectory("sfmig").toFile()
         try {

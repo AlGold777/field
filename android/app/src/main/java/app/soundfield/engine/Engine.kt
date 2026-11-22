@@ -4598,11 +4598,9 @@ class Engine private constructor(private val app: Context) {
     private fun seekFrame(frame: Long) {
         if (calibRunning) return
         if (mode != SourceMode.MUSIC) restoreMusic(false)
-        val progressive = source as? app.soundfield.core.SegmentedPcmSource
-        val readyLimit = progressive?.takeUnless { it.complete }?.let { (it.readyFrames - 1).coerceAtLeast(0) }
-        val requested = frame.coerceIn(0L, maxOf(0L, source.totalFrames - 1))
-        val f = readyLimit?.let { requested.coerceAtMost(it) } ?: requested
-        if (readyLimit != null && f != requested) toast("Можно перематывать до подготовленного участка (${f * 1000 / SF.SAMPLE_RATE / 1000} с)")
+        val f = frame.coerceIn(0L, maxOf(0L, source.totalFrames - 1))
+        // Длинный трек ещё декодируется: декодер переходит к месту перемотки, пока его нет — буферизация.
+        (source as? app.soundfield.core.SegmentedPcmSource)?.takeUnless { it.complete }?.focus(f)
         val playing = serverPlay.timeline.running
         clearProgressiveBufferState()
         cancelScheduledPause()
@@ -4732,7 +4730,9 @@ class Engine private constructor(private val app: Context) {
         source = loaded
         currentQueueSource = loaded
         savedFrame = 0
-        decodeProgress = (loaded as? app.soundfield.core.SegmentedPcmSource)?.takeUnless { it.complete }?.progress()
+        val progressive = (loaded as? app.soundfield.core.SegmentedPcmSource)?.takeUnless { it.complete }
+        if (pendingStartFrame > 0) progressive?.focus(pendingStartFrame.coerceAtMost(loaded.totalFrames))
+        decodeProgress = progressive?.progress()
         ui { copy(loadingTracks = false, loadingTrackId = null, queueIndex = queueIndex, decodingProgress = decodeProgress) }
         val now = System.nanoTime()
         cancelScheduledPause()

@@ -179,8 +179,52 @@ object AudioFileDecoder {
                     if (final) sink.write(outBlock, c.finish(outBlock))
                 }
                 var lastProgressAt = SystemClock.elapsedRealtime()
-                while (!outputEnded) {
+                // Перемотка за готовую часть: декодер переходит к нужному сегменту, пропуски дозаполняет потом.
+                var dropBeforeUs = -1L          // входные кадры раньше этого времени отбрасываются (после перехода)
+                var passStartIndex = 0L         // сегмент, с которого начат текущий проход
+                var endExclusive = Long.MAX_VALUE   // сегментов с этим номером и дальше нет (известно после конца файла)
+                var endFrame = -1L              // точная длина трека, если конец файла уже декодирован
+                fun jumpTo(index: Long) {
+                    inCount = 0
+                    try { converter?.close() } catch (_: Exception) {}
+                    converter = null; converterRate = -1
+                    codec.flush()
+                    sink.restartAt(index)
+                    val targetUs = index * SegmentedPcmSource.SEGMENT_FRAMES * 1_000_000L / SF.SAMPLE_RATE
+                    extractor.seekTo((targetUs - SEEK_PREROLL_US).coerceAtLeast(0L), MediaExtractor.SEEK_TO_PREVIOUS_SYNC)
+                    dropBeforeUs = targetUs
+                    inputEnded = false; outputEnded = false
+                    passStartIndex = index
+                    lastProgressAt = SystemClock.elapsedRealtime()
+                }
+                /** Следующее место для декодирования или null, если весь трек готов. */
+                fun nextGap(from: Long): Long? =
+                    source.firstMissingSegment(from, endExclusive) ?: source.firstMissingSegment(0, minOf(from, endExclusive))
+                while (true) {
                     if (cancelled()) throw CancelledException()
+                    if (outputEnded) {
+                        flushInput(final = true)
+                        val passEnd = sink.positionFrame
+                        val reachedEnd = sink.wroteSinceRestart && !sink.collided
+                        sink.finish()
+                        if (reachedEnd) {
+                            endFrame = passEnd
+                            endExclusive = (endFrame + SegmentedPcmSource.SEGMENT_FRAMES - 1) / SegmentedPcmSource.SEGMENT_FRAMES
+                        } else if (!sink.wroteSinceRestart) {
+                            // Переход оказался за концом файла (длительность в метаданных завышена).
+                            endExclusive = minOf(endExclusive, passStartIndex)
+                        }
+                        val gap = source.firstMissingSegment(0, endExclusive) ?: break
+                        jumpTo(gap)
+                        continue
+                    }
+                    val requested = source.takeRequestedSegment()
+                    if (requested != null || sink.collided) {
+                        val from = if (requested != null && requested < endExclusive) requested else sink.index
+                        val target = nextGap(from)
+                        if (target == null) break
+                        if (target != sink.index || sink.collided) jumpTo(target)
+                    }
                     if (!inputEnded) {
                         val inputIndex = codec.dequeueInputBuffer(10_000)
                         if (inputIndex >= 0) {
@@ -228,6 +272,7 @@ object AudioFileDecoder {
                                     else -> error("Кодек вернул неподдерживаемый PCM формат ($encoding)")
                                 }
                                 val frames = info.size / (bps * channels)
+                                val bufferUs = info.presentationTimeUs
                                 for (fr in 0 until frames) {
                                     var l = readSample(buffer, encoding)
                                     var r = if (channels >= 2) readSample(buffer, encoding) else l
@@ -241,6 +286,11 @@ object AudioFileDecoder {
                                         l = ((l + DOWNMIX_SIDE * (c + sl)) * DOWNMIX_NORM).toFloat()
                                         r = ((r + DOWNMIX_SIDE * (c + sr)) * DOWNMIX_NORM).toFloat()
                                     } else for (c in 2 until channels) readSample(buffer, encoding)   // прочие раскладки: L и R
+                                    if (dropBeforeUs >= 0) {
+                                        if (bufferUs + fr * 1_000_000L / sampleRate < dropBeforeUs) continue
+                                        dropBeforeUs = -1L
+                                    }
+                                    if (sink.collided) continue
                                     inBlock[inCount * 2] = l; inBlock[inCount * 2 + 1] = r
                                     if (++inCount == inFrames) flushInput(final = false)
                                 }
@@ -251,11 +301,10 @@ object AudioFileDecoder {
                     }
                     check(SystemClock.elapsedRealtime() - lastProgressAt < 30_000) { "Декодер аудио не отвечает" }
                 }
-                flushInput(final = true)
-                sink.finish()
                 sink.publishPeak()
-                require(sink.framesOut > 0) { "В файле нет аудиоданных" }
-                source.finish(sink.framesOut)
+                val total = if (endFrame >= 0) endFrame else source.publishedEndFrame()
+                require(total > 0) { "В файле нет аудиоданных" }
+                source.finish(total)
                 return source
             } finally {
                 // SRC закрываем и при отмене или ошибке кодека: иначе нативный хендл утекал.
@@ -291,6 +340,8 @@ object AudioFileDecoder {
     /** Формат кэша: PCM 24 бит little-endian, `*.pcm24`, метка завершения «v3 <кадры>». */
     private const val CACHE_FORMAT = "v3"
     private const val BLOCK_FRAMES = 4096
+    /** После перехода декодер начинает чуть раньше нужного места: первые кадры MP3 после seek неполные. */
+    private const val SEEK_PREROLL_US = 300_000L
 
     private class PcmSegmentWriter(
         private val directory: File,
@@ -302,17 +353,32 @@ object AudioFileDecoder {
         private val encoder = Pcm24StereoEncoder(seed = 0x5F24)
         private val meter = app.soundfield.dsp.TruePeakMeter()
         private var bytes = ByteArray(0)
-        private var index = 0L
         private var segmentFrames = 0
         private var output: BufferedOutputStream? = null
         private var notifiedReady = false
-        var framesOut = 0L
+        /** Номер сегмента, который сейчас пишется. */
+        var index = 0L
             private set
+        /** Следующий сегмент уже готов (декодирован при перемотке): запись остановлена, нужен переход. */
+        var collided = false
+            private set
+        var wroteSinceRestart = false
+            private set
+        /** Абсолютный номер следующего записываемого кадра. */
+        val positionFrame: Long get() = index * SegmentedPcmSource.SEGMENT_FRAMES + segmentFrames
+
+        /** Начать запись с начала сегмента [segment]; недописанный сегмент отбрасывается. */
+        fun restartAt(segment: Long) {
+            output?.close(); output = null
+            File(directory, "$index.tmp").delete()
+            index = segment; segmentFrames = 0
+            collided = false; wroteSinceRestart = false
+        }
 
         /** [frames] кадров интерлива L/R (float) → 24 бит с TPDF-дизерингом, сегментами по 5 с. */
         fun write(block: FloatArray, frames: Int) {
             var done = 0
-            while (done < frames) {
+            while (done < frames && !collided) {
                 val n = minOf(frames - done, SegmentedPcmSource.SEGMENT_FRAMES - segmentFrames)
                 if (bytes.size < n * 6) bytes = ByteArray(n * 6)
                 val part = if (done == 0 && n == frames) block else block.copyOfRange(done * 2, (done + n) * 2)
@@ -320,7 +386,7 @@ object AudioFileDecoder {
                 encoder.encode(part, n, bytes)
                 if (output == null) output = BufferedOutputStream(FileOutputStream(File(directory, "$index.tmp")), 1 shl 16)
                 output!!.write(bytes, 0, n * 6)
-                segmentFrames += n; framesOut += n; done += n
+                segmentFrames += n; done += n; wroteSinceRestart = true
                 if (segmentFrames == SegmentedPcmSource.SEGMENT_FRAMES) publishSegment()
             }
         }
@@ -342,6 +408,7 @@ object AudioFileDecoder {
             source.publish(index, segment, segmentFrames)
             segmentFrames = 0
             index++
+            collided = source.hasSegment(index)
             onProgress(source)
             if (!notifiedReady && source.readyFrames >= readyThreshold) {
                 notifiedReady = true
