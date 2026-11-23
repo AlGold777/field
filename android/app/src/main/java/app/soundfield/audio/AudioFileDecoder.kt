@@ -8,6 +8,11 @@ import android.media.MediaFormat
 import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.os.SystemClock
+import android.util.Log
+import app.soundfield.audio.mp3.ChannelByteSource
+import app.soundfield.audio.mp3.Mp3FrameIndex
+import app.soundfield.audio.mp3.Mp3FrameReader
+import app.soundfield.audio.mp3.PREROLL_FRAMES
 import app.soundfield.core.SegmentedPcmSource
 import app.soundfield.core.Pcm24StereoEncoder
 import app.soundfield.core.SampleRateConverter
@@ -106,6 +111,83 @@ object AudioFileDecoder {
     }
 
     class CancelledException : RuntimeException("Подготовка трека отменена")
+
+    /** MP3 — через собственный индекс кадров (точная перемотка и в VBR), остальное — через MediaExtractor. */
+    private fun openInput(context: Context, uri: Uri): CompressedInput {
+        val extractor = ExtractorInput.open(context, uri)
+        if (extractor.mime != MediaFormat.MIMETYPE_AUDIO_MPEG) return extractor
+        val mp3 = try { Mp3Input.open(context, uri, extractor.format) }
+            catch (e: Exception) { Log.w("SoundField", "MP3 index failed, using MediaExtractor", e); null }
+        if (mp3 == null) return extractor
+        extractor.close()
+        return mp3
+    }
+
+    /** Индекс кадров MP3 строится один раз на файл и хранится в `mp3_index` (≈3 байта на кадр). */
+    private fun mp3Index(context: Context, uri: Uri, src: ChannelByteSource): Mp3FrameIndex? {
+        val dir = File(context.filesDir, "mp3_index").apply { mkdirs() }
+        val file = TrackIdentity.of(context, uri)?.let { File(dir, "${it.key}.idx") }
+        file?.takeIf { it.isFile }?.let { cached ->
+            runCatching { cached.inputStream().buffered().use { Mp3FrameIndex.read(it) } }.getOrNull()
+                ?.takeIf { it.sourceSize == src.size }?.let { cached.setLastModified(System.currentTimeMillis()); return it }
+        }
+        val index = Mp3FrameIndex.build(src) ?: return null
+        if (file != null) runCatching {
+            val tmp = File(dir, "${file.name}.tmp")
+            tmp.outputStream().buffered().use { index.write(it) }
+            check(tmp.renameTo(file))
+            dir.listFiles { f -> f.extension == "idx" }.orEmpty().sortedByDescending { it.lastModified() }
+                .drop(MP3_INDEX_KEEP).forEach { it.delete() }
+        }
+        return index
+    }
+
+    private class Mp3Input(
+        private val pfd: android.os.ParcelFileDescriptor,
+        private val stream: java.io.FileInputStream,
+        private val index: Mp3FrameIndex,
+        src: ChannelByteSource,
+        override val format: MediaFormat,
+    ) : CompressedInput {
+        private val reader = Mp3FrameReader(src, index)
+        /** Задержка кодера из LAME-тега плюс стандартная задержка декодера MP3; без тега — 0, как у MediaExtractor. */
+        private val delaySamples = if (index.encoderDelay > 0) index.encoderDelay + Mp3FrameIndex.DECODER_DELAY_SAMPLES else 0
+        override val mime = MediaFormat.MIMETYPE_AUDIO_MPEG
+        override val durationUs = index.totalSamples * 1_000_000L / index.sampleRate
+        override val delayUs = delaySamples * 1_000_000L / index.sampleRate
+        private var next = 0
+        override var lastPtsUs = 0L
+            private set
+
+        override fun seekTo(targetUs: Long) {
+            val sample = targetUs.coerceAtLeast(0L) * index.sampleRate / 1_000_000L
+            val extra = delaySamples - index.encoderDelay
+            next = (index.frameForSample(sample, extra) - PREROLL_FRAMES).coerceAtLeast(0)
+        }
+
+        override fun read(dst: ByteBuffer): Int {
+            if (next >= index.frameCount) return -1
+            val size = reader.read(next, dst)
+            if (size < 0) error("Не удалось прочитать кадр MP3 $next")
+            lastPtsUs = reader.presentationTimeUs(next)
+            next++
+            return size
+        }
+
+        override fun close() { try { stream.close() } finally { pfd.close() } }
+
+        companion object {
+            fun open(context: Context, uri: Uri, format: MediaFormat): Mp3Input? {
+                val pfd = context.contentResolver.openFileDescriptor(uri, "r") ?: return null
+                val stream = java.io.FileInputStream(pfd.fileDescriptor)
+                try {
+                    val src = ChannelByteSource(stream.channel)
+                    val index = mp3Index(context, uri, src) ?: run { stream.close(); pfd.close(); return null }
+                    return Mp3Input(pfd, stream, index, src, format)
+                } catch (t: Throwable) { stream.close(); pfd.close(); throw t }
+            }
+        }
+    }
 
     /** Сжатые пакеты одной аудиодорожки. Позиционирование — по времени трека. */
     private interface CompressedInput : AutoCloseable {
@@ -317,7 +399,7 @@ object AudioFileDecoder {
         private val startFrame: Long,
         onSource: (SegmentedPcmSource) -> Unit,
     ) : AutoCloseable {
-        private val input: CompressedInput = ExtractorInput.open(context, track.uri)
+        private val input: CompressedInput = openInput(context, track.uri)
         val source = SegmentedPcmSource(track.title, track.artist, input.durationUs * SF.SAMPLE_RATE / 1_000_000)
         private val writer = SegmentWriter(source)
         private val pipeline: PcmPipeline
@@ -436,7 +518,7 @@ object AudioFileDecoder {
         private fun publishSegment() {
             val data = segment ?: return
             segment = null
-            if (source.loudnessLufs.isNaN()) source.truePeakDbtp = maxOf(source.truePeakDbtp.takeUnless { it.isNaN() } ?: -200.0, meter.truePeakDbtp)
+            if (!source.analyzed) source.truePeakDbtp = maxOf(source.truePeakDbtp.takeUnless { it.isNaN() } ?: -200.0, meter.truePeakDbtp)
             source.publish(index, ByteBuffer.wrap(data, 0, segmentFrames * 6).slice(), segmentFrames)
             segmentFrames = 0
             index++
@@ -450,4 +532,6 @@ object AudioFileDecoder {
     private const val BLOCK_FRAMES = 4096
     /** После перехода декодер начинает чуть раньше нужного места: первые кадры MP3 после seek неполные. */
     private const val SEEK_PREROLL_US = 300_000L
+    /** Сколько индексов MP3 хранить (последние открытые). */
+    private const val MP3_INDEX_KEEP = 300
 }

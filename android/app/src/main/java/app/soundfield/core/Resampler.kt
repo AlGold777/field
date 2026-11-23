@@ -115,6 +115,9 @@ class SegmentedPcmSource(
     @Volatile override var truePeakDbtp: Double = Double.NaN
     /** Громкость известна только из анализа всего файла (частичная ввела бы в заблуждение). */
     @Volatile override var loudnessLufs: Double = Double.NaN
+    /** Пик и громкость взяты из анализа всего файла ([applyAnalysis]); декодер их больше не трогает. */
+    @Volatile var analyzed: Boolean = false
+        private set
     @Volatile override var totalFrames: Long = estimatedFrames.coerceAtLeast(0)
         private set
     /** Точная длина известна: декодер дошёл до конца файла (или её дал индекс файла). */
@@ -167,6 +170,13 @@ class SegmentedPcmSource(
             checkComplete()
             recomputeRun()
         }
+    }
+
+    /** Результат анализа файла (один раз на файл, хранится постоянно). */
+    fun applyAnalysis(truePeakDbtp: Double, loudnessLufs: Double) {
+        this.truePeakDbtp = truePeakDbtp
+        this.loudnessLufs = loudnessLufs
+        analyzed = true
     }
 
     /** Совместимость: трек целиком декодирован (тесты, короткие источники). */

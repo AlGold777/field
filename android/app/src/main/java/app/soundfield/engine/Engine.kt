@@ -66,6 +66,11 @@ import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
 import java.security.SecureRandom
+import app.soundfield.audio.TrackAnalysisStore
+import app.soundfield.audio.TrackAnalyzer
+import app.soundfield.audio.TrackIdentity
+import app.soundfield.audio.TruePeakMeterAdapter
+import app.soundfield.audio.of
 import java.io.File
 import java.io.FileOutputStream
 import java.io.BufferedInputStream
@@ -4673,7 +4678,10 @@ class Engine private constructor(private val app: Context) {
             post {
                 if (loaded == null) { if (role == Role.SERVER) failTrackLoad(item, generation); return@post }
                 openStreams.add(loaded)
-                if (role == Role.SERVER && generation == trackLoadGeneration) activateLoadedTrack(item, generation, loaded)
+                if (role == Role.SERVER && generation == trackLoadGeneration) {
+                    activateLoadedTrack(item, generation, loaded)
+                    if (currentQueueSource === loaded) queueIo.execute { requestAnalysis(item, loaded, priority = true) }
+                }
                 retireUnusedStreams()
             }
         }
@@ -4724,6 +4732,25 @@ class Engine private constructor(private val app: Context) {
     // ------------------------------------------------------------------ декодированные треки
     /** Заранее открытый следующий трек (его декодер уже заполнил начало окна): переход без паузы. */
     private val decodedTracks = java.util.concurrent.ConcurrentHashMap<String, SegmentedPcmSource>()
+    /** Пик и громкость файла: считаются один раз в фоне и хранятся постоянно (как ReplayGain). */
+    private val trackAnalyzer by lazy {
+        TrackAnalyzer(
+            TrackAnalysisStore(File(app.filesDir, "track_analysis")),
+            scan = { uri, cancelled, consumer -> AudioFileDecoder.scanPcm(app, uri, cancelled, consumer) },
+            meterFactory = { TruePeakMeterAdapter() },
+        )
+    }
+
+    /** Применить анализ файла к открытому треку (сразу, если он уже есть; иначе — по готовности). */
+    private fun requestAnalysis(item: QueueItem, target: SegmentedPcmSource, priority: Boolean) {
+        val id = runCatching { TrackIdentity.of(app, item.uri) }.getOrNull() ?: return
+        trackAnalyzer.request(id, item.uri, priority, onError = { e -> Log.w(TAG, "analysis failed: ${item.title}", e) }) { result ->
+            target.applyAnalysis(result.truePeakDbtp, result.lufs)
+            telemetry.record("TRACK_ANALYSIS", mapOf("track" to TelemetryIdentifiers.hash(item.id),
+                "lufs" to result.lufs, "truePeakDbtp" to result.truePeakDbtp, "frames" to result.frames))
+        }
+    }
+
     /** Все открытые декодеры; лишние останавливает [retireUnusedStreams]. Только поток движка. */
     private val openStreams = mutableListOf<SegmentedPcmSource>()
     /** Трек, который сейчас предзагружается (поток движка); удаление его из очереди отменяет предзагрузку. */
@@ -4810,7 +4837,10 @@ class Engine private constructor(private val app: Context) {
                 if (prefetchTrackId == next.id) prefetchTrackId = null
                 if (loaded == null || openStreams.any { it === loaded }) return@post
                 openStreams.add(loaded)
-                if (generation == trackLoadGeneration && queue.any { it.id == next.id }) decodedTracks[next.id] = loaded
+                if (generation == trackLoadGeneration && queue.any { it.id == next.id }) {
+                    decodedTracks[next.id] = loaded
+                    queueIo.execute { requestAnalysis(next, loaded, priority = false) }
+                }
                 retireUnusedStreams()
             }
         }
