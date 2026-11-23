@@ -6071,7 +6071,9 @@ class Engine private constructor(private val app: Context) {
             decodeReadyAtLastCheck = readyFrames
             decodeReadyChangedAtMs = nowMs
         }
-        val decodedLead = if (readyFrames >= 0) readyFrames - position else -1L
+        // Запас декодера — в кадрах источника (при скорости ≠ 1 шкала эпохи идёт в других кадрах).
+        val decodePosition = if (role == Role.SERVER) toSourceFrame(position) else position
+        val decodedLead = if (readyFrames >= 0) readyFrames - decodePosition else -1L
         val totalFrames = progressive?.totalFrames ?: -1L
         val audioUnderruns = audio.underruns
         val sourceMissing = if (role == Role.SERVER) serverRenderer.windowSourceMissingFrames.getAndSet(0) else 0
@@ -6118,7 +6120,7 @@ class Engine private constructor(private val app: Context) {
                 outputTimestampValid = output.timestampValid, musicVolume = output.streamVolume,
                 musicVolumeMin = output.streamMinVolume, musicVolumeMax = output.streamMaxVolume, musicMuted = output.streamMuted,
                 audioRoute = output.route, audioFocus = output.audioFocus, serverChannelRmsDbfs = serverSignalDbfs,
-                decodeLeadFrames = decodedLead, decodeReadyFrames = readyFrames, decodePositionFrame = position,
+                decodeLeadFrames = decodedLead, decodeReadyFrames = readyFrames, decodePositionFrame = decodePosition,
                 tickP95Ms = tickP95, heartbeatIntervalMs = heartbeatP95,
                 tcpRxAgeMs = link?.let { nowMs - it.lastRx } ?: -1,
                 udpPacketsPerSec = udpRate, sentAudioPacketsPerSec = sentRate, udpInvalid = invalidNow,

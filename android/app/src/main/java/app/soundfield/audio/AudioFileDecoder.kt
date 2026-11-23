@@ -76,6 +76,9 @@ object AudioFileDecoder {
         val ready = CompletableFuture<SegmentedPcmSource>()
         val opened = java.util.concurrent.atomic.AtomicReference<SegmentedPcmSource?>()
         Thread({
+            // Выше потока интерфейса: декодер работает короткими рывками, а голодание звука хуже рывка анимации.
+            // Измерено на эмуляторе с программной отрисовкой: с обычным приоритетом декодер давал ~0,3× реального времени.
+            runCatching { android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_DISPLAY) }
             try {
                 StreamDecoder(context, track, startFrame) { opened.set(it) }.use { decoder -> decoder.run(ready) }
             } catch (t: Throwable) {
@@ -159,6 +162,7 @@ object AudioFileDecoder {
         override val mime = MediaFormat.MIMETYPE_AUDIO_MPEG
         override val durationUs = index.totalSamples * 1_000_000L / index.sampleRate
         override val delayUs = delaySamples * 1_000_000L / index.sampleRate
+        override val endUs = if (index.encoderDelay > 0) durationUs else Long.MAX_VALUE
         private var next = 0
         override var lastPtsUs = 0L
             private set
@@ -188,7 +192,10 @@ object AudioFileDecoder {
                 try {
                     val src = ChannelByteSource(stream.channel)
                     val index = mp3Index(context, uri, src, buildIfMissing) ?: run { stream.close(); pfd.close(); return null }
-                    return Mp3Input(pfd, stream, index, src, format)
+                    // Задержку и заполнение кодера обрезаем сами (точно по LAME-тегу); без этих ключей кодек их не трогает,
+                    // иначе на разных версиях Android обрезка шла бы дважды или не шла вовсе.
+                    val plain = MediaFormat.createAudioFormat(MediaFormat.MIMETYPE_AUDIO_MPEG, index.sampleRate, index.channels)
+                    return Mp3Input(pfd, stream, index, src, plain)
                 } catch (t: Throwable) { stream.close(); pfd.close(); throw t }
             }
         }
@@ -202,6 +209,8 @@ object AudioFileDecoder {
         val durationUs: Long
         /** Задержка кодера, мкс: столько звука в начале потока не принадлежит треку. */
         val delayUs: Long get() = 0L
+        /** Конец звука трека, мкс (после него — заполнение кодера); Long.MAX_VALUE — обрезает кодек или неизвестно. */
+        val endUs: Long get() = Long.MAX_VALUE
         /** Перейти так, чтобы первые пакеты начинались не позже [targetUs]. */
         fun seekTo(targetUs: Long)
         /** Следующий пакет в [dst]: размер или −1 — конец потока. Время пакета — [lastPtsUs]. */
@@ -289,8 +298,9 @@ object AudioFileDecoder {
             if (replacement != null) { val old = input; input = replacement; old.close() }
             inCount = 0
             closeConverter()
-            if (sawOutput) codec.flush()
-            else { codec.stop(); codec.configure(input.format, null, null, 0); codec.start() }   // до первого выхода flush потерял бы CSD
+            // До первого выхода flush потерял бы CSD; при смене источника — его формат (у MP3 без ключей обрезки кодеком).
+            if (sawOutput && replacement == null) codec.flush()
+            else { codec.stop(); codec.configure(input.format, null, null, 0); codec.start(); sawOutput = false }
             input.seekTo(targetUs)
             dropBeforeUs = targetUs
             inputEnded = false; ended = false
@@ -369,6 +379,7 @@ object AudioFileDecoder {
                     l = ((l + DOWNMIX_SIDE * (c + sl)) * DOWNMIX_NORM).toFloat()
                     r = ((r + DOWNMIX_SIDE * (c + sr)) * DOWNMIX_NORM).toFloat()
                 } else for (c in 2 until channels) readSample(buffer, encoding)   // прочие раскладки: L и R
+                if (input.endUs != Long.MAX_VALUE && bufferUs + fr * 1_000_000L / sampleRate >= input.endUs) continue
                 if (dropBeforeUs >= 0) {
                     // Допуск 2 мкс: метки времени округлены до мкс, соседние сэмплы отстоят ≥ 5 мкс даже при 192 кГц.
                     if (bufferUs + fr * 1_000_000L / sampleRate < dropBeforeUs - DROP_TOLERANCE_US) continue
