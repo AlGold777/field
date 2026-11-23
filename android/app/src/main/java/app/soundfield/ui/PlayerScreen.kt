@@ -253,12 +253,15 @@ fun PlayerScreen(ui: UiState, engine: Engine, openCalibration: () -> Unit, openD
         Row(Modifier.fillMaxWidth().padding(vertical = 18.dp), horizontalArrangement = Arrangement.SpaceEvenly,
             verticalAlignment = Alignment.CenterVertically) {
             RoundIcon("⏮", "Предыдущий трек") { engine.previousTrack() }
+            // Длинные файлы (лекции, миксы): точный шаг вместо ползунка. Живые источники не перематываются.
+            if (!ui.input.live) RoundIcon("−15", "Назад на 15 секунд", small = true) { engine.skipMs(-15_000) }
             Box(Modifier.size(76.dp).clip(CircleShape).background(SFColors.accent)
                 .semantics { contentDescription = if (ui.playing || ui.audioBuffering) "Пауза" else "Воспроизведение"; role = androidx.compose.ui.semantics.Role.Button }
                 .clickable { engine.togglePlay() },
                 contentAlignment = Alignment.Center) {
                 Text(if (ui.playing || ui.audioBuffering) "❚❚" else "▶", color = Color.White, fontSize = 28.sp)
             }
+            if (!ui.input.live) RoundIcon("+30", "Вперёд на 30 секунд", small = true) { engine.skipMs(30_000) }
             RoundIcon("⏭", "Следующий трек") { engine.nextTrack() }
         }
 
@@ -450,11 +453,11 @@ private fun DeviceChoiceTile(name: String, platform: String, modifier: Modifier 
 }
 
 @Composable
-private fun RoundIcon(icon: String, label: String, onClick: () -> Unit) {
-    Box(Modifier.size(54.dp).clip(CircleShape).background(SFColors.Secondary)
+private fun RoundIcon(icon: String, label: String, small: Boolean = false, onClick: () -> Unit) {
+    Box(Modifier.size(if (small) 46.dp else 54.dp).clip(CircleShape).background(SFColors.Secondary)
         .semantics { contentDescription = label; role = androidx.compose.ui.semantics.Role.Button }
         .clickable(onClickLabel = label, onClick = onClick),
-        contentAlignment = Alignment.Center) { Text(icon, color = Color.White, fontSize = 20.sp) }
+        contentAlignment = Alignment.Center) { Text(icon, color = Color.White, fontSize = if (small) 15.sp else 20.sp) }
 }
 
 private fun balanceLabel(value: Float): String {

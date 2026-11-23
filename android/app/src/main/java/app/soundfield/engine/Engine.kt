@@ -66,6 +66,10 @@ import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
 import java.security.SecureRandom
+import app.soundfield.audio.QueueSnapshot
+import app.soundfield.audio.QueueStateStore
+import app.soundfield.audio.ResumePositions
+import app.soundfield.audio.SavedTrack
 import app.soundfield.audio.TrackAnalysisStore
 import app.soundfield.audio.TrackAnalyzer
 import app.soundfield.audio.TrackIdentity
@@ -576,6 +580,7 @@ class Engine private constructor(private val app: Context) {
         log("Запуск: TCP ${tcp.localPort}, UDP ${udp.localPort}")
         // Главная страница — плеер: соло стартует сразу, без пары. Пара — надстройка (см. becomePaired / goIdle).
         post { if (!soloMode && phase == Phase.IDLE) startSoloPlayback() }
+        restoreQueue()
         if (autoResume && record != null) post { startAutoResume() }
     }
 
@@ -1659,6 +1664,7 @@ class Engine private constructor(private val app: Context) {
     fun onBackground() = post {
         telemetry.event("APP_BACKGROUND", "phase=$phase")
         appVisible = false
+        persistQueue(immediate = true)
         if (role == Role.POINT) cancelPointFileTransfer()
         // Без пары процесс замораживается вскоре после ухода с экрана, если его не держит сервис (играющее соло).
         if (phase == Phase.IDLE && !(soloMode && soloServiceActive)) hideWhileBackground()
@@ -4330,6 +4336,7 @@ class Engine private constructor(private val app: Context) {
     }
 
     private fun publishQueue() {
+        persistQueue(immediate = true)
         val tracks = queue.map { QueueTrackUi(it.id, it.title, it.artist) }
         ui { copy(queueTracks = tracks, queueIndex = queueIndex) }
         queueRevision++
@@ -4621,6 +4628,7 @@ class Engine private constructor(private val app: Context) {
             return
         }
         clearProgressiveBufferState()
+        persistQueue(immediate = true)
         // Пауза по общей шкале: оба телефона замолкают на одном кадре через PAUSE_LEAD. Раньше Server
         // замолкал сразу, а Point — только когда до него доходила команда (на 10–200 мс позже), со щелчком.
         val at = System.nanoTime() + SF.PAUSE_LEAD_NS
@@ -4645,6 +4653,7 @@ class Engine private constructor(private val app: Context) {
         cancelScheduledPause()
         val now = System.nanoTime()
         newEpoch(playing, f, if (playing) now + SF.START_DELAY_NS else now)
+        persistQueue(immediate = true)
     }
 
     private fun startTestMode(src: AudioSource, anchorNs: Long = System.nanoTime() + SF.START_DELAY_NS) {
@@ -4711,8 +4720,13 @@ class Engine private constructor(private val app: Context) {
         queueIo.execute {
             val cancelled = { generation != trackLoadGeneration || (!soloMode && phase !in setOf(Phase.PAIRED, Phase.RECONNECTING)) || role != Role.SERVER }
             val loaded = loadTrack(item, cancelled, startAt)
+            // Длинный файл слушали раньше — продолжаем с того места (как плееры аудиокниг и подкастов).
+            val resumeFrame = if (startAt == 0L && loaded != null) trackKeyFor(item)?.let { key ->
+                resumePositions.positionFor(key, loaded.totalFrames * 1000 / SF.SAMPLE_RATE)?.let { it * SF.SAMPLE_RATE / 1000 }
+            } else null
             post {
                 if (loaded == null) { if (role == Role.SERVER) failTrackLoad(item, generation); return@post }
+                if (resumeFrame != null && generation == trackLoadGeneration) pendingStartFrame = resumeFrame
                 openStreams.add(loaded)
                 if (role == Role.SERVER && generation == trackLoadGeneration) {
                     activateLoadedTrack(item, generation, loaded)
@@ -4747,6 +4761,7 @@ class Engine private constructor(private val app: Context) {
         val now = System.nanoTime()
         cancelScheduledPause()
         newEpoch(pendingShouldPlay, pendingStartFrame.coerceAtMost(loaded.totalFrames), if (pendingShouldPlay) now + SF.START_DELAY_NS else now)
+        persistQueue(immediate = true)
         prefetchAround(index)
     }
 
@@ -4763,6 +4778,53 @@ class Engine private constructor(private val app: Context) {
             val failed = queue.indexOfFirst { it.id == item.id }
             if (failed >= 0 && failed + 1 < queue.size) selectTrack(failed + 1)
             else newEpoch(false, source.totalFrames, System.nanoTime())
+        }
+    }
+
+    // ------------------------------------------------------------------ память очереди и позиций
+    /** Очередь, трек и позиция переживают перезапуск приложения. */
+    private val queueStore by lazy { QueueStateStore(File(app.filesDir, "queue_state.txt")) }
+    /** Позиция в длинных файлах (лекции, миксы, аудиокниги) — отдельно для каждого файла. */
+    private val resumePositions by lazy { ResumePositions(File(app.filesDir, "resume_positions.txt")) }
+    /** Ключ файла (адрес+размер+дата) по id элемента очереди; считается в queueIo. */
+    private val trackKeys = java.util.concurrent.ConcurrentHashMap<String, String>()
+
+    /** queueIo: ключ файла для позиции (запрос к ContentResolver — не на потоке движка). */
+    private fun trackKeyFor(item: QueueItem): String? = trackKeys[item.id]
+        ?: runCatching { TrackIdentity.of(app, item.uri)?.key }.getOrNull()?.also { trackKeys[item.id] = it }
+
+    /** Поток движка: снимок очереди и позиция текущего трека. [immediate] — записать сразу (пауза, смена трека, уход в фон). */
+    private fun persistQueue(immediate: Boolean) {
+        if (role != Role.SERVER || input.live || mode != SourceMode.MUSIC) return
+        if (!hasImportedQueue || queue.isEmpty()) { if (immediate && queue.isEmpty()) queueStore.clear(); return }
+        val positionMs = posFrame() * 1000 / SF.SAMPLE_RATE
+        val snapshot = QueueSnapshot(
+            queue.map { SavedTrack(it.uri.toString(), it.title, it.artist) },
+            queueIndex.coerceIn(0, queue.lastIndex), positionMs, serverPlay.timeline.running)
+        if (immediate) queueStore.save(snapshot) else queueStore.saveDebounced(snapshot)
+        val item = queue.getOrNull(queueIndex) ?: return
+        val key = trackKeys[item.id] ?: return
+        resumePositions.update(key, positionMs, currentTrackFrames() * 1000 / SF.SAMPLE_RATE)
+        if (immediate) resumePositions.flush()
+    }
+
+    /** Запуск: вернуть очередь и место, где остановились (на паузе). */
+    private fun restoreQueue() = queueIo.execute {
+        val snapshot = runCatching { queueStore.load() }.getOrNull() ?: return@execute
+        val items = snapshot.tracks.mapIndexedNotNull { i, t ->
+            val uri = runCatching { Uri.parse(t.uri) }.getOrNull() ?: return@mapIndexedNotNull null
+            if (!AudioFileDecoder.isReadable(app, uri)) return@mapIndexedNotNull null
+            i to QueueItem(java.util.UUID.randomUUID().toString(), uri, t.title, t.artist)
+        }
+        if (items.isEmpty()) return@execute
+        val index = items.indexOfFirst { it.first == snapshot.index }
+        post {
+            if (hasImportedQueue || role != Role.SERVER || (!soloMode && phase !in setOf(Phase.PAIRED, Phase.RECONNECTING))) return@post
+            queue.clear(); queue.addAll(items.map { it.second })
+            hasImportedQueue = true
+            publishQueue()
+            val start = if (index >= 0) snapshot.positionMs * SF.SAMPLE_RATE / 1000 else 0L
+            selectTrack(index.coerceAtLeast(0), forcePaused = true, startFrame = start)
         }
     }
 
@@ -4837,6 +4899,7 @@ class Engine private constructor(private val app: Context) {
                 post { opened[0]?.let { onStreamFailed(item, it) } }
             })
             opened[0] = source
+            trackKeyFor(item)
             val elapsed = SystemClock.elapsedRealtime() - startedAt
             telemetry.record("AUDIO_DECODE_FIRST_AUDIO", mapOf("track" to trackTag, "elapsedMs" to elapsed,
                 "readyFrames" to source.readyFrames, "estimatedFrames" to source.totalFrames, "startFrame" to startFrame), op = op)
@@ -5108,8 +5171,11 @@ class Engine private constructor(private val app: Context) {
     }
 
     /** Каждые 100 мс: конец трека / конец тестового сигнала. */
+    private var persistTicks = 0
+
     private fun serverTick() {
         if (role != Role.SERVER || (!ui.value.inPair && !soloMode)) return
+        if (++persistTicks >= 20) { persistTicks = 0; if (serverPlay.timeline.running) persistQueue(immediate = false) }
         val tl = serverPlay.timeline
         val nowNs = System.nanoTime()
         val progressive = if (mode == SourceMode.MUSIC) source as? TrackChain else null
@@ -5274,7 +5340,13 @@ class Engine private constructor(private val app: Context) {
         SpotifyReceiver(app, ::onSpotifyEvent) { text -> telemetry.limited("SPOTIFY_LOG", text.take(300)) }
     }
 
-    private fun musicSource(): AudioSource = liveSource ?: if (queueIndex in queue.indices) currentQueueSource ?: music else music
+    /** Источник музыки для новой эпохи: трек очереди — в цепочке (переход без паузы), кадры от начала трека. */
+    private fun musicSource(): AudioSource {
+        liveSource?.let { return it }
+        val track = if (queueIndex in queue.indices) currentQueueSource else null
+        trackOffset = 0L
+        return (track as? SegmentedPcmSource)?.let { TrackChain(it) } ?: track ?: music
+    }
 
     /** Кнопки источников под управлением плеера. Источник живёт на телефоне с музыкой (Server или Solo). */
     fun requestInput(kind: InputSource) = post {
