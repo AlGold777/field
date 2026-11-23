@@ -135,7 +135,8 @@ class PreLimitedSource(
                 var progressed = false
                 while (running.get() && nextInput < inputLimit && restartAt.get() == NO_RESTART) {
                     // Блок не пересекает границу трека цепочки: усиление нормализации меняется ровно на ней.
-                    val boundary = (inner as? PositionalTrackMeters)?.nextTrackStartAfter(nextInput) ?: Long.MAX_VALUE
+                    val boundary = ((inner as? PositionalTrackMeters)?.nextTrackStartAfter(nextInput) ?: Long.MAX_VALUE)
+                        .coerceAtLeast(nextInput + 1)
                     val end = minOf(nextInput + CHUNK_FRAMES, inputLimit, boundary)
                     val n = (end - nextInput).toInt()
                     var available = 0

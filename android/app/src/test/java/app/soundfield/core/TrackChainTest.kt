@@ -58,4 +58,19 @@ class TrackChainTest {
         assertEquals(0f, chain.sample(10, 0), 0f)   // сыгранный трек отпущен
         assertFalse(chain.entriesSnapshot().any { it.track === a })
     }
+
+    @Test fun trackBoundaryThroughSpeedStageAlwaysMovesForward() {
+        // 1,75×: округление прямого и обратного перевода давало границу «на месте» — предлимитер вставал навсегда.
+        for (len in 1000 until 1400) {
+            val chain = TrackChain(track(1, len, 0.1f))
+            chain.append(track(1, 1000, 0.2f))
+            SpeedSource(chain, 1.75, 0L).use { stage ->
+                val b = stage.nextTrackStartAfter(0L)
+                for (f in (b - 3).coerceAtLeast(0L)..(b + 3)) {
+                    val next = stage.nextTrackStartAfter(f)
+                    assertTrue("len=$len f=$f next=$next", next > f)
+                }
+            }
+        }
+    }
 }

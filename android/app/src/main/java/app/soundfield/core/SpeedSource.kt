@@ -24,7 +24,8 @@ class SpeedSource(
     override fun trackKeyAt(frame: Long): Long = (inner as? PositionalTrackMeters)?.trackKeyAt(inputFrameOf(frame)) ?: 0L
     override fun nextTrackStartAfter(frame: Long): Long {
         val next = (inner as? PositionalTrackMeters)?.nextTrackStartAfter(inputFrameOf(frame)) ?: Long.MAX_VALUE
-        return if (next == Long.MAX_VALUE) next else outputFrameOf(next)
+        // Округление прямого и обратного перевода не должно дать границу «на месте» — иначе пустой блок у читателя.
+        return if (next == Long.MAX_VALUE) next else maxOf(frame + 1, outputFrameOf(next))
     }
     override val truePeakDbtp: Double get() = (inner as? TrackMeters)?.truePeakDbtp ?: Double.NaN
     override val loudnessLufs: Double get() = (inner as? TrackMeters)?.loudnessLufs ?: Double.NaN

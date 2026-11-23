@@ -37,8 +37,15 @@ class TrackChain(first: SegmentedPcmSource) : AudioSource, TrackMeters, Position
         }
     }
 
+    /**
+     * В очереди есть следующий трек, который ещё может быть приклеен. Пока так, цепочка не «завершена»:
+     * обёртки не дорабатывают хвост тишиной, которую потом пришлось бы заменить началом следующего трека.
+     */
+    @Volatile var moreExpected: Boolean = false
+
     /** Больше данных не будет: от позиции до конца последнего трека всё готово. */
     override val complete: Boolean get() {
+        if (moreExpected) return false
         val list = entries
         if (indexAt(list, focusFrame) < list.lastIndex) {
             return readyFrames >= totalFrames && list.last().track.complete
