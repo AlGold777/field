@@ -1,4 +1,4 @@
-# SoundField — стереопара из двух смартфонов (V1)
+# SoundField  (V1)
 
 ```
 SoundField/
