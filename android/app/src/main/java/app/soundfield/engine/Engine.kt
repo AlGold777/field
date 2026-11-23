@@ -1606,9 +1606,8 @@ class Engine private constructor(private val app: Context) {
         later(350) { if (soloMode) applySoloEqRoute(audio.routeKey(), savePrevious = true) }
         PlaybackService.refresh(app)
         val item = queue.getOrNull(queueIndex)
-        if (reloadInterrupted && item != null && currentQueueSource is app.soundfield.core.SegmentedPcmSource &&
-            !File(AudioFileDecoder.pcmFile(app, item.ref()), "complete").isFile) {
-            // Becoming Point cancels the local decoder and removes its incomplete PCM directory.
+        if (reloadInterrupted && item != null && (currentQueueSource as? SegmentedPcmSource)?.closed == true) {
+            // Декодер остановлен (роль Point или ошибка): открываем трек заново с той же позиции.
             currentQueueSource = null; decodedTracks.remove(item.id)
             selectTrack(queueIndex, forcePaused = !playing, startPlayback = playing, startFrame = frame)
         }
@@ -4599,8 +4598,8 @@ class Engine private constructor(private val app: Context) {
         if (calibRunning) return
         if (mode != SourceMode.MUSIC) restoreMusic(false)
         val f = frame.coerceIn(0L, maxOf(0L, source.totalFrames - 1))
-        // Длинный трек ещё декодируется: декодер переходит к месту перемотки, пока его нет — буферизация.
-        (source as? app.soundfield.core.SegmentedPcmSource)?.takeUnless { it.complete }?.focus(f)
+        // Декодер переходит к месту перемотки; пока звука там нет — короткая буферизация.
+        (source as? SegmentedPcmSource)?.focus(f)
         val playing = serverPlay.timeline.running
         clearProgressiveBufferState()
         cancelScheduledPause()
@@ -4667,49 +4666,15 @@ class Engine private constructor(private val app: Context) {
         pendingTrackId = item.id
         decodeProgress = null; decodeProgressTrackId = item.id
         ui { copy(loadingTracks = true, loadingTrackId = item.id, decodingProgress = null) }
+        val startAt = pendingStartFrame
         queueIo.execute {
-            var initialSource: AudioSource? = null
             val cancelled = { generation != trackLoadGeneration || (!soloMode && phase !in setOf(Phase.PAIRED, Phase.RECONNECTING)) || role != Role.SERVER }
-            val loaded = loadTrack(item, cancelled,
-                onReady = { ready ->
-                    initialSource = ready
-                    post { activateLoadedTrack(item, generation, ready) }
-                },
-                onProgress = { progressSource ->
-                    val value = progressSource.progress()
-                    post {
-                        if (role == Role.SERVER && generation == trackLoadGeneration &&
-                            (currentQueueSource === progressSource || pendingTrackId == item.id)) {
-                            decodeProgress = value
-                            ui { copy(decodingProgress = value) }
-                            publishState()
-                        }
-                    }
-                })
+            val loaded = loadTrack(item, cancelled, startAt)
             post {
-                if (role != Role.SERVER || generation != trackLoadGeneration) return@post
-                if (loaded != null) {
-                    decodedTracks[item.id] = loaded
-                    if (initialSource == null) activateLoadedTrack(item, generation, loaded)
-                    if (currentQueueSource === loaded) {
-                        decodeProgress = null; decodeProgressTrackId = null
-                        ui { copy(decodingProgress = null, loadingTracks = false, loadingTrackId = null) }
-                        publishState()
-                    }
-                    Log.i(TAG, "decoded «${item.title}» fully")
-                } else if (initialSource == null) {
-                    failTrackLoad(item, generation)
-                } else if (currentQueueSource === initialSource) {
-                    val progressiveSource = initialSource as? app.soundfield.core.SegmentedPcmSource
-                    progressiveSource?.finish(progressiveSource.readyFrames)
-                    val lastReady = (progressiveSource?.readyFrames?.minus(1)
-                        ?: ((initialSource?.totalFrames ?: 1L) - 1L)).coerceAtLeast(0)
-                    clearProgressiveBufferState()
-                    newEpoch(false, posFrame().coerceAtMost(lastReady), System.nanoTime())
-                    decodeProgress = null; decodeProgressTrackId = null
-                    ui { copy(decodingProgress = null, loadingTracks = false, loadingTrackId = null) }
-                    publishState(); toast("Не удалось завершить подготовку «${item.title}»")
-                }
+                if (loaded == null) { if (role == Role.SERVER) failTrackLoad(item, generation); return@post }
+                openStreams.add(loaded)
+                if (role == Role.SERVER && generation == trackLoadGeneration) activateLoadedTrack(item, generation, loaded)
+                retireUnusedStreams()
             }
         }
     }
@@ -4730,10 +4695,10 @@ class Engine private constructor(private val app: Context) {
         source = loaded
         currentQueueSource = loaded
         savedFrame = 0
-        val progressive = (loaded as? app.soundfield.core.SegmentedPcmSource)?.takeUnless { it.complete }
-        if (pendingStartFrame > 0) progressive?.focus(pendingStartFrame.coerceAtMost(loaded.totalFrames))
-        decodeProgress = progressive?.progress()
-        ui { copy(loadingTracks = false, loadingTrackId = null, queueIndex = queueIndex, decodingProgress = decodeProgress) }
+        (loaded as? SegmentedPcmSource)?.focus(pendingStartFrame.coerceAtMost(loaded.totalFrames))
+        decodedTracks.remove(item.id)
+        decodeProgress = null; decodeProgressTrackId = null
+        ui { copy(loadingTracks = false, loadingTrackId = null, queueIndex = queueIndex, decodingProgress = null) }
         val now = System.nanoTime()
         cancelScheduledPause()
         newEpoch(pendingShouldPlay, pendingStartFrame.coerceAtMost(loaded.totalFrames), if (pendingShouldPlay) now + SF.START_DELAY_NS else now)
@@ -4757,67 +4722,62 @@ class Engine private constructor(private val app: Context) {
     }
 
     // ------------------------------------------------------------------ декодированные треки
-    /** Готовые (декодированные в файл) треки: текущий, следующий и предыдущий. */
-    private val decodedTracks = java.util.concurrent.ConcurrentHashMap<String, AudioSource>()
+    /** Заранее открытый следующий трек (его декодер уже заполнил начало окна): переход без паузы. */
+    private val decodedTracks = java.util.concurrent.ConcurrentHashMap<String, SegmentedPcmSource>()
+    /** Все открытые декодеры; лишние останавливает [retireUnusedStreams]. Только поток движка. */
+    private val openStreams = mutableListOf<SegmentedPcmSource>()
     /** Трек, который сейчас предзагружается (поток движка); удаление его из очереди отменяет предзагрузку. */
     private var prefetchTrackId: String? = null
 
-    /** Декодирование в фоне (queueIo). Ловим Throwable: OutOfMemoryError раньше ронял приложение. */
-    private fun loadTrack(
-        item: QueueItem,
-        cancelled: () -> Boolean = { false },
-        onReady: (AudioSource) -> Unit = {},
-        onProgress: (app.soundfield.core.SegmentedPcmSource) -> Unit = {},
-    ): AudioSource? {
+    /** Останавливает декодеры треков, которые не играют и не ждут своей очереди. Поток движка. */
+    private fun retireUnusedStreams() {
+        val keep = listOfNotNull(currentQueueSource, source) + decodedTracks.values
+        openStreams.removeAll { stream ->
+            val unused = keep.none { it === stream }
+            if (unused) stream.close()
+            unused
+        }
+    }
+
+    /**
+     * Открытие трека (queueIo): декодер на лету, возврат — когда готов звук у [startFrame].
+     * Ловим Throwable: OutOfMemoryError раньше ронял приложение.
+     */
+    private fun loadTrack(item: QueueItem, cancelled: () -> Boolean = { false }, startFrame: Long = 0L): SegmentedPcmSource? {
         val op = java.util.UUID.randomUUID().toString()
         val trackTag = TelemetryIdentifiers.hash(item.id)
         currentDecodeOp = op
-        decodedTracks[item.id]?.let {
-            telemetry.record("AUDIO_DECODE_START", mapOf("track" to trackTag, "source" to "cache"), op = op)
-            telemetry.record("AUDIO_DECODE_COMPLETE", mapOf("track" to trackTag, "frames" to it.totalFrames,
-                "cacheHit" to true, "result" to "ok"), op = op)
-            onReady(it)
+        decodedTracks[item.id]?.takeUnless { it.closed }?.let {
+            telemetry.record("AUDIO_DECODE_START", mapOf("track" to trackTag, "source" to "prefetched"), op = op)
+            it.focus(startFrame)
             currentDecodeOp = null
             return it
         }
         val inputBytes = runCatching { fileSize(item.ref().uri) }.getOrDefault(-1L)
         val mime = runCatching { app.contentResolver.getType(item.ref().uri) }.getOrNull() ?: "unknown"
         val startedAt = SystemClock.elapsedRealtime()
-        var firstAudioAt: Long? = null
         telemetry.record("AUDIO_DECODE_START", mapOf("track" to trackTag, "mime" to mime, "bytes" to inputBytes), op = op)
+        val opened = arrayOfNulls<SegmentedPcmSource>(1)
         return try {
-            val decoded = AudioFileDecoder.decode(app, item.ref(), cancelled,
-                onReady = { ready ->
-                    val now = SystemClock.elapsedRealtime()
-                    if (firstAudioAt == null) {
-                        firstAudioAt = now
-                        telemetry.record("AUDIO_DECODE_FIRST_AUDIO", mapOf("track" to trackTag, "elapsedMs" to now - startedAt,
-                            "readyFrames" to ready.readyFrames, "estimatedFrames" to ready.totalFrames), op = op)
-                    }
-                    onReady(ready)
-                }, onProgress = { progress ->
-                    telemetry.limited("AUDIO_DECODE_PROGRESS",
-                        "track=$trackTag readyFrames=${progress.readyFrames} estimatedFrames=${progress.totalFrames}", op = op)
-                    onProgress(progress)
-                })
+            val source = AudioFileDecoder.open(app, item.ref(), startFrame, cancelled, onError = { error ->
+                telemetry.record("AUDIO_DECODE_FAILED", mapOf("track" to trackTag, "mime" to mime, "stage" to "stream",
+                    "result" to "error"), op = op, error = error)
+                post { opened[0]?.let { onStreamFailed(item, it) } }
+            })
+            opened[0] = source
             val elapsed = SystemClock.elapsedRealtime() - startedAt
-            val durationMs = (decoded.totalFrames * 1_000.0 / SF.SAMPLE_RATE).toLong()
-            telemetry.record("AUDIO_DECODE_COMPLETE", mapOf(
-                "track" to trackTag, "mime" to mime, "bytes" to inputBytes, "elapsedMs" to elapsed,
-                "durationMs" to durationMs, "frames" to decoded.totalFrames,
-                "firstAudioMs" to (firstAudioAt?.minus(startedAt) ?: -1L), "result" to "ok", "cacheHit" to false,
-            ), op = op)
+            telemetry.record("AUDIO_DECODE_FIRST_AUDIO", mapOf("track" to trackTag, "elapsedMs" to elapsed,
+                "readyFrames" to source.readyFrames, "estimatedFrames" to source.totalFrames, "startFrame" to startFrame), op = op)
             currentDecodeOp = null
-            Log.i(TAG, "decoded «${item.title}» in $elapsed ms")
-            decoded
+            Log.i(TAG, "opened «${item.title}» in $elapsed ms")
+            source
         } catch (t: Throwable) {
-            val wasCancelled = cancelled()
+            val wasCancelled = cancelled() || t is AudioFileDecoder.CancelledException
             val elapsed = SystemClock.elapsedRealtime() - startedAt
             val codecDiagnostic = (t as? MediaCodec.CodecException)?.diagnosticInfo
                 ?.take(160)?.let { " codecDiagnostic=$it" }.orEmpty()
             telemetry.record(if (wasCancelled) "AUDIO_DECODE_CANCELLED" else "AUDIO_DECODE_FAILED", mapOf(
                 "track" to trackTag, "mime" to mime, "bytes" to inputBytes, "elapsedMs" to elapsed,
-                "firstAudioMs" to (firstAudioAt?.minus(startedAt) ?: -1L),
                 "result" to if (wasCancelled) "cancelled" else "error", "codecDiagnostic" to codecDiagnostic,
             ), op = op, error = t)
             currentDecodeOp = null
@@ -4826,29 +4786,32 @@ class Engine private constructor(private val app: Context) {
         }
     }
 
-    /**
-     * После загрузки трека заранее готовим следующий — переход между треками происходит сразу,
-     * без паузы на декодирование. Лишние декодированные файлы удаляем (диск).
-     */
+    /** Декодер играющего трека упал посреди файла: трек заканчивается на последнем готовом месте. */
+    private fun onStreamFailed(item: QueueItem, failed: SegmentedPcmSource) {
+        if (currentQueueSource !== failed) return
+        if (!failed.endKnown) failed.markEnd(failed.readyFrames.coerceAtLeast(1L))
+        val lastReady = (failed.readyFrames - 1L).coerceAtLeast(0)
+        clearProgressiveBufferState()
+        newEpoch(false, posFrame().coerceAtMost(lastReady), System.nanoTime())
+        publishState(); toast("Не удалось дочитать «${item.title}»")
+    }
+
+    /** Следующий трек открываем заранее: его начало уже декодировано к моменту перехода. */
     private fun prefetchAround(index: Int) {
-        val keep = listOfNotNull(queue.getOrNull(index - 1), queue.getOrNull(index), queue.getOrNull(index + 1)).map { it.id }.toSet()
-        decodedTracks.keys.filter { it !in keep }.forEach { id ->
-            decodedTracks.remove(id)
-            queue.firstOrNull { it.id == id }?.let { AudioFileDecoder.pcmFile(app, it.ref()).deleteRecursively() }
-        }
-        val next = queue.getOrNull(index + 1) ?: return
-        if (decodedTracks.containsKey(next.id)) return
+        val next = queue.getOrNull(index + 1)
+        decodedTracks.keys.filter { it != next?.id }.forEach { decodedTracks.remove(it) }
+        retireUnusedStreams()
+        if (next == null || decodedTracks.containsKey(next.id)) return
         val generation = trackLoadGeneration
-        // Именованный аргумент: завершающая лямбда попадала в onProgress, и предзагрузку нельзя было отменить —
-        // выбранный трек ждал в однопоточной queueIo, пока устаревший декодируется до конца.
         prefetchTrackId = next.id
         queueIo.execute {
             val loaded = loadTrack(next, cancelled = { generation != trackLoadGeneration })
-            // Готовый трек кладём в decodedTracks: переход к нему не будет перечитывать кэш с диска.
             post {
                 if (prefetchTrackId == next.id) prefetchTrackId = null
-                if (loaded != null && generation == trackLoadGeneration && queue.any { it.id == next.id })
-                    decodedTracks[next.id] = loaded
+                if (loaded == null || openStreams.any { it === loaded }) return@post
+                openStreams.add(loaded)
+                if (generation == trackLoadGeneration && queue.any { it.id == next.id }) decodedTracks[next.id] = loaded
+                retireUnusedStreams()
             }
         }
     }
@@ -4890,7 +4853,8 @@ class Engine private constructor(private val app: Context) {
         } else if (current != null) {
             queueIndex = queue.indexOfFirst { it.id == current.id }
         }
-        removed.forEach { (_, item) -> decodedTracks.remove(item.id); AudioFileDecoder.pcmFile(app, item.ref()).deleteRecursively() }
+        removed.forEach { (_, item) -> decodedTracks.remove(item.id) }
+        retireUnusedStreams()
 
         undoText = if (removed.size == 1) "Удалено: ${trackLabel(removed[0].second.title, removed[0].second.artist)}"
                    else "Удалено треков: ${removed.size}"
@@ -5047,10 +5011,8 @@ class Engine private constructor(private val app: Context) {
     }
 
     private fun deleteQueueFiles(items: List<QueueItem>) {
-        items.forEach { item ->
-            decodedTracks.remove(item.id)
-            AudioFileDecoder.pcmFile(app, item.ref()).deleteRecursively()
-        }
+        items.forEach { item -> decodedTracks.remove(item.id) }
+        retireUnusedStreams()
     }
 
     private fun clearProgressiveBufferState() {
@@ -5071,19 +5033,26 @@ class Engine private constructor(private val app: Context) {
         if (role != Role.SERVER || (!ui.value.inPair && !soloMode)) return
         val tl = serverPlay.timeline
         val nowNs = System.nanoTime()
-        val progressive = if (mode == SourceMode.MUSIC) source as? app.soundfield.core.SegmentedPcmSource else null
+        val progressive = if (mode == SourceMode.MUSIC) source as? SegmentedPcmSource else null
         (source as? LiveSource)?.let { live -> if (mode == SourceMode.MUSIC) { liveTick(live, nowNs); return } }
+        // Окно декодера идёт за шкалой; при буферизации — держим его у места остановки.
+        // Во время TCP-предзагрузки шкала ещё от прошлого трека: её позицию к новому источнику не применяем.
+        if (pendingTrackId == null && tcpAudioPreload == null)
+            progressive?.focus(if (progressivePausedFrame >= 0) progressivePausedFrame else tl.positionFrame(nowNs).coerceAtLeast(0L))
+        /** Конец трека ближе запаса: ждать больше звука, чем осталось, нельзя. */
+        fun readyTarget(from: Long, lead: Long): Long =
+            if (progressive?.endKnown == true) minOf(from + lead, progressive.totalFrames) else from + lead
 
         if (progressivePausedFrame >= 0) {
             val pausedAt = progressivePausedFrame
-            if (progressive == null || progressive.complete && pausedAt >= progressive.totalFrames) {
+            if (progressive == null || progressive.endKnown && pausedAt >= progressive.totalFrames) {
                 progressivePausedFrame = -1L
                 setProgressiveBuffering(false)
                 if (queueIndex + 1 < queue.size) selectTrack(queueIndex + 1, startPlayback = true)
                 else newEpoch(false, source.totalFrames, nowNs)
                 return
             }
-            if (progressive.complete || progressive.readyFrames >= pausedAt + PROGRESSIVE_RESUME_BUFFER_FRAMES) {
+            if (progressive.complete || progressive.readyFrames >= readyTarget(pausedAt, PROGRESSIVE_RESUME_BUFFER_FRAMES)) {
                 progressivePausedFrame = -1L
                 setProgressiveBuffering(false)
                 newEpoch(true, pausedAt.coerceAtMost((source.totalFrames - 1).coerceAtLeast(0)), nowNs + SF.START_DELAY_NS)
@@ -5112,7 +5081,8 @@ class Engine private constructor(private val app: Context) {
         if (!tl.playing || pendingTrackId != null || tcpAudioPreload != null) return
         val position = tl.positionFrame(nowNs)
         if (progressive != null && !progressive.complete) {
-            if (position >= source.totalFrames || progressive.readyFrames < position + PROGRESSIVE_LOOKAHEAD_FRAMES) {
+            if ((position >= source.totalFrames && !progressive.endKnown) ||
+                (position < source.totalFrames && progressive.readyFrames < readyTarget(position, PROGRESSIVE_LOOKAHEAD_FRAMES))) {
                 val safeReady = (progressive.readyFrames - PROGRESSIVE_FADE_FRAMES).coerceAtLeast(0)
                 val scheduled = minOf(tl.positionFrame(nowNs + SF.PAUSE_LEAD_NS), safeReady)
                 progressiveResumeAfterBuffer = true
@@ -5130,8 +5100,8 @@ class Engine private constructor(private val app: Context) {
             }
         }
         if (position < source.totalFrames) return
-        // Метаданные иногда занижают длительность. Не переключаем очередь до завершения декодирования.
-        if (progressive != null && !progressive.complete) return
+        // Метаданные иногда занижают длительность. Не переключаем очередь, пока декодер не дошёл до конца файла.
+        if (progressive != null && !progressive.endKnown) return
         when (mode) {
             SourceMode.MUSIC -> if (queueIndex + 1 < queue.size) selectTrack(queueIndex + 1)
                 else newEpoch(false, source.totalFrames, System.nanoTime())

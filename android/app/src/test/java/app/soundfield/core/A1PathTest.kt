@@ -87,65 +87,44 @@ class A1PathTest {
     }
 
     @Test fun segmentedSourceReadsThe24BitCache() {
-        val dir = java.nio.file.Files.createTempDirectory("sf24").toFile()
-        try {
-            val frames = 1_000
-            val x = FloatArray(frames * 2) { i -> (0.5 * sin(2 * PI * 440.0 * (i / 2) / SF.SAMPLE_RATE) * if (i % 2 == 0) 1 else -1).toFloat() }
-            val bytes = ByteArray(frames * 6)
-            Pcm24StereoEncoder(seed = 4).use { it.encode(x, frames, bytes) }
-            val f = File(dir, "0.pcm24").also { it.writeBytes(bytes) }
-            val source = SegmentedPcmSource(dir, "t", "a", frames.toLong())
-            source.publish(0, f, frames)
-            source.finish(frames.toLong())
-            for (i in 0 until frames) for (c in 0..1) assertTrue(abs(source.sample(i.toLong(), c) - x[i * 2 + c]) <= 1.5f / Pcm24.SCALE)
-            assertEquals(0f, source.sample(frames.toLong(), 0), 0f)
-        } finally { dir.deleteRecursively() }
+        val frames = 1_000
+        val x = FloatArray(frames * 2) { i -> (0.5 * sin(2 * PI * 440.0 * (i / 2) / SF.SAMPLE_RATE) * if (i % 2 == 0) 1 else -1).toFloat() }
+        val bytes = ByteArray(frames * 6)
+        Pcm24StereoEncoder(seed = 4).use { it.encode(x, frames, bytes) }
+        val source = SegmentedPcmSource("t", "a", frames.toLong())
+        source.publish(0, ByteBuffer.wrap(bytes), frames)
+        source.markEnd(frames.toLong())
+        assertTrue(source.complete)
+        for (i in 0 until frames) for (c in 0..1) assertTrue(abs(source.sample(i.toLong(), c) - x[i * 2 + c]) <= 1.5f / Pcm24.SCALE)
+        assertEquals(0f, source.sample(frames.toLong(), 0), 0f)
     }
 
-    @Test fun segmentedSourceTracksReadyRunFromSeekFocus() {
-        val dir = java.nio.file.Files.createTempDirectory("sfseek").toFile()
-        try {
-            val seg = SegmentedPcmSource.SEGMENT_FRAMES
-            fun segment(i: Long, frames: Int = seg) = File(dir, "$i.pcm24").also { it.writeBytes(ByteArray(frames * 6)) }
-            val source = SegmentedPcmSource(dir, "t", "a", 10L * seg)
-            source.publish(0, segment(0), seg)
-            source.publish(1, segment(1), seg)
-            assertEquals(2L * seg, source.readyFrames)
-            assertNull(source.takeRequestedSegment())
-            // Перемотка в недекодированный сегмент 6: готового участка там нет, декодер получает запрос.
-            source.focus(6L * seg + 100)
-            assertEquals(6L * seg, source.readyFrames)
-            assertEquals(6L, source.takeRequestedSegment())
-            assertNull(source.takeRequestedSegment())
-            source.publish(6, segment(6), seg)
-            source.publish(7, segment(7), seg)
-            assertEquals(8L * seg, source.readyFrames)
-            assertEquals(2L, source.firstMissingSegment(0, 10))
-            assertEquals(8L, source.firstMissingSegment(6, 10))
-            // Назад в начало: готовый участок снова от нуля, до первого пропуска.
-            source.focus(10)
-            assertEquals(2L * seg, source.readyFrames)
-            source.publish(9, segment(9, 100), 100)
-            assertEquals(9L * seg + 100, source.publishedEndFrame())
-            assertFalse(source.complete)
-            source.finish(9L * seg + 100)
-            assertEquals(9L * seg + 100, source.readyFrames)
-        } finally { dir.deleteRecursively() }
-    }
-
-    @Test fun legacyPcm16CacheMarkerIsRecognisedAndRejected() {
-        val dir = java.nio.file.Files.createTempDirectory("sfmig").toFile()
-        try {
-            val old = File(dir, "complete").also { it.writeText("48000") }          // метка PCM16-кэша: только число кадров
-            assertNull(AudioFileDecoder.parseComplete(old))
-            val current = File(dir, "complete2").also { it.writeText("v3 48000") }
-            assertEquals(48_000L, AudioFileDecoder.parseComplete(current)!!.frames)
-            assertTrue(AudioFileDecoder.parseComplete(current)!!.truePeakDbtp.isNaN())
-            val withTp = File(dir, "complete4").also { it.writeText("v3 48000 tp=1.25") }
-            assertEquals(1.25, AudioFileDecoder.parseComplete(withTp)!!.truePeakDbtp, 0.0)
-            val broken = File(dir, "complete3").also { it.writeText("v3 x") }
-            assertNull(AudioFileDecoder.parseComplete(broken))
-        } finally { dir.deleteRecursively() }
+    @Test fun segmentedSourceKeepsWindowAroundPlayhead() {
+        val seg = SegmentedPcmSource.SEGMENT_FRAMES
+        fun segment() = ByteBuffer.wrap(ByteArray(seg * 6))
+        val source = SegmentedPcmSource("t", "a", 400L * seg)
+        assertEquals(0L, source.nextWantedSegment())
+        for (i in 0 until SegmentedPcmSource.AHEAD_SEGMENTS) source.publish(i, segment(), seg)
+        assertNull(source.nextWantedSegment())                       // окно заполнено — декодер ждёт
+        assertEquals(SegmentedPcmSource.AHEAD_SEGMENTS * seg, source.readyFrames)
+        // Перемотка к сегменту 300: готового участка нет, декодер нужен там.
+        source.focus(300L * seg + 100)
+        assertEquals(300L * seg, source.readyFrames)
+        assertEquals(300L, source.nextWantedSegment())
+        source.publish(300, segment(), seg)
+        source.publish(301, segment(), seg)
+        assertEquals(302L * seg, source.readyFrames)
+        assertEquals(302L, source.nextWantedSegment())
+        // Старые сегменты вытеснены: в памяти только окно.
+        assertFalse(source.hasSegment(0))
+        assertTrue(source.residentSegments <= SegmentedPcmSource.AHEAD_SEGMENTS + SegmentedPcmSource.BEHIND_SEGMENTS + 1)
+        // Конец файла: окно не выходит за последний сегмент, длинный трек не становится complete.
+        source.markEnd(305L * seg + 10)
+        assertTrue(source.endKnown)
+        assertFalse(source.complete)
+        assertEquals(306L, source.endSegmentExclusive)
+        source.focus(304L * seg)
+        assertEquals(304L, source.nextWantedSegment())
     }
 
     @Test fun sampleRateConverterKeepsToneLevelAndLength() {

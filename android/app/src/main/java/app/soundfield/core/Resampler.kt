@@ -1,12 +1,8 @@
 package app.soundfield.core
 
-import java.io.File
-import java.io.RandomAccessFile
 import java.nio.ByteOrder
-import java.nio.MappedByteBuffer
-import java.nio.channels.FileChannel
+import java.nio.ByteBuffer
 import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.PI
 import kotlin.math.cos
 import kotlin.math.min
@@ -99,71 +95,96 @@ class StreamResampler(private val inRate: Int, private val outRate: Int, private
 }
 
 /**
- * PCM-файл, публикуемый декодером частями. Реалтайм-чтение никогда не ждёт декодер:
- * ещё не готовый сегмент возвращает тишину. Server отправляет эту же тишину в UDP,
- * поэтому обе стороны сохраняют одну временную шкалу. Размер трека не ограничен Int.MAX_VALUE.
+ * Трек, декодируемый на лету в скользящее окно сегментов по 5 с (48 кГц, стерео, 24 бит) в памяти.
+ * Реалтайм-чтение никогда не ждёт декодер: ещё не готовый сегмент возвращает тишину. Server отправляет
+ * эту же тишину в UDP, поэтому обе стороны сохраняют одну временную шкалу. Длина трека не ограничена:
+ * в памяти только окно вокруг позиции воспроизведения ([AHEAD_SEGMENTS] вперёд, [BEHIND_SEGMENTS] назад).
  *
- * Сегменты могут появляться не по порядку: при перемотке за готовую часть [focus] просит декодер
- * перейти к новому месту, а пропущенные участки он дозаполняет позже. [readyFrames] — конец
- * непрерывного готового участка от точки [focus] (от начала трека, пока перемотки не было).
+ * Позицию сообщает движок ([focus]); декодер (поток в [app.soundfield.audio.AudioFileDecoder]) заполняет
+ * первый недостающий сегмент окна, при перемотке переходит к новому месту. [readyFrames] — конец
+ * непрерывного готового участка от позиции. Короткий трек, целиком поместившийся в окно, становится
+ * [complete] и больше не вытесняется.
  */
 class SegmentedPcmSource(
-    private val directory: File,
     override val title: String,
     override val artist: String,
     estimatedFrames: Long,
-) : AudioSource, TrackMeters {
+) : AudioSource, TrackMeters, AutoCloseable {
     override val mode = SourceMode.MUSIC
-    /** Максимальный true-peak по уже декодированной части (растёт по мере декодирования), NaN — пока нет данных. */
+    /** True-peak трека: из анализа файла, пока его нет — максимум по уже декодированному; NaN — нет данных. */
     @Volatile override var truePeakDbtp: Double = Double.NaN
-    /** Громкость известна только у полностью декодированного трека (частичная ввела бы в заблуждение). */
+    /** Громкость известна только из анализа всего файла (частичная ввела бы в заблуждение). */
     @Volatile override var loudnessLufs: Double = Double.NaN
     @Volatile override var totalFrames: Long = estimatedFrames.coerceAtLeast(0)
+        private set
+    /** Точная длина известна: декодер дошёл до конца файла (или её дал индекс файла). */
+    @Volatile var endKnown: Boolean = false
         private set
     @Volatile private var runEnd: Long = 0
     @Volatile private var focusFrame: Long = 0
     override val readyFrames: Long get() = if (complete) totalFrames else runEnd
     @Volatile override var complete: Boolean = false
         private set
-    private val segments = ConcurrentHashMap<Long, MappedByteBuffer>()
-    private val requestedSegment = AtomicLong(NO_REQUEST)
+    /** Декодер остановлен ([close]) или завершился ошибкой ([failure]). */
+    @Volatile var closed: Boolean = false
+        private set
+    @Volatile var failure: Throwable? = null
+        private set
+    private val segments = ConcurrentHashMap<Long, ByteBuffer>()
+    private val wake = Object()
+    private var onClose: (() -> Unit)? = null
 
-    fun publish(index: Long, file: File, frames: Int) {
+    /** Кадр, вокруг которого держится окно. */
+    val playheadFrame: Long get() = focusFrame
+    val playheadSegment: Long get() = focusFrame / SEGMENT_FRAMES
+    /** Номер сегмента за последним (исключительно), если длина известна; иначе Long.MAX_VALUE. */
+    val endSegmentExclusive: Long get() =
+        if (endKnown) (totalFrames + SEGMENT_FRAMES - 1) / SEGMENT_FRAMES else Long.MAX_VALUE
+    val residentSegments: Int get() = segments.size
+
+    /** Сегмент [index] из [frames] кадров ([data] — 24 бит LE интерлив, позиция 0, limit = frames·6). */
+    fun publish(index: Long, data: ByteBuffer, frames: Int) {
         require(frames in 1..SEGMENT_FRAMES)
-        RandomAccessFile(file, "r").use { raf ->
-            val bytes = frames.toLong() * BYTES_PER_FRAME
-            val mapped = raf.channel.map(FileChannel.MapMode.READ_ONLY, 0, bytes)
-            mapped.order(ByteOrder.LITTLE_ENDIAN)
-            segments[index] = mapped
-        }
+        require(data.limit().toLong() == frames * BYTES_PER_FRAME)
+        data.order(ByteOrder.LITTLE_ENDIAN)
+        segments[index] = data
         val ready = index * SEGMENT_FRAMES + frames
         synchronized(this) {
-            // Некоторые контейнеры/потоки не сообщают длительность заранее. До конца декодирования
-            // показываем уже доступную длину; finish() заменит её точным числом кадров.
-            if (!complete) totalFrames = maxOf(totalFrames, ready)
+            // Длительность из метаданных бывает занижена: до конца файла показываем не меньше декодированного.
+            if (!endKnown) totalFrames = maxOf(totalFrames, ready)
+            checkComplete()
+            if (!complete) evictOutsideWindow()
             recomputeRun()
         }
     }
 
+    /** Декодер дошёл до конца файла: [actualFrames] — точная длина. */
+    fun markEnd(actualFrames: Long) {
+        synchronized(this) {
+            totalFrames = actualFrames.coerceAtLeast(0)
+            endKnown = true
+            segments.keys.filter { it * SEGMENT_FRAMES >= totalFrames }.forEach { segments.remove(it) }
+            checkComplete()
+            recomputeRun()
+        }
+    }
+
+    /** Совместимость: трек целиком декодирован (тесты, короткие источники). */
     fun finish(actualFrames: Long) {
-        synchronized(this) {
-            totalFrames = actualFrames
-            complete = true
-            runEnd = actualFrames
-        }
+        markEnd(actualFrames)
+        synchronized(this) { complete = true; runEnd = totalFrames }
     }
 
-    /** Воспроизведение переходит к [frame]: готовый участок считается от него, декодер переходит сюда, если здесь пусто. */
+    /** Воспроизведение сейчас у [frame] (перемотка или ход шкалы): окно и готовый участок считаются от него. */
     fun focus(frame: Long) {
+        val f = frame.coerceAtLeast(0)
+        if (f == focusFrame) return
         synchronized(this) {
-            focusFrame = frame.coerceAtLeast(0)
+            focusFrame = f
             recomputeRun()
         }
-        if (!complete) requestedSegment.set(focusFrame / SEGMENT_FRAMES)
+        synchronized(wake) { wake.notifyAll() }
     }
-
-    /** Сегмент, к которому просили перейти после последнего вызова, или null. Для потока декодера. */
-    fun takeRequestedSegment(): Long? = requestedSegment.getAndSet(NO_REQUEST).takeIf { it != NO_REQUEST }
 
     fun hasSegment(index: Long): Boolean = segments.containsKey(index)
 
@@ -174,41 +195,76 @@ class SegmentedPcmSource(
         return null
     }
 
+    /** Следующий сегмент, который нужен окну, или null — окно заполнено. Для потока декодера. */
+    fun nextWantedSegment(): Long? {
+        if (complete) return null
+        val first = playheadSegment
+        return firstMissingSegment(first, minOf(first + AHEAD_SEGMENTS, endSegmentExclusive))
+    }
+
+    /** Поток декодера ждёт смены позиции (не дольше [timeoutMs]). */
+    fun awaitDemand(timeoutMs: Long) {
+        synchronized(wake) { if (!closed && nextWantedSegment() == null) wake.wait(timeoutMs) }
+    }
+
     /** Конец последнего опубликованного сегмента (кадр, исключительно). */
     fun publishedEndFrame(): Long = segments.entries.maxOfOrNull { it.key * SEGMENT_FRAMES + segmentFrames(it.value) } ?: 0L
 
-    private fun segmentFrames(mapped: MappedByteBuffer): Long = mapped.limit() / BYTES_PER_FRAME
+    /** Вызывается декодером при запуске: что сделать при [close]. */
+    fun setOnClose(action: () -> Unit) { onClose = action }
+
+    /** Декодер завершился с ошибкой: дальше окно не пополняется. */
+    fun fail(error: Throwable) { failure = error; closed = true; synchronized(wake) { wake.notifyAll() } }
+
+    /** Остановить декодер. Уже готовые сегменты остаются читаемыми (их держит этот объект). */
+    override fun close() {
+        if (closed) return
+        closed = true
+        synchronized(wake) { wake.notifyAll() }
+        onClose?.invoke()
+    }
+
+    private fun segmentFrames(data: ByteBuffer): Long = data.limit() / BYTES_PER_FRAME
+
+    private fun checkComplete() {
+        if (complete || !endKnown) return
+        val last = endSegmentExclusive
+        if ((0 until last).all { segments.containsKey(it) }) { complete = true; runEnd = totalFrames }
+    }
+
+    private fun evictOutsideWindow() {
+        val from = playheadSegment - BEHIND_SEGMENTS
+        val to = playheadSegment + AHEAD_SEGMENTS
+        segments.keys.filter { it < from || it > to }.forEach { segments.remove(it) }
+    }
 
     private fun recomputeRun() {
         if (complete) { runEnd = totalFrames; return }
         var i = focusFrame / SEGMENT_FRAMES
-        var mapped = segments[i] ?: run { runEnd = i * SEGMENT_FRAMES; return }
-        while (segmentFrames(mapped) == SEGMENT_FRAMES.toLong()) {
-            mapped = segments[i + 1] ?: break
+        var data = segments[i] ?: run { runEnd = i * SEGMENT_FRAMES; return }
+        while (segmentFrames(data) == SEGMENT_FRAMES.toLong()) {
+            data = segments[i + 1] ?: break
             i++
         }
-        runEnd = i * SEGMENT_FRAMES + segmentFrames(mapped)
-    }
-
-    fun progress(): Float {
-        if (complete) return 1f
-        val expected = (totalFrames + SEGMENT_FRAMES - 1) / SEGMENT_FRAMES
-        return if (expected <= 0) 0f else (segments.size.toDouble() / expected).toFloat().coerceIn(0f, 1f)
+        runEnd = i * SEGMENT_FRAMES + segmentFrames(data)
     }
 
     override fun sample(frame: Long, ch: Int): Float {
         if (frame < 0 || frame >= totalFrames || ch !in 0..1) return 0f
         val index = frame / SEGMENT_FRAMES
-        val mapped = segments[index] ?: return 0f
+        val data = segments[index] ?: return 0f
         val within = (frame % SEGMENT_FRAMES).toInt()
         val offset = (within * BYTES_PER_FRAME + ch * Pcm24.BYTES).toInt()
-        if (offset + Pcm24.BYTES > mapped.limit()) return 0f
-        return Pcm24.readLe(mapped, offset)
+        if (offset + Pcm24.BYTES > data.limit()) return 0f
+        return Pcm24.readLe(data, offset)
     }
 
     companion object {
-        private const val NO_REQUEST = -1L
         const val SEGMENT_FRAMES = 5 * SF.SAMPLE_RATE
         const val BYTES_PER_FRAME = 6L          // стерео, 24 бит little-endian, интерлив
+        /** Сколько сегментов держать впереди позиции (40 с; декодер MP3/AAC идёт в десятки раз быстрее реального времени). */
+        const val AHEAD_SEGMENTS = 8L
+        /** Сколько сегментов оставлять позади позиции (10 с: короткая перемотка назад без ожидания). */
+        const val BEHIND_SEGMENTS = 2L
     }
 }
