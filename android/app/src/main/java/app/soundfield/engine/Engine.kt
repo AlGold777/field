@@ -67,6 +67,8 @@ import java.net.ServerSocket
 import java.net.Socket
 import java.security.SecureRandom
 import app.soundfield.audio.QueueSnapshot
+import app.soundfield.audio.RecentFile
+import app.soundfield.audio.RecentFilesStore
 import app.soundfield.audio.QueueStateStore
 import app.soundfield.audio.ResumePositions
 import app.soundfield.audio.SavedTrack
@@ -2088,6 +2090,7 @@ class Engine private constructor(private val app: Context) {
                         queueIndex = -1
                     }
                     queue.addAll(prepared.map { QueueItem(it.id, it.uri, it.title, it.artist) })
+                    rememberRecent(prepared.map { RecentFile(it.uri.toString(), it.title, it.artist, 0) })
                     // A later file in the same batch may already be arriving while this import finishes.
                     ui { copy(fileTransferText = if (incomingFileTransfer == null && !fileTransferActive.get()) "" else fileTransferText) }
                     if (isFirstImport) releaseUnusedGrants()
@@ -4791,6 +4794,7 @@ class Engine private constructor(private val app: Context) {
                 if (loaded == null) { if (role == Role.SERVER) failTrackLoad(item, generation); return@post }
                 if (resumeFrame != null && generation == trackLoadGeneration) pendingStartFrame = resumeFrame
                 openStreams.add(loaded)
+                rememberRecent(listOf(RecentFile(item.uri.toString(), item.title, item.artist, 0)))
                 if (role == Role.SERVER && generation == trackLoadGeneration) {
                     activateLoadedTrack(item, generation, loaded)
                     if (currentQueueSource === loaded) queueIo.execute { requestAnalysis(item, loaded, priority = true) }
@@ -4851,6 +4855,22 @@ class Engine private constructor(private val app: Context) {
     private val queueStore by lazy { QueueStateStore(File(app.filesDir, "queue_state.txt")) }
     /** Позиция в длинных файлах (лекции, миксы, аудиокниги) — отдельно для каждого файла. */
     private val resumePositions by lazy { ResumePositions(File(app.filesDir, "resume_positions.txt")) }
+    /** Недавно добавленные и открытые файлы (для быстрого повторного добавления). */
+    private val recentFiles by lazy { RecentFilesStore(File(app.filesDir, "recent_files.txt")) }
+
+    /** Только content://-адреса: у файлов во внутреннем хранилище приложения (приём от второго телефона) нет постоянного доступа. */
+    private fun rememberRecent(items: List<RecentFile>) {
+        val usable = items.filter { it.uri.startsWith("content://") }
+        if (usable.isNotEmpty()) queueIo.execute { recentFiles.touch(usable) }
+    }
+
+    /** Для окна «Недавние» (вызывать не на главном потоке): список без файлов, которые перестали открываться. */
+    fun loadRecentFiles(): List<RecentFile> {
+        val all = recentFiles.load()
+        val dead = all.filter { r -> !runCatching { AudioFileDecoder.isReadable(app, Uri.parse(r.uri)) }.getOrDefault(false) }
+        if (dead.isNotEmpty()) { recentFiles.remove(dead.map { it.uri }); post { releaseUnusedGrants() } }
+        return all - dead.toSet()
+    }
     /** Ключ файла (адрес+размер+дата) по id элемента очереди; считается в queueIo. */
     private val trackKeys = java.util.concurrent.ConcurrentHashMap<String, String>()
 
@@ -5226,6 +5246,7 @@ class Engine private constructor(private val app: Context) {
         val used = HashSet<String>()
         prefs.getString("audioBrowserRoot", null)?.let { used += it }
         queue.forEach { used += it.uri.toString() }
+        recentFiles.load().forEach { used += it.uri }
         removedBackup.forEach { used += it.second.uri.toString() }
         playlistDir.listFiles { f -> f.extension == "json" }.orEmpty().forEach { f ->
             val arr = readPlaylist(f)?.optJSONArray("tracks") ?: return@forEach

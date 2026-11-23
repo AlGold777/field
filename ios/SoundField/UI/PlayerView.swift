@@ -607,6 +607,9 @@ private struct AudioBrowserView: View {
     @State private var loading = false
     @State private var error: String?
     @State private var scoped = false
+    @State private var showRecent = false
+    @State private var recent: [RecentFile] = []
+    @State private var recentSelected = Set<String>()
     private var current: URL { path.last ?? root }
     private struct Entry: Identifiable {
         let url: URL
@@ -617,11 +620,34 @@ private struct AudioBrowserView: View {
         NavigationStack {
             VStack(spacing: 0) {
                 HStack {
-                    Button("‹ Назад") { selected.removeAll(); path.removeLast() }.disabled(path.isEmpty)
+                    if showRecent { Button("‹ Папки") { showRecent = false } }
+                    else { Button("‹ Назад") { selected.removeAll(); path.removeLast() }.disabled(path.isEmpty) }
                     Spacer()
-                    Text(current.lastPathComponent).lineLimit(1)
+                    Text(showRecent ? "Недавние файлы" : current.lastPathComponent).lineLimit(1)
+                    if !showRecent { Button("Недавние") { openRecent() }.padding(.leading, 8) }
                 }.padding()
-                if loading { ProgressView().frame(maxWidth: .infinity, maxHeight: .infinity) }
+                if showRecent {
+                    List(recent, id: \.path) { r in
+                        Button {
+                            if recentSelected.contains(r.path) { recentSelected.remove(r.path) } else { recentSelected.insert(r.path) }
+                        } label: {
+                            HStack {
+                                Image(systemName: recentSelected.contains(r.path) ? "checkmark.circle.fill" : "circle")
+                                    .foregroundColor(SFColor.accent1).frame(width: 26)
+                                VStack(alignment: .leading) {
+                                    Text(r.title.isEmpty ? (r.path as NSString).lastPathComponent : r.title).foregroundColor(SFColor.text).lineLimit(2)
+                                    if !r.artist.isEmpty { Text(r.artist).foregroundColor(SFColor.dim).lineLimit(1) }
+                                }
+                                Spacer()
+                            }
+                        }.buttonStyle(.plain)
+                    }.listStyle(.plain)
+                    if recent.isEmpty { Text("Пока нет недавних файлов").foregroundColor(SFColor.dim).padding() }
+                    Button(recentSelected.isEmpty ? "Добавить" : "Добавить (\(recentSelected.count))") {
+                        onImport(recent.filter { recentSelected.contains($0.path) }.map { root.appendingPathComponent($0.path) })
+                        dismiss()
+                    }.buttonStyle(.borderedProminent).disabled(recentSelected.isEmpty).padding()
+                } else if loading { ProgressView().frame(maxWidth: .infinity, maxHeight: .infinity) }
                 else if let error { Text(error).foregroundColor(SFColor.warn).padding().frame(maxHeight: .infinity) }
                 else {
                     List(entries) { entry in
@@ -641,10 +667,12 @@ private struct AudioBrowserView: View {
                     }.listStyle(.plain)
                     if entries.isEmpty { Text("В папке нет аудиофайлов").foregroundColor(SFColor.dim).padding() }
                 }
-                Button(selected.isEmpty ? "Добавить папку" : "Добавить (\(selected.count))") {
-                    onImport(selected.isEmpty ? [current] : entries.filter { selected.contains($0.url) }.map(\.url))
-                    dismiss()
-                }.buttonStyle(.borderedProminent).disabled(loading || error != nil).padding()
+                if !showRecent {
+                    Button(selected.isEmpty ? "Добавить папку" : "Добавить (\(selected.count))") {
+                        onImport(selected.isEmpty ? [current] : entries.filter { selected.contains($0.url) }.map(\.url))
+                        dismiss()
+                    }.buttonStyle(.borderedProminent).disabled(loading || error != nil).padding()
+                }
             }
             .navigationTitle("Добавить музыку").navigationBarTitleDisplayMode(.inline)
             .toolbar {
@@ -654,6 +682,17 @@ private struct AudioBrowserView: View {
             .task(id: current) { await load() }
             .onDisappear { if scoped { root.stopAccessingSecurityScopedResource(); scoped = false } }
         }.preferredColorScheme(.dark)
+    }
+    /// Список недавних: файлы, которых уже нет в папке, убираем.
+    private func openRecent() {
+        if !scoped { scoped = root.startAccessingSecurityScopedResource() }
+        let store = RecentFilesStore()
+        let all = store.load()
+        let dead = Set(all.filter { !FileManager.default.fileExists(atPath: root.appendingPathComponent($0.path).path) }.map(\.path))
+        if !dead.isEmpty { store.remove(dead) }
+        recent = all.filter { !dead.contains($0.path) }
+        recentSelected.removeAll()
+        showRecent = true
     }
     @MainActor private func load() async {
         if !scoped { scoped = root.startAccessingSecurityScopedResource() }

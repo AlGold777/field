@@ -205,6 +205,7 @@ fun AppRoot(engine: Engine) {
             root = Uri.parse(browserRoot),
             onDismiss = { showAudioBrowser = false },
             onChangeRoot = { showAudioBrowser = false; audioRootLauncher.launch(browserRoot?.let(Uri::parse)) },
+            loadRecent = { engine.loadRecentFiles() },
             onImport = { uris -> showAudioBrowser = false; engine.addAudioFiles(uris) },
         )
     }

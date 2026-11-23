@@ -20,6 +20,8 @@ final class Engine {
         let fileURL: URL
         let title: String
         let artist: String
+        /// Путь исходного файла внутри папки с музыкой (для списка недавних); nil у файлов от второго телефона и плейлистов.
+        var recentPath: String? = nil
     }
 
     static let shared = Engine()
@@ -772,7 +774,13 @@ final class Engine {
                     if firstImport {
                         self.queue.removeAll(); self.currentQueueSource = nil; self.queueIndex = -1; self.hasImportedQueue = true
                     }
-                    self.queue.append(contentsOf: prepared.map { QueueEntry(id: $0.id, fileURL: $0.url, title: $0.title, artist: $0.artist) })
+                    self.queue.append(contentsOf: prepared.map { p in
+                        QueueEntry(id: p.id, fileURL: p.url, title: p.title, artist: p.artist,
+                                   recentPath: securityRoot.flatMap { root in p.source.flatMap { RecentFilesStore.relativePath(of: $0, in: root) } })
+                    })
+                    RecentFilesStore().touch(self.queue.suffix(prepared.count).compactMap { e in
+                        e.recentPath.map { (path: $0, title: e.title, artist: e.artist) }
+                    })
                     self.ui { $0.queueTracks = self.queue.map { QueueTrackUi(id: $0.id, title: $0.title, artist: $0.artist) } }
                     self.publishQueue()
                     if firstImport {
@@ -1763,6 +1771,7 @@ final class Engine {
             if startPlayback { cmdPlay() }
             return
         }
+        if let path = item.recentPath { RecentFilesStore().touch([(path: path, title: item.title, artist: item.artist)]) }
         pendingShouldPlay = !forcePaused && (startPlayback || playBox.value.timeline.playing)
         trackLoadGeneration += 1
         let generation = trackLoadGeneration

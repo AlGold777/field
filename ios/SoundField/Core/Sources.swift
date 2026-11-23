@@ -6,6 +6,8 @@ struct PreparedAudioFile {
     let url: URL
     let title: String
     let artist: String
+    /// Исходный файл (до копирования в хранилище приложения); нужен для списка недавних.
+    var source: URL? = nil
 }
 
 enum AudioFileDecoder {
@@ -23,7 +25,7 @@ enum AudioFileDecoder {
         let title = metadata.first { $0.commonKey == .commonKeyTitle }?.stringValue
             ?? source.deletingPathExtension().lastPathComponent
         let artist = metadata.first { $0.commonKey == .commonKeyArtist }?.stringValue ?? ""
-        return PreparedAudioFile(id: id, url: destination, title: title, artist: artist)
+        return PreparedAudioFile(id: id, url: destination, title: title, artist: artist, source: source)
     }
 
     static func decode(_ item: PreparedAudioFile) throws -> PcmSource {
