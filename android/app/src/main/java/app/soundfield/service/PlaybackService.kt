@@ -11,7 +11,20 @@ import android.content.pm.ServiceInfo
 import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.IBinder
+import android.os.Handler
+import android.os.Looper
 import android.os.PowerManager
+import android.os.SystemClock
+import android.support.v4.media.MediaMetadataCompat
+import android.support.v4.media.session.MediaSessionCompat
+import android.support.v4.media.session.PlaybackStateCompat
+import androidx.media.app.NotificationCompat.MediaStyle
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import app.soundfield.R
@@ -31,6 +44,11 @@ class PlaybackService : Service() {
     private var wifiLock: WifiManager.WifiLock? = null
     private var wifiLockBg: WifiManager.WifiLock? = null
     private var wakeLock: PowerManager.WakeLock? = null
+    private var session: MediaSessionCompat? = null
+    private var scope: CoroutineScope? = null
+    private var lastInput: MediaInput? = null
+    private var lastPos = 0L
+    private var lastPosAt = 0L
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -62,12 +80,71 @@ class PlaybackService : Service() {
         }
         val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
         wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "soundfield:audio").apply { setReferenceCounted(false); acquire() }
+        startMediaSession()
+    }
+
+    private fun startMediaSession() {
+        val engine = Engine.get(this)
+        val s = MediaSessionCompat(this, "SoundField")
+        s.setCallback(object : MediaSessionCompat.Callback() {
+            override fun onPlay() = engine.play()
+            override fun onPause() = engine.pause()
+            override fun onStop() = engine.pause()
+            override fun onSkipToNext() = engine.nextTrack()
+            override fun onSkipToPrevious() = engine.previousTrack()
+            override fun onSeekTo(pos: Long) {
+                if (!engine.ui.value.input.live) engine.seekMs(pos.coerceAtLeast(0L))
+            }
+        })
+        s.setSessionActivity(PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java)
+            .addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP), PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE))
+        s.isActive = true
+        session = s
+        sessionToken = s.sessionToken
+        syncSession(force = true)
+        val sc = CoroutineScope(SupervisorJob() + Dispatchers.Main)
+        scope = sc
+        sc.launch { engine.ui.collect { syncSession(force = false) } }
+        // Перемотка и смена трека без смены состояния: раз в секунду сверяем позицию с экстраполяцией системы.
+        sc.launch { while (true) { delay(1000); syncSession(force = false) } }
+    }
+
+    private fun syncSession(force: Boolean) {
+        val s = session ?: return
+        try {
+            val engine = Engine.get(this)
+            val input = engine.ui.value.toMediaInput()
+            val pos = if (input.hasTrack && !input.live) engine.positionMs() else 0L
+            val now = SystemClock.elapsedRealtime()
+            val changed = force || input != lastInput
+            if (!changed && !MediaSessionMapping.positionDrifted(input.playing, lastPos, lastPosAt, pos, now)) return
+            val prev = lastInput
+            lastInput = input; lastPos = pos; lastPosAt = now
+            if (changed && (prev == null || prev.title != input.title || prev.artist != input.artist || prev.durationMs != input.durationMs || prev.live != input.live)) {
+                val m = MediaSessionMapping.metadata(input)
+                s.setMetadata(MediaMetadataCompat.Builder()
+                    .putString(MediaMetadataCompat.METADATA_KEY_TITLE, m.title)
+                    .putString(MediaMetadataCompat.METADATA_KEY_ARTIST, m.artist)
+                    .putLong(MediaMetadataCompat.METADATA_KEY_DURATION, m.durationMs)
+                    .build())
+            }
+            val p = MediaSessionMapping.playback(input, pos)
+            s.setPlaybackState(PlaybackStateCompat.Builder()
+                .setActions(p.actions)
+                .setState(p.state, p.positionMs, p.speed, now)
+                .build())
+            if (changed && prev != null && (prev.playing != input.playing || prev.title != input.title || prev.artist != input.artist)) refresh(this)
+        } catch (e: Exception) {
+            android.util.Log.w("SoundField", "media session sync: ${e.message}")
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val engine = Engine.get(this)
         when (intent?.action) {
             ACTION_TOGGLE -> engine.togglePlay()
+            ACTION_PREVIOUS -> engine.previousTrack()
+            ACTION_NEXT -> engine.nextTrack()
         }
         val n = build(this)
         try {
@@ -86,6 +163,10 @@ class PlaybackService : Service() {
 
     override fun onDestroy() {
         Telemetry.get(this).event("SERVICE_DESTROY")
+        scope?.cancel(); scope = null
+        sessionToken = null
+        try { session?.run { isActive = false; release() } } catch (_: Exception) {}
+        session = null
         try { wifiLock?.release() } catch (_: Exception) {}
         try { wifiLockBg?.release() } catch (_: Exception) {}
         try { wakeLock?.release() } catch (_: Exception) {}
@@ -96,6 +177,9 @@ class PlaybackService : Service() {
         private const val CHANNEL = "soundfield_pair"
         private const val ID = 42
         const val ACTION_TOGGLE = "app.soundfield.TOGGLE"
+        const val ACTION_PREVIOUS = "app.soundfield.PREVIOUS"
+        const val ACTION_NEXT = "app.soundfield.NEXT"
+        @Volatile private var sessionToken: MediaSessionCompat.Token? = null
         @Volatile private var running = false
 
         fun start(ctx: Context) {
@@ -132,6 +216,8 @@ class PlaybackService : Service() {
             val open = PendingIntent.getActivity(ctx, 0, Intent(ctx, MainActivity::class.java)
                 .addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP), flags)
             val toggle = PendingIntent.getService(ctx, 1, Intent(ctx, PlaybackService::class.java).setAction(ACTION_TOGGLE), flags)
+            val prev = PendingIntent.getService(ctx, 2, Intent(ctx, PlaybackService::class.java).setAction(ACTION_PREVIOUS), flags)
+            val next = PendingIntent.getService(ctx, 3, Intent(ctx, PlaybackService::class.java).setAction(ACTION_NEXT), flags)
             val roleText = if (s.role == Role.SERVER) "Server" else "Point"
             val ch = if (s.myChannel == 0) "левый" else "правый"
             val title = when {
@@ -149,7 +235,11 @@ class PlaybackService : Service() {
                 .setOnlyAlertOnce(true)
                 .setCategory(NotificationCompat.CATEGORY_TRANSPORT)
                 .setVisibility(NotificationCompat.VISIBILITY_PRIVATE)
-                .addAction(0, if (s.playing) "Пауза" else "Играть", toggle)
+                .addAction(android.R.drawable.ic_media_previous, "Предыдущий", prev)
+                .addAction(if (s.playing) android.R.drawable.ic_media_pause else android.R.drawable.ic_media_play,
+                    if (s.playing) "Пауза" else "Играть", toggle)
+                .addAction(android.R.drawable.ic_media_next, "Следующий", next)
+                .setStyle(MediaStyle().setShowActionsInCompactView(0, 1, 2).also { st -> sessionToken?.let { st.setMediaSession(it) } })
                 .build()
         }
     }
