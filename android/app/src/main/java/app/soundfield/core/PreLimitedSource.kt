@@ -134,7 +134,9 @@ class PreLimitedSource(
                 val inputLimit = if (sourceComplete) minOf(wanted, total) + latency else minOf(wanted + latency, ready)
                 var progressed = false
                 while (running.get() && nextInput < inputLimit && restartAt.get() == NO_RESTART) {
-                    val end = minOf(nextInput + CHUNK_FRAMES, inputLimit)
+                    // Блок не пересекает границу трека цепочки: усиление нормализации меняется ровно на ней.
+                    val boundary = (inner as? PositionalTrackMeters)?.nextTrackStartAfter(nextInput) ?: Long.MAX_VALUE
+                    val end = minOf(nextInput + CHUNK_FRAMES, inputLimit, boundary)
                     val n = (end - nextInput).toInt()
                     var available = 0
                     while (available < n) {
@@ -162,7 +164,7 @@ class PreLimitedSource(
                         java.util.Arrays.fill(buffer, 0, n * 2, 0f)
                         available = n
                     } else stallSinceMs = 0L
-                    applyStaticGain(available)
+                    applyStaticGain(available, nextInput)
                     limiter.process(buffer, 0, available)
                     // Invalidate overwritten slots before exposing new PCM in them.
                     retainedFrom = maxOf(retainedFrom, minOf(total, nextInput + available - latency) - capacity)
@@ -196,9 +198,15 @@ class PreLimitedSource(
      * а не ослабляется лимитером в каждом пике. Пока трек декодируется, tp — максимум по уже готовой части (усиление только
      * уменьшается); смена цели сглаживается линейно на блок (21 мс). Предлимитер остаётся страховкой (Spatial/EQ могут поднять пики).
      */
-    private fun applyStaticGain(n: Int) {
-        val goal = TruePeakMeter.normalizationGainDb(loudnessLufs, truePeakDbtp)
-        val db = if (goal <= currentDb) goal else minOf(goal, currentDb + MAX_RISE_DB_PER_S * n / SF.SAMPLE_RATE)
+    private fun applyStaticGain(n: Int, frame: Long) {
+        val positional = inner as? PositionalTrackMeters
+        val goal = if (positional != null) TruePeakMeter.normalizationGainDb(positional.loudnessAt(frame), positional.truePeakAt(frame))
+            else TruePeakMeter.normalizationGainDb(loudnessLufs, truePeakDbtp)
+        // Новый трек цепочки (переход без паузы): своя цель сразу, переход сглажен на блок; «подъезд» — только внутри трека.
+        val key = positional?.trackKeyAt(frame) ?: 0L
+        val newTrack = key != gainTrackKey
+        gainTrackKey = key
+        val db = if (goal <= currentDb || newTrack) goal else minOf(goal, currentDb + MAX_RISE_DB_PER_S * n / SF.SAMPLE_RATE)
         currentDb = db
         staticGainDb = db
         val target = Math.pow(10.0, db / 20.0)
@@ -211,7 +219,13 @@ class PreLimitedSource(
         currentGain = target
     }
 
-    private fun initialGainDb() = TruePeakMeter.normalizationGainDb(loudnessLufs, truePeakDbtp)
+    private var gainTrackKey = Long.MIN_VALUE
+
+    private fun initialGainDb(): Double {
+        val positional = inner as? PositionalTrackMeters
+        return if (positional != null) TruePeakMeter.normalizationGainDb(positional.loudnessAt(startAtFrame), positional.truePeakAt(startAtFrame))
+            else TruePeakMeter.normalizationGainDb(loudnessLufs, truePeakDbtp)
+    }
 
     private fun collectStats() {
         val s = limiter.takeStats()
@@ -227,6 +241,7 @@ class PreLimitedSource(
         val from = maxOf(0L, target - WARMUP_FRAMES)
         limiter.reset()
         currentDb = initialGainDb()   // после перемотки без «подъезда»
+        gainTrackKey = Long.MIN_VALUE
         currentGain = Math.pow(10.0, currentDb / 20.0)
         nextInput = from
         // Нечётное поколение — границы кэша меняются: читатели отбрасывают значение (seqlock).

@@ -30,6 +30,19 @@ interface TrackMeters {
     val loudnessLufs: Double get() = Double.NaN
 }
 
+/**
+ * Несколько треков на одной шкале ([TrackChain]): пик и громкость зависят от места. Нормализация
+ * (предлимитер) берёт их по кадру и меняет усиление ровно на границе трека, а не по позиции воспроизведения.
+ */
+interface PositionalTrackMeters {
+    fun truePeakAt(frame: Long): Double
+    fun loudnessAt(frame: Long): Double
+    /** Одинаков для кадров одного трека, различается у соседних треков. */
+    fun trackKeyAt(frame: Long): Long
+    /** Первый кадр следующего трека после [frame] или Long.MAX_VALUE. */
+    fun nextTrackStartAfter(frame: Long): Long = Long.MAX_VALUE
+}
+
 /** Sources with a forward worker can precompute frames before a consumer reads them. */
 interface PrefetchableAudioSource {
     fun requestThrough(frameExclusive: Long)

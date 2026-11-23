@@ -21,9 +21,14 @@ class SpatialSource(
     cacheSeconds: Int = DEFAULT_CACHE_SECONDS,
     spatialConfig: SpatialDspConfig = SpatialDspConfig(),
     private val xtcDesign: CompletableFuture<XtcFilterSet>? = null,
-) : AudioSource, AutoCloseable, PrefetchableAudioSource, TrackMeters {
+) : AudioSource, AutoCloseable, PrefetchableAudioSource, TrackMeters, PositionalTrackMeters {
     override val truePeakDbtp: Double get() = (inner as? TrackMeters)?.truePeakDbtp ?: Double.NaN
     override val loudnessLufs: Double get() = (inner as? TrackMeters)?.loudnessLufs ?: Double.NaN
+    // Выход Spatial выровнен по кадрам входа: место трека на шкале то же.
+    override fun truePeakAt(frame: Long): Double = (inner as? PositionalTrackMeters)?.truePeakAt(frame) ?: truePeakDbtp
+    override fun loudnessAt(frame: Long): Double = (inner as? PositionalTrackMeters)?.loudnessAt(frame) ?: loudnessLufs
+    override fun trackKeyAt(frame: Long): Long = (inner as? PositionalTrackMeters)?.trackKeyAt(frame) ?: 0L
+    override fun nextTrackStartAfter(frame: Long): Long = (inner as? PositionalTrackMeters)?.nextTrackStartAfter(frame) ?: Long.MAX_VALUE
     private val bypass = !spatialConfig.enabled
     override val mode get() = inner.mode
     override val title get() = inner.title

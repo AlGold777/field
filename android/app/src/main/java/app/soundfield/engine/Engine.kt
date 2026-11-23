@@ -2660,7 +2660,7 @@ class Engine private constructor(private val app: Context) {
         val now = System.nanoTime()
         val frame: Long; val total: Long
         if (role == Role.SERVER) {
-            val st = serverPlay; frame = st.timeline.positionFrame(now); total = st.source.totalFrames
+            frame = (serverPlay.timeline.positionFrame(now) - trackOffset).coerceAtLeast(0L); total = currentTrackFrames()
         } else {
             val tl = rx.timeline
             frame = if (clock.ready) tl.positionFrame(clock.toServer(now)) else tl.anchorFrame
@@ -3984,7 +3984,7 @@ class Engine private constructor(private val app: Context) {
     private fun currentRenderedSource(): AudioSource {
         val current = serverPlay.source
         if (current is CrossfadeAudioSource || tcpAudioPreload != null) return current
-        return renderSourceFor(source, posFrame())
+        return renderSourceFor(source, timelineFrame())
     }
 
     private fun closeSpatialLater(source: AudioSource) {
@@ -3995,7 +3995,7 @@ class Engine private constructor(private val app: Context) {
         when (source) {
             is CrossfadeAudioSource -> { closeSpatialTree(source.previous); closeSpatialTree(source.next) }
             is SpatialSource, is PreLimitedSource -> {
-                val oldest = posFrame() - SF.MAX_TRIM_MS.toLong() * SF.SAMPLE_RATE / 1000
+                val oldest = timelineFrame() - SF.MAX_TRIM_MS.toLong() * SF.SAMPLE_RATE / 1000
                 if (usesRenderSource(serverPlay.source, source, oldest) ||
                     tcpAudioPreload?.let { usesRenderSource(it.source, source, it.startFrame) } == true) {
                     closeSpatialLater(source)
@@ -4094,7 +4094,7 @@ class Engine private constructor(private val app: Context) {
         val now = System.nanoTime()
         val isPlaying = timeline.playing && mode == SourceMode.MUSIC
         val fadeFrames = SF.SAMPLE_RATE / 20
-        val requested = if (isPlaying) timeline.frameAt(now + SF.LEAD_NS + 200_000_000L).toLong() else posFrame()
+        val requested = if (isPlaying) timeline.frameAt(now + SF.LEAD_NS + 200_000_000L).toLong() else timelineFrame()
         val f = if (isPlaying) requested.coerceIn(0L, maxOf(0L, source.totalFrames - fadeFrames))
             else requested.coerceIn(0L, source.totalFrames)
         spatialSettings = clean
@@ -4224,7 +4224,10 @@ class Engine private constructor(private val app: Context) {
         return descriptions.ifEmpty { listOf("сеть Wi‑Fi не определена") }.joinToString(", ")
     }
 
+    /** [frame] — кадр текущего трека (как [posFrame]). */
     private fun newEpoch(playing: Boolean, frame: Long, anchorNs: Long) {
+        collapseTrackChain()
+        (source as? TrackChain)?.focus(frame.coerceAtLeast(0L))
         // Живой поток опережает воспроизведение всего на секунду: ждать предзагрузку нечем, запас уйдёт.
         if (playing && mode != SourceMode.SYNC_PROBE && phase == Phase.PAIRED && role == Role.SERVER && source !is LiveSource &&
             "tcpAudio" in negotiatedCapabilities && serverTcpAudioSocket?.let { it.isConnected && !it.isClosed } == true) {
@@ -4417,7 +4420,31 @@ class Engine private constructor(private val app: Context) {
         PlaybackService.refresh(app)
     }
 
-    private fun posFrame(): Long = serverPlay.timeline.positionFrame(System.nanoTime()).coerceIn(0L, source.totalFrames)
+    /**
+     * Позиция в текущем треке. При переходе без паузы ([TrackChain]) шкала эпохи идёт через несколько треков,
+     * текущий начинается на ней с кадра [trackOffset]; новая эпоха сбрасывает цепочку, и кадры снова считаются от начала трека.
+     */
+    private fun posFrame(): Long = (timelineFrame() - trackOffset).coerceIn(0L, currentTrackFrames())
+
+    /** Позиция на шкале эпохи (в кадрах источника рендера). */
+    private fun timelineFrame(): Long = serverPlay.timeline.positionFrame(System.nanoTime()).coerceIn(0L, source.totalFrames)
+
+    /** Длина текущего трека (в цепочке — только его, без следующих). */
+    private fun currentTrackFrames(): Long =
+        if (source is TrackChain) (currentQueueSource?.totalFrames ?: source.totalFrames) else source.totalFrames
+
+    /** Кадр текущего трека, с которого он начинается на шкале эпохи (0 без перехода без паузы). */
+    @Volatile private var trackOffset = 0L
+
+    /** Новая эпоха: цепочка треков сворачивается до текущего трека, кадры — от его начала. */
+    private fun collapseTrackChain() {
+        val chain = source as? TrackChain ?: return
+        val current = currentQueueSource as? SegmentedPcmSource ?: return
+        if (chain.entryCount == 1 && trackOffset == 0L) return
+        source = TrackChain(current)
+        trackOffset = 0L
+        retireUnusedStreams()
+    }
 
     private fun handleCmd(o: JSONObject) {
         val now = System.nanoTime()
@@ -4567,7 +4594,7 @@ class Engine private constructor(private val app: Context) {
         clearProgressiveBufferState()
         cancelScheduledPause()
         val pos = posFrame()   // при отменённой паузе — кадр, на котором она бы наступила
-        val f = if (pos >= source.totalFrames) 0L else pos
+        val f = if (pos >= currentTrackFrames()) 0L else pos
         newEpoch(true, f, System.nanoTime() + SF.START_DELAY_NS)
     }
 
@@ -4596,16 +4623,15 @@ class Engine private constructor(private val app: Context) {
         pauseTask?.cancel(false)
         pauseTask = later(SF.PAUSE_LEAD_NS / 1_000_000 + 60) {
             val cur = serverPlay.timeline
-            if (cur.epoch == tl.epoch && cur.stopFrame == stop) newEpoch(false, stop, System.nanoTime())
+            if (cur.epoch == tl.epoch && cur.stopFrame == stop) newEpoch(false, (stop - trackOffset).coerceAtLeast(0L), System.nanoTime())
         }
     }
 
     private fun seekFrame(frame: Long) {
         if (calibRunning) return
         if (mode != SourceMode.MUSIC) restoreMusic(false)
-        val f = frame.coerceIn(0L, maxOf(0L, source.totalFrames - 1))
-        // Декодер переходит к месту перемотки; пока звука там нет — короткая буферизация.
-        (source as? SegmentedPcmSource)?.focus(f)
+        val f = frame.coerceIn(0L, maxOf(0L, currentTrackFrames() - 1))
+        // Декодер переходит к месту перемотки (focus в newEpoch); пока звука там нет — короткая буферизация.
         val playing = serverPlay.timeline.running
         clearProgressiveBufferState()
         cancelScheduledPause()
@@ -4702,7 +4728,8 @@ class Engine private constructor(private val app: Context) {
         spatialBypassedInput = null
         spatialPerfInput = null
         spatialSlowSinceMs = 0L
-        source = loaded
+        source = (loaded as? SegmentedPcmSource)?.let { TrackChain(it) } ?: loaded
+        trackOffset = 0L
         currentQueueSource = loaded
         savedFrame = 0
         (loaded as? SegmentedPcmSource)?.focus(pendingStartFrame.coerceAtMost(loaded.totalFrames))
@@ -4767,7 +4794,8 @@ class Engine private constructor(private val app: Context) {
 
     /** Останавливает декодеры треков, которые не играют и не ждут своей очереди. Поток движка. */
     private fun retireUnusedStreams() {
-        val keep = listOfNotNull(currentQueueSource, source) + decodedTracks.values
+        val keep = listOfNotNull(currentQueueSource, source) + decodedTracks.values +
+            ((source as? TrackChain)?.entriesSnapshot()?.map { it.track } ?: emptyList())
         openStreams.removeAll { stream ->
             val unused = keep.none { it === stream }
             if (unused) stream.close()
@@ -5076,7 +5104,7 @@ class Engine private constructor(private val app: Context) {
         if (role != Role.SERVER || (!ui.value.inPair && !soloMode)) return
         val tl = serverPlay.timeline
         val nowNs = System.nanoTime()
-        val progressive = if (mode == SourceMode.MUSIC) source as? SegmentedPcmSource else null
+        val progressive = if (mode == SourceMode.MUSIC) source as? TrackChain else null
         (source as? LiveSource)?.let { live -> if (mode == SourceMode.MUSIC) { liveTick(live, nowNs); return } }
         // Окно декодера идёт за шкалой; при буферизации — держим его у места остановки.
         // Во время TCP-предзагрузки шкала ещё от прошлого трека: её позицию к новому источнику не применяем.
@@ -5092,13 +5120,14 @@ class Engine private constructor(private val app: Context) {
                 progressivePausedFrame = -1L
                 setProgressiveBuffering(false)
                 if (queueIndex + 1 < queue.size) selectTrack(queueIndex + 1, startPlayback = true)
-                else newEpoch(false, source.totalFrames, nowNs)
+                else newEpoch(false, currentTrackFrames(), nowNs)
                 return
             }
             if (progressive.complete || progressive.readyFrames >= readyTarget(pausedAt, PROGRESSIVE_RESUME_BUFFER_FRAMES)) {
                 progressivePausedFrame = -1L
                 setProgressiveBuffering(false)
-                newEpoch(true, pausedAt.coerceAtMost((source.totalFrames - 1).coerceAtLeast(0)), nowNs + SF.START_DELAY_NS)
+                val local = (pausedAt - trackOffset).coerceIn(0L, (currentTrackFrames() - 1).coerceAtLeast(0))
+                newEpoch(true, local, nowNs + SF.START_DELAY_NS)
             }
             return
         }
@@ -5107,14 +5136,15 @@ class Engine private constructor(private val app: Context) {
             if (progressive?.complete == true && progressiveResumeAfterBuffer) {
                 progressiveStopFrame = -1L
                 setProgressiveBuffering(false)
-                newEpoch(true, tl.positionFrame(nowNs), nowNs + SF.START_DELAY_NS)
+                newEpoch(true, (tl.positionFrame(nowNs) - trackOffset).coerceAtLeast(0L), nowNs + SF.START_DELAY_NS)
                 return
             }
             val stop = progressiveStopFrame
             if (nowNs >= tl.timeOf(stop)) {
                 progressiveStopFrame = -1L
-                progressivePausedFrame = if (progressiveResumeAfterBuffer) stop else -1L
-                newEpoch(false, stop, nowNs)
+                val local = (stop - trackOffset).coerceAtLeast(0L)   // новая эпоха сворачивает цепочку: дальше кадры трека
+                newEpoch(false, local, nowNs)
+                progressivePausedFrame = if (progressiveResumeAfterBuffer) local else -1L
             }
             return
         }
@@ -5131,8 +5161,9 @@ class Engine private constructor(private val app: Context) {
                 progressiveResumeAfterBuffer = true
                 setProgressiveBuffering(true)
                 if (scheduled <= position) {
-                    progressivePausedFrame = position
-                    newEpoch(false, position, nowNs)
+                    val local = (position - trackOffset).coerceAtLeast(0L)
+                    newEpoch(false, local, nowNs)
+                    progressivePausedFrame = local
                 } else {
                     progressiveStopFrame = scheduled
                     serverPlay = ServerPlayState(
@@ -5142,17 +5173,69 @@ class Engine private constructor(private val app: Context) {
                 return
             }
         }
+        if (progressive != null) updateTrackChain(progressive, position)
         if (position < source.totalFrames) return
         // Метаданные иногда занижают длительность. Не переключаем очередь, пока декодер не дошёл до конца файла.
         if (progressive != null && !progressive.endKnown) return
         when (mode) {
             SourceMode.MUSIC -> if (queueIndex + 1 < queue.size) selectTrack(queueIndex + 1)
-                else newEpoch(false, source.totalFrames, System.nanoTime())
+                else newEpoch(false, currentTrackFrames(), System.nanoTime())
             SourceMode.CHANNEL_TEST, SourceMode.CENTER_CHECK -> restoreMusic(savedPlaying)
             else -> {}
         }
     }
 
+
+    /** Какому элементу очереди принадлежит трек цепочки (по объекту источника). */
+    private val chainItemIds = java.util.IdentityHashMap<SegmentedPcmSource, String>()
+
+    /**
+     * Переход без паузы (поток движка, каждые 100 мс во время игры):
+     * — длина текущего трека известна и следующий уже открыт → приклеиваем его к шкале;
+     * — позиция перешла границу → текущим становится следующий трек (только UI и очередь; звук уже идёт);
+     * — очередь изменилась и приклеенный трек больше не следующий → отцепляем его.
+     */
+    private fun updateTrackChain(chain: TrackChain, position: Long) {
+        val playing = chain.entryAt(position)
+        if (playing.track !== currentQueueSource && playing.offset > trackOffset) {
+            val itemId = chainItemIds[playing.track]
+            val index = queue.indexOfFirst { it.id == itemId }
+            currentQueueSource = playing.track
+            trackOffset = playing.offset
+            if (index >= 0) queueIndex = index
+            itemId?.let { decodedTracks.remove(it) }
+            telemetry.record("TRACK_GAPLESS", mapOf("track" to itemId?.let(TelemetryIdentifiers::hash),
+                "offsetFrames" to playing.offset, "queueIndex" to queueIndex))
+            ui { copy(queueIndex = queueIndex, title = playing.track.title, artist = playing.track.artist,
+                durationMs = playing.track.totalFrames * 1000 / SF.SAMPLE_RATE) }
+            publishState()
+            PlaybackService.refresh(app)
+            if (queueIndex >= 0) prefetchAround(queueIndex)
+        }
+        // Сыгранные треки (с запасом на задержку вывода и трим Point) больше не нужны.
+        chain.dropEndedBefore(position - 5L * SF.SAMPLE_RATE).forEach { chainItemIds.remove(it) }
+        val current = currentQueueSource as? SegmentedPcmSource ?: return
+        val currentEntry = chain.entriesSnapshot().firstOrNull { it.track === current } ?: return
+        val following = chain.entriesSnapshot().dropWhile { it !== currentEntry }.drop(1)
+        val nextItem = queue.getOrNull(queueIndex + 1)
+        // Приклеен не тот трек (очередь изменили): отцепляем, пока до него не дошли.
+        if (following.isNotEmpty() && (nextItem == null || chainItemIds[following.first().track] != nextItem.id) &&
+            position < following.first().offset - SF.SAMPLE_RATE) {
+            chain.truncateAfter(currentEntry).forEach { chainItemIds.remove(it) }
+            publishState()
+            retireUnusedStreams()
+            return
+        }
+        if (following.isNotEmpty() || nextItem == null || !current.endKnown) return
+        val next = decodedTracks[nextItem.id]?.takeUnless { it.closed } ?: return
+        if (chain.last.track !== current) return
+        val entry = chain.append(next)
+        next.focus(0L)
+        chainItemIds[next] = nextItem.id
+        telemetry.record("TRACK_CHAIN_APPEND", mapOf("track" to TelemetryIdentifiers.hash(nextItem.id),
+            "offsetFrames" to entry.offset, "leadMs" to (entry.offset - position) * 1000 / SF.SAMPLE_RATE))
+        publishState()   // Point узнаёт новую длину шкалы до границы
+    }
 
     // ================================================================== живые источники: Spotify и YouTube
     @Volatile private var input = InputSource.PLAYER
@@ -5796,7 +5879,7 @@ class Engine private constructor(private val app: Context) {
             ))
             lastSpatialPerfAtMs = nowMs
         }
-        val progressive = if (role == Role.SERVER && mode == SourceMode.MUSIC) source as? SegmentedPcmSource else null
+        val progressive = if (role == Role.SERVER && mode == SourceMode.MUSIC) source as? TrackChain else null
         val readyFrames = progressive?.readyFrames ?: -1L
         val decodeTrack = currentDecodeTrackTag()
         if (decodeTrack != decodeReadyTrackTag || readyFrames != decodeReadyAtLastCheck) {
