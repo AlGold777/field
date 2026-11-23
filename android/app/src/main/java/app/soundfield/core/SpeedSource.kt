@@ -17,7 +17,15 @@ class SpeedSource(
     val speed: Double,
     val startFrame: Long,
     cacheSeconds: Int = DEFAULT_CACHE_SECONDS,
-) : AudioSource, PrefetchableAudioSource, AutoCloseable, TrackMeters {
+) : AudioSource, PrefetchableAudioSource, AutoCloseable, TrackMeters, PositionalTrackMeters {
+    // Нормализация по месту трека (переход без паузы): кадр выхода переводится в кадр входа.
+    override fun truePeakAt(frame: Long): Double = (inner as? PositionalTrackMeters)?.truePeakAt(inputFrameOf(frame)) ?: truePeakDbtp
+    override fun loudnessAt(frame: Long): Double = (inner as? PositionalTrackMeters)?.loudnessAt(inputFrameOf(frame)) ?: loudnessLufs
+    override fun trackKeyAt(frame: Long): Long = (inner as? PositionalTrackMeters)?.trackKeyAt(inputFrameOf(frame)) ?: 0L
+    override fun nextTrackStartAfter(frame: Long): Long {
+        val next = (inner as? PositionalTrackMeters)?.nextTrackStartAfter(inputFrameOf(frame)) ?: Long.MAX_VALUE
+        return if (next == Long.MAX_VALUE) next else outputFrameOf(next)
+    }
     override val truePeakDbtp: Double get() = (inner as? TrackMeters)?.truePeakDbtp ?: Double.NaN
     override val loudnessLufs: Double get() = (inner as? TrackMeters)?.loudnessLufs ?: Double.NaN
     override val mode get() = inner.mode

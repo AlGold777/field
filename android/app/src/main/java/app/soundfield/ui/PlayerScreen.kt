@@ -249,6 +249,16 @@ fun PlayerScreen(ui: UiState, engine: Engine, openCalibration: () -> Unit, openD
             Spacer(Modifier.weight(1f))
             Text(fmtTime(ui.durationMs), color = SFColors.TextDim, fontSize = 12.sp)
         }
+        // Скорость: нажатие переключает по кругу, как в плеерах подкастов и аудиокниг.
+        if (!ui.input.live) Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
+            val speeds = listOf(1f, 1.25f, 1.5f, 1.75f, 2f, 0.75f)
+            val current = speeds.minByOrNull { abs(it - ui.playbackSpeed) } ?: 1f
+            Text(speedLabel(ui.playbackSpeed), color = if (current == 1f) SFColors.TextDim else SFColors.Accent1, fontSize = 13.sp,
+                modifier = Modifier.clip(CircleShape)
+                    .semantics { contentDescription = "Скорость ${speedLabel(ui.playbackSpeed)}"; role = androidx.compose.ui.semantics.Role.Button }
+                    .clickable { engine.setPlaybackSpeed(speeds[(speeds.indexOf(current) + 1) % speeds.size].toDouble()) }
+                    .padding(horizontal = 14.dp, vertical = 6.dp))
+        }
 
         Row(Modifier.fillMaxWidth().padding(vertical = 18.dp), horizontalArrangement = Arrangement.SpaceEvenly,
             verticalAlignment = Alignment.CenterVertically) {
@@ -459,6 +469,9 @@ private fun RoundIcon(icon: String, label: String, small: Boolean = false, onCli
         .clickable(onClickLabel = label, onClick = onClick),
         contentAlignment = Alignment.Center) { Text(icon, color = Color.White, fontSize = if (small) 15.sp else 20.sp) }
 }
+
+private fun speedLabel(speed: Float): String =
+    (if (abs(speed - Math.round(speed)) < 0.01f) "${Math.round(speed)}" else String.format(Locale.US, "%.2f", speed).trimEnd('0')) + "×"
 
 private fun balanceLabel(value: Float): String {
     val p = 2f * value.coerceIn(0f, 1f) - 1f

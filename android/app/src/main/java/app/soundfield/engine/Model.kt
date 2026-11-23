@@ -308,6 +308,8 @@ data class XtcDeveloperReport(
 )
 
 data class UiState(
+    /** Скорость воспроизведения файлов (0,5–2×, тон сохраняется). */
+    val playbackSpeed: Float = 1f,
     val myId: String = "",
     val myName: String = "",
     val phase: Phase = Phase.IDLE,

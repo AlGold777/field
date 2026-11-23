@@ -117,7 +117,7 @@ class PlaybackService : Service() {
             val pos = if (input.hasTrack && !input.live) engine.positionMs() else 0L
             val now = SystemClock.elapsedRealtime()
             val changed = force || input != lastInput
-            if (!changed && !MediaSessionMapping.positionDrifted(input.playing, lastPos, lastPosAt, pos, now)) return
+            if (!changed && !MediaSessionMapping.positionDrifted(input.playing, lastPos, lastPosAt, pos, now, speed = input.speed)) return
             val prev = lastInput
             lastInput = input; lastPos = pos; lastPosAt = now
             if (changed && (prev == null || prev.title != input.title || prev.artist != input.artist || prev.durationMs != input.durationMs || prev.live != input.live)) {

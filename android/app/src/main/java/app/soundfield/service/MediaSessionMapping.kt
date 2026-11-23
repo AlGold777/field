@@ -14,6 +14,8 @@ data class MediaInput(
     val buffering: Boolean,
     val live: Boolean,
     val queueSize: Int,
+    /** Скорость воспроизведения: система экстраполирует позицию с ней. */
+    val speed: Float = 1f,
 )
 
 fun UiState.toMediaInput() = MediaInput(
@@ -25,6 +27,7 @@ fun UiState.toMediaInput() = MediaInput(
     buffering = audioBuffering || loadingTrackId != null || phase == Phase.RECONNECTING,
     live = input.live,
     queueSize = queueTracks.size,
+    speed = if (input.live) 1f else playbackSpeed,
 )
 
 /** Что отдать в PlaybackStateCompat. */
@@ -46,7 +49,7 @@ object MediaSessionMapping {
             else -> PlaybackStateCompat.STATE_PAUSED
         }
         val pos = if (i.live) 0L else positionMs.coerceIn(0L, if (i.durationMs > 0) i.durationMs else Long.MAX_VALUE)
-        val speed = if (state == PlaybackStateCompat.STATE_PLAYING) 1f else 0f
+        val speed = if (state == PlaybackStateCompat.STATE_PLAYING) i.speed else 0f
         return PlaybackSpec(state, actions, pos, speed)
     }
 
@@ -57,8 +60,9 @@ object MediaSessionMapping {
     )
 
     /** Позиция ушла от экстраполяции системы (перемотка, смена трека без смены состояния) — отдать заново. */
-    fun positionDrifted(playing: Boolean, lastPos: Long, lastAtMs: Long, nowPos: Long, nowMs: Long, toleranceMs: Long = 1500L): Boolean {
-        val expected = if (playing) lastPos + (nowMs - lastAtMs) else lastPos
+    fun positionDrifted(playing: Boolean, lastPos: Long, lastAtMs: Long, nowPos: Long, nowMs: Long, toleranceMs: Long = 1500L,
+                        speed: Float = 1f): Boolean {
+        val expected = if (playing) lastPos + ((nowMs - lastAtMs) * speed).toLong() else lastPos
         return kotlin.math.abs(nowPos - expected) > toleranceMs
     }
 }

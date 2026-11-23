@@ -474,6 +474,8 @@ class Engine private constructor(private val app: Context) {
     /** Point: начало и длина текущего трека на шкале Server (переход без паузы), для позиции в UI. */
     @Volatile private var pointTrackOffset = 0L
     @Volatile private var pointTrackFrames = 0L
+    @Volatile private var pointSpeed = 1.0
+    @Volatile private var pointSpeedAnchor = 0L
     private val pointRenderer = PointRenderer(rx, clock, tcpAudioBuffer, { currentAudioPath }) { pointParams }
     @Volatile private var serverUdp: InetSocketAddress? = null
     private var pingSeq = 0
@@ -579,6 +581,8 @@ class Engine private constructor(private val app: Context) {
         watchNetwork()
         log("Запуск: TCP ${tcp.localPort}, UDP ${udp.localPort}")
         // Главная страница — плеер: соло стартует сразу, без пары. Пара — надстройка (см. becomePaired / goIdle).
+        playbackSpeed = prefs.getFloat("playbackSpeed", 1f).toDouble().coerceIn(0.5, 2.0)
+        ui { copy(playbackSpeed = playbackSpeed.toFloat()) }
         post { if (!soloMode && phase == Phase.IDLE) startSoloPlayback() }
         restoreQueue()
         if (autoResume && record != null) post { startAutoResume() }
@@ -1710,6 +1714,25 @@ class Engine private constructor(private val app: Context) {
     fun pause() = cmd("pause")
     fun seekMs(ms: Long) = cmd("seek") { put("ms", ms) }
     fun skipMs(delta: Long) = cmd("skip") { put("ms", delta) }
+    /** Скорость воспроизведения 0,5–2× без изменения тона (лекции, подкасты, аудиокниги). */
+    fun setPlaybackSpeed(speed: Double) = cmd("speed") { put("v", speed) }
+
+    /** Server: новая скорость — новая эпоха с той же позиции трека. */
+    private fun setSpeedNow(requested: Double) {
+        val speed = requested.coerceIn(0.5, 2.0)
+        if (abs(speed - playbackSpeed) < 1e-6) return
+        playbackSpeed = speed
+        prefs.edit().putFloat("playbackSpeed", speed.toFloat()).apply()
+        ui { copy(playbackSpeed = speed.toFloat()) }
+        if (mode == SourceMode.MUSIC && source is TrackChain) {
+            val playing = serverPlay.timeline.running
+            clearProgressiveBufferState()
+            cancelScheduledPause()
+            val now = System.nanoTime()
+            newEpoch(playing, posFrame(), if (playing) now + SF.START_DELAY_NS else now)
+        }
+        publishState()
+    }
     fun swapChannels() = cmd("swap")
     fun setTrimMs(ms: Double) = cmd("trim") { put("ms", ms); put("reset", false) }
     fun resetTrim() = cmd("trim") { put("ms", 0.0); put("reset", true) }
@@ -2669,10 +2692,11 @@ class Engine private constructor(private val app: Context) {
         val now = System.nanoTime()
         val frame: Long; val total: Long
         if (role == Role.SERVER) {
-            frame = (serverPlay.timeline.positionFrame(now) - trackOffset).coerceAtLeast(0L); total = currentTrackFrames()
+            frame = posFrame(); total = currentTrackFrames()
         } else {
             val tl = rx.timeline
-            frame = (if (clock.ready) tl.positionFrame(clock.toServer(now)) else tl.anchorFrame) - pointTrackOffset
+            val o = if (clock.ready) tl.positionFrame(clock.toServer(now)) else tl.anchorFrame
+            frame = pointSpeedAnchor + Math.round((o - pointSpeedAnchor) * pointSpeed) - pointTrackOffset
             total = pointTrackFrames
         }
         return (frame.coerceIn(0L, maxOf(0L, total)) * 1000 / SF.SAMPLE_RATE)
@@ -3940,9 +3964,29 @@ class Engine private constructor(private val app: Context) {
     private fun renderSourceForEpoch(frame: Long): AudioSource {
         val previous = serverPlay.source
         val backwards = frame < serverPlay.timeline.positionFrame(System.nanoTime()) - SF.SAMPLE_RATE
-        val fresh = backwards || frame < previous.firstReadyFrame || frame > previous.readyFrames + SF.SAMPLE_RATE / 2
-        return renderSourceFor(source, frame, fresh)
+        // Скорость ≠ 1: своя ступень растяжения на эпоху; домен шкалы совпадает с треком в кадре [frame].
+        val oldStage = speedStage
+        val stage = if (mode == SourceMode.MUSIC && source is TrackChain && abs(playbackSpeed - 1.0) > 1e-6)
+            SpeedSource(source, playbackSpeed, frame) else null
+        speedStage = stage
+        if (oldStage != null && oldStage !== stage) later(5_000) { oldStage.close() }
+        val fresh = backwards || stage != null || oldStage != null || frame < previous.firstReadyFrame ||
+            frame > previous.readyFrames + SF.SAMPLE_RATE / 2
+        return renderSourceFor(stage ?: source, frame, fresh)
     }
+
+    /** Скорость воспроизведения (0,5–2×) с сохранением высоты тона; 1.0 — без обработки. */
+    @Volatile private var playbackSpeed = 1.0
+    /** Ступень растяжения текущей эпохи: шкала эпохи — её выходные кадры. */
+    @Volatile private var speedStage: SpeedSource? = null
+
+    /** Кадр шкалы эпохи → кадр источника (цепочки треков). */
+    private fun toSourceFrame(timeline: Long): Long = speedStage?.inputFrameOf(timeline) ?: timeline
+    /** Кадр источника → кадр шкалы эпохи. */
+    private fun toTimelineFrame(sourceFrame: Long): Long = speedStage?.outputFrameOf(sourceFrame) ?: sourceFrame
+
+    /** Вход рендера: ступень скорости или сам источник. */
+    private fun renderInput(): AudioSource = speedStage ?: source
 
     @Volatile private var currentPreLimited: PreLimitedSource? = null
 
@@ -3993,7 +4037,7 @@ class Engine private constructor(private val app: Context) {
     private fun currentRenderedSource(): AudioSource {
         val current = serverPlay.source
         if (current is CrossfadeAudioSource || tcpAudioPreload != null) return current
-        return renderSourceFor(source, timelineFrame())
+        return renderSourceFor(renderInput(), timelineFrame())
     }
 
     private fun closeSpatialLater(source: AudioSource) {
@@ -4108,7 +4152,7 @@ class Engine private constructor(private val app: Context) {
             else requested.coerceIn(0L, source.totalFrames)
         spatialSettings = clean
         val renderStart = if (isPlaying) (f - fadeFrames).coerceAtLeast(0L) else 0L
-        val updated = renderSourceFor(source, renderStart)
+        val updated = renderSourceFor(renderInput(), renderStart)
         val appliedSource = if (isPlaying) CrossfadeAudioSource(previousSource, updated, f, fadeFrames) else updated
         serverPlay = ServerPlayState(timeline, appliedSource, renderChannel(), serverGain(), activeEqConfig())
         spatialReprocessFrame = f
@@ -4313,8 +4357,11 @@ class Engine private constructor(private val app: Context) {
             (if (input == InputSource.YOUTUBE) captureMusicActive else liveWantPlay) else tl.running || ui.value.audioBuffering
         val track = if (source is TrackChain) currentQueueSource ?: source else source
         // durFrames — длина шкалы рендера (вся цепочка при переходе без паузы); trackOffset/trackDurFrames — текущий трек для UI.
-        return JSONObject().put("t", "state").put("playing", playingNow).put("durFrames", source.totalFrames)
+        val stage = speedStage
+        return JSONObject().put("t", "state").put("playing", playingNow).put("durFrames", renderInput().totalFrames)
             .put("trackOffset", trackOffset).put("trackDurFrames", currentTrackFrames())
+            .put("speed", stage?.speed ?: 1.0).put("speedAnchor", stage?.startFrame ?: 0L)
+            .put("playbackSpeed", playbackSpeed)
             .put("input", input.wire)
             .put("title", track.title).put("artist", track.artist).put("mode", mode.wire)
             .put("queueIndex", queueIndex).put("queueCount", queue.size).put("trackId", queue.getOrNull(queueIndex)?.id ?: "")
@@ -4385,7 +4432,10 @@ class Engine private constructor(private val app: Context) {
         val playing = o.optBoolean("playing")
         val dur = o.optLong("durFrames")
         val trackDur = o.optLong("trackDurFrames", dur)
-        if (role == Role.POINT) { pointTrackOffset = o.optLong("trackOffset", 0L); pointTrackFrames = trackDur }
+        if (role == Role.POINT) {
+            pointTrackOffset = o.optLong("trackOffset", 0L); pointTrackFrames = trackDur
+            pointSpeed = o.optDouble("speed", 1.0); pointSpeedAnchor = o.optLong("speedAnchor", 0L)
+        }
         val vL = o.optDouble("volL", 1.0).toFloat(); val vR = o.optDouble("volR", 1.0).toFloat()
         val m = o.optDouble("master", 0.8).toFloat()
         val b = o.optDouble("balance", 0.5).toFloat().coerceIn(0f, 1f)
@@ -4415,6 +4465,7 @@ class Engine private constructor(private val app: Context) {
         }
         val progress = if (o.isNull("decodeProgress")) null else o.optDouble("decodeProgress").toFloat().coerceIn(0f, 1f)
         ui { copy(playing = playing, durationMs = trackDur * 1000 / SF.SAMPLE_RATE, title = o.optString("title"),
+            playbackSpeed = o.optDouble("playbackSpeed", 1.0).toFloat(),
             artist = o.optString("artist"), mode = incomingMode, audioBuffering = o.optBoolean("audioBuffering"),
             input = InputSource.fromWire(o.optString("input")),
             queueIndex = o.optInt("queueIndex", -1), undoText = o.optString("undo", ""),
@@ -4439,10 +4490,11 @@ class Engine private constructor(private val app: Context) {
      * Позиция в текущем треке. При переходе без паузы ([TrackChain]) шкала эпохи идёт через несколько треков,
      * текущий начинается на ней с кадра [trackOffset]; новая эпоха сбрасывает цепочку, и кадры снова считаются от начала трека.
      */
-    private fun posFrame(): Long = (timelineFrame() - trackOffset).coerceIn(0L, currentTrackFrames())
+    private fun posFrame(): Long = (toSourceFrame(timelineFrame()) - trackOffset).coerceIn(0L, currentTrackFrames())
 
-    /** Позиция на шкале эпохи (в кадрах источника рендера). */
-    private fun timelineFrame(): Long = serverPlay.timeline.positionFrame(System.nanoTime()).coerceIn(0L, source.totalFrames)
+    /** Позиция на шкале эпохи (кадры рендера; при скорости ≠ 1 — выходные кадры растяжения). */
+    private fun timelineFrame(): Long =
+        serverPlay.timeline.positionFrame(System.nanoTime()).coerceIn(0L, (speedStage ?: source).totalFrames)
 
     /** Длина текущего трека (в цепочке — только его, без следующих). */
     private fun currentTrackFrames(): Long =
@@ -4481,6 +4533,7 @@ class Engine private constructor(private val app: Context) {
             "toggle" -> if ((serverPlay.timeline.running || ui.value.audioBuffering) && mode != SourceMode.CALIBRATION) cmdPause() else cmdPlay()
             // ms ограничиваются до умножения: большие значения из сети не должны переполнить Long
             "seek" -> seekFrame(o.optLong("ms").coerceIn(0L, 86_400_000L) * SF.SAMPLE_RATE / 1000)
+            "speed" -> setSpeedNow(o.optDouble("v", 1.0))
             "skip" -> seekFrame(posFrame() + o.optLong("ms").coerceIn(-3_600_000L, 3_600_000L) * SF.SAMPLE_RATE / 1000)
             "next" -> selectTrack(navigationIndex() + 1, startPlayback = true)
             "previous" -> selectTrack(navigationIndex() - 1, startPlayback = true)
@@ -4632,14 +4685,14 @@ class Engine private constructor(private val app: Context) {
         // Пауза по общей шкале: оба телефона замолкают на одном кадре через PAUSE_LEAD. Раньше Server
         // замолкал сразу, а Point — только когда до него доходила команда (на 10–200 мс позже), со щелчком.
         val at = System.nanoTime() + SF.PAUSE_LEAD_NS
-        val stop = maxOf(tl.anchorFrame, tl.frameAt(at).toLong()).coerceAtMost(source.totalFrames)
+        val stop = maxOf(tl.anchorFrame, tl.frameAt(at).toLong()).coerceAtMost(renderInput().totalFrames)
         serverPlay = ServerPlayState(Timeline(tl.epoch, true, tl.anchorFrame, tl.anchorNs, stop), currentRenderedSource(), renderChannel(), serverGain(), activeEqConfig())
         sendTimeline()
         publishState()
         pauseTask?.cancel(false)
         pauseTask = later(SF.PAUSE_LEAD_NS / 1_000_000 + 60) {
             val cur = serverPlay.timeline
-            if (cur.epoch == tl.epoch && cur.stopFrame == stop) newEpoch(false, (stop - trackOffset).coerceAtLeast(0L), System.nanoTime())
+            if (cur.epoch == tl.epoch && cur.stopFrame == stop) newEpoch(false, (toSourceFrame(stop) - trackOffset).coerceAtLeast(0L), System.nanoTime())
         }
     }
 
@@ -5183,7 +5236,7 @@ class Engine private constructor(private val app: Context) {
         // Окно декодера идёт за шкалой; при буферизации — держим его у места остановки.
         // Во время TCP-предзагрузки шкала ещё от прошлого трека: её позицию к новому источнику не применяем.
         if (pendingTrackId == null && tcpAudioPreload == null)
-            progressive?.focus(if (progressivePausedFrame >= 0) progressivePausedFrame else tl.positionFrame(nowNs).coerceAtLeast(0L))
+            progressive?.focus(if (progressivePausedFrame >= 0) progressivePausedFrame else toSourceFrame(tl.positionFrame(nowNs)).coerceAtLeast(0L))
         /** Конец трека ближе запаса: ждать больше звука, чем осталось, нельзя. */
         fun readyTarget(from: Long, lead: Long): Long =
             if (progressive?.endKnown == true) minOf(from + lead, progressive.totalFrames) else from + lead
@@ -5210,13 +5263,13 @@ class Engine private constructor(private val app: Context) {
             if (progressive?.complete == true && progressiveResumeAfterBuffer) {
                 progressiveStopFrame = -1L
                 setProgressiveBuffering(false)
-                newEpoch(true, (tl.positionFrame(nowNs) - trackOffset).coerceAtLeast(0L), nowNs + SF.START_DELAY_NS)
+                newEpoch(true, (toSourceFrame(tl.positionFrame(nowNs)) - trackOffset).coerceAtLeast(0L), nowNs + SF.START_DELAY_NS)
                 return
             }
             val stop = progressiveStopFrame
             if (nowNs >= tl.timeOf(stop)) {
                 progressiveStopFrame = -1L
-                val local = (stop - trackOffset).coerceAtLeast(0L)   // новая эпоха сворачивает цепочку: дальше кадры трека
+                val local = (toSourceFrame(stop) - trackOffset).coerceAtLeast(0L)   // новая эпоха сворачивает цепочку: дальше кадры трека
                 newEpoch(false, local, nowNs)
                 progressivePausedFrame = if (progressiveResumeAfterBuffer) local else -1L
             }
@@ -5226,15 +5279,16 @@ class Engine private constructor(private val app: Context) {
         // Во время TCP-предзагрузки source уже новый, а шкала ещё старая: сравнивать их нельзя
         // (новый трек пропускался или стартовал с позиции старого).
         if (!tl.playing || pendingTrackId != null || tcpAudioPreload != null) return
-        val position = tl.positionFrame(nowNs)
+        val timelinePosition = tl.positionFrame(nowNs)
+        val position = toSourceFrame(timelinePosition)   // кадр цепочки треков
         if (progressive != null && !progressive.complete) {
             if ((position >= source.totalFrames && !progressive.endKnown) ||
                 (position < source.totalFrames && progressive.readyFrames < readyTarget(position, PROGRESSIVE_LOOKAHEAD_FRAMES))) {
                 val safeReady = (progressive.readyFrames - PROGRESSIVE_FADE_FRAMES).coerceAtLeast(0)
-                val scheduled = minOf(tl.positionFrame(nowNs + SF.PAUSE_LEAD_NS), safeReady)
+                val scheduled = minOf(tl.positionFrame(nowNs + SF.PAUSE_LEAD_NS), toTimelineFrame(safeReady))
                 progressiveResumeAfterBuffer = true
                 setProgressiveBuffering(true)
-                if (scheduled <= position) {
+                if (scheduled <= timelinePosition) {
                     val local = (position - trackOffset).coerceAtLeast(0L)
                     newEpoch(false, local, nowNs)
                     progressivePausedFrame = local
