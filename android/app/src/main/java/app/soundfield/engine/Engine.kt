@@ -467,6 +467,9 @@ class Engine private constructor(private val app: Context) {
     private val clock = ClockSync()
     private val rx = PointReceiver(clock)
     @Volatile private var pointParams = PointParams(0.8f, 0, 0)
+    /** Point: начало и длина текущего трека на шкале Server (переход без паузы), для позиции в UI. */
+    @Volatile private var pointTrackOffset = 0L
+    @Volatile private var pointTrackFrames = 0L
     private val pointRenderer = PointRenderer(rx, clock, tcpAudioBuffer, { currentAudioPath }) { pointParams }
     @Volatile private var serverUdp: InetSocketAddress? = null
     private var pingSeq = 0
@@ -2663,8 +2666,8 @@ class Engine private constructor(private val app: Context) {
             frame = (serverPlay.timeline.positionFrame(now) - trackOffset).coerceAtLeast(0L); total = currentTrackFrames()
         } else {
             val tl = rx.timeline
-            frame = if (clock.ready) tl.positionFrame(clock.toServer(now)) else tl.anchorFrame
-            total = pointParams.totalFrames
+            frame = (if (clock.ready) tl.positionFrame(clock.toServer(now)) else tl.anchorFrame) - pointTrackOffset
+            total = pointTrackFrames
         }
         return (frame.coerceIn(0L, maxOf(0L, total)) * 1000 / SF.SAMPLE_RATE)
     }
@@ -4302,9 +4305,12 @@ class Engine private constructor(private val app: Context) {
         val tl = serverPlay.timeline
         val playingNow = if (mode == SourceMode.MUSIC && source is LiveSource)
             (if (input == InputSource.YOUTUBE) captureMusicActive else liveWantPlay) else tl.running || ui.value.audioBuffering
+        val track = if (source is TrackChain) currentQueueSource ?: source else source
+        // durFrames — длина шкалы рендера (вся цепочка при переходе без паузы); trackOffset/trackDurFrames — текущий трек для UI.
         return JSONObject().put("t", "state").put("playing", playingNow).put("durFrames", source.totalFrames)
+            .put("trackOffset", trackOffset).put("trackDurFrames", currentTrackFrames())
             .put("input", input.wire)
-            .put("title", source.title).put("artist", source.artist).put("mode", mode.wire)
+            .put("title", track.title).put("artist", track.artist).put("mode", mode.wire)
             .put("queueIndex", queueIndex).put("queueCount", queue.size).put("trackId", queue.getOrNull(queueIndex)?.id ?: "")
             .put("volL", volL.toDouble()).put("volR", volR.toDouble()).put("master", master.toDouble())
             .put("balance", balance.toDouble())
@@ -4371,6 +4377,8 @@ class Engine private constructor(private val app: Context) {
         if (role == Role.POINT) observeCommand(o)
         val playing = o.optBoolean("playing")
         val dur = o.optLong("durFrames")
+        val trackDur = o.optLong("trackDurFrames", dur)
+        if (role == Role.POINT) { pointTrackOffset = o.optLong("trackOffset", 0L); pointTrackFrames = trackDur }
         val vL = o.optDouble("volL", 1.0).toFloat(); val vR = o.optDouble("volR", 1.0).toFloat()
         val m = o.optDouble("master", 0.8).toFloat()
         val b = o.optDouble("balance", 0.5).toFloat().coerceIn(0f, 1f)
@@ -4399,7 +4407,7 @@ class Engine private constructor(private val app: Context) {
                 if (incomingMode == SourceMode.MUSIC && eqAvailableInPair()) eqConfig else EqConfig.neutral())
         }
         val progress = if (o.isNull("decodeProgress")) null else o.optDouble("decodeProgress").toFloat().coerceIn(0f, 1f)
-        ui { copy(playing = playing, durationMs = dur * 1000 / SF.SAMPLE_RATE, title = o.optString("title"),
+        ui { copy(playing = playing, durationMs = trackDur * 1000 / SF.SAMPLE_RATE, title = o.optString("title"),
             artist = o.optString("artist"), mode = incomingMode, audioBuffering = o.optBoolean("audioBuffering"),
             input = InputSource.fromWire(o.optString("input")),
             queueIndex = o.optInt("queueIndex", -1), undoText = o.optString("undo", ""),
