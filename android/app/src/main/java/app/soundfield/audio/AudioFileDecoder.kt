@@ -112,25 +112,29 @@ object AudioFileDecoder {
 
     class CancelledException : RuntimeException("Подготовка трека отменена")
 
-    /** MP3 — через собственный индекс кадров (точная перемотка и в VBR), остальное — через MediaExtractor. */
-    private fun openInput(context: Context, uri: Uri): CompressedInput {
+    /**
+     * MP3 — через собственный индекс кадров (точная перемотка и в VBR), остальное — через MediaExtractor.
+     * Индекса ещё нет — открываем MediaExtractor сразу (звук без ожидания), [needsMp3Index] = true.
+     */
+    private fun openInput(context: Context, uri: Uri): Pair<CompressedInput, Boolean> {
         val extractor = ExtractorInput.open(context, uri)
-        if (extractor.mime != MediaFormat.MIMETYPE_AUDIO_MPEG) return extractor
-        val mp3 = try { Mp3Input.open(context, uri, extractor.format) }
-            catch (e: Exception) { Log.w("SoundField", "MP3 index failed, using MediaExtractor", e); null }
-        if (mp3 == null) return extractor
+        if (extractor.mime != MediaFormat.MIMETYPE_AUDIO_MPEG) return extractor to false
+        val mp3 = try { Mp3Input.open(context, uri, extractor.format, buildIfMissing = false) }
+            catch (e: Exception) { Log.w("SoundField", "MP3 index cache unreadable", e); null }
+        if (mp3 == null) return extractor to true
         extractor.close()
-        return mp3
+        return mp3 to false
     }
 
     /** Индекс кадров MP3 строится один раз на файл и хранится в `mp3_index` (≈3 байта на кадр). */
-    private fun mp3Index(context: Context, uri: Uri, src: ChannelByteSource): Mp3FrameIndex? {
+    private fun mp3Index(context: Context, uri: Uri, src: ChannelByteSource, buildIfMissing: Boolean): Mp3FrameIndex? {
         val dir = File(context.filesDir, "mp3_index").apply { mkdirs() }
         val file = TrackIdentity.of(context, uri)?.let { File(dir, "${it.key}.idx") }
         file?.takeIf { it.isFile }?.let { cached ->
             runCatching { cached.inputStream().buffered().use { Mp3FrameIndex.read(it) } }.getOrNull()
                 ?.takeIf { it.sourceSize == src.size }?.let { cached.setLastModified(System.currentTimeMillis()); return it }
         }
+        if (!buildIfMissing) return null
         val index = Mp3FrameIndex.build(src) ?: return null
         if (file != null) runCatching {
             val tmp = File(dir, "${file.name}.tmp")
@@ -174,15 +178,16 @@ object AudioFileDecoder {
             return size
         }
 
-        override fun close() { try { stream.close() } finally { pfd.close() } }
+        private var closed = false
+        override fun close() { if (closed) return; closed = true; try { stream.close() } finally { pfd.close() } }
 
         companion object {
-            fun open(context: Context, uri: Uri, format: MediaFormat): Mp3Input? {
+            fun open(context: Context, uri: Uri, format: MediaFormat, buildIfMissing: Boolean): Mp3Input? {
                 val pfd = context.contentResolver.openFileDescriptor(uri, "r") ?: return null
                 val stream = java.io.FileInputStream(pfd.fileDescriptor)
                 try {
                     val src = ChannelByteSource(stream.channel)
-                    val index = mp3Index(context, uri, src) ?: run { stream.close(); pfd.close(); return null }
+                    val index = mp3Index(context, uri, src, buildIfMissing) ?: run { stream.close(); pfd.close(); return null }
                     return Mp3Input(pfd, stream, index, src, format)
                 } catch (t: Throwable) { stream.close(); pfd.close(); throw t }
             }
@@ -218,7 +223,8 @@ object AudioFileDecoder {
             extractor.advance()
             return size
         }
-        override fun close() = extractor.release()
+        private var closed = false
+        override fun close() { if (!closed) { closed = true; extractor.release() } }
 
         companion object {
             fun open(context: Context, uri: Uri): ExtractorInput {
@@ -250,7 +256,7 @@ object AudioFileDecoder {
      * Сжатый поток → MediaCodec → ресемплер ядра → 48 кГц стерео float, блоками в [emit].
      * Однопоточный: все вызовы — из одного потока. [seek] переходит к времени трека с точностью до кадра PCM.
      */
-    private class PcmPipeline(private val input: CompressedInput, private val emit: (FloatArray, Int) -> Unit) : AutoCloseable {
+    private class PcmPipeline(private var input: CompressedInput, private val emit: (FloatArray, Int) -> Unit) : AutoCloseable {
         private val codec = MediaCodec.createDecoderByType(input.mime)
         private val info = MediaCodec.BufferInfo()
         private var inputEnded = false
@@ -278,7 +284,9 @@ object AudioFileDecoder {
         /** Поток стоял при полном окне: время простоя не считается зависанием кодека. */
         fun resetWatchdog() { lastProgressAt = SystemClock.elapsedRealtime() }
 
-        fun seek(targetUs: Long) {
+        /** [replacement] — другой источник того же потока (индекс MP3 достроился): берём его с этого перехода. */
+        fun seek(targetUs: Long, replacement: CompressedInput? = null) {
+            if (replacement != null) { val old = input; input = replacement; old.close() }
             inCount = 0
             closeConverter()
             if (sawOutput) codec.flush()
@@ -389,7 +397,7 @@ object AudioFileDecoder {
             // SRC закрываем и при отмене или ошибке кодека: иначе нативный хендл утекал.
             closeConverter()
             try { codec.stop() } catch (_: Exception) {}
-            codec.release()
+            try { codec.release() } finally { input.close() }
         }
     }
 
@@ -403,17 +411,26 @@ object AudioFileDecoder {
         private val startFrame: Long,
         onSource: (SegmentedPcmSource) -> Unit,
     ) : AutoCloseable {
-        private val input: CompressedInput = openInput(context, track.uri)
+        private val opened = openInput(context, track.uri)
+        private val input: CompressedInput = opened.first
         val source = SegmentedPcmSource(track.title, track.artist, input.durationUs * SF.SAMPLE_RATE / 1_000_000)
         private val writer = SegmentWriter(source)
         private val pipeline: PcmPipeline
         @Volatile private var stopped = false
+        /** Индекс MP3 достроен в фоне: точный источник для следующего перехода. */
+        private val indexedInput = java.util.concurrent.atomic.AtomicReference<CompressedInput?>()
 
         init {
             try { pipeline = PcmPipeline(input) { block, frames -> writer.write(block, frames) } }
             catch (t: Throwable) { input.close(); writer.close(); throw t }
             onSource(source)
             source.setOnClose { stopped = true }
+            if (opened.second) Thread({
+                // Первый раз файл индексируется в фоне: звук уже идёт через MediaExtractor.
+                val mp3 = try { Mp3Input.open(context, track.uri, input.format, buildIfMissing = true) }
+                    catch (e: Exception) { Log.w("SoundField", "MP3 index failed", e); null }
+                if (mp3 != null) { indexedInput.set(mp3); if (stopped || source.closed) indexedInput.getAndSet(null)?.close() }
+            }, "sf-mp3-index").apply { isDaemon = true; priority = Thread.MIN_PRIORITY; start() }
         }
 
         fun run(ready: CompletableFuture<SegmentedPcmSource>) {
@@ -424,7 +441,7 @@ object AudioFileDecoder {
             var backtracking = false    // ищем настоящий конец файла, вне окна
             fun jumpTo(index: Long) {
                 writer.restartAt(index)
-                pipeline.seek(index * SegmentedPcmSource.SEGMENT_FRAMES * 1_000_000L / SF.SAMPLE_RATE)
+                pipeline.seek(index * SegmentedPcmSource.SEGMENT_FRAMES * 1_000_000L / SF.SAMPLE_RATE, indexedInput.getAndSet(null))
                 passStart = index
                 endHandled = false
             }
@@ -462,7 +479,7 @@ object AudioFileDecoder {
         }
 
         override fun close() {
-            try { pipeline.close() } finally { input.close(); writer.close() }
+            try { pipeline.close() } finally { writer.close(); indexedInput.getAndSet(null)?.close() }
         }
     }
 
