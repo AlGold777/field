@@ -125,6 +125,12 @@ class A1PathTest {
         assertEquals(306L, source.endSegmentExclusive)
         source.focus(304L * seg)
         assertEquals(304L, source.nextWantedSegment())
+        // Всё от позиции до конца файла готово: обёртки дорабатывают хвост (complete), хотя начало вытеснено.
+        for (i in 302L..304L) source.publish(i, segment(), seg)
+        source.publish(305, ByteBuffer.wrap(ByteArray(10 * 6)), 10)
+        assertTrue(source.complete)
+        assertEquals(305L * seg + 10, source.readyFrames)
+        assertNull(source.nextWantedSegment())
     }
 
     @Test fun sampleRateConverterKeepsToneLevelAndLength() {

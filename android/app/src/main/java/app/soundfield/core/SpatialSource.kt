@@ -93,7 +93,7 @@ class SpatialSource(
     private val thread: Thread
 
     init {
-        require(startAtFrame in 0..inner.totalFrames)
+        require(startAtFrame >= 0)   // длина потокового трека может уменьшиться (конец файла раньше оценки)
         require(cacheCapacityFrames >= HOP_SIZE)
         thread = Thread(::processLoop, "sf-spatial").apply {
             priority = minOf(Thread.MAX_PRIORITY, Thread.NORM_PRIORITY + 1)
@@ -104,7 +104,7 @@ class SpatialSource(
 
     /** Ask the processor to make this exclusive frame position available. Safe from consumer threads. */
     override fun requestThrough(frameExclusive: Long) {
-        val target = frameExclusive.coerceIn(startAtFrame, inner.totalFrames)
+        val target = frameExclusive.coerceAtMost(inner.totalFrames).coerceAtLeast(startAtFrame)
         // sample() зовёт это на каждый отвод интерполятора из аудиопотока: вниз по цепочке — только когда голова ушла вперёд.
         var advanced = false
         while (true) {
@@ -212,7 +212,7 @@ class SpatialSource(
     }
 
     private fun scheduleRestart(frame: Long) {
-        val target = frame.coerceIn(startAtFrame, inner.totalFrames)
+        val target = frame.coerceAtMost(inner.totalFrames).coerceAtLeast(startAtFrame)
         restartAtFrame.set(target)
         requestThrough(target + 1)
     }

@@ -275,6 +275,9 @@ object AudioFileDecoder {
             catch (t: Throwable) { codec.release(); throw t }
         }
 
+        /** Поток стоял при полном окне: время простоя не считается зависанием кодека. */
+        fun resetWatchdog() { lastProgressAt = SystemClock.elapsedRealtime() }
+
         fun seek(targetUs: Long) {
             inCount = 0
             closeConverter()
@@ -359,7 +362,8 @@ object AudioFileDecoder {
                     r = ((r + DOWNMIX_SIDE * (c + sr)) * DOWNMIX_NORM).toFloat()
                 } else for (c in 2 until channels) readSample(buffer, encoding)   // прочие раскладки: L и R
                 if (dropBeforeUs >= 0) {
-                    if (bufferUs + fr * 1_000_000L / sampleRate < dropBeforeUs) continue
+                    // Допуск 2 мкс: метки времени округлены до мкс, соседние сэмплы отстоят ≥ 5 мкс даже при 192 кГц.
+                    if (bufferUs + fr * 1_000_000L / sampleRate < dropBeforeUs - DROP_TOLERANCE_US) continue
                     dropBeforeUs = -1L
                 }
                 inBlock[inCount * 2] = l; inBlock[inCount * 2 + 1] = r
@@ -416,6 +420,8 @@ object AudioFileDecoder {
             source.focus(startFrame)
             var passStart = 0L
             var endHandled = false
+            var idled = false
+            var backtracking = false    // ищем настоящий конец файла, вне окна
             fun jumpTo(index: Long) {
                 writer.restartAt(index)
                 pipeline.seek(index * SegmentedPcmSource.SEGMENT_FRAMES * 1_000_000L / SF.SAMPLE_RATE)
@@ -429,20 +435,26 @@ object AudioFileDecoder {
                     val passEnd = writer.positionFrame
                     val reachedEnd = writer.wroteSinceRestart && !writer.collided
                     writer.finish()
+                    backtracking = false
                     if (reachedEnd) source.markEnd(passEnd)
                     else if (!writer.wroteSinceRestart) {
-                        // Переход оказался за концом файла (длительность в метаданных завышена).
-                        val limit = passStart * SegmentedPcmSource.SEGMENT_FRAMES
-                        source.markEnd(source.publishedEndFrame().coerceAtMost(limit).coerceAtLeast(1L))
+                        // Переход оказался за концом файла (длительность в метаданных завышена):
+                        // сегментов отсюда нет, шагаем назад, пока не найдём настоящий конец.
+                        source.limitSegments(passStart)
+                        if (passStart > 0) { jumpTo(passStart - 1); backtracking = true; continue }
+                        source.markEnd(1L)
                     }
                     if (!ready.isDone) ready.complete(source)
                 }
                 val target = source.nextWantedSegment()
+                if (target == null && backtracking) { pipeline.step(); continue }
                 if (target == null) {
                     if (!ready.isDone && pipeline.ended) ready.complete(source)
                     source.awaitDemand(100)
+                    idled = true
                     continue
                 }
+                if (idled) { pipeline.resetWatchdog(); idled = false }
                 if (target != writer.index || writer.collided || pipeline.ended) jumpTo(target)
                 pipeline.step()
             }
@@ -532,6 +544,7 @@ object AudioFileDecoder {
     private const val BLOCK_FRAMES = 4096
     /** После перехода декодер начинает чуть раньше нужного места: первые кадры MP3 после seek неполные. */
     private const val SEEK_PREROLL_US = 300_000L
+    private const val DROP_TOLERANCE_US = 2L
     /** Сколько индексов MP3 хранить (последние открытые). */
     private const val MP3_INDEX_KEEP = 300
 }

@@ -126,8 +126,15 @@ class SegmentedPcmSource(
     @Volatile private var runEnd: Long = 0
     @Volatile private var focusFrame: Long = 0
     override val readyFrames: Long get() = if (complete) totalFrames else runEnd
-    @Volatile override var complete: Boolean = false
-        private set
+    /** Весь трек в памяти (короткий трек): окно больше не вытесняется. */
+    @Volatile private var fullyResident: Boolean = false
+    /**
+     * Больше данных не будет: весь трек в памяти или готово всё от позиции до конца файла.
+     * Обёртки (Spatial, предлимитер) по этому признаку дорабатывают хвост трека.
+     */
+    override val complete: Boolean get() = fullyResident || (endKnown && runEnd >= totalFrames)
+    /** Сегментов с этим номером и дальше в файле нет (переход за конец при завышенной длительности). */
+    @Volatile private var segmentLimit: Long = Long.MAX_VALUE
     /** Декодер остановлен ([close]) или завершился ошибкой ([failure]). */
     @Volatile var closed: Boolean = false
         private set
@@ -142,7 +149,12 @@ class SegmentedPcmSource(
     val playheadSegment: Long get() = focusFrame / SEGMENT_FRAMES
     /** Номер сегмента за последним (исключительно), если длина известна; иначе Long.MAX_VALUE. */
     val endSegmentExclusive: Long get() =
-        if (endKnown) (totalFrames + SEGMENT_FRAMES - 1) / SEGMENT_FRAMES else Long.MAX_VALUE
+        minOf(segmentLimit, if (endKnown) (totalFrames + SEGMENT_FRAMES - 1) / SEGMENT_FRAMES else Long.MAX_VALUE)
+
+    /** Переход к сегменту [index] не дал звука: файл кончается раньше, сегменты от [index] не запрашиваются. */
+    fun limitSegments(index: Long) {
+        segmentLimit = minOf(segmentLimit, index.coerceAtLeast(0))
+    }
     val residentSegments: Int get() = segments.size
 
     /** Сегмент [index] из [frames] кадров ([data] — 24 бит LE интерлив, позиция 0, limit = frames·6). */
@@ -156,7 +168,7 @@ class SegmentedPcmSource(
             // Длительность из метаданных бывает занижена: до конца файла показываем не меньше декодированного.
             if (!endKnown) totalFrames = maxOf(totalFrames, ready)
             checkComplete()
-            if (!complete) evictOutsideWindow()
+            if (!fullyResident) evictOutsideWindow()
             recomputeRun()
         }
     }
@@ -182,7 +194,7 @@ class SegmentedPcmSource(
     /** Совместимость: трек целиком декодирован (тесты, короткие источники). */
     fun finish(actualFrames: Long) {
         markEnd(actualFrames)
-        synchronized(this) { complete = true; runEnd = totalFrames }
+        synchronized(this) { fullyResident = true; runEnd = totalFrames }
     }
 
     /** Воспроизведение сейчас у [frame] (перемотка или ход шкалы): окно и готовый участок считаются от него. */
@@ -207,7 +219,7 @@ class SegmentedPcmSource(
 
     /** Следующий сегмент, который нужен окну, или null — окно заполнено. Для потока декодера. */
     fun nextWantedSegment(): Long? {
-        if (complete) return null
+        if (fullyResident) return null
         val first = playheadSegment
         return firstMissingSegment(first, minOf(first + AHEAD_SEGMENTS, endSegmentExclusive))
     }
@@ -237,9 +249,9 @@ class SegmentedPcmSource(
     private fun segmentFrames(data: ByteBuffer): Long = data.limit() / BYTES_PER_FRAME
 
     private fun checkComplete() {
-        if (complete || !endKnown) return
+        if (fullyResident || !endKnown) return
         val last = endSegmentExclusive
-        if ((0 until last).all { segments.containsKey(it) }) { complete = true; runEnd = totalFrames }
+        if ((0 until last).all { segments.containsKey(it) }) { fullyResident = true; runEnd = totalFrames }
     }
 
     private fun evictOutsideWindow() {
@@ -249,7 +261,7 @@ class SegmentedPcmSource(
     }
 
     private fun recomputeRun() {
-        if (complete) { runEnd = totalFrames; return }
+        if (fullyResident) { runEnd = totalFrames; return }
         var i = focusFrame / SEGMENT_FRAMES
         var data = segments[i] ?: run { runEnd = i * SEGMENT_FRAMES; return }
         while (segmentFrames(data) == SEGMENT_FRAMES.toLong()) {

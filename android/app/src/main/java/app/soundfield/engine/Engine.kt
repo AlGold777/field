@@ -3395,6 +3395,7 @@ class Engine private constructor(private val app: Context) {
         if (r == Role.POINT && input.live) switchInput(InputSource.PLAYER)
         if (soloMode) leaveSoloForPair(r)
         soloMode = false
+        if (r == Role.POINT) closeAllStreams()
         audio.preferPhoneSpeaker = true
         peerPathDiagnoses.getOrPut(pid) { PeerPathDiagnosis() }.onConnected()
         if (manualLanBlockedPeerId == pid) manualLanBlockedPeerId = null
@@ -4660,7 +4661,8 @@ class Engine private constructor(private val app: Context) {
     private fun selectTrack(index: Int, forcePaused: Boolean = false, startPlayback: Boolean = false, startFrame: Long = 0L) {
         if (input.live || calibRunning || (!soloMode && phase !in setOf(Phase.PAIRED, Phase.RECONNECTING)) || index !in queue.indices) return
         val item = queue[index]
-        if (queueIndex == index && pendingTrackId == null && currentQueueSource != null) {
+        if (queueIndex == index && pendingTrackId == null && currentQueueSource != null &&
+            (currentQueueSource as? SegmentedPcmSource)?.closed != true) {
             if (startPlayback) cmdPlay()
             return
         }
@@ -4756,6 +4758,13 @@ class Engine private constructor(private val app: Context) {
     /** Трек, который сейчас предзагружается (поток движка); удаление его из очереди отменяет предзагрузку. */
     private var prefetchTrackId: String? = null
 
+    /** Телефон стал Point: свои декодеры не нужны (звук приходит от Server). Поток движка. */
+    private fun closeAllStreams() {
+        decodedTracks.clear()
+        openStreams.forEach { it.close() }
+        openStreams.clear()
+    }
+
     /** Останавливает декодеры треков, которые не играют и не ждут своей очереди. Поток движка. */
     private fun retireUnusedStreams() {
         val keep = listOfNotNull(currentQueueSource, source) + decodedTracks.values
@@ -4813,14 +4822,18 @@ class Engine private constructor(private val app: Context) {
         }
     }
 
-    /** Декодер играющего трека упал посреди файла: трек заканчивается на последнем готовом месте. */
+    /** Декодер играющего трека упал посреди файла: играем дальше по очереди (или останавливаемся на готовом месте). */
     private fun onStreamFailed(item: QueueItem, failed: SegmentedPcmSource) {
         if (currentQueueSource !== failed) return
         if (!failed.endKnown) failed.markEnd(failed.readyFrames.coerceAtLeast(1L))
-        val lastReady = (failed.readyFrames - 1L).coerceAtLeast(0)
+        toast("Не удалось дочитать «${item.title}»")
+        val wasPlaying = serverPlay.timeline.running || progressivePausedFrame >= 0
         clearProgressiveBufferState()
+        val index = queue.indexOfFirst { it.id == item.id }
+        if (wasPlaying && index >= 0 && index + 1 < queue.size) { selectTrack(index + 1, startPlayback = true); return }
+        val lastReady = (failed.readyFrames - 1L).coerceAtLeast(0)
         newEpoch(false, posFrame().coerceAtMost(lastReady), System.nanoTime())
-        publishState(); toast("Не удалось дочитать «${item.title}»")
+        publishState()
     }
 
     /** Следующий трек открываем заранее: его начало уже декодировано к моменту перехода. */

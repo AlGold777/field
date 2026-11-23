@@ -73,7 +73,7 @@ class PreLimitedSource(
     val isNativeLimiter: Boolean get() = limiter.isNative
 
     init {
-        require(startAtFrame in 0..inner.totalFrames)
+        require(startAtFrame >= 0)   // длина потокового трека может уменьшиться (конец файла раньше оценки)
         thread = Thread(::processLoop, "sf-prelimit").apply {
             priority = minOf(Thread.MAX_PRIORITY, Thread.NORM_PRIORITY + 1)
             isDaemon = true
@@ -86,7 +86,7 @@ class PreLimitedSource(
         LimiterStats(statBlocks.getAndSet(0), statActive.getAndSet(0), statMaxMilliDb.getAndSet(0) / 1_000.0)
 
     override fun requestThrough(frameExclusive: Long) {
-        val target = frameExclusive.coerceIn(startAtFrame, inner.totalFrames)
+        val target = frameExclusive.coerceAtMost(inner.totalFrames).coerceAtLeast(startAtFrame)
         // sample() зовёт это на каждый отвод интерполятора из аудиопотока: вниз по цепочке — только когда голова ушла вперёд.
         var advanced = false
         while (true) {
